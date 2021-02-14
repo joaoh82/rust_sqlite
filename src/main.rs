@@ -18,6 +18,7 @@ fn main() -> rustyline::Result<()> {
     "Enter .help for usage hints.\n",
     "Connected to a transient in-memory database.\n",
     "Use '.open FILENAME' to reopen on a persistent database.");
+    //TODO: Get info about application name and version dinamically.
 
     let matches = App::new("Rust-SQLite")
                           .version("0.0.1")
