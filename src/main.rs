@@ -1,3 +1,4 @@
+extern crate clap;
 mod repl;
 
 use repl::{REPLHelper, get_config};
@@ -5,8 +6,24 @@ use repl::{REPLHelper, get_config};
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
 
+use clap::{App};
+
 fn main() -> rustyline::Result<()> {
     env_logger::init();
+
+    // Friendly intro message for the user
+    println!("{}{}{}{}{}",
+    "Rust-SQLite - 0.0.1 - 2021\n",
+    "Enter .exit to quit.\n",
+    "Enter .help for usage hints.\n",
+    "Connected to a transient in-memory database.\n",
+    "Use '.open FILENAME' to reopen on a persistent database.");
+
+    let matches = App::new("Rust-SQLite")
+                          .version("0.0.1")
+                          .author("João Henrique Machado Silva <joaoh82@gmail.com>")
+                          .about("Light version of SQLite developed with Rust")
+                          .get_matches();
 
     // Starting Rustyline with a default configuration
     let config = get_config();
