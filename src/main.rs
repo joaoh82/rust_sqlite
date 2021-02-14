@@ -42,6 +42,8 @@ fn main() -> rustyline::Result<()> {
                 // println!("Line: {}", line);
                 if line.eq(".exit") {
                     break;
+                }else{
+                    println!("Unrecognized command '{}'", &line);
                 }
             }
             Err(ReadlineError::Interrupted) => {
