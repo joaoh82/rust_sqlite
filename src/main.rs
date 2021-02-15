@@ -6,7 +6,7 @@ use repl::{REPLHelper, get_config};
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
 
-use clap::{App};
+use clap::{App, crate_version};
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
@@ -40,7 +40,7 @@ fn main() -> rustyline::Result<()> {
         if count == 1 {
             // Friendly intro message for the user
             println!("{}{}{}{}{}",
-            "Rust-SQLite - 0.0.1 - 2021\n",
+            format!("Rust-SQLite - {}\n", crate_version!()),
             "Enter .exit to quit.\n",
             "Enter .help for usage hints.\n",
             "Connected to a transient in-memory database.\n",
