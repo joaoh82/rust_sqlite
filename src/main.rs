@@ -11,7 +11,7 @@ use clap::{App, crate_version};
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
-    let matches = App::new("Rust-SQLite")
+    let _matches = App::new("Rust-SQLite")
                           .version("0.0.1")
                           .author("João Henrique Machado Silva <joaoh82@gmail.com>")
                           .about("Light version of SQLite developed with Rust")
