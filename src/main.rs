@@ -63,7 +63,7 @@ fn main() -> rustyline::Result<()> {
                 if command.eq(".exit") {
                     break;
                 }else{
-                    println!("Unrecognized command '{}'", &command);
+                    println!("Error: unknown command or invalid arguments: '{}'. Enter '.help'", &command);
                 }
             }
             Err(ReadlineError::Interrupted) => {
