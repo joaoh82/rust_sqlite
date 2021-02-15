@@ -11,15 +11,6 @@ use clap::{App};
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
-    // Friendly intro message for the user
-    println!("{}{}{}{}{}",
-    "Rust-SQLite - 0.0.1 - 2021\n",
-    "Enter .exit to quit.\n",
-    "Enter .help for usage hints.\n",
-    "Connected to a transient in-memory database.\n",
-    "Use '.open FILENAME' to reopen on a persistent database.");
-    //TODO: Get info about application name and version dinamically.
-
     let matches = App::new("Rust-SQLite")
                           .version("0.0.1")
                           .author("João Henrique Machado Silva <joaoh82@gmail.com>")
@@ -46,6 +37,17 @@ fn main() -> rustyline::Result<()> {
     // commands he has ran.
     let mut count = 1;
     loop {
+        if count == 1 {
+            // Friendly intro message for the user
+            println!("{}{}{}{}{}",
+            "Rust-SQLite - 0.0.1 - 2021\n",
+            "Enter .exit to quit.\n",
+            "Enter .help for usage hints.\n",
+            "Connected to a transient in-memory database.\n",
+            "Use '.open FILENAME' to reopen on a persistent database.");
+            //TODO: Get info about application name and version dinamically.
+        }
+
         let p = format!("rust-sqlite | {}> ", count);
         repl.helper_mut()
             .expect("No helper found")
@@ -55,13 +57,13 @@ fn main() -> rustyline::Result<()> {
 
         let readline = repl.readline(&p);
         match readline {
-            Ok(line) => {
-                repl.add_history_entry(line.as_str());
-                // println!("Line: {}", line);
-                if line.eq(".exit") {
+            Ok(command) => {
+                repl.add_history_entry(command.as_str());
+                // println!("Command: {}", line);
+                if command.eq(".exit") {
                     break;
                 }else{
-                    println!("Unrecognized command '{}'", &line);
+                    println!("Unrecognized command '{}'", &command);
                 }
             }
             Err(ReadlineError::Interrupted) => {
