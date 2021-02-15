@@ -1,21 +1,19 @@
 use std::borrow::Cow::{self, Borrowed, Owned};
 
-use rustyline_derive::{Helper};
+use rustyline_derive::{Helper, Completer};
 use rustyline::error::ReadlineError;
 use rustyline::config::OutputStreamType;
 use rustyline::{CompletionType, Config, Context, EditMode};
 use rustyline::validate::{MatchingBracketValidator, Validator};
 use rustyline::validate::{ValidationContext, ValidationResult};
-use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 
 // REPL Helper Struct with all functionalities
-#[derive(Helper)]
+#[derive(Helper, Completer)]
 pub struct REPLHelper {
     pub validator: MatchingBracketValidator,
     pub colored_prompt: String,
-    pub completer: FilenameCompleter,
     pub hinter: HistoryHinter,
     pub highlighter: MatchingBracketHighlighter,
 }
@@ -24,23 +22,12 @@ impl REPLHelper {
     // Default constructor
     pub fn new() -> Self {
         REPLHelper {
-            completer: FilenameCompleter::new(),
+            // completer: FilenameCompleter::new(),
             highlighter: MatchingBracketHighlighter::new(),
             hinter: HistoryHinter {},
             colored_prompt: "".to_owned(),
             validator: MatchingBracketValidator::new(),
         }
-    }
-}
-
-// Implementing trait called for tab-completion
-impl Completer for REPLHelper {
-    type Candidate = Pair;
-
-    // Takes the currently edited line with the cursor position and 
-    // returns the start position and the completion candidates for the partial word to be completed.
-    fn complete(&self, line: &str, pos: usize, ctx: &Context<'_>,) -> Result<(usize, Vec<Pair>), ReadlineError> {
-        self.completer.complete(line, pos, ctx)
     }
 }
 
