@@ -2,7 +2,7 @@
 use std::fmt;
 
 /// MetaCommand enumeration
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MetaCommand {
     Exit,
     Help,
@@ -21,7 +21,7 @@ impl fmt::Display for MetaCommand {
 }
 
 /// MetaCommandResult enumeration
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MetaCommandResult {
     MetaCommandSuccess(MetaCommand),
     MetaCommandUnrecognizedCommand,
@@ -37,5 +37,26 @@ pub fn check_meta_command(command: &String) -> MetaCommandResult {
         MetaCommandResult::MetaCommandSuccess(MetaCommand::Open)
     } else {
         MetaCommandResult::MetaCommandUnrecognizedCommand 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_meta_command_success_test() {
+        let inputed_command = String::from(".exit");
+
+        let function_result = check_meta_command(&inputed_command);
+        assert_eq!(function_result, MetaCommandResult::MetaCommandSuccess(MetaCommand::Exit));
+    }
+
+    #[test]
+    fn check_meta_command_failed_test() {
+        let inputed_command = String::from(".random_command");
+
+        let function_result = check_meta_command(&inputed_command);
+        assert_eq!(function_result, MetaCommandResult::MetaCommandUnrecognizedCommand);
     }
 }
