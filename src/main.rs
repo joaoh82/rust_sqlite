@@ -2,6 +2,7 @@ extern crate clap;
 mod repl;
 
 use repl::{REPLHelper, get_config};
+use repl::metacommand::*;
 
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
@@ -59,11 +60,26 @@ fn main() -> rustyline::Result<()> {
         match readline {
             Ok(command) => {
                 repl.add_history_entry(command.as_str());
-                // println!("Command: {}", line);
-                if command.eq(".exit") {
-                    break;
+                if command.starts_with(".") {
+                    match check_meta_command(&command) {
+                        MetaCommandResult::MetaCommandSuccess(cmd) => {
+                            match cmd {
+                                MetaCommand::Exit => break,
+                                MetaCommand::Help => {
+                                    println!("{}{}{}{}","Special commands:\n",
+                                            ".help - Display this message\n",
+                                            ".open <FILENAME> - Reopens a persistent database.\n",
+                                            ".exit - Quits this application");
+                                },
+                                MetaCommand::Open => println!("To be implemented")
+                            }
+                        },
+                        MetaCommandResult::MetaCommandUnrecognizedCommand => {
+                            println!("Error: unknown command or invalid arguments: '{}'. Enter '.help'", &command);
+                        },
+                    }
                 }else{
-                    println!("Error: unknown command or invalid arguments: '{}'. Enter '.help'", &command);
+                    println!("SQL Statement: {}", command);
                 }
             }
             Err(ReadlineError::Interrupted) => {

@@ -1,10 +1,13 @@
+pub mod metacommand;
+mod sql_statement;
+
 use std::borrow::Cow::{self, Borrowed, Owned};
 
 use rustyline_derive::{Helper, Completer};
 use rustyline::error::ReadlineError;
 use rustyline::config::OutputStreamType;
 use rustyline::{CompletionType, Config, Context, EditMode};
-use rustyline::validate::{MatchingBracketValidator, Validator};
+use rustyline::validate::{Validator};
 use rustyline::validate::{ValidationContext, ValidationResult};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
@@ -12,7 +15,7 @@ use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 // REPL Helper Struct with all functionalities
 #[derive(Helper, Completer)]
 pub struct REPLHelper {
-    pub validator: MatchingBracketValidator,
+    // pub validator: MatchingBracketValidator,
     pub colored_prompt: String,
     pub hinter: HistoryHinter,
     pub highlighter: MatchingBracketHighlighter,
@@ -22,11 +25,9 @@ impl REPLHelper {
     // Default constructor
     pub fn new() -> Self {
         REPLHelper {
-            // completer: FilenameCompleter::new(),
             highlighter: MatchingBracketHighlighter::new(),
             hinter: HistoryHinter {},
             colored_prompt: "".to_owned(),
-            validator: MatchingBracketValidator::new(),
         }
     }
 }
@@ -53,10 +54,7 @@ impl Validator for REPLHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> Result<ValidationResult, ReadlineError> {
         use ValidationResult::{Incomplete, /*Invalid,*/ Valid};
         let input = ctx.input();
-        // let result = if !input.starts_with("SELECT") {
-        //     Invalid(Some(" --< Expect: SELECT stmt".to_owned()))
-        // } else 
-        let result = if input.eq(".exit") {
+        let result = if input.starts_with(".") {
             Valid(None)
         } else if !input.ends_with(';') {
             Incomplete
@@ -64,11 +62,6 @@ impl Validator for REPLHelper {
             Valid(None)
         };
         Ok(result)
-    }
-
-    // Configure whether validation is performed while typing or only when user presses the Enter key.
-    fn validate_while_typing(&self) -> bool {
-        self.validator.validate_while_typing()
     }
 }
 
