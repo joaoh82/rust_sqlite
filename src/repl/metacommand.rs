@@ -40,6 +40,8 @@ fn check_meta_command(command: &String) -> MetaCommandResult {
     }
 }
 
+/// Function responsible for calling any action regarding a command and also returning an Option<String> to be 
+/// printed out to the user
 pub fn get_meta_command(command: &String) -> Option<String> {
     let meta_command = check_meta_command(&command);
     match meta_command {
@@ -64,6 +66,14 @@ pub fn get_meta_command(command: &String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_meta_command_exit_test() {
+        let inputed_command = String::from(".exit");
+
+        let function_result = get_meta_command(&inputed_command);
+        assert_eq!(function_result, None);
+    }
 
     #[test]
     fn check_meta_command_success_test() {
