@@ -28,7 +28,7 @@ pub enum MetaCommandResult {
 }
 
 /// Checks if meta command exists and returns Enum type or MetaCommandResult::MetaCommandUnrecognizedCommand 
-pub fn check_meta_command(command: &String) -> MetaCommandResult {
+fn check_meta_command(command: &String) -> MetaCommandResult {
     if command.eq(".exit") {
         MetaCommandResult::MetaCommandSuccess(MetaCommand::Exit)
     } else if command.eq(".help") {
@@ -37,6 +37,27 @@ pub fn check_meta_command(command: &String) -> MetaCommandResult {
         MetaCommandResult::MetaCommandSuccess(MetaCommand::Open)
     } else {
         MetaCommandResult::MetaCommandUnrecognizedCommand 
+    }
+}
+
+pub fn get_meta_command(command: &String) -> Option<String> {
+    let meta_command = check_meta_command(&command);
+    match meta_command {
+        MetaCommandResult::MetaCommandSuccess(cmd) => {
+            match cmd {
+                MetaCommand::Exit => None,
+                MetaCommand::Help => {
+                    Some(format!("{}{}{}{}","Special commands:\n",
+                            ".help - Display this message\n",
+                            ".open <FILENAME> - Reopens a persistent database.\n",
+                            ".exit - Quits this application"))
+                },
+                MetaCommand::Open => Some(format!("To be implemented"))
+            }
+        },
+        MetaCommandResult::MetaCommandUnrecognizedCommand => {
+            Some(format!("Error: unknown command or invalid arguments: '{}'. Enter '.help'", &command))
+        },
     }
 }
 

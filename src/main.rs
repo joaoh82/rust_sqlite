@@ -61,22 +61,10 @@ fn main() -> rustyline::Result<()> {
             Ok(command) => {
                 repl.add_history_entry(command.as_str());
                 if command.starts_with(".") {
-                    match check_meta_command(&command) {
-                        MetaCommandResult::MetaCommandSuccess(cmd) => {
-                            match cmd {
-                                MetaCommand::Exit => break,
-                                MetaCommand::Help => {
-                                    println!("{}{}{}{}","Special commands:\n",
-                                            ".help - Display this message\n",
-                                            ".open <FILENAME> - Reopens a persistent database.\n",
-                                            ".exit - Quits this application");
-                                },
-                                MetaCommand::Open => println!("To be implemented")
-                            }
-                        },
-                        MetaCommandResult::MetaCommandUnrecognizedCommand => {
-                            println!("Error: unknown command or invalid arguments: '{}'. Enter '.help'", &command);
-                        },
+                    let action = get_meta_command(&command);
+                    match action {
+                        Some(expr) => println!("{}",expr),
+                        None => break,
                     }
                 }else{
                     println!("SQL Statement: {}", command);
