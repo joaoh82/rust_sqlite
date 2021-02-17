@@ -92,6 +92,14 @@ mod tests {
     }
 
     #[test]
+    fn get_meta_command_unknown_command_test() {
+        let inputed_command = String::from(".random_command");
+
+        let function_result = get_meta_command(&inputed_command);
+        assert_eq!(function_result.is_some(), true);
+    }
+
+    #[test]
     fn check_meta_command_success_test() {
         let inputed_command = String::from(".exit");
 
@@ -105,5 +113,16 @@ mod tests {
 
         let function_result = check_meta_command(&inputed_command);
         assert_eq!(function_result, MetaCommandResult::MetaCommandUnrecognizedCommand);
+    }
+
+    #[test]
+    fn meta_command_display_trait_test() {
+        let exit = MetaCommand::Exit;
+        let help = MetaCommand::Help;
+        let open = MetaCommand::Open;
+
+        assert_eq!(format!("{}", exit), ".exit");
+        assert_eq!(format!("{}", help), ".help");
+        assert_eq!(format!("{}", open), ".open");
     }
 }
