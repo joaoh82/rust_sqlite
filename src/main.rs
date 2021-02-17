@@ -22,7 +22,7 @@ fn main() -> rustyline::Result<()> {
     let config = get_config();
 
     // Getting a new Rustyline Helper
-    let helper = REPLHelper::new();
+    let helper = REPLHelper::default();
     
     // Initiatlizing Rustyline Editor with set config and setting helper
     let mut repl = Editor::with_config(config);

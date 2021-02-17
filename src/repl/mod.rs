@@ -1,7 +1,7 @@
 pub mod metacommand;
 mod sql_statement;
 
-use std::borrow::Cow::{self, Borrowed, Owned};
+use std::{borrow::Cow::{self, Borrowed, Owned}, io::SeekFrom};
 
 use rustyline_derive::{Helper, Completer};
 use rustyline::error::ReadlineError;
@@ -21,13 +21,13 @@ pub struct REPLHelper {
     pub highlighter: MatchingBracketHighlighter,
 }
 
-impl REPLHelper {
-    // Default constructor
-    pub fn new() -> Self {
-        REPLHelper {
+// Implementing the Default trait to give our struct a default value
+impl Default for REPLHelper {
+    fn default() -> Self {
+        Self {
             highlighter: MatchingBracketHighlighter::new(),
             hinter: HistoryHinter {},
-            colored_prompt: "".to_owned(),
+            colored_prompt: "".to_owned()
         }
     }
 }
