@@ -15,6 +15,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - name: Install Tarpaulin
+      uses: actions-rs/install@v0.1
+      with:
+        crate: cargo-tarpaulin
+        version: 0.14.2
+        use-tool-cache: true
+
     - uses: actions/checkout@v2
 
     - name: Build
@@ -23,6 +30,9 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
     
+    - name: Coverage
+      run: cargo tarpaulin -o Lcov --output-dir ./coverage
+
     - name: Coveralls
       uses: coverallsapp/github-action@master
       with:
