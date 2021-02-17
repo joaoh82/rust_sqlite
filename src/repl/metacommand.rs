@@ -76,6 +76,22 @@ mod tests {
     }
 
     #[test]
+    fn get_meta_command_help_test() {
+        let inputed_command = String::from(".help");
+
+        let function_result = get_meta_command(&inputed_command);
+        assert_eq!(function_result.is_some(), true);
+    }
+
+    #[test]
+    fn get_meta_command_open_test() {
+        let inputed_command = String::from(".open");
+
+        let function_result = get_meta_command(&inputed_command);
+        assert_eq!(function_result.is_some(), true);
+    }
+
+    #[test]
     fn check_meta_command_success_test() {
         let inputed_command = String::from(".exit");
 
