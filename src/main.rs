@@ -63,7 +63,7 @@ fn main() -> rustyline::Result<()> {
                 if command.starts_with(".") {
                     let action = get_meta_command(&command);
                     match action {
-                        Some(expr) => println!("{}",expr),
+                        Some(response) => println!("{}",response),
                         None => break,
                     }
                 }else{
