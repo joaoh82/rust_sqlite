@@ -10,7 +10,7 @@ Rust SQLite
 Read the series of posts about it:
 [What would SQLite look like if written in Rust?](https://medium.com/the-polyglot-programmer/what-would-sqlite-would-look-like-if-written-in-rust-part-0-4fc192368984)
 
-![The SQLite Architecture](https://res.cloudinary.com/practicaldev/image/fetch/s--K0dtFQsY--/c_limit%2Cf_auto%2Cfl_progressive%2Cq_auto%2Cw_880/https://dev-to-uploads.s3.amazonaws.com/uploads/articles/0vd8g41vtmdpjewr7b9v.png "The SQLite Architecture")
+![The SQLite Architecture](architecture.png "The SQLite Architecture")
 
 
 ### Requirements
