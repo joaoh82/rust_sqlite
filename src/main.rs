@@ -38,23 +38,20 @@ fn main() -> rustyline::Result<()> {
         println!("No previous history.");
     }
 
+    // Friendly intro message for the user
+    println!("Rust-SQLite - {}\n{}{}{}{}",
+    crate_version!(),
+    "Enter .exit to quit.\n",
+    "Enter .help for usage hints.\n",
+    "Connected to a transient in-memory database.\n",
+    "Use '.open FILENAME' to reopen on a persistent database.");
+
     let dialect = SQLiteDialect{};
 
     // Counter is set to improve user experience and show user how many 
     // commands he has ran.
     let mut count = 1;
     loop {
-        if count == 1 {
-            // Friendly intro message for the user
-            println!("{}{}{}{}{}",
-            format!("Rust-SQLite - {}\n", crate_version!()),
-            "Enter .exit to quit.\n",
-            "Enter .help for usage hints.\n",
-            "Connected to a transient in-memory database.\n",
-            "Use '.open FILENAME' to reopen on a persistent database.");
-            //TODO: Get info about application name and version dinamically.
-        }
-
         let p = format!("rust-sqlite | {}> ", count);
         repl.helper_mut()
             .expect("No helper found")
