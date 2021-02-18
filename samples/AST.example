@@ -1,0 +1,45 @@
+Example: SELECT * from users;
+AST: [
+    Query(
+        Query { 
+            with: None, 
+            body: Select(
+                Select { 
+                    distinct: false, 
+                    top: None, 
+                    projection: [Wildcard], 
+                    from: [
+                        TableWithJoins { 
+                            relation: Table { 
+                                name: ObjectName(
+                                    [
+                                        Ident { 
+                                            value: "users", 
+                                            quote_style: None 
+                                        }
+                                    ]
+                                ), 
+                                alias: None, 
+                                args: [], 
+                                with_hints: [] 
+                            }, 
+                            joins: [] 
+                        }
+                    ], 
+                    lateral_views: [], 
+                    selection: None, 
+                    group_by: [], 
+                    cluster_by: [], 
+                    distribute_by: [], 
+                    sort_by: [], 
+                    having: 
+                    None 
+                }
+            ), 
+            order_by: [], 
+            limit: None, 
+            offset: None, 
+            fetch: None 
+        }
+    )
+]

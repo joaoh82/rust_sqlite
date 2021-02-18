@@ -1,7 +1,7 @@
 pub mod metacommand;
 mod sql_statement;
 
-use std::{borrow::Cow::{self, Borrowed, Owned}, io::SeekFrom};
+use std::{borrow::Cow::{self, Borrowed, Owned}};
 
 use rustyline_derive::{Helper, Completer};
 use rustyline::error::ReadlineError;

@@ -7,15 +7,18 @@ use repl::metacommand::*;
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
 
-use clap::{App, crate_version};
+use clap::{App, crate_authors, crate_description, crate_version};
+
+use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
     let _matches = App::new("Rust-SQLite")
-                          .version("0.0.1")
-                          .author("João Henrique Machado Silva <joaoh82@gmail.com>")
-                          .about("Light version of SQLite developed with Rust")
+                          .version(crate_version!())
+                          .author(crate_authors!())
+                          .about(crate_description!())
                           .get_matches();
 
     // Starting Rustyline with a default configuration
@@ -34,6 +37,9 @@ fn main() -> rustyline::Result<()> {
     if repl.load_history("history").is_err() {
         println!("No previous history.");
     }
+
+    let dialect = SQLiteDialect{};
+
     // Counter is set to improve user experience and show user how many 
     // commands he has ran.
     let mut count = 1;
@@ -67,7 +73,8 @@ fn main() -> rustyline::Result<()> {
                         None => break,
                     }
                 }else{
-                    println!("SQL Statement: {}", command);
+                    let ast = Parser::parse_sql(&dialect, &command).unwrap();
+                    println!("AST: {:?}", ast);
                 }
             }
             Err(ReadlineError::Interrupted) => {
