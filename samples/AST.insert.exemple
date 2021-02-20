@@ -1,0 +1,44 @@
+Example: INSERT INTO users (name) VALUES ("josh");
+AST: [
+    Insert { 
+        or: None, 
+        table_name: ObjectName(
+            [Ident { 
+                value: "users", 
+                quote_style: None 
+            }
+            ]
+        ), 
+        columns: [
+            Ident { 
+                value: "name", 
+                quote_style: None 
+            }
+        ], 
+        overwrite: false, 
+        source: Query { 
+            with: None, 
+            body: Values(
+                Values(
+                    [
+                        [
+                            Identifier(
+                                Ident {
+                                    value: "josh",
+                                    quote_style: Some('\"') 
+                                }
+                            )
+                        ]
+                    ]
+                )
+            ), 
+            order_by: [], 
+            limit: None, 
+            offset: None, 
+            fetch: None 
+        }, 
+        partitioned: None, 
+        after_columns: [], 
+        table: false 
+    }
+]

@@ -1,0 +1,29 @@
+Exemple: DELETE FROM users WHERE id=1;
+AST: [
+    Delete { 
+        table_name: ObjectName(
+            [Ident { 
+                value: "users", 
+                quote_style: None 
+            }
+            ]
+        ), 
+        selection: Some(
+            BinaryOp { 
+                left: Identifier(
+                    Ident { 
+                        value: "id", 
+                        quote_style: None 
+                    }
+                ), 
+                op: Eq, 
+                right: Value(
+                    Number(
+                        "1", 
+                        false
+                    )
+                ) 
+            }
+        ) 
+    }
+]

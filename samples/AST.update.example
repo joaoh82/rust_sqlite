@@ -1,0 +1,43 @@
+Example: UPDATE users SET name="josh" where id=1;
+AST: [
+    Update { 
+        table_name: ObjectName(
+            [Ident { 
+                value: "users", 
+                quote_style: None 
+            }
+            ]
+        ), 
+        assignments: [
+            Assignment { 
+                id: Ident { 
+                    value: "name", 
+                    quote_style: None 
+                }, 
+                value: Identifier(
+                    Ident { 
+                        value: "josh", 
+                        quote_style: Some('\"') 
+                    }
+                ) 
+            }
+        ], 
+        selection: Some(
+            BinaryOp { 
+                left: Identifier(
+                    Ident { 
+                        value: "id", 
+                        quote_style: None 
+                    }
+                ), 
+                op: Eq, 
+                right: Value(
+                    Number(
+                        "1", 
+                        false
+                    )
+                ) 
+            }
+        ) 
+    }
+]
