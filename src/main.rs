@@ -1,16 +1,17 @@
 extern crate clap;
+
 mod repl;
+mod sql;
+mod error;
 
 use repl::{REPLHelper, get_config};
-use repl::metacommand::*;
+use repl::meta_command::*;
+use sql::*;
 
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
 
 use clap::{App, crate_authors, crate_description, crate_version};
-
-use sqlparser::dialect::SQLiteDialect;
-use sqlparser::parser::Parser;
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
@@ -46,8 +47,6 @@ fn main() -> rustyline::Result<()> {
     "Connected to a transient in-memory database.\n",
     "Use '.open FILENAME' to reopen on a persistent database.");
 
-    let dialect = SQLiteDialect{};
-
     // Counter is set to improve user experience and show user how many 
     // commands he has ran.
     let mut count = 1;
@@ -70,8 +69,10 @@ fn main() -> rustyline::Result<()> {
                         None => break,
                     }
                 }else{
-                    let ast = Parser::parse_sql(&dialect, &command).unwrap();
-                    println!("AST: {:?}", ast);
+                    let _ = match prepare_statement(&command) {
+                        Ok(response) => println!("{}",response),
+                        Err(err) => println!("An error occured: {}", err),
+                    };
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -81,7 +82,7 @@ fn main() -> rustyline::Result<()> {
                 break;
             }
             Err(err) => {
-                println!("Error: {:?}", err);
+                println!("An error occured: {:?}", err);
                 break;
             }
         }

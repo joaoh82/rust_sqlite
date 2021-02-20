@@ -1,5 +1,4 @@
-pub mod metacommand;
-mod sql_statement;
+pub mod meta_command;
 
 use std::{borrow::Cow::{self, Borrowed, Owned}};
 

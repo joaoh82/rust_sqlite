@@ -49,9 +49,10 @@ pub fn get_meta_command(command: &String) -> Option<String> {
             match cmd {
                 MetaCommand::Exit => None,
                 MetaCommand::Help => {
-                    Some(format!("{}{}{}{}","Special commands:\n",
+                    Some(format!("{}{}{}{}{}","Special commands:\n",
                             ".help - Display this message\n",
                             ".open <FILENAME> - Reopens a persistent database.\n",
+                            ".ast <QUERY> - Show the abstract syntax tree for QUERY.\n",
                             ".exit - Quits this application"))
                 },
                 MetaCommand::Open => Some(format!("To be implemented"))
