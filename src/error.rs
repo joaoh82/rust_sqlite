@@ -17,6 +17,7 @@ pub enum SQLRiteError {
     General(String),
     Internal(String),
     SqlError(ParserError),
+    UnknownCommand(String),
     // IoError(io::Error),
 }
 
@@ -57,6 +58,7 @@ impl Display for SQLRiteError {
             SQLRiteError::SqlError(ref desc) => write!(f, "SQL error: {:?}", desc),
             // SQLRiteError::IoError(ref desc) => write!(f, "IO error: {}", desc),
             SQLRiteError::Internal(desc) => write!(f, "Internal SQLRite error: {}", desc),
+            SQLRiteError::UnknownCommand(desc) => write!(f, "Unknown command error: {}", desc),
         }
     }
 }

@@ -1,4 +1,5 @@
-pub mod meta_command;
+use crate::meta_command::*;
+use crate::sql::*;
 
 use std::{borrow::Cow::{self, Borrowed, Owned}};
 
@@ -10,6 +11,21 @@ use rustyline::validate::{Validator};
 use rustyline::validate::{ValidationContext, ValidationResult};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
+
+/// We have two different types of commands MetaCommand and SQLCommand
+#[derive(Debug, PartialEq)]
+pub enum CommandType {
+    MetaCommand(MetaCommand),
+    SQLCommand(SQLCommand),
+}
+
+/// Returns the type of command inputed in the REPL
+pub fn get_command_type(command: &String) -> CommandType {
+    match command.starts_with(".") {
+        true => CommandType::MetaCommand(MetaCommand::new(command.to_owned())),
+        false => CommandType::SQLCommand(SQLCommand::new(command.to_owned())),
+    }
+}
 
 // REPL Helper Struct with all functionalities
 #[derive(Helper, Completer)]
@@ -100,4 +116,28 @@ pub fn get_config() -> Config {
         .edit_mode(EditMode::Emacs)
         .output_stream(OutputStreamType::Stdout)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_command_type_meta_command_test() {
+        let input = String::from(".help");
+        let expected = CommandType::MetaCommand(MetaCommand::Help);
+
+        let result = get_command_type(&input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn get_command_type_sql_command_test() {
+        let input = String::from("SELECT * from users;");
+        let expected = CommandType::SQLCommand(SQLCommand::Unknown(input.clone()));
+
+        let result = get_command_type(&input);
+        assert_eq!(result, expected);
+
+    }
 }

@@ -1,12 +1,13 @@
 extern crate clap;
 
+mod meta_command;
 mod repl;
 mod sql;
 mod error;
 
-use repl::{REPLHelper, get_config};
-use repl::meta_command::*;
-use sql::*;
+use repl::{REPLHelper, get_config, get_command_type, CommandType};
+use meta_command::{handle_meta_command};
+use sql::{process_command};
 
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
@@ -47,11 +48,8 @@ fn main() -> rustyline::Result<()> {
     "Connected to a transient in-memory database.\n",
     "Use '.open FILENAME' to reopen on a persistent database.");
 
-    // Counter is set to improve user experience and show user how many 
-    // commands he has ran.
-    let mut count = 1;
     loop {
-        let p = format!("rust-sqlite | {}> ", count);
+        let p = format!("sqlrite> ");
         repl.helper_mut()
             .expect("No helper found")
             .colored_prompt = format!("\x1b[1;32m{}\x1b[0m", p);
@@ -62,17 +60,19 @@ fn main() -> rustyline::Result<()> {
         match readline {
             Ok(command) => {
                 repl.add_history_entry(command.as_str());
-                if command.starts_with(".") {
-                    let action = get_meta_command(&command);
-                    match action {
-                        Some(response) => println!("{}",response),
-                        None => break,
+                match get_command_type(&command.trim().to_owned()) {
+                    CommandType::SQLCommand(_cmd) => {
+                        let _ = match process_command(&command) {
+                            Ok(response) => println!("{}",response),
+                            Err(err) => println!("An error occured: {}", err),
+                        };
                     }
-                }else{
-                    let _ = match prepare_statement(&command) {
-                        Ok(response) => println!("{}",response),
-                        Err(err) => println!("An error occured: {}", err),
-                    };
+                    CommandType::MetaCommand(cmd) => {
+                        let _ = match handle_meta_command(cmd) {
+                            Ok(response) => println!("{}",response),
+                            Err(err) => println!("An error occured: {}", err),
+                        };
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -86,7 +86,6 @@ fn main() -> rustyline::Result<()> {
                 break;
             }
         }
-        count += 1;
     }
     repl.append_history("history").unwrap();
 
