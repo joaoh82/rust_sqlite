@@ -67,13 +67,52 @@ impl Error for SQLRiteError {}
 mod tests {
     use super::*;
 
-
     #[test]
     fn sqlrite_error_test() {
         let input = String::from("test error"); 
         let expected = SQLRiteError::General("test error".to_string());
 
         let result = sqlrite_error(&input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sqlrite_display_not_implemented_test() {
+        let error_string = String::from("Feature not implemented."); 
+        let input = SQLRiteError::NotImplemented(error_string.clone());
+        
+        let expected = format!("Not implemented: {}", error_string);
+        let result = format!("{}", input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sqlrite_display_general_test() {
+        let error_string = String::from("General error."); 
+        let input = SQLRiteError::General(error_string.clone());
+        
+        let expected = format!("General error: {}", error_string);
+        let result = format!("{}", input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sqlrite_display_internal_test() {
+        let error_string = String::from("Internet error."); 
+        let input = SQLRiteError::Internal(error_string.clone());
+        
+        let expected = format!("Internal SQLRite error: {}", error_string);
+        let result = format!("{}", input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sqlrite_display_sqlrite_test() {
+        let error_string = String::from("SQL error."); 
+        let input = SQLRiteError::SqlError(ParserError::ParserError(error_string.clone()));
+        
+        let expected = format!("SQL error: ParserError(\"{}\")", error_string);
+        let result = format!("{}", input);
         assert_eq!(result, expected);
     }
 }
