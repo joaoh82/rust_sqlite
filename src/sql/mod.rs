@@ -53,10 +53,16 @@ pub fn process_command(query: &str) -> Result<String> {
         Statement::CreateTable{..} => {
             let result = CreateQuery::new(&query);
             match result {
-                Ok(payload) => println!("Table name: {}", payload.table_name),
+                Ok(payload) => {
+                    println!("Table name: {}", payload.table_name);
+                    for col in payload.columns {
+                        println!("Column Name: {}, Column Type: {}", col.name, col.datatype);
+                    }
+                },
                 Err(err) => return Err(err),
             }
             message = String::from("CREATE TABLE Statement executed.");
+            // TODO: Push table to DB
         },
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
         Statement::Insert {..} => message = String::from("INSERT Statement executed."),

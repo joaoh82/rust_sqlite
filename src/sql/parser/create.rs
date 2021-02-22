@@ -61,15 +61,15 @@ impl CreateQuery {
                         };
                     }
 
-                    // parsed_columns.push(ParsedColumn {
-                    //     name,
-                    //     datatype: datatype.to_string(),
-                    //     is_pk,
-                    //     is_nullable: false,
-                    // });
+                    parsed_columns.push(ParsedColumn {
+                        name,
+                        datatype: datatype.to_string(),
+                        is_pk,
+                        is_nullable: false,
+                    });
                 }
                 // TODO: Handle constraints,
-                // Unique, Primary Key, Nullable, Default value etc.
+                // Unique, Primary Key, Nullable, Default value and others.
                 for constraint in _constraints {
                     println!("{:?}", constraint);
                 }
