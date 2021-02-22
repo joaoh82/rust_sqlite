@@ -1,4 +1,4 @@
-Rust SQLite (SQLRite)
+Rust-SQLite (SQLRite)
 ===
 [![Build Status](https://github.com/joaoh82/rust_sqlite/workflows/Rust/badge.svg)](https://github.com/joaoh82/rust_sqlite/actions)
 [![dependency status](https://deps.rs/repo/github/joaoh82/rust_sqlite/status.svg)](https://deps.rs/repo/github/joaoh82/rust_sqlite)
@@ -6,7 +6,10 @@ Rust SQLite (SQLRite)
 [![Maintenance](https://img.shields.io/badge/maintenance-actively%20maintained-brightgreen.svg)](https://deps.rs/repo/github/joaoh82/rust_sqlite)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-Project name is a `Rust-SQLite`, someone suggested `SQLRite` because is being developed in `Rust` and I like it, anyway the goal is write a database modeled off `SQLite`, in `Rust`.
+`Rust-SQLite`, aka `SQLRite` , is a simple embedded database modeled off `SQLite`, but developed with `Rust`. The goal is get a better understanding of database internals by building one.
+
+> What I cannot create, I do not understand. 
+> — Richard Feynman
 
 ### Read the series of posts about it:
 ##### What would SQLite look like if written in Rust?
@@ -35,6 +38,44 @@ FLAGS:
     -h, --help       Prints help information
     -V, --version    Prints version information
 ```
+
+### Project Progress
+*Not checked means I am currently working on.*
+- [x] CLI and REPL Interface
+- [x] Parse meta commands and sql commands.
+- [x] Execute simple commands
+- [x] Standarized error handling
+- [x] Generic validation structure for SQL Commands.
+- [ ] `Create Table` Command
+- [ ] Improve error handling with https://github.com/dtolnay/thiserror
+
+### Roadmap
+Features that are in the roadmap of the project:
+*Ideally in order or priority, but nothing set in stone.*
+
+- [ ] Serialization | Deserialization to and from binary encodings.
+- [ ] Simple INSERT queries.
+- [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
+- [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
+- [ ] Storage engine.
+  - Maybe use https://github.com/spacejam/sled
+- [ ] Implement Open command to load database with a command `.open`
+- [ ] UNIQUE key constraints.
+- [ ] Joins
+  - [ ] INNER JOIN (or sometimes called simple join)
+  - [ ] LEFT OUTER JOIN (or sometimes called LEFT JOIN)
+  - [ ] CROSS JOIN
+  - The RIGHT OUTER JOIN and FULL OUTER JOIN are not supported in SQLite.
+- [ ] `Pager Module` 
+  - [ ] Implementing transactional ACID properties
+  - [ ] Concurrency
+  - [ ] Lock Manager
+- [ ] Indexing - cost and performance gain analysis
+- [ ] Benchmarking vs SQLite for comparison
+- [ ] Server Client / Connection Manager
+- [ ] Different implementations of storage engines and data structures to optimize for different scenarios
+  - [ ] Write Heavy - `LSM Tree && SSTable`
+  - [ ] Read Heavy - `B-Tree`
 
 ### Contributing
 **Pull requests are warmly welcome!!!**
