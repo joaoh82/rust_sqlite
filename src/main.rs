@@ -60,14 +60,19 @@ fn main() -> rustyline::Result<()> {
         match readline {
             Ok(command) => {
                 repl.add_history_entry(command.as_str());
+                // Parsing user's input and returning and enum of repl::CommandType
                 match get_command_type(&command.trim().to_owned()) {
                     CommandType::SQLCommand(_cmd) => {
+                        // process_command takes care of tokenizing, parsing and executing
+                        // the SQL Statement and returning a Result<String, SQLRiteError>
                         let _ = match process_command(&command) {
                             Ok(response) => println!("{}",response),
                             Err(err) => println!("An error occured: {}", err),
                         };
                     }
                     CommandType::MetaCommand(cmd) => {
+                        // handle_meta_command parses and executes the MetaCommand
+                        // and returns a Result<String, SQLRiteError>
                         let _ = match handle_meta_command(cmd) {
                             Ok(response) => println!("{}",response),
                             Err(err) => println!("An error occured: {}", err),

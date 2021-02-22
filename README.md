@@ -47,7 +47,7 @@ FLAGS:
 - [x] Standarized error handling
 - [x] Generic validation structure for SQL Commands.
 - [ ] `Create Table` Command
-- [ ] Improve error handling with https://github.com/dtolnay/thiserror
+- [x] Improve error handling with https://github.com/dtolnay/thiserror
 
 ### Roadmap
 Features that are in the roadmap of the project:

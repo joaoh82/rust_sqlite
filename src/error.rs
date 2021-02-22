@@ -1,75 +1,29 @@
 use thiserror::Error;
 
-use std::{
-    error::Error, 
-    fmt::{Display, Formatter},
-    result,
-};
+use std::{result};
 
 use sqlparser::parser::ParserError;
 
 pub type Result<T> = result::Result<T, SQLRiteError>;
 
-#[derive(Error, Debug)]
-pub enum TempError {
-    #[error("Unknown command error: {0}")]
-    UnknownCommand(String)
-}
-
-/// SQLRite error
-#[derive(Debug, PartialEq)]
+#[derive(Error, Debug, PartialEq)]
 pub enum SQLRiteError {
+    #[error("Not Implemented error: {0}")]
     NotImplemented(String),
+    #[error("General error: {0}")]
     General(String),
+    #[error("Internal error: {0}")]
     Internal(String),
-    SqlError(ParserError),
+    #[error("Unknown command error: {0}")]
     UnknownCommand(String),
-    // IoError(io::Error),
-}
-
-impl<T> Into<Result<T>> for SQLRiteError {
-    fn into(self) -> Result<T> {
-        Err(self)
-    }
+    #[error("SQL error: {0:?}")] 
+    SqlError(#[from] ParserError),
 }
 
 /// Return SQLRite errors from String
 pub fn sqlrite_error(message: &str) -> SQLRiteError {
     SQLRiteError::General(message.to_owned())
 }
-
-impl From<String> for SQLRiteError {
-    fn from(e: String) -> Self {
-        SQLRiteError::General(e)
-    }
-}
-
-impl From<ParserError> for SQLRiteError {
-    fn from(e: ParserError) -> Self {
-        SQLRiteError::SqlError(e)
-    }
-}
-
-// impl From<io::Error> for SQLRiteError {
-//     fn from(e: io::Error) -> Self {
-//         SQLRiteError::IoError(e)
-//     }
-// }
-
-impl Display for SQLRiteError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SQLRiteError::NotImplemented(ref desc) => write!(f, "Not implemented: {}", desc),
-            SQLRiteError::General(ref desc) => write!(f, "General error: {}", desc),
-            SQLRiteError::SqlError(ref desc) => write!(f, "SQL error: {:?}", desc),
-            // SQLRiteError::IoError(ref desc) => write!(f, "IO error: {}", desc),
-            SQLRiteError::Internal(desc) => write!(f, "Internal SQLRite error: {}", desc),
-            SQLRiteError::UnknownCommand(desc) => write!(f, "Unknown command error: {}", desc),
-        }
-    }
-}
-
-impl Error for SQLRiteError {}
 
 #[cfg(test)]
 mod tests {
@@ -89,7 +43,7 @@ mod tests {
         let error_string = String::from("Feature not implemented."); 
         let input = SQLRiteError::NotImplemented(error_string.clone());
         
-        let expected = format!("Not implemented: {}", error_string);
+        let expected = format!("Not Implemented error: {}", error_string);
         let result = format!("{}", input);
         assert_eq!(result, expected);
     }
@@ -109,7 +63,7 @@ mod tests {
         let error_string = String::from("Internet error."); 
         let input = SQLRiteError::Internal(error_string.clone());
         
-        let expected = format!("Internal SQLRite error: {}", error_string);
+        let expected = format!("Internal error: {}", error_string);
         let result = format!("{}", input);
         assert_eq!(result, expected);
     }
@@ -127,7 +81,7 @@ mod tests {
     #[test]
     fn sqlrite_unknown_test() {
         let error_string = String::from("Unknown error."); 
-        let input = TempError::UnknownCommand(error_string.clone());
+        let input = SQLRiteError::UnknownCommand(error_string.clone());
         
         let expected = format!("Unknown command error: {}", error_string);
         let result = format!("{}", input);
