@@ -51,7 +51,8 @@ FLAGS:
 
 ### Roadmap
 Features that are in the roadmap of the project:
-*Ideally in order or priority, but nothing set in stone.*
+
+*Ideally in order of priority, but nothing set in stone.*
 
 - [ ] Serialization | Deserialization to and from binary encodings.
 - [ ] Simple INSERT queries.
