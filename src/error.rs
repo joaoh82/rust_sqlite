@@ -1,4 +1,4 @@
-//! Error Types
+use thiserror::Error;
 
 use std::{
     error::Error, 
@@ -9,6 +9,12 @@ use std::{
 use sqlparser::parser::ParserError;
 
 pub type Result<T> = result::Result<T, SQLRiteError>;
+
+#[derive(Error, Debug)]
+pub enum TempError {
+    #[error("Unknown command error: {0}")]
+    UnknownCommand(String)
+}
 
 /// SQLRite error
 #[derive(Debug, PartialEq)]
@@ -114,6 +120,16 @@ mod tests {
         let input = SQLRiteError::SqlError(ParserError::ParserError(error_string.clone()));
         
         let expected = format!("SQL error: ParserError(\"{}\")", error_string);
+        let result = format!("{}", input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sqlrite_unknown_test() {
+        let error_string = String::from("Unknown error."); 
+        let input = TempError::UnknownCommand(error_string.clone());
+        
+        let expected = format!("Unknown command error: {}", error_string);
         let result = format!("{}", input);
         assert_eq!(result, expected);
     }
