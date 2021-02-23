@@ -15,12 +15,13 @@ pub struct ParsedColumn {
 #[derive(Debug)]
 pub struct CreateQuery {
     pub table_name: String,         // table name
-    pub columns: Vec<ParsedColumn>, // columns that will be fetched
+    pub columns: Vec<ParsedColumn>, // columns
 }
 
 impl CreateQuery {
     pub fn new(statement: &Statement) -> Result<CreateQuery> {
         match statement {
+            // Confirming the Statement is sqlparser::ast:Statement::CreateTable
             Statement::CreateTable {
                 name,
                 columns,
@@ -34,9 +35,13 @@ impl CreateQuery {
                 let table_name = name;
                 let mut parsed_columns: Vec<ParsedColumn> = vec![];
 
+                // Iterating over the columns returned form the Parser::parse:sql
+                // in the mod sql
                 for col in columns {
                     let name = col.name.to_string();
                     // TODO: Add datetime and timestamp here
+                    // Parsing each column for it data type
+                    // For now only accepting basic data types
                     let datatype = match &col.data_type {
                         DataType::SmallInt => "int",
                         DataType::Int => "int",
