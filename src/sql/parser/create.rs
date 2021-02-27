@@ -1,6 +1,6 @@
 use sqlparser::ast::{ColumnOption, DataType, ObjectName, Statement};
 
-use crate::error::{SQLRiteError, Result};
+use crate::error::{Result, SQLRiteError};
 
 // Represents Columns in a table
 #[derive(PartialEq, Debug)]
@@ -89,12 +89,10 @@ impl CreateQuery {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::*;
-
 
     // A simple test just have something for now
     #[test]

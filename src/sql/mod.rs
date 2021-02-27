@@ -1,15 +1,15 @@
 mod parser;
 pub mod tokenizer;
 
-use parser::create::{CreateQuery};
+use parser::create::CreateQuery;
 
-use sqlparser::ast::{Statement};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
-use crate::error::{SQLRiteError, Result};
+use crate::error::{Result, SQLRiteError};
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum SQLCommand {
     Insert(String),
     Delete(String),
@@ -35,7 +35,7 @@ impl SQLCommand {
 
 /// Performs initial parsing of SQL Statement using sqlparser-rs
 pub fn process_command(query: &str) -> Result<String> {
-    let dialect = SQLiteDialect{};
+    let dialect = SQLiteDialect {};
     let message: String;
     let mut ast = Parser::parse_sql(&dialect, &query).map_err(SQLRiteError::from)?;
 
@@ -50,7 +50,7 @@ pub fn process_command(query: &str) -> Result<String> {
 
     // Initialy only implementing some basic SQL Statements
     match query {
-        Statement::CreateTable{..} => {
+        Statement::CreateTable { .. } => {
             let result = CreateQuery::new(&query);
             match result {
                 Ok(payload) => {
@@ -58,18 +58,19 @@ pub fn process_command(query: &str) -> Result<String> {
                     for col in payload.columns {
                         println!("Column Name: {}, Column Type: {}", col.name, col.datatype);
                     }
-                },
+                }
                 Err(err) => return Err(err),
             }
             message = String::from("CREATE TABLE Statement executed.");
             // TODO: Push table to DB
-        },
+        }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
-        Statement::Insert {..} => message = String::from("INSERT Statement executed."),
-        Statement::Delete{..} => message = String::from("DELETE Statement executed."),
+        Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
+        Statement::Delete { .. } => message = String::from("DELETE Statement executed."),
         _ => {
             return Err(SQLRiteError::NotImplemented(
-                "SQL Statement not supported yet.".to_string()))
+                "SQL Statement not supported yet.".to_string(),
+            ))
         }
     };
 
@@ -82,7 +83,7 @@ mod tests {
 
     #[test]
     fn process_command_select_test() {
-        let inputed_query = String::from("SELECT * from users;"); 
+        let inputed_query = String::from("SELECT * from users;");
 
         let _ = match process_command(&inputed_query) {
             Ok(response) => assert_eq!(response, "SELECT Statement executed."),
@@ -92,7 +93,7 @@ mod tests {
 
     #[test]
     fn process_command_insert_test() {
-        let inputed_query = String::from("INSERT INTO users (name) Values ('josh');"); 
+        let inputed_query = String::from("INSERT INTO users (name) Values ('josh');");
 
         let _ = match process_command(&inputed_query) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
@@ -102,7 +103,7 @@ mod tests {
 
     #[test]
     fn process_command_delete_test() {
-        let inputed_query = String::from("DELETE FROM users WHERE id=1;"); 
+        let inputed_query = String::from("DELETE FROM users WHERE id=1;");
 
         let _ = match process_command(&inputed_query) {
             Ok(response) => assert_eq!(response, "DELETE Statement executed."),
@@ -112,11 +113,12 @@ mod tests {
 
     #[test]
     fn process_command_not_implemented_test() {
-        let inputed_query = String::from("UPDATE users SET name='josh' where id=1;"); 
-        let expected = Err(SQLRiteError::NotImplemented("SQL Statement not supported yet.".to_string()));
+        let inputed_query = String::from("UPDATE users SET name='josh' where id=1;");
+        let expected = Err(SQLRiteError::NotImplemented(
+            "SQL Statement not supported yet.".to_string(),
+        ));
 
         let result = process_command(&inputed_query).map_err(|e| e);
         assert_eq!(result, expected);
     }
-
 }
