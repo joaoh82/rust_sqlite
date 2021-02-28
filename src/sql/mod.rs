@@ -54,6 +54,7 @@ pub fn process_command(query: &str) -> Result<String> {
             let result = CreateQuery::new(&query);
             match result {
                 Ok(payload) => {
+                    // TODO: Remove these println! Debugging purpose
                     println!("Table name: {}", payload.table_name);
                     for col in payload.columns {
                         println!("Column Name: {}, Column Type: {}", col.name, col.datatype);

@@ -12,12 +12,12 @@ use sql::process_command;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
-use clap::{crate_authors, crate_description, crate_version, App};
+use clap::{crate_name ,crate_authors, crate_description, crate_version, App};
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
-    let _matches = App::new("Rust-SQLite")
+    let _matches = App::new(crate_name!())
         .version(crate_version!())
         .author(crate_authors!())
         .about(crate_description!())
@@ -42,7 +42,8 @@ fn main() -> rustyline::Result<()> {
 
     // Friendly intro message for the user
     println!(
-        "Rust-SQLite - {}\n{}{}{}{}",
+        "{} - {}\n{}{}{}{}",
+        crate_name!(),
         crate_version!(),
         "Enter .exit to quit.\n",
         "Enter .help for usage hints.\n",

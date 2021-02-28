@@ -39,12 +39,15 @@ pub fn handle_meta_command(command: MetaCommand) -> Result<String> {
     match command {
         MetaCommand::Exit => std::process::exit(0),
         MetaCommand::Help => Ok(format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             "Special commands:\n",
-            ".help - Display this message\n",
-            ".open <FILENAME> - Reopens a persistent database.\n",
-            ".ast <QUERY> - Show the abstract syntax tree for QUERY.\n",
-            ".exit - Quits this application"
+            ".help            - Display this message\n",
+            ".open <FILENAME> - Close existing database and reopen FILENAME\n",
+            ".save <FILENAME> - Write in-memory database into FILENAME\n",
+            ".read <FILENAME> - Read input from FILENAME\n",
+            ".tables          - List names of tables\n",
+            ".ast <QUERY>     - Show the abstract syntax tree for QUERY.\n",
+            ".exit            - Quits this application"
         )),
         MetaCommand::Open(args) => Ok(format!("To be implemented: {}", args)),
         MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(format!(

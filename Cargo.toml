@@ -1,5 +1,5 @@
 [package]
-name = "rust_sqlite"
+name = "SQLRite"
 version = "0.1.0"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2018"
