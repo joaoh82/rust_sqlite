@@ -46,8 +46,9 @@ FLAGS:
 - [x] Execute simple commands
 - [x] Standarized error handling
 - [x] Generic validation structure for SQL Commands.
-- [x] `Create Table` Command
+- [x] `Create Table` Command Parsing
 - [x] Improve error handling with https://github.com/dtolnay/thiserror
+- [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
 - [ ] Simple INSERT queries command parsing.
 - [ ] Serialization | Deserialization to and from binary encodings (Investigating).
 
@@ -57,7 +58,7 @@ Features that are in the roadmap of the project:
 
 *Ideally in order of priority, but nothing set in stone.*
 
-- [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
+
 - [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
 - [ ] Storage engine.
   - Maybe use https://github.com/spacejam/sled
