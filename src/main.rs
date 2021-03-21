@@ -69,7 +69,7 @@ fn main() -> rustyline::Result<()> {
                         // the SQL Statement and returning a Result<String, SQLRiteError>
                         let _ = match process_command(&command) {
                             Ok(response) => println!("{}", response),
-                            Err(err) => println!("An error occured: {}", err),
+                            Err(err) => eprintln!("An error occured: {}", err),
                         };
                     }
                     CommandType::MetaCommand(cmd) => {
@@ -77,7 +77,7 @@ fn main() -> rustyline::Result<()> {
                         // and returns a Result<String, SQLRiteError>
                         let _ = match handle_meta_command(cmd) {
                             Ok(response) => println!("{}", response),
-                            Err(err) => println!("An error occured: {}", err),
+                            Err(err) => eprintln!("An error occured: {}", err),
                         };
                     }
                 }
@@ -89,7 +89,7 @@ fn main() -> rustyline::Result<()> {
                 break;
             }
             Err(err) => {
-                println!("An error occured: {:?}", err);
+                eprintln!("An error occured: {:?}", err);
                 break;
             }
         }

@@ -57,16 +57,19 @@ pub fn process_command(query: &str) -> Result<String> {
                     // TODO: Remove these println! Debugging purpose
                     println!("Table name: {}", payload.table_name);
                     for col in payload.columns {
-                        println!("Column Name: {}, Column Type: {}", col.name, col.datatype);
+                        println!("Column Name: {}, Column Type: {}, Primary Key: {}, Is Nullable: {}, UNIQUE: {}", col.name, col.datatype, col.is_pk, col.is_nullable, col.is_unique);
                     }
+                    message = String::from("CREATE TABLE Statement executed.");
+                    // TODO: Push table to DB
                 }
                 Err(err) => return Err(err),
             }
-            message = String::from("CREATE TABLE Statement executed.");
-            // TODO: Push table to DB
+        }
+        Statement::Insert { .. } => { 
+            message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
-        Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
+        // Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
         Statement::Delete { .. } => message = String::from("DELETE Statement executed."),
         _ => {
             return Err(SQLRiteError::NotImplemented(

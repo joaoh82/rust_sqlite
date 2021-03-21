@@ -5,6 +5,7 @@ authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2018"
 description = "Light version of SQLite developed with Rust"
 repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -17,3 +18,4 @@ rustyline-derive = "0.4.0"
 clap = "2.33.3"
 sqlparser = "0.8.0"
 thiserror = "1.0.24"
+serde = "1.0.123"

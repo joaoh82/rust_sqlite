@@ -27,7 +27,7 @@ Before you begin, ensure you have met the following requirements:
 
 ```shell
 > ./rust_sqlite -- help
-Rust-SQLite 0.1.0
+SQLRite 0.1.0
 Joao Henrique Machado Silva <joaoh82@gmail.com>
 Light version of SQLite developed with Rust
 

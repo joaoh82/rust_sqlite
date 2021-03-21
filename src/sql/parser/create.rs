@@ -1,4 +1,4 @@
-use sqlparser::ast::{ColumnOption, DataType, ObjectName, Statement};
+use sqlparser::ast::{ColumnOption, DataType, Statement};
 
 use crate::error::{Result, SQLRiteError};
 
@@ -9,6 +9,7 @@ pub struct ParsedColumn {
     pub datatype: String,
     pub is_pk: bool,
     pub is_nullable: bool,
+    pub is_unique: bool,
 }
 
 /// Represents a SQL Statement CREATE TABLE
@@ -53,16 +54,30 @@ impl CreateQuery {
                         DataType::Double => "float",
                         DataType::Decimal(_precision1, _precision2) => "float",
                         _ => {
-                            println!("not matched on custom type");
+                            eprintln!("not matched on custom type");
                             "invalid"
                         }
                     };
 
+                    // checking if column is PRIMARY KEY
                     let mut is_pk: bool = false;
+                    // chekcing if column is UNIQUE
+                    let mut is_unique: bool = false;
+                    // chekcing if column is NULLABLE
+                    let mut is_nullable: bool = true;
                     for column_option in &col.options {
-                        is_pk = match column_option.option {
-                            ColumnOption::Unique { is_primary } => is_primary,
-                            _ => false,
+                        match column_option.option {
+                            ColumnOption::Unique { is_primary } => {
+                                is_pk = is_primary;
+                                if is_primary {
+                                    is_nullable = false;
+                                }
+                                is_unique = true;
+                            },
+                            ColumnOption::NotNull => {
+                                is_nullable = false;
+                            }
+                            _ => (),
                         };
                     }
 
@@ -70,11 +85,12 @@ impl CreateQuery {
                         name,
                         datatype: datatype.to_string(),
                         is_pk,
-                        is_nullable: false,
+                        is_nullable,
+                        is_unique,
                     });
                 }
                 // TODO: Handle constraints,
-                // Unique, Primary Key, Nullable, Default value and others.
+                // Default value and others.
                 for constraint in _constraints {
                     println!("{:?}", constraint);
                 }
