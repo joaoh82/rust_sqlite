@@ -1,5 +1,6 @@
 mod parser;
 pub mod tokenizer;
+pub mod db;
 
 use parser::create::CreateQuery;
 

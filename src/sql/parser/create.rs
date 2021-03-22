@@ -44,15 +44,15 @@ impl CreateQuery {
                     // Parsing each column for it data type
                     // For now only accepting basic data types
                     let datatype = match &col.data_type {
-                        DataType::SmallInt => "int",
-                        DataType::Int => "int",
-                        DataType::BigInt => "int",
+                        DataType::SmallInt => "integer",
+                        DataType::Int => "integer",
+                        DataType::BigInt => "integer",
                         DataType::Boolean => "bool",
-                        DataType::Text => "string",
-                        DataType::Varchar(_bytes) => "string",
-                        DataType::Float(_precision) => "float",
-                        DataType::Double => "float",
-                        DataType::Decimal(_precision1, _precision2) => "float",
+                        DataType::Text => "text",
+                        DataType::Varchar(_bytes) => "text",
+                        DataType::Float(_precision) => "real",
+                        DataType::Double => "real",
+                        DataType::Decimal(_precision1, _precision2) => "real",
                         _ => {
                             eprintln!("not matched on custom type");
                             "invalid"

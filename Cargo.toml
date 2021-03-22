@@ -18,4 +18,4 @@ rustyline-derive = "0.4.0"
 clap = "2.33.3"
 sqlparser = "0.8.0"
 thiserror = "1.0.24"
-serde = "1.0.123"
+serde = { version = "1.0.123", features = ["derive"] }
