@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+
+/// SQLRite data types
+/// Mapped after SQLite Data Type Storage Classes and SQLite Affinity Type
+/// (Datatypes In SQLite Version 3)[https://www.sqlite.org/datatype3.html]
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum DataType {
     Integer,
@@ -41,9 +45,32 @@ impl fmt::Display for DataType {
     }
 }
 
+/// SQLRite Table Structure
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct Table {
     // pub columns: Vec<ColumnHeader>,
     pub name: String,
     // pub rows: BTreeMap<String, ColumnData>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datatype_display_trait_test() {
+        let integer = DataType::Integer;
+        let text = DataType::Text;
+        let real = DataType::Real;
+        let boolean = DataType::Bool;
+        let none = DataType::None;
+        let invalid = DataType::Invalid;
+
+        assert_eq!(format!("{}", integer), "Integer");
+        assert_eq!(format!("{}", text), "Text");
+        assert_eq!(format!("{}", real), "Real");
+        assert_eq!(format!("{}", boolean), "Boolean");
+        assert_eq!(format!("{}", none), "None");
+        assert_eq!(format!("{}", invalid), "Invalid");
+    }
 }

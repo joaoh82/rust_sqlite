@@ -16,7 +16,7 @@ impl Database {
     /// ```
     /// let db = sql::db::database::Database::new();
     /// ``` 
-    pub fn new() -> Database {
+    pub fn new() -> Self {
         Database {
             tables: HashMap::new(),
         }
