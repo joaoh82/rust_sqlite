@@ -67,6 +67,7 @@ pub fn process_command(query: &str) -> Result<String> {
             }
         }
         Statement::Insert { .. } => { 
+            // println!("{:?}", &query);
             message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),

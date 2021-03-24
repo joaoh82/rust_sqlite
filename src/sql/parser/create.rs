@@ -38,18 +38,13 @@ impl CreateQuery {
                 let table_name = name;
                 let mut parsed_columns: Vec<ParsedColumn> = vec![];
 
-                // pushed_columns is used only to check for duplicate columns
-                // I choose to go this way, instead of iterating the current parsed_columns
-                // because this way would be more performant, although uses more memory.
-                let mut pushed_columns: HashMap<String, bool> = HashMap::new();
-
                 // Iterating over the columns returned form the Parser::parse:sql
                 // in the mod sql
                 for col in columns {
                     let name = col.name.to_string();
 
                     // Checks is columm already added to parsed_columns, if so, returns an error
-                    if pushed_columns.contains_key(&name) {
+                    if parsed_columns.iter().any(|col| col.name == name){
                         return Err(SQLRiteError::Internal(format!("Duplicate column name: {}", &name)))
                     }
                     
@@ -92,8 +87,6 @@ impl CreateQuery {
                             _ => (),
                         };
                     }
-
-                    pushed_columns.insert(name.clone(), true);
 
                     parsed_columns.push(ParsedColumn {
                         name,
