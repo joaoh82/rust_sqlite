@@ -43,7 +43,7 @@ impl CreateQuery {
                 for col in columns {
                     let name = col.name.to_string();
 
-                    // Checks is columm already added to parsed_columns, if so, returns an error
+                    // Checks if columm already added to parsed_columns, if so, returns an error
                     if parsed_columns.iter().any(|col| col.name == name){
                         return Err(SQLRiteError::Internal(format!("Duplicate column name: {}", &name)))
                     }
@@ -77,6 +77,10 @@ impl CreateQuery {
                             ColumnOption::Unique { is_primary } => {
                                 is_pk = is_primary;
                                 if is_primary {
+                                    // Checks if table being created already has a PRIMARY KEY, if so, returns an error
+                                    if parsed_columns.iter().any(|col| col.is_pk == true){
+                                        return Err(SQLRiteError::Internal(format!("Table '{}' has more than one primary key", &table_name)))
+                                    }
                                     is_nullable = false;
                                 }
                                 is_unique = true;

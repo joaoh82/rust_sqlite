@@ -49,6 +49,7 @@ FLAGS:
 - [x] `Create Table` Command Parsing
 - [x] Improve error handling with https://github.com/dtolnay/thiserror
 - [x] Added support for parsing duplicate columns on CREATE TABLE
+- [x] Added support for parsing multiple PRIMARY KEY on CREATE TABLE
 - [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
 - [ ] Simple INSERT queries command parsing.
 - [ ] Serialization | Deserialization to and from binary encodings (Investigating).
