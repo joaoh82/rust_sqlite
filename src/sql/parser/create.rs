@@ -2,6 +2,8 @@ use sqlparser::ast::{ColumnOption, DataType, Statement};
 
 use crate::error::{Result, SQLRiteError};
 
+use std::collections::HashMap;
+
 // Represents Columns in a table
 #[derive(PartialEq, Debug)]
 pub struct ParsedColumn {
@@ -35,11 +37,15 @@ impl CreateQuery {
             } => {
                 let table_name = name;
                 let mut parsed_columns: Vec<ParsedColumn> = vec![];
+                let mut pushed_columns: HashMap<String, bool> = HashMap::new();
 
                 // Iterating over the columns returned form the Parser::parse:sql
                 // in the mod sql
                 for col in columns {
                     let name = col.name.to_string();
+                    if pushed_columns.contains_key(&name) {
+                        return Err(SQLRiteError::Internal(format!("Duplicate column name: {}", &name)))
+                    }
                     // TODO: Add datetime and timestamp here
                     // Parsing each column for it data type
                     // For now only accepting basic data types
@@ -81,6 +87,8 @@ impl CreateQuery {
                         };
                     }
 
+                    pushed_columns.insert(name.clone(), true);
+
                     parsed_columns.push(ParsedColumn {
                         name,
                         datatype: datatype.to_string(),
@@ -88,6 +96,7 @@ impl CreateQuery {
                         is_nullable,
                         is_unique,
                     });
+                    
                 }
                 // TODO: Handle constraints,
                 // Default value and others.

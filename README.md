@@ -48,6 +48,7 @@ FLAGS:
 - [x] Generic validation structure for SQL Commands.
 - [x] `Create Table` Command Parsing
 - [x] Improve error handling with https://github.com/dtolnay/thiserror
+- [x] Added support for parsing duplicate columns on CREATE TABLE
 - [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
 - [ ] Simple INSERT queries command parsing.
 - [ ] Serialization | Deserialization to and from binary encodings (Investigating).
