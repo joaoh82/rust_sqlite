@@ -52,7 +52,7 @@ FLAGS:
 - [x] Added support for parsing multiple PRIMARY KEY on CREATE TABLE
 - [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
 - [ ] Simple INSERT queries command parsing.
-- [ ] Serialization | Deserialization to and from binary encodings (Investigating).
+- [ ] Serialization | Deserialization to and from binary encodings ([bincode](https://crates.io/crates/bincode)).
 
 
 ### Roadmap
@@ -62,20 +62,19 @@ Features that are in the roadmap of the project:
 
 
 - [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
-- [ ] Storage engine.
-  - Maybe use https://github.com/spacejam/sled
 - [ ] Implement Open command to load database with a command `.open`
-- [ ] UNIQUE key constraints.
+- [ ] Implementation UNIQUE key constraints.
 - [ ] Joins
   - [ ] INNER JOIN (or sometimes called simple join)
   - [ ] LEFT OUTER JOIN (or sometimes called LEFT JOIN)
   - [ ] CROSS JOIN
   - The RIGHT OUTER JOIN and FULL OUTER JOIN are not supported in SQLite.
+- [ ] WAL - Write Ahead Log Implementation
 - [ ] `Pager Module` 
   - [ ] Implementing transactional ACID properties
   - [ ] Concurrency
   - [ ] Lock Manager
-- [ ] Indexing - cost and performance gain analysis
+- [ ] Composite Indexing - cost and performance gain analysis
 - [ ] Benchmarking vs SQLite for comparison
 - [ ] Server Client / Connection Manager
 - [ ] Different implementations of storage engines and data structures to optimize for different scenarios
