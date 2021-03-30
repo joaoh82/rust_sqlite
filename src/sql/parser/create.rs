@@ -2,23 +2,30 @@ use sqlparser::ast::{ColumnOption, DataType, Statement};
 
 use crate::error::{Result, SQLRiteError};
 
-use std::collections::HashMap;
-
-// Represents Columns in a table
+/// The schema for each SQL column in every table is represented by
+/// the following structure after parsed and tokenized
 #[derive(PartialEq, Debug)]
 pub struct ParsedColumn {
+    /// Name of the column
     pub name: String,
+    /// Datatype of the column in String format
     pub datatype: String,
+    /// Value representing if column is PRIMARY KEY
     pub is_pk: bool,
-    pub is_nullable: bool,
+    /// Value representing if column was declared with the NOT NULL Constraint
+    pub not_null: bool,
+    /// Value representing if column was declared with the UNIQUE Constraint
     pub is_unique: bool,
 }
 
-/// Represents a SQL Statement CREATE TABLE
+/// The following structure represents a CREATE TABLE query already parsed
+/// and broken down into name and a Vector of `ParsedColumn` metadata
 #[derive(Debug)]
 pub struct CreateQuery {
-    pub table_name: String,         // table name
-    pub columns: Vec<ParsedColumn>, // columns
+    /// name of table after parking and tokenizing of query
+    pub table_name: String,      
+    /// Vector of `ParsedColumn` type with column metadata information
+    pub columns: Vec<ParsedColumn>,
 }
 
 impl CreateQuery {
@@ -51,18 +58,18 @@ impl CreateQuery {
                     // Parsing each column for it data type
                     // For now only accepting basic data types
                     let datatype = match &col.data_type {
-                        DataType::SmallInt => "integer",
-                        DataType::Int => "integer",
-                        DataType::BigInt => "integer",
-                        DataType::Boolean => "bool",
-                        DataType::Text => "text",
-                        DataType::Varchar(_bytes) => "text",
-                        DataType::Float(_precision) => "real",
-                        DataType::Double => "real",
-                        DataType::Decimal(_precision1, _precision2) => "real",
+                        DataType::SmallInt => "Integer",
+                        DataType::Int => "Integer",
+                        DataType::BigInt => "Integer",
+                        DataType::Boolean => "Bool",
+                        DataType::Text => "Text",
+                        DataType::Varchar(_bytes) => "Text",
+                        DataType::Float(_precision) => "Real",
+                        DataType::Double => "Real",
+                        DataType::Decimal(_precision1, _precision2) => "Real",
                         _ => {
                             eprintln!("not matched on custom type");
-                            "invalid"
+                            "Invalid"
                         }
                     };
 
@@ -71,7 +78,7 @@ impl CreateQuery {
                     // chekcing if column is UNIQUE
                     let mut is_unique: bool = false;
                     // chekcing if column is NULLABLE
-                    let mut is_nullable: bool = true;
+                    let mut not_null: bool = false;
                     for column_option in &col.options {
                         match column_option.option {
                             ColumnOption::Unique { is_primary } => {
@@ -81,12 +88,12 @@ impl CreateQuery {
                                     if parsed_columns.iter().any(|col| col.is_pk == true){
                                         return Err(SQLRiteError::Internal(format!("Table '{}' has more than one primary key", &table_name)))
                                     }
-                                    is_nullable = false;
+                                    not_null = true;
                                 }
                                 is_unique = true;
                             },
                             ColumnOption::NotNull => {
-                                is_nullable = false;
+                                not_null = true;
                             }
                             _ => (),
                         };
@@ -96,7 +103,7 @@ impl CreateQuery {
                         name,
                         datatype: datatype.to_string(),
                         is_pk,
-                        is_nullable,
+                        not_null,
                         is_unique,
                     });
                     

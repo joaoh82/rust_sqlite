@@ -1,5 +1,5 @@
-mod parser;
-pub mod tokenizer;
+pub mod parser;
+// pub mod tokenizer;
 pub mod db;
 
 use parser::create::CreateQuery;
@@ -9,6 +9,8 @@ use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::{Result, SQLRiteError};
+use crate::sql::db::table::Table;
+use crate::sql::db::database::Database;
 
 #[derive(Debug, PartialEq)]
 pub enum SQLCommand {
@@ -35,7 +37,7 @@ impl SQLCommand {
 }
 
 /// Performs initial parsing of SQL Statement using sqlparser-rs
-pub fn process_command(query: &str) -> Result<String> {
+pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     let dialect = SQLiteDialect {};
     let message: String;
     let mut ast = Parser::parse_sql(&dialect, &query).map_err(SQLRiteError::from)?;
@@ -52,13 +54,14 @@ pub fn process_command(query: &str) -> Result<String> {
     // Initialy only implementing some basic SQL Statements
     match query {
         Statement::CreateTable { .. } => {
-            let result = CreateQuery::new(&query);
-            match result {
+            let create_query = CreateQuery::new(&query);
+            match create_query {
                 Ok(payload) => {
-                    // TODO: Remove these println! Debugging purpose
-                    println!("Table name: {}", payload.table_name);
-                    for col in payload.columns {
-                        println!("Column Name: {}, Column Type: {}, Primary Key: {}, Is Nullable: {}, UNIQUE: {}", col.name, col.datatype, col.is_pk, col.is_nullable, col.is_unique);
+                    let table_name = &payload.table_name;
+                    db.tables.insert(table_name.to_string(), Table::new(payload));
+                    // Iterate over everything.
+                    for (table_name, _) in &db.tables {
+                        println!("{}" , table_name);
                     }
                     message = String::from("CREATE TABLE Statement executed.");
                     // TODO: Push table to DB
@@ -90,8 +93,9 @@ mod tests {
     #[test]
     fn process_command_select_test() {
         let inputed_query = String::from("SELECT * from users;");
+        let mut db = Database::new("tempdb".to_string());
 
-        let _ = match process_command(&inputed_query) {
+        let _ = match process_command(&inputed_query, &mut db) {
             Ok(response) => assert_eq!(response, "SELECT Statement executed."),
             Err(_) => assert!(false),
         };
@@ -100,8 +104,9 @@ mod tests {
     #[test]
     fn process_command_insert_test() {
         let inputed_query = String::from("INSERT INTO users (name) Values ('josh');");
+        let mut db = Database::new("tempdb".to_string());
 
-        let _ = match process_command(&inputed_query) {
+        let _ = match process_command(&inputed_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
             Err(_) => assert!(false),
         };
@@ -110,8 +115,9 @@ mod tests {
     #[test]
     fn process_command_delete_test() {
         let inputed_query = String::from("DELETE FROM users WHERE id=1;");
+        let mut db = Database::new("tempdb".to_string());
 
-        let _ = match process_command(&inputed_query) {
+        let _ = match process_command(&inputed_query, &mut db) {
             Ok(response) => assert_eq!(response, "DELETE Statement executed."),
             Err(_) => assert!(false),
         };
@@ -120,11 +126,12 @@ mod tests {
     #[test]
     fn process_command_not_implemented_test() {
         let inputed_query = String::from("UPDATE users SET name='josh' where id=1;");
+        let mut db = Database::new("tempdb".to_string());
         let expected = Err(SQLRiteError::NotImplemented(
             "SQL Statement not supported yet.".to_string(),
         ));
 
-        let result = process_command(&inputed_query).map_err(|e| e);
+        let result = process_command(&inputed_query, &mut db).map_err(|e| e);
         assert_eq!(result, expected);
     }
 }

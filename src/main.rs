@@ -8,6 +8,7 @@ mod sql;
 use meta_command::handle_meta_command;
 use repl::{get_command_type, get_config, CommandType, REPLHelper};
 use sql::process_command;
+use sql::db::database::Database;
 
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -51,6 +52,8 @@ fn main() -> rustyline::Result<()> {
         "Use '.open FILENAME' to reopen on a persistent database."
     );
 
+    let mut db = Database::new("tempdb".to_string());
+
     loop {
         let p = format!("sqlrite> ");
         repl.helper_mut().expect("No helper found").colored_prompt =
@@ -67,7 +70,7 @@ fn main() -> rustyline::Result<()> {
                     CommandType::SQLCommand(_cmd) => {
                         // process_command takes care of tokenizing, parsing and executing
                         // the SQL Statement and returning a Result<String, SQLRiteError>
-                        let _ = match process_command(&command) {
+                        let _ = match process_command(&command, &mut db) {
                             Ok(response) => println!("{}", response),
                             Err(err) => eprintln!("An error occured: {}", err),
                         };
