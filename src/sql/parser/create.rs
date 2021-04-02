@@ -64,6 +64,7 @@ impl CreateQuery {
                         DataType::Boolean => "Bool",
                         DataType::Text => "Text",
                         DataType::Varchar(_bytes) => "Text",
+                        DataType::Real => "Real",
                         DataType::Float(_precision) => "Real",
                         DataType::Double => "Real",
                         DataType::Decimal(_precision1, _precision2) => "Real",
@@ -82,15 +83,19 @@ impl CreateQuery {
                     for column_option in &col.options {
                         match column_option.option {
                             ColumnOption::Unique { is_primary } => {
-                                is_pk = is_primary;
-                                if is_primary {
-                                    // Checks if table being created already has a PRIMARY KEY, if so, returns an error
-                                    if parsed_columns.iter().any(|col| col.is_pk == true){
-                                        return Err(SQLRiteError::Internal(format!("Table '{}' has more than one primary key", &table_name)))
+                                // For now, only Integer and Text types can be PRIMERY KEY and Unique
+                                // Therefore Indexed.
+                                if datatype != "Real" && datatype != "Bool" {
+                                    is_pk = is_primary;
+                                    if is_primary {
+                                        // Checks if table being created already has a PRIMARY KEY, if so, returns an error
+                                        if parsed_columns.iter().any(|col| col.is_pk == true){
+                                            return Err(SQLRiteError::Internal(format!("Table '{}' has more than one primary key", &table_name)))
+                                        }
+                                        not_null = true;
                                     }
-                                    not_null = true;
+                                    is_unique = true;
                                 }
-                                is_unique = true;
                             },
                             ColumnOption::NotNull => {
                                 not_null = true;

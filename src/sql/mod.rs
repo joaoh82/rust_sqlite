@@ -2,7 +2,8 @@ pub mod parser;
 // pub mod tokenizer;
 pub mod db;
 
-use parser::create::CreateQuery;
+use parser::create::{CreateQuery};
+use parser::insert::{InsertQuery};
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
@@ -58,19 +59,66 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             match create_query {
                 Ok(payload) => {
                     let table_name = &payload.table_name;
-                    db.tables.insert(table_name.to_string(), Table::new(payload));
-                    // Iterate over everything.
-                    for (table_name, _) in &db.tables {
-                        println!("{}" , table_name);
+                    // Checking if table already exists, after parsing CREATE TABLE query
+                    match db.contains_table(table_name.to_string()) {
+                        true => {
+                            return Err(SQLRiteError::Internal("Cannot create, table already exists.".to_string()));
+                        }
+                        false => {
+                            db.tables.insert(table_name.to_string(), Table::new(payload));
+                            // Iterate over everything.
+                            // for (table_name, _) in &db.tables {
+                            //     println!("{}" , table_name);
+                            // }
+                            message = String::from("CREATE TABLE Statement executed.");
+                        }
                     }
-                    message = String::from("CREATE TABLE Statement executed.");
-                    // TODO: Push table to DB
                 }
                 Err(err) => return Err(err),
             }
         }
         Statement::Insert { .. } => { 
-            // println!("{:?}", &query);
+            let insert_query = InsertQuery::new(&query);
+            match insert_query {
+                Ok(payload) => {
+                    let table_name = payload.table_name;
+                    let columns = payload.columns;
+                    let values = payload.rows;
+
+                    // println!("table_name = {:?}\n cols = {:?}\n vals = {:?}", table_name, columns, values);
+                    match db.contains_table(table_name.to_string()) {
+                        true => {
+                            // Tbale exists
+                            let db_table = db.get_table_mut(table_name.to_string()).unwrap();
+                            match columns.iter().all(|column| db_table.contains_column(column.to_string())) {
+                                true => {
+                                    for value in &values {
+                                        // println!("{:?}", value);
+                                        // Checking if number of columns in query are the same as number of values
+                                        if columns.len() != value.len() {
+                                            return Err(SQLRiteError::Internal(format!("{} values for {} columns", value.len(), columns.len())))
+                                        }
+                                        match db_table.validate_unique_constraint(&columns, value)
+                                        {
+                                            Ok(()) => {
+                                                // No unique constraint violation, moving forward with inserting row
+                                                db_table.insert_row(&columns, &values);
+                                            }
+                                            Err(err) => return Err(SQLRiteError::Internal(format!("Unique key constaint violation: {}",err))),
+                                        }
+                                    }
+                                }
+                                false => {
+                                    return Err(SQLRiteError::Internal("Cannot insert, some of the columns do not exist".to_string()));
+                                }
+                            }
+                        }
+                        false => return Err(SQLRiteError::Internal("Table doesn't exist".to_string())),
+                    }
+                }
+                Err(err) => return Err(err),
+            } 
+            
             message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
@@ -97,18 +145,42 @@ mod tests {
 
         let _ = match process_command(&inputed_query, &mut db) {
             Ok(response) => assert_eq!(response, "SELECT Statement executed."),
-            Err(_) => assert!(false),
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                assert!(false)
+            },
         };
     }
 
     #[test]
     fn process_command_insert_test() {
-        let inputed_query = String::from("INSERT INTO users (name) Values ('josh');");
+        // Creating temporary database
         let mut db = Database::new("tempdb".to_string());
 
-        let _ = match process_command(&inputed_query, &mut db) {
+        // Creating temporary table for testing purposes
+        let query_statement = "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name TEXT
+        );";
+        let dialect = SQLiteDialect {};
+        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        if ast.len() > 1 {
+            panic!("Expected a single query statement, but there are more then 1.")
+        }
+        let query = ast.pop().unwrap();
+        let create_query = CreateQuery::new(&query).unwrap();
+
+        // Inserting table into database
+        db.tables.insert(create_query.table_name.to_string(), Table::new(create_query));
+
+        // Inserting data into table
+        let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
+        let _ = match process_command(&insert_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
-            Err(_) => assert!(false),
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                assert!(false)
+            },
         };
     }
 
@@ -119,7 +191,10 @@ mod tests {
 
         let _ = match process_command(&inputed_query, &mut db) {
             Ok(response) => assert_eq!(response, "DELETE Statement executed."),
-            Err(_) => assert!(false),
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                assert!(false)
+            },
         };
     }
 
