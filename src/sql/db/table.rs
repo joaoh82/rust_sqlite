@@ -121,6 +121,8 @@ impl Table {
         }
     }
 
+    /// Returns a `bool` informing if a `Column` with a specific name exists or not
+    /// 
     pub fn contains_column(&self, column: String) -> bool {
         self.columns.contains_key(&column)
     }
@@ -147,6 +149,9 @@ impl Table {
         }
     }
 
+    /// Validates if columns and values being inserted violate the UNIQUE constraint
+    /// As a reminder the PRIMARY KEY column automatically also is a UNIQUE column.
+    ///
     pub fn validate_unique_constraint(
         &mut self,
         cols: &Vec<String>,
@@ -194,6 +199,14 @@ impl Table {
         return Ok(());
     }
 
+    /// Inserts all VALUES in its approprieta COLUMNS, using the ROWID an embedded INDEX on all ROWS
+    /// Every `Table` keeps track of the `last_rowid` in order to facilitate what the next one would be.
+    /// One limitation of this data structure is that we can only have one write transaction at a time, otherwise 
+    /// we could have a race condition on the last_rowid.println!
+    /// 
+    /// Since we are loosely modeling after SQLite, this is also a limitation of SQLite (allowing only one write transcation at a time),
+    /// So we are good. :)
+    /// 
     pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<Vec<String>>) {
         // For every column in the INSERT statement
         for i in 0..cols.len() {

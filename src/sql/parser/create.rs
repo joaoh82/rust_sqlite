@@ -20,6 +20,7 @@ pub struct ParsedColumn {
 
 /// The following structure represents a CREATE TABLE query already parsed
 /// and broken down into name and a Vector of `ParsedColumn` metadata
+/// 
 #[derive(Debug)]
 pub struct CreateQuery {
     /// name of table after parking and tokenizing of query

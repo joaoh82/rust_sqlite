@@ -2,6 +2,9 @@ use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value, Values};
 
 use crate::error::{Result, SQLRiteError};
 
+/// The following structure represents a INSERT query already parsed
+/// and broken down into `table_name` a `Vec<String>` representing the `Columns`
+/// and `Vec<Vec<String>>` representing the list of `Rows` to be inserted 
 #[derive(Debug)]
 pub struct InsertQuery {
     pub table_name: String,
