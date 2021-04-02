@@ -50,8 +50,10 @@ FLAGS:
 - [x] Improve error handling with https://github.com/dtolnay/thiserror
 - [x] Added support for parsing duplicate columns on CREATE TABLE
 - [x] Added support for parsing multiple PRIMARY KEY on CREATE TABLE
-- [ ] In memory BTreeMap indexes initially only for PRIMARY KEYS.
-- [ ] Simple INSERT queries command parsing.
+- [x] In memory BTreeMap indexes initially only for PRIMARY KEYS.
+- [x] Simple INSERT queries command parsing.
+- [x] Implementation UNIQUE key constraints.
+- [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
 - [ ] Serialization | Deserialization to and from binary encodings ([bincode](https://crates.io/crates/bincode)).
 
 
@@ -61,9 +63,8 @@ Features that are in the roadmap of the project:
 *Ideally in order of priority, but nothing set in stone.*
 
 
-- [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
 - [ ] Implement Open command to load database with a command `.open`
-- [ ] Implementation UNIQUE key constraints.
+
 - [ ] Joins
   - [ ] INNER JOIN (or sometimes called simple join)
   - [ ] LEFT OUTER JOIN (or sometimes called LEFT JOIN)
