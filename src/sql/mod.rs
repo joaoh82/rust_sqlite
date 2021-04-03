@@ -121,6 +121,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 }
                 Err(err) => return Err(err),
             } 
+            // TODO: Test snippet. REMOVE IT
             println!(" ------- \n");
             let table = db.get_table("users".to_string()).unwrap();
             let rows_clone = Rc::clone(&table.rows);

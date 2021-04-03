@@ -230,6 +230,7 @@ impl Table {
             // Getting index for column, if it exist
             let col_index = column_headers.get_mut_index();
 
+            // We only AUTO ASSIGN in case the ROW is a PRIMARY KEY and INTEGER type
             match &mut table_col_data {
                 Row::Integer(tree) => {
                     let val = next_rowid as i32;
@@ -241,10 +242,15 @@ impl Table {
                 _ => (),
             }
         } else {
+            // If PRIMARY KEY Column is in the Column list from INSERT Query,
+            // We get the value assigned to it in the VALUES part of the query
+            // and assign it to next_rowid, so every value if indexed by same rowid
+            // Also, next ROWID should keep AUTO INCREMENTING from last ROWID
             let rows_clone = Rc::clone(&self.rows);
             let mut row_data = rows_clone.as_ref().borrow_mut();
             let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
 
+            // Again, this is only valid for PRIMARY KEYs of INTEGER type
             match &mut table_col_data {
                 Row::Integer(_) => {
                     for i in 0..cols.len() {
