@@ -1,6 +1,8 @@
 use crate::error::{Result, SQLRiteError};
 
 use std::fmt;
+use rustyline::Editor;
+use crate::repl::{REPLHelper};
 
 #[derive(Debug, PartialEq)]
 pub enum MetaCommand {
@@ -35,9 +37,12 @@ impl MetaCommand {
     }
 }
 
-pub fn handle_meta_command(command: MetaCommand) -> Result<String> {
+pub fn handle_meta_command(command: MetaCommand, repl: &mut Editor<REPLHelper>) -> Result<String> {
     match command {
-        MetaCommand::Exit => std::process::exit(0),
+        MetaCommand::Exit => {
+            repl.append_history("history").unwrap();
+            std::process::exit(0)
+        },
         MetaCommand::Help => Ok(format!(
             "{}{}{}{}{}{}{}{}",
             "Special commands:\n",
@@ -59,28 +64,59 @@ pub fn handle_meta_command(command: MetaCommand) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repl::{get_config, REPLHelper};
 
     #[test]
     fn get_meta_command_exit_test() {
+        // Starting Rustyline with a default configuration
+        let config = get_config();
+
+        // Getting a new Rustyline Helper
+        let helper = REPLHelper::default();
+
+        // Initiatlizing Rustyline Editor with set config and setting helper
+        let mut repl = Editor::with_config(config);
+        repl.set_helper(Some(helper));
+
         let inputed_command = MetaCommand::Help;
 
-        let result = handle_meta_command(inputed_command);
+        let result = handle_meta_command(inputed_command, &mut repl);
         assert_eq!(result.is_ok(), true);
     }
 
     #[test]
     fn get_meta_command_open_test() {
+        // Starting Rustyline with a default configuration
+        let config = get_config();
+
+        // Getting a new Rustyline Helper
+        let helper = REPLHelper::default();
+
+        // Initiatlizing Rustyline Editor with set config and setting helper
+        let mut repl = Editor::with_config(config);
+        repl.set_helper(Some(helper));
+
         let inputed_command = MetaCommand::Open(".open database.db".to_string());
 
-        let result = handle_meta_command(inputed_command);
+        let result = handle_meta_command(inputed_command, &mut repl);
         assert_eq!(result.is_ok(), true);
     }
 
     #[test]
     fn get_meta_command_unknown_command_test() {
+        // Starting Rustyline with a default configuration
+        let config = get_config();
+
+        // Getting a new Rustyline Helper
+        let helper = REPLHelper::default();
+
+        // Initiatlizing Rustyline Editor with set config and setting helper
+        let mut repl = Editor::with_config(config);
+        repl.set_helper(Some(helper));
+
         let inputed_command = MetaCommand::Unknown;
 
-        let result = handle_meta_command(inputed_command);
+        let result = handle_meta_command(inputed_command, &mut repl);
         assert_eq!(result.is_err(), true);
     }
 

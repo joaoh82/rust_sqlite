@@ -64,7 +64,6 @@ Features that are in the roadmap of the project:
 
 
 - [ ] Implement Open command to load database with a command `.open`
-
 - [ ] Joins
   - [ ] INNER JOIN (or sometimes called simple join)
   - [ ] LEFT OUTER JOIN (or sometimes called LEFT JOIN)

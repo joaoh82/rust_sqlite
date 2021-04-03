@@ -11,7 +11,10 @@ use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
+use crate::sql::db::table::Row;
 use crate::sql::db::database::Database;
+
+use std::rc::Rc;
 
 #[derive(Debug, PartialEq)]
 pub enum SQLCommand {
@@ -93,7 +96,6 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                             match columns.iter().all(|column| db_table.contains_column(column.to_string())) {
                                 true => {
                                     for value in &values {
-                                        // println!("{:?}", value);
                                         // Checking if number of columns in query are the same as number of values
                                         if columns.len() != value.len() {
                                             return Err(SQLRiteError::Internal(format!("{} values for {} columns", value.len(), columns.len())))
@@ -102,7 +104,8 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                         {
                                             Ok(()) => {
                                                 // No unique constraint violation, moving forward with inserting row
-                                                db_table.insert_row(&columns, &values);
+                                                db_table.insert_row(&columns, &value);
+                                                
                                             }
                                             Err(err) => return Err(SQLRiteError::Internal(format!("Unique key constaint violation: {}",err))),
                                         }
@@ -118,7 +121,26 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 }
                 Err(err) => return Err(err),
             } 
-            
+            println!(" ------- \n");
+            let table = db.get_table("users".to_string()).unwrap();
+            let rows_clone = Rc::clone(&table.rows);
+            let row_data = rows_clone.as_ref().borrow();
+            for (key, val) in row_data.iter() {
+                println!("key: {}", key);
+                match val{
+                    Row::Integer(tree) => {
+                        for (key, value) in tree.iter() {
+                            println!("{}: {}", key, value);
+                        }
+                    }
+                    Row::Text(tree) => {
+                        for (key, value) in tree.iter() {
+                            println!("{}: {}", key, value);
+                        }
+                    }
+                    _ => println!("non interger / text value")
+                };
+            }
             message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),

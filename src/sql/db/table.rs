@@ -62,17 +62,23 @@ pub struct Table {
     pub indexes: HashMap<String, String>,
     /// ROWID of most recent insert
     pub last_rowid: i64,
+    /// PRIMARY KEY Column name, if table does not have PRIMARY KEY this would be -1
+    pub primary_key: String,
 }
 
 impl Table {
     pub fn new(create_query: CreateQuery) -> Self {
         let table_name = create_query.table_name;
+        let mut primary_key: String = String::from("-1");
         let columns = create_query.columns;
 
         let mut table_cols: HashMap<String, Column> = HashMap::new();
         let table_rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
         for col in &columns {
             let col_name = &col.name;
+            if col.is_pk {
+                primary_key = col_name.to_string();
+            }
             table_cols.insert(
                 col_name.clone(),
                 Column::new(
@@ -118,11 +124,12 @@ impl Table {
             rows: table_rows,
             indexes: HashMap::new(),
             last_rowid: 0,
+            primary_key: primary_key,
         }
     }
 
     /// Returns a `bool` informing if a `Column` with a specific name exists or not
-    /// 
+    ///
     pub fn contains_column(&self, column: String) -> bool {
         self.columns.contains_key(&column)
     }
@@ -201,13 +208,58 @@ impl Table {
 
     /// Inserts all VALUES in its approprieta COLUMNS, using the ROWID an embedded INDEX on all ROWS
     /// Every `Table` keeps track of the `last_rowid` in order to facilitate what the next one would be.
-    /// One limitation of this data structure is that we can only have one write transaction at a time, otherwise 
+    /// One limitation of this data structure is that we can only have one write transaction at a time, otherwise
     /// we could have a race condition on the last_rowid.println!
-    /// 
+    ///
     /// Since we are loosely modeling after SQLite, this is also a limitation of SQLite (allowing only one write transcation at a time),
     /// So we are good. :)
-    /// 
-    pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<Vec<String>>) {
+    ///
+    pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<String>) {
+        let mut next_rowid = self.last_rowid + i64::from(1);
+
+        // Checking if primary key is in INSERT QUERY columns
+        // If it is not, assign the next_rowid to it.
+        if !cols.iter().any(|col| col == &self.primary_key) {
+            let rows_clone = Rc::clone(&self.rows);
+            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
+
+            // Getting the header based on the column name
+            let column_headers = self.columns.get_mut(&self.primary_key).unwrap();
+
+            // Getting index for column, if it exist
+            let col_index = column_headers.get_mut_index();
+
+            match &mut table_col_data {
+                Row::Integer(tree) => {
+                    let val = next_rowid as i32;
+                    tree.insert(next_rowid.clone(), val);
+                    if let Index::Integer(index) = col_index {
+                        index.insert(val, next_rowid.clone());
+                    }
+                }
+                _ => (),
+            }
+        } else {
+            let rows_clone = Rc::clone(&self.rows);
+            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
+
+            match &mut table_col_data {
+                Row::Integer(_) => {
+                    for i in 0..cols.len() {
+                        // Getting column name
+                        let key = &cols[i];
+                        if key == &self.primary_key {
+                            let val = &values[i];
+                            next_rowid = val.parse::<i64>().unwrap();
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+
         // For every column in the INSERT statement
         for i in 0..cols.len() {
             // Getting column name
@@ -224,36 +276,33 @@ impl Table {
             // Getting index for column, if it exist
             let col_index = column_headers.get_mut_index();
 
-            for value in values {
-                let next_rowid = self.last_rowid + i64::from(1);
-
-                let val = &value[i];
-                match &mut table_col_data {
-                    Row::Integer(tree) => {
-                        let val = val.parse::<i32>().unwrap();
-                        tree.insert(next_rowid.clone(), val);
-                        if let Index::Integer(index) = col_index {
-                            index.insert(val, next_rowid.clone());
-                        }
+            let val = &values[i];
+            match &mut table_col_data {
+                Row::Integer(tree) => {
+                    let val = val.parse::<i32>().unwrap();
+                    tree.insert(next_rowid.clone(), val);
+                    if let Index::Integer(index) = col_index {
+                        index.insert(val, next_rowid.clone());
                     }
-                    Row::Text(tree) => {
-                        tree.insert(next_rowid.clone(), val.to_string());
-                        if let Index::Text(index) = col_index {
-                            index.insert(val.to_string(), next_rowid.clone());
-                        }
-                    }
-                    Row::Real(tree) => {
-                        let val = val.parse::<f32>().unwrap();
-                        tree.insert(next_rowid.clone(), val);
-                    }
-                    Row::Bool(tree) => {
-                        let val = val.parse::<bool>().unwrap();
-                        tree.insert(next_rowid.clone(), val);
-                    }
-                    Row::None => panic!("None data Found"),
                 }
+                Row::Text(tree) => {
+                    tree.insert(next_rowid.clone(), val.to_string());
+                    if let Index::Text(index) = col_index {
+                        index.insert(val.to_string(), next_rowid.clone());
+                    }
+                }
+                Row::Real(tree) => {
+                    let val = val.parse::<f32>().unwrap();
+                    tree.insert(next_rowid.clone(), val);
+                }
+                Row::Bool(tree) => {
+                    let val = val.parse::<bool>().unwrap();
+                    tree.insert(next_rowid.clone(), val);
+                }
+                Row::None => panic!("None data Found"),
             }
         }
+        self.last_rowid = next_rowid;
     }
 }
 
