@@ -123,26 +123,26 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 Err(err) => return Err(err),
             } 
             // TODO: Test snippet. REMOVE IT
-            println!(" ------- \n");
-            let table = db.get_table("test1".to_string()).unwrap();
-            let rows_clone = Rc::clone(&table.rows);
-            let row_data = rows_clone.as_ref().borrow();
-            for (key, val) in row_data.iter() {
-                println!("key: {}", key);
-                match val{
-                    Row::Integer(tree) => {
-                        for (key, value) in tree.iter() {
-                            println!("{}: {}", key, value);
-                        }
-                    }
-                    Row::Text(tree) => {
-                        for (key, value) in tree.iter() {
-                            println!("{}: {}", key, value);
-                        }
-                    }
-                    _ => println!("non interger / text value")
-                };
-            }
+            // println!(" ------- \n");
+            // let table = db.get_table("test1".to_string()).unwrap();
+            // let rows_clone = Rc::clone(&table.rows);
+            // let row_data = rows_clone.as_ref().borrow();
+            // for (key, val) in row_data.iter() {
+            //     println!("key: {}", key);
+            //     match val{
+            //         Row::Integer(tree) => {
+            //             for (key, value) in tree.iter() {
+            //                 println!("{}: {}", key, value);
+            //             }
+            //         }
+            //         Row::Text(tree) => {
+            //             for (key, value) in tree.iter() {
+            //                 println!("{}: {}", key, value);
+            //             }
+            //         }
+            //         _ => println!("non interger / text value")
+            //     };
+            // }
             message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
