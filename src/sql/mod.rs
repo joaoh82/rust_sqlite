@@ -89,10 +89,11 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                     let values = payload.rows;
 
                     // println!("table_name = {:?}\n cols = {:?}\n vals = {:?}", table_name, columns, values);
+                    // Checking if Table exists in Database
                     match db.contains_table(table_name.to_string()) {
                         true => {
-                            // Tbale exists
                             let db_table = db.get_table_mut(table_name.to_string()).unwrap();
+                            // Checking if columns on INSERT query exist on Table
                             match columns.iter().all(|column| db_table.contains_column(column.to_string())) {
                                 true => {
                                     for value in &values {
@@ -123,7 +124,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             } 
             // TODO: Test snippet. REMOVE IT
             println!(" ------- \n");
-            let table = db.get_table("users".to_string()).unwrap();
+            let table = db.get_table("test1".to_string()).unwrap();
             let rows_clone = Rc::clone(&table.rows);
             let row_data = rows_clone.as_ref().borrow();
             for (key, val) in row_data.iter() {

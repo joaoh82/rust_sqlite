@@ -217,52 +217,55 @@ impl Table {
     pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<String>) {
         let mut next_rowid = self.last_rowid + i64::from(1);
 
-        // Checking if primary key is in INSERT QUERY columns
-        // If it is not, assign the next_rowid to it.
-        if !cols.iter().any(|col| col == &self.primary_key) {
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
-            let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
+        // Checks if table has a PRIMARY KEY
+        if self.primary_key != "-1"{
+            // Checking if primary key is in INSERT QUERY columns
+            // If it is not, assign the next_rowid to it
+            if !cols.iter().any(|col| col == &self.primary_key) {
+                let rows_clone = Rc::clone(&self.rows);
+                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
 
-            // Getting the header based on the column name
-            let column_headers = self.columns.get_mut(&self.primary_key).unwrap();
+                // Getting the header based on the column name
+                let column_headers = self.columns.get_mut(&self.primary_key).unwrap();
 
-            // Getting index for column, if it exist
-            let col_index = column_headers.get_mut_index();
+                // Getting index for column, if it exist
+                let col_index = column_headers.get_mut_index();
 
-            // We only AUTO ASSIGN in case the ROW is a PRIMARY KEY and INTEGER type
-            match &mut table_col_data {
-                Row::Integer(tree) => {
-                    let val = next_rowid as i32;
-                    tree.insert(next_rowid.clone(), val);
-                    if let Index::Integer(index) = col_index {
-                        index.insert(val, next_rowid.clone());
-                    }
-                }
-                _ => (),
-            }
-        } else {
-            // If PRIMARY KEY Column is in the Column list from INSERT Query,
-            // We get the value assigned to it in the VALUES part of the query
-            // and assign it to next_rowid, so every value if indexed by same rowid
-            // Also, next ROWID should keep AUTO INCREMENTING from last ROWID
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
-            let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
-
-            // Again, this is only valid for PRIMARY KEYs of INTEGER type
-            match &mut table_col_data {
-                Row::Integer(_) => {
-                    for i in 0..cols.len() {
-                        // Getting column name
-                        let key = &cols[i];
-                        if key == &self.primary_key {
-                            let val = &values[i];
-                            next_rowid = val.parse::<i64>().unwrap();
+                // We only AUTO ASSIGN in case the ROW is a PRIMARY KEY and INTEGER type
+                match &mut table_col_data {
+                    Row::Integer(tree) => {
+                        let val = next_rowid as i32;
+                        tree.insert(next_rowid.clone(), val);
+                        if let Index::Integer(index) = col_index {
+                            index.insert(val, next_rowid.clone());
                         }
                     }
+                    _ => (),
                 }
-                _ => (),
+            } else {
+                // If PRIMARY KEY Column is in the Column list from INSERT Query,
+                // We get the value assigned to it in the VALUES part of the query
+                // and assign it to next_rowid, so every value if indexed by same rowid
+                // Also, next ROWID should keep AUTO INCREMENTING from last ROWID
+                let rows_clone = Rc::clone(&self.rows);
+                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let mut table_col_data = row_data.get_mut(&self.primary_key).unwrap();
+
+                // Again, this is only valid for PRIMARY KEYs of INTEGER type
+                match &mut table_col_data {
+                    Row::Integer(_) => {
+                        for i in 0..cols.len() {
+                            // Getting column name
+                            let key = &cols[i];
+                            if key == &self.primary_key {
+                                let val = &values[i];
+                                next_rowid = val.parse::<i64>().unwrap();
+                            }
+                        }
+                    }
+                    _ => (),
+                }
             }
         }
 
