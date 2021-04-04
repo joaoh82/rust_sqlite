@@ -53,6 +53,7 @@ FLAGS:
 - [x] In memory BTreeMap indexes initially only for PRIMARY KEYS.
 - [x] Simple INSERT queries command parsing.
 - [x] Implementation UNIQUE key constraints.
+- [ ] Improve Error Handling and return without Panic!
 - [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
 - [ ] Serialization | Deserialization to and from binary encodings ([bincode](https://crates.io/crates/bincode)).
 
