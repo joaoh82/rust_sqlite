@@ -209,6 +209,37 @@ mod tests {
     }
 
     #[test]
+    fn process_command_insert_no_pk_test() {
+        // Creating temporary database
+        let mut db = Database::new("tempdb".to_string());
+
+        // Creating temporary table for testing purposes
+        let query_statement = "CREATE TABLE users (
+            name TEXT
+        );";
+        let dialect = SQLiteDialect {};
+        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        if ast.len() > 1 {
+            panic!("Expected a single query statement, but there are more then 1.")
+        }
+        let query = ast.pop().unwrap();
+        let create_query = CreateQuery::new(&query).unwrap();
+
+        // Inserting table into database
+        db.tables.insert(create_query.table_name.to_string(), Table::new(create_query));
+
+        // Inserting data into table
+        let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
+        let _ = match process_command(&insert_query, &mut db) {
+            Ok(response) => assert_eq!(response, "INSERT Statement executed."),
+            Err(err) => {
+                eprintln!("Error: {}", err);
+                assert!(false)
+            },
+        };
+    }
+
+    #[test]
     fn process_command_delete_test() {
         let inputed_query = String::from("DELETE FROM users WHERE id=1;");
         let mut db = Database::new("tempdb".to_string());
