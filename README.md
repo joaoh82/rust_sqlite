@@ -22,7 +22,7 @@ Rust-SQLite (SQLRite)
 
 ### Requirements
 Before you begin, ensure you have met the following requirements:
-* Rust (latest stable) – (How to install Rust)[https://www.rust-lang.org/en-US/install.html]
+* Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
 
 ### Usage (TBD)
 
