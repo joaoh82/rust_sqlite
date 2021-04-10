@@ -61,19 +61,21 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             let create_query = CreateQuery::new(&query);
             match create_query {
                 Ok(payload) => {
-                    let table_name = &payload.table_name;
+                    let table_name = payload.table_name.clone();
                     // Checking if table already exists, after parsing CREATE TABLE query
                     match db.contains_table(table_name.to_string()) {
                         true => {
                             return Err(SQLRiteError::Internal("Cannot create, table already exists.".to_string()));
                         }
                         false => {
-                            db.tables.insert(table_name.to_string(), Table::new(payload));
+                            let table = Table::new(payload);
+                            let _  = table.print_table_schema();
+                            db.tables.insert(table_name.to_string(), table);
                             // Iterate over everything.
                             // for (table_name, _) in &db.tables {
                             //     println!("{}" , table_name);
                             // }
-                            message = String::from("CREATE TABLE Statement executed.");
+                            message  =  String::from("CREATE TABLE Statement executed.");
                         }
                     }
                 }
@@ -116,33 +118,14 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                     return Err(SQLRiteError::Internal("Cannot insert, some of the columns do not exist".to_string()));
                                 }
                             }
+                            db_table.print_table_data();
                         }
                         false => return Err(SQLRiteError::Internal("Table doesn't exist".to_string())),
                     }
                 }
                 Err(err) => return Err(err),
-            } 
-            // TODO: Test snippet. REMOVE IT
-            // println!(" ------- \n");
-            // let table = db.get_table("test1".to_string()).unwrap();
-            // let rows_clone = Rc::clone(&table.rows);
-            // let row_data = rows_clone.as_ref().borrow();
-            // for (key, val) in row_data.iter() {
-            //     println!("key: {}", key);
-            //     match val{
-            //         Row::Integer(tree) => {
-            //             for (key, value) in tree.iter() {
-            //                 println!("{}: {}", key, value);
-            //             }
-            //         }
-            //         Row::Text(tree) => {
-            //             for (key, value) in tree.iter() {
-            //                 println!("{}: {}", key, value);
-            //             }
-            //         }
-            //         _ => println!("non interger / text value")
-            //     };
-            // }
+            }
+
             message = String::from("INSERT Statement executed.") 
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),

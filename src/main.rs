@@ -1,4 +1,5 @@
 extern crate clap;
+#[macro_use] extern crate prettytable;
 
 mod error;
 mod meta_command;
