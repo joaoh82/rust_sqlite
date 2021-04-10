@@ -20,6 +20,9 @@ Rust-SQLite (SQLRite)
 
 ![The SQLite Architecture](images/architecture.png "The SQLite Architecture")
 
+### CREATE TABLE and INSERT Statements
+[![asciicast](https://asciinema.org/a/406447.svg)](https://asciinema.org/a/406447)
+
 ### Requirements
 Before you begin, ensure you have met the following requirements:
 * Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
