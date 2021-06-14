@@ -13,10 +13,10 @@ Rust-SQLite (SQLRite)
 
 <table style="width:100%">
 <tr>
-  <td>
+  <td style="width:60%">
     <table style="width:100%">
       <tr>
-        <td width="60%"> key </td>
+        <td> key </td>
         <td> value </td>
       </tr>
       <tr>
@@ -28,13 +28,13 @@ Rust-SQLite (SQLRite)
         <td><a href="https://docs.rs/sqlrite"><img src="https://docs.rs/sqlrite/badge.svg"></a></td>
       </tr>
       <tr>
-        <td><a href="https://discord.gg/dHPmw89zAE">chat about databases with us</a></td>
+        <td><a href="https://discord.gg/dHPmw89zAE">Come and Chat about databases with us</a></td>
         <td><a href="https://discord.gg/dHPmw89zAE">
         <img src="https://discordapp.com/api/guilds/853931853219758091/widget.png?style=banner2" alt="sqlritedb discord server"/></a></td>
       </tr>
      </table>
   </td>
-  <td>
+  <td  style="width:40%">
 <p align="center">
   <img src="images/SQLRite_logo.png" width="50%" height="auto" /> 
   </p>
