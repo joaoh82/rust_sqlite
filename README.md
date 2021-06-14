@@ -11,6 +11,37 @@ Rust-SQLite (SQLRite)
 > What I cannot create, I do not understand. 
 > — Richard Feynman
 
+<table style="width:100%">
+<tr>
+  <td>
+    <table style="width:100%">
+      <tr>
+        <td> key </td>
+        <td> value </td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/sponsors/joaoh82">Show us your support by buying us a coffee, so we can keep building cool stuff. (coming soon)</a></td>
+        <td><a href="https://github.com/sponsors/joaoh82"><img src="https://img.shields.io/opencollective/backers/sqlrite"></a></td>
+      </tr>
+      <tr>
+        <td><a href="https://docs.rs/sqlrite">Documentation (coming soon)</a></td>
+        <td><a href="https://docs.rs/sqlrite"><img src="https://docs.rs/sqlrite/badge.svg"></a></td>
+      </tr>
+      <tr>
+        <td><a href="https://discord.gg/dHPmw89zAE">chat about databases with us</a></td>
+        <td><a href="https://discord.gg/dHPmw89zAE">
+        <img src="https://discordapp.com/api/guilds/853931853219758091/widget.png?style=banner2" alt="sqlritedb discord server"/></a></td>
+      </tr>
+     </table>
+  </td>
+  <td>
+<p align="center">
+  <img src="images/SQLRite_logo.png" width="50%" height="auto" /> 
+  </p>
+  </td>
+ </tr>
+</table>
+
 ### Read the series of posts about it:
 ##### What would SQLite look like if written in Rust?
 * [Part 0 - Overview](https://medium.com/the-polyglot-programmer/what-would-sqlite-would-look-like-if-written-in-rust-part-0-4fc192368984)
@@ -26,6 +57,7 @@ Rust-SQLite (SQLRite)
 ### Requirements
 Before you begin, ensure you have met the following requirements:
 * Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
+* SQLite3
 
 ### Usage (TBD)
 
