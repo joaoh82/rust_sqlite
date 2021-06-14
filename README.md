@@ -13,7 +13,7 @@ Rust-SQLite (SQLRite)
 
 <table style="width:100%">
 <tr>
-  <td style="width:60%">
+  <td>
     <table style="width:100%">
       <tr>
         <td> key </td>
@@ -34,7 +34,7 @@ Rust-SQLite (SQLRite)
       </tr>
      </table>
   </td>
-  <td  style="width:40%">
+  <td>
 <p align="center">
   <img src="images/SQLRite_logo.png" width="50%" height="auto" /> 
   </p>
