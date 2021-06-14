@@ -30,7 +30,7 @@ Rust-SQLite (SQLRite)
       <tr>
         <td><a href="https://discord.gg/dHPmw89zAE">Come and Chat about databases with us</a></td>
         <td><a href="https://discord.gg/dHPmw89zAE">
-        <img src="https://discordapp.com/api/guilds/853931853219758091/widget.png?style=banner2" alt="sqlritedb discord server"/></a></td>
+        <img src="https://discordapp.com/api/guilds/853931853219758091/widget.png?style=shield" alt="sqlritedb discord server"/></a></td>
       </tr>
      </table>
   </td>
