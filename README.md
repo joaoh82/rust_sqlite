@@ -16,7 +16,7 @@ Rust-SQLite (SQLRite)
   <td>
     <table style="width:100%">
       <tr>
-        <td> key </td>
+        <td width="60%"> key </td>
         <td> value </td>
       </tr>
       <tr>
