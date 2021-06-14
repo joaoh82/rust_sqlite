@@ -20,7 +20,7 @@ Rust-SQLite (SQLRite)
         <td> value </td>
       </tr>
       <tr>
-        <td><a href="https://github.com/sponsors/joaoh82">Show us your support by buying us a coffee, so we can keep building cool stuff. (coming soon)</a></td>
+        <td><a href="https://github.com/sponsors/joaoh82">Show us your support by buying us a coffee, <br>so we can keep building cool stuff. (coming soon)</a></td>
         <td><a href="https://github.com/sponsors/joaoh82"><img src="https://img.shields.io/opencollective/backers/sqlrite"></a></td>
       </tr>
       <tr>
