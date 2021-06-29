@@ -21,7 +21,7 @@ Rust-SQLite (SQLRite)
         <td> value </td>
       </tr>
       <tr>
-        <td><a href="https://github.com/sqlrite/design">Design and discussions about direction of the project going on over here.</a></td>
+        <td><a href="https://github.com/sqlrite/design">Design and discussions about direction<br>of the project going on over here.</a></td>
         <td></td>
       </tr>
       <tr>
