@@ -11,6 +11,7 @@ Rust-SQLite (SQLRite)
 > What I cannot create, I do not understand. 
 > — Richard Feynman
 
+
 <table style="width:100%">
 <tr>
   <td>
@@ -18,6 +19,10 @@ Rust-SQLite (SQLRite)
       <tr>
         <td> key </td>
         <td> value </td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/sqlrite/design">Design and discussions about direction of the project going on over here.</a></td>
+        <td></td>
       </tr>
       <tr>
         <td><a href="https://github.com/sponsors/joaoh82">Show us your support by buying us a coffee, <br>so we can keep building cool stuff. (coming soon)</a></td>
