@@ -19,7 +19,7 @@ impl Database {
     ///
     /// ```
     /// let mut db = sql::db::database::Database::new("my_db".to_string());
-    /// ``` 
+    /// ```
     pub fn new(db_name: String) -> Self {
         Database {
             db_name,
@@ -33,7 +33,7 @@ impl Database {
         self.tables.contains_key(&table_name)
     }
 
-    /// Returns an immutable reference of `sql::db::table::Table` if the database contains a 
+    /// Returns an immutable reference of `sql::db::table::Table` if the database contains a
     /// table with the specified key as a table name.
     ///
     pub fn get_table(&self, table_name: String) -> Result<&Table> {
@@ -44,7 +44,7 @@ impl Database {
         }
     }
 
-    /// Returns an mutable reference of `sql::db::table::Table` if the database contains a 
+    /// Returns an mutable reference of `sql::db::table::Table` if the database contains a
     /// table with the specified key as a table name.
     ///
     pub fn get_table_mut(&mut self, table_name: String) -> Result<&mut Table> {
@@ -88,7 +88,7 @@ mod tests {
         }
         let query = ast.pop().unwrap();
 
-        let create_query = CreateQuery::new(&query).unwrap(); 
+        let create_query = CreateQuery::new(&query).unwrap();
         let table_name = &create_query.table_name;
         db.tables.insert(table_name.to_string(), Table::new(create_query));
 

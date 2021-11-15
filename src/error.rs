@@ -8,8 +8,8 @@ use sqlparser::parser::ParserError;
 /// and makes function signatures easier to read.
 pub type Result<T> = result::Result<T, SQLRiteError>;
 
-/// SQLRiteError is an enum with all the standardized errors available for returning 
-/// 
+/// SQLRiteError is an enum with all the standardized errors available for returning
+///
 #[derive(Error, Debug, PartialEq)]
 pub enum SQLRiteError {
     #[error("Not Implemented error: {0}")]

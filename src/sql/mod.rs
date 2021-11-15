@@ -82,7 +82,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 Err(err) => return Err(err),
             }
         }
-        Statement::Insert { .. } => { 
+        Statement::Insert { .. } => {
             let insert_query = InsertQuery::new(&query);
             match insert_query {
                 Ok(payload) => {
@@ -108,7 +108,6 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                             Ok(()) => {
                                                 // No unique constraint violation, moving forward with inserting row
                                                 db_table.insert_row(&columns, &value);
-                                                
                                             }
                                             Err(err) => return Err(SQLRiteError::Internal(format!("Unique key constaint violation: {}",err))),
                                         }
@@ -126,7 +125,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 Err(err) => return Err(err),
             }
 
-            message = String::from("INSERT Statement executed.") 
+            message = String::from("INSERT Statement executed.")
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
         // Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
