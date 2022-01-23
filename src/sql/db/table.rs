@@ -298,12 +298,12 @@ impl Table {
                 } else{
                     if &self.primary_key == &column_names[i]{
                         continue
-                    } 
-                } 
+                    }
+                }
             }else{
                 if &self.primary_key == &column_names[i]{
                     continue
-                } 
+                }
             }
 
             // Getting the rows from the column name
@@ -348,11 +348,11 @@ impl Table {
     /// Print the table schema to standard output in a pretty formatted way
     ///
     /// # Example
-    /// 
+    ///
     /// ```
     /// let table = Table::new(payload);
     /// table.print_table_schema();
-    /// 
+    ///
     /// Prints to standard output:
     ///    +-------------+-----------+-------------+--------+----------+
     ///    | Column Name | Data Type | PRIMARY KEY | UNIQUE | NOT NULL |
@@ -380,11 +380,11 @@ impl Table {
     /// Print the table data to standard output in a pretty formatted way
     ///
     /// # Example
-    /// 
+    ///
     /// ```
     /// let db_table = db.get_table_mut(table_name.to_string()).unwrap();
     /// db_table.print_table_data();
-    /// 
+    ///
     /// Prints to standard output:
     ///     +----+---------+------------------------+
     ///     | id | name    | email                  |
@@ -429,8 +429,8 @@ impl Table {
                 if let Some(cell) = &columns.get(i){
                     print_table_rows[i].add_cell(PrintCell::new(cell));
                 }else{
-                    print_table_rows[i].add_cell(PrintCell::new("")); 
-                }                
+                    print_table_rows[i].add_cell(PrintCell::new(""));
+                }
             }
         }
 

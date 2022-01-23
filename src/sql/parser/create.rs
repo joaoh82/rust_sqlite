@@ -20,11 +20,11 @@ pub struct ParsedColumn {
 
 /// The following structure represents a CREATE TABLE query already parsed
 /// and broken down into name and a Vector of `ParsedColumn` metadata
-/// 
+///
 #[derive(Debug)]
 pub struct CreateQuery {
     /// name of table after parking and tokenizing of query
-    pub table_name: String,      
+    pub table_name: String,
     /// Vector of `ParsedColumn` type with column metadata information
     pub columns: Vec<ParsedColumn>,
 }
@@ -55,7 +55,7 @@ impl CreateQuery {
                     if parsed_columns.iter().any(|col| col.name == name){
                         return Err(SQLRiteError::Internal(format!("Duplicate column name: {}", &name)))
                     }
-                    
+
                     // Parsing each column for it data type
                     // For now only accepting basic data types
                     let datatype = match &col.data_type {
@@ -112,7 +112,7 @@ impl CreateQuery {
                         not_null,
                         is_unique,
                     });
-                    
+
                 }
                 // TODO: Handle constraints,
                 // Default value and others.
@@ -164,6 +164,6 @@ mod tests {
                 }
             },
             _ => ()
-        };          
+        };
     }
 }
