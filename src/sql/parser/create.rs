@@ -52,16 +52,19 @@ impl CreateQuery {
                     let name = col.name.to_string();
 
                     // Checks if columm already added to parsed_columns, if so, returns an error
-                    if parsed_columns.iter().any(|col| col.name == name){
-                        return Err(SQLRiteError::Internal(format!("Duplicate column name: {}", &name)))
+                    if parsed_columns.iter().any(|col| col.name == name) {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Duplicate column name: {}",
+                            &name
+                        )));
                     }
 
                     // Parsing each column for it data type
                     // For now only accepting basic data types
                     let datatype = match &col.data_type {
-                        DataType::SmallInt => "Integer",
-                        DataType::Int => "Integer",
-                        DataType::BigInt => "Integer",
+                        DataType::SmallInt(_) => "Integer",
+                        DataType::Int(_) => "Integer",
+                        DataType::BigInt(_) => "Integer",
                         DataType::Boolean => "Bool",
                         DataType::Text => "Text",
                         DataType::Varchar(_bytes) => "Text",
@@ -90,14 +93,17 @@ impl CreateQuery {
                                     is_pk = is_primary;
                                     if is_primary {
                                         // Checks if table being created already has a PRIMARY KEY, if so, returns an error
-                                        if parsed_columns.iter().any(|col| col.is_pk == true){
-                                            return Err(SQLRiteError::Internal(format!("Table '{}' has more than one primary key", &table_name)))
+                                        if parsed_columns.iter().any(|col| col.is_pk == true) {
+                                            return Err(SQLRiteError::Internal(format!(
+                                                "Table '{}' has more than one primary key",
+                                                &table_name
+                                            )));
                                         }
                                         not_null = true;
                                     }
                                     is_unique = true;
                                 }
-                            },
+                            }
                             ColumnOption::NotNull => {
                                 not_null = true;
                             }
@@ -112,7 +118,6 @@ impl CreateQuery {
                         not_null,
                         is_unique,
                     });
-
                 }
                 // TODO: Handle constraints,
                 // Default value and others.
@@ -137,12 +142,14 @@ mod tests {
 
     #[test]
     fn create_table_validate_tablename_test() {
-        let sql_input = String::from("CREATE TABLE contacts (
+        let sql_input = String::from(
+            "CREATE TABLE contacts (
             id INTEGER PRIMARY KEY,
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULl,
             email TEXT NOT NULL UNIQUE
-        );");
+        );",
+        );
         let expected_table_name = String::from("contacts");
 
         let dialect = SQLiteDialect {};
@@ -160,10 +167,13 @@ mod tests {
                     Ok(payload) => {
                         assert_eq!(payload.table_name, expected_table_name);
                     }
-                    Err(_) => assert!(false, "an error occured during parsing CREATE TABLE Statement"),
+                    Err(_) => assert!(
+                        false,
+                        "an error occured during parsing CREATE TABLE Statement"
+                    ),
                 }
-            },
-            _ => ()
+            }
+            _ => (),
         };
     }
 }

@@ -2,19 +2,16 @@ pub mod parser;
 // pub mod tokenizer;
 pub mod db;
 
-use parser::create::{CreateQuery};
-use parser::insert::{InsertQuery};
+use parser::create::CreateQuery;
+use parser::insert::InsertQuery;
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::error::{Result, SQLRiteError};
-use crate::sql::db::table::Table;
-use crate::sql::db::table::Row;
 use crate::sql::db::database::Database;
-
-use std::rc::Rc;
+use crate::sql::db::table::Table;
 
 #[derive(Debug, PartialEq)]
 pub enum SQLCommand {
@@ -65,17 +62,19 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                     // Checking if table already exists, after parsing CREATE TABLE query
                     match db.contains_table(table_name.to_string()) {
                         true => {
-                            return Err(SQLRiteError::Internal("Cannot create, table already exists.".to_string()));
+                            return Err(SQLRiteError::Internal(
+                                "Cannot create, table already exists.".to_string(),
+                            ));
                         }
                         false => {
                             let table = Table::new(payload);
-                            let _  = table.print_table_schema();
+                            let _ = table.print_table_schema();
                             db.tables.insert(table_name.to_string(), table);
                             // Iterate over everything.
                             // for (table_name, _) in &db.tables {
                             //     println!("{}" , table_name);
                             // }
-                            message  =  String::from("CREATE TABLE Statement executed.");
+                            message = String::from("CREATE TABLE Statement executed.");
                         }
                     }
                 }
@@ -96,30 +95,46 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                         true => {
                             let db_table = db.get_table_mut(table_name.to_string()).unwrap();
                             // Checking if columns on INSERT query exist on Table
-                            match columns.iter().all(|column| db_table.contains_column(column.to_string())) {
+                            match columns
+                                .iter()
+                                .all(|column| db_table.contains_column(column.to_string()))
+                            {
                                 true => {
                                     for value in &values {
                                         // Checking if number of columns in query are the same as number of values
                                         if columns.len() != value.len() {
-                                            return Err(SQLRiteError::Internal(format!("{} values for {} columns", value.len(), columns.len())))
+                                            return Err(SQLRiteError::Internal(format!(
+                                                "{} values for {} columns",
+                                                value.len(),
+                                                columns.len()
+                                            )));
                                         }
-                                        match db_table.validate_unique_constraint(&columns, value)
-                                        {
+                                        match db_table.validate_unique_constraint(&columns, value) {
                                             Ok(()) => {
                                                 // No unique constraint violation, moving forward with inserting row
                                                 db_table.insert_row(&columns, &value);
                                             }
-                                            Err(err) => return Err(SQLRiteError::Internal(format!("Unique key constaint violation: {}",err))),
+                                            Err(err) => {
+                                                return Err(SQLRiteError::Internal(format!(
+                                                    "Unique key constaint violation: {}",
+                                                    err
+                                                )))
+                                            }
                                         }
                                     }
                                 }
                                 false => {
-                                    return Err(SQLRiteError::Internal("Cannot insert, some of the columns do not exist".to_string()));
+                                    return Err(SQLRiteError::Internal(
+                                        "Cannot insert, some of the columns do not exist"
+                                            .to_string(),
+                                    ));
                                 }
                             }
                             db_table.print_table_data();
                         }
-                        false => return Err(SQLRiteError::Internal("Table doesn't exist".to_string())),
+                        false => {
+                            return Err(SQLRiteError::Internal("Table doesn't exist".to_string()))
+                        }
                     }
                 }
                 Err(err) => return Err(err),
@@ -154,7 +169,7 @@ mod tests {
             Err(err) => {
                 eprintln!("Error: {}", err);
                 assert!(false)
-            },
+            }
         };
     }
 
@@ -177,7 +192,10 @@ mod tests {
         let create_query = CreateQuery::new(&query).unwrap();
 
         // Inserting table into database
-        db.tables.insert(create_query.table_name.to_string(), Table::new(create_query));
+        db.tables.insert(
+            create_query.table_name.to_string(),
+            Table::new(create_query),
+        );
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
@@ -186,7 +204,7 @@ mod tests {
             Err(err) => {
                 eprintln!("Error: {}", err);
                 assert!(false)
-            },
+            }
         };
     }
 
@@ -208,7 +226,10 @@ mod tests {
         let create_query = CreateQuery::new(&query).unwrap();
 
         // Inserting table into database
-        db.tables.insert(create_query.table_name.to_string(), Table::new(create_query));
+        db.tables.insert(
+            create_query.table_name.to_string(),
+            Table::new(create_query),
+        );
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
@@ -217,7 +238,7 @@ mod tests {
             Err(err) => {
                 eprintln!("Error: {}", err);
                 assert!(false)
-            },
+            }
         };
     }
 
@@ -231,7 +252,7 @@ mod tests {
             Err(err) => {
                 eprintln!("Error: {}", err);
                 assert!(false)
-            },
+            }
         };
     }
 
