@@ -1,8 +1,8 @@
 use crate::error::{Result, SQLRiteError};
 
-use std::fmt;
+use crate::repl::REPLHelper;
 use rustyline::Editor;
-use crate::repl::{REPLHelper};
+use std::fmt;
 
 #[derive(Debug, PartialEq)]
 pub enum MetaCommand {
@@ -42,7 +42,7 @@ pub fn handle_meta_command(command: MetaCommand, repl: &mut Editor<REPLHelper>) 
         MetaCommand::Exit => {
             repl.append_history("history").unwrap();
             std::process::exit(0)
-        },
+        }
         MetaCommand::Help => Ok(format!(
             "{}{}{}{}{}{}{}{}",
             "Special commands:\n",

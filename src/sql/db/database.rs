@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The database is represented by this structure.assert_eq!
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -61,7 +61,7 @@ mod tests {
     use super::*;
     use crate::sql::parser::create::CreateQuery;
     use sqlparser::dialect::SQLiteDialect;
-    use sqlparser::parser::{Parser};
+    use sqlparser::parser::Parser;
 
     #[test]
     fn new_database_create_test() {
@@ -90,7 +90,8 @@ mod tests {
 
         let create_query = CreateQuery::new(&query).unwrap();
         let table_name = &create_query.table_name;
-        db.tables.insert(table_name.to_string(), Table::new(create_query));
+        db.tables
+            .insert(table_name.to_string(), Table::new(create_query));
 
         assert!(db.contains_table("contacts".to_string()));
     }
@@ -113,17 +114,17 @@ mod tests {
         }
         let query = ast.pop().unwrap();
 
-        let create_query = CreateQuery::new(&query).unwrap(); 
+        let create_query = CreateQuery::new(&query).unwrap();
         let table_name = &create_query.table_name;
-        db.tables.insert(table_name.to_string(), Table::new(create_query));
+        db.tables
+            .insert(table_name.to_string(), Table::new(create_query));
 
         let table = db.get_table(String::from("contacts")).unwrap();
         assert_eq!(table.columns.len(), 4);
 
         let mut table = db.get_table_mut(String::from("contacts")).unwrap();
         table.last_rowid += 1;
-        assert_eq!(table.columns.len(), 4); 
-        assert_eq!(table.last_rowid, 1); 
+        assert_eq!(table.columns.len(), 4);
+        assert_eq!(table.last_rowid, 1);
     }
-
 }

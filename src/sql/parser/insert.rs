@@ -48,7 +48,7 @@ impl InsertQuery {
                                     for e in i {
                                         match e {
                                             Expr::Value(v) => match v {
-                                                Value::Number(n,_) => {
+                                                Value::Number(n, _) => {
                                                     value_set.push(n.to_string());
                                                 }
                                                 Value::Boolean(b) => match *b {
@@ -76,7 +76,11 @@ impl InsertQuery {
                     }
                 }
             }
-            _ => return Err(SQLRiteError::Internal("Error parsing insert query".to_string())),
+            _ => {
+                return Err(SQLRiteError::Internal(
+                    "Error parsing insert query".to_string(),
+                ))
+            }
         }
 
         match tname {
@@ -85,7 +89,9 @@ impl InsertQuery {
                 columns,
                 rows: all_values,
             }),
-            None => Err(SQLRiteError::Internal("Error parsing insert query".to_string())),
+            None => Err(SQLRiteError::Internal(
+                "Error parsing insert query".to_string(),
+            )),
         }
     }
 }

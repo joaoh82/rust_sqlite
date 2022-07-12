@@ -1,5 +1,6 @@
 extern crate clap;
-#[macro_use] extern crate prettytable;
+#[macro_use]
+extern crate prettytable;
 
 mod error;
 mod meta_command;
@@ -8,18 +9,18 @@ mod sql;
 
 use meta_command::handle_meta_command;
 use repl::{get_command_type, get_config, CommandType, REPLHelper};
-use sql::process_command;
 use sql::db::database::Database;
+use sql::process_command;
 
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
-use clap::{crate_name ,crate_authors, crate_description, crate_version, App};
+use clap::{crate_authors, crate_description, crate_name, crate_version, Command};
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
-    let _matches = App::new(crate_name!())
+    let _matches = Command::new(crate_name!())
         .version(crate_version!())
         .author(crate_authors!())
         .about(crate_description!())

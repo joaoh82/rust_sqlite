@@ -81,15 +81,13 @@ impl Table {
             if col.is_pk {
                 primary_key = col_name.to_string();
             }
-            table_cols.push(
-                Column::new(
-                    col_name.to_string(),
-                    col.datatype.to_string(),
-                    col.is_pk,
-                    col.not_null,
-                    col.is_unique,
-                ),
-            );
+            table_cols.push(Column::new(
+                col_name.to_string(),
+                col.datatype.to_string(),
+                col.is_pk,
+                col.not_null,
+                col.is_unique,
+            ));
 
             match DataType::new(col.datatype.to_string()) {
                 DataType::Integer => table_rows
@@ -139,27 +137,29 @@ impl Table {
     /// column with the specified key as a column name.
     ///
     pub fn get_column(&mut self, column_name: String) -> Result<&Column> {
-        if let Some(column) = self.columns
+        if let Some(column) = self
+            .columns
             .iter()
             .filter(|c| c.column_name == column_name)
             .collect::<Vec<&Column>>()
-            .first(){
-                Ok(column)
-            } else {
-                Err(SQLRiteError::General(String::from("Column not found.")))
-            }
+            .first()
+        {
+            Ok(column)
+        } else {
+            Err(SQLRiteError::General(String::from("Column not found.")))
+        }
     }
 
     /// Returns an mutable reference of `sql::db::table::Column` if the table contains a
     /// column with the specified key as a column name.
     ///
     pub fn get_column_mut<'a>(&mut self, column_name: String) -> Result<&mut Column> {
-            for elem in self.columns.iter_mut() {
-                if elem.column_name == column_name{
-                    return Ok(elem)
-                }
+        for elem in self.columns.iter_mut() {
+            if elem.column_name == column_name {
+                return Ok(elem);
             }
-            Err(SQLRiteError::General(String::from("Column not found.")))
+        }
+        Err(SQLRiteError::General(String::from("Column not found.")))
     }
 
     /// Validates if columns and values being inserted violate the UNIQUE constraint
@@ -224,7 +224,7 @@ impl Table {
         let mut next_rowid = self.last_rowid + i64::from(1);
 
         // Checks if table has a PRIMARY KEY
-        if self.primary_key != "-1"{
+        if self.primary_key != "-1" {
             // Checking if primary key is in INSERT QUERY columns
             // If it is not, assign the next_rowid to it
             if !cols.iter().any(|col| col == &self.primary_key) {
@@ -288,21 +288,21 @@ impl Table {
         // For every column in the INSERT statement
         for i in 0..column_names.len() {
             let mut val = String::from("Null");
-            let mut key = &column_names[i];
+            let key = &column_names[i];
 
-            if let Some(key) = &cols.get(j){
+            if let Some(key) = &cols.get(j) {
                 if &key.to_string() == &column_names[i] {
                     // Getting column name
                     val = values[j].to_string();
                     j += 1;
-                } else{
-                    if &self.primary_key == &column_names[i]{
-                        continue
+                } else {
+                    if &self.primary_key == &column_names[i] {
+                        continue;
                     }
                 }
-            }else{
-                if &self.primary_key == &column_names[i]{
-                    continue
+            } else {
+                if &self.primary_key == &column_names[i] {
+                    continue;
                 }
             }
 
@@ -367,10 +367,22 @@ impl Table {
     ///
     pub fn print_table_schema(&self) -> Result<usize> {
         let mut table = PrintTable::new();
-        table.add_row(row!["Column Name", "Data Type", "PRIMARY KEY", "UNIQUE", "NOT NULL"]);
+        table.add_row(row![
+            "Column Name",
+            "Data Type",
+            "PRIMARY KEY",
+            "UNIQUE",
+            "NOT NULL"
+        ]);
 
         for col in &self.columns {
-            table.add_row(row![col.column_name, col.datatype, col.is_pk, col.is_unique, col.not_null]);
+            table.add_row(row![
+                col.column_name,
+                col.datatype,
+                col.is_pk,
+                col.is_unique,
+                col.not_null
+            ]);
         }
 
         let lines = table.printstd();
@@ -415,7 +427,9 @@ impl Table {
 
         let rows_clone = Rc::clone(&self.rows);
         let row_data = rows_clone.as_ref().borrow();
-        let first_col_data = row_data.get(&self.columns.first().unwrap().column_name).unwrap();
+        let first_col_data = row_data
+            .get(&self.columns.first().unwrap().column_name)
+            .unwrap();
         let num_rows = first_col_data.count();
         let mut print_table_rows: Vec<PrintRow> = vec![PrintRow::new(vec![]); num_rows];
 
@@ -426,9 +440,9 @@ impl Table {
             let columns: Vec<String> = col_val.get_serialized_col_data();
 
             for i in 0..num_rows {
-                if let Some(cell) = &columns.get(i){
+                if let Some(cell) = &columns.get(i) {
                     print_table_rows[i].add_cell(PrintCell::new(cell));
-                }else{
+                } else {
                     print_table_rows[i].add_cell(PrintCell::new(""));
                 }
             }
@@ -524,10 +538,10 @@ pub enum Row {
 impl Row {
     fn get_serialized_col_data(&self) -> Vec<String> {
         match self {
-            Row::Integer(cd) => cd.iter().map(|(i, v)| v.to_string()).collect(),
-            Row::Real(cd) => cd.iter().map(|(i, v)| v.to_string()).collect(),
-            Row::Text(cd) => cd.iter().map(|(i, v)| v.to_string()).collect(),
-            Row::Bool(cd) => cd.iter().map(|(i, v)| v.to_string()).collect(),
+            Row::Integer(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
+            Row::Real(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
+            Row::Text(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
+            Row::Bool(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
             Row::None => panic!("Found None in columns"),
         }
     }
@@ -591,16 +605,18 @@ mod tests {
         assert_eq!(table.last_rowid, 0);
 
         let id_column = "id".to_string();
-        if let Some(column) = table.columns
+        if let Some(column) = table
+            .columns
             .iter()
             .filter(|c| c.column_name == id_column)
             .collect::<Vec<&Column>>()
-            .first() {
-                assert_eq!(column.is_pk, true);
-                assert_eq!(column.datatype, DataType::Integer);
-            } else {
-                panic!("column not found");
-            }
+            .first()
+        {
+            assert_eq!(column.is_pk, true);
+            assert_eq!(column.datatype, DataType::Integer);
+        } else {
+            panic!("column not found");
+        }
     }
 
     #[test]
