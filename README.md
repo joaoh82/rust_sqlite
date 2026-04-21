@@ -64,64 +64,128 @@ Before you begin, ensure you have met the following requirements:
 * Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
 * SQLite3
 
-### Usage (TBD)
+### Usage
+
+Build and launch the REPL:
 
 ```shell
-> ./rust_sqlite -- help
-SQLRite 0.1.0
-Joao Henrique Machado Silva <joaoh82@gmail.com>
-Light version of SQLite developed with Rust
-
-USAGE:
-    rust_sqlite
-
-FLAGS:
-    -h, --help       Prints help information
-    -V, --version    Prints version information
+cargo run
 ```
 
-### Project Progress
-*Not checked means I am currently working on.*
-- [x] CLI and REPL Interface
-- [x] Parse meta commands and sql commands.
-- [x] Execute simple commands
-- [x] Standarized error handling
-- [x] Generic validation structure for SQL Commands.
-- [x] `Create Table` Command Parsing
-- [x] Improve error handling with https://github.com/dtolnay/thiserror
-- [x] Added support for parsing duplicate columns on CREATE TABLE
-- [x] Added support for parsing multiple PRIMARY KEY on CREATE TABLE
-- [x] In memory BTreeMap indexes initially only for PRIMARY KEYS.
-- [x] Simple INSERT queries command parsing.
-- [x] Implementation UNIQUE key constraints.
-- [ ] Improve Error Handling and return without Panic!
-- [ ] Simple SELECT queries (Single WHERE clause and no JOINS).
-- [ ] Serialization | Deserialization to and from binary encodings ([bincode](https://crates.io/crates/bincode)).
+You'll drop into a REPL connected to a transient in-memory database. On-disk persistence (`.open`, `.save`) is coming in Phase 2.
 
+```
+SQLRite - 0.1.0
+Enter .exit to quit.
+Enter .help for usage hints.
+Connected to a transient in-memory database.
+Use '.open FILENAME' to reopen on a persistent database.
+sqlrite> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+sqlrite> INSERT INTO users (name, age) VALUES ('alice', 30);
+sqlrite> INSERT INTO users (name, age) VALUES ('bob', 25);
+sqlrite> SELECT name FROM users WHERE age > 25 ORDER BY age DESC LIMIT 5;
++-------+
+| name  |
++-------+
+| alice |
++-------+
+SELECT Statement executed. 1 row returned.
+sqlrite> UPDATE users SET age = age + 1 WHERE name = 'bob';
+sqlrite> DELETE FROM users WHERE age < 30;
+```
+
+#### Supported SQL
+
+| Statement | Features |
+|---|---|
+| `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN` |
+| `INSERT INTO` | auto-ROWID for INTEGER PRIMARY KEY; UNIQUE enforcement; clean type errors (no panics) |
+| `SELECT` | `*` or column list, `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n` |
+| `UPDATE` | multi-column `SET`, `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
+| `DELETE` | `WHERE` predicate or full-table delete |
+
+Expressions in `WHERE` and `SET`:
+
+- Comparisons — `=`, `<>`, `<`, `<=`, `>`, `>=`
+- Logical — `AND`, `OR`, `NOT`
+- Arithmetic — `+`, `-`, `*`, `/`, `%` (integer ops stay integer; any `REAL` promotes to `f64`; divide/modulo by zero is a clean error)
+- String concat — `||`
+- Literals — numbers, single-quoted strings, booleans, `NULL`; parentheses
+
+Not yet implemented: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, expressions in the projection list, `OFFSET`. See the [Roadmap](#roadmap).
+
+#### Meta commands
+
+| Command | Status |
+|---|---|
+| `.help` | working |
+| `.exit` | working |
+| `.open FILENAME` | Phase 2 |
+| `.save FILENAME` | Phase 2 |
+| `.tables` | Phase 2 |
+| `.read FILENAME` | later |
+| `.ast QUERY` | later |
 
 ### Roadmap
-Features that are in the roadmap of the project:
 
-*Ideally in order of priority, but nothing set in stone.*
+The project is staged in phases, each independently shippable. A finished phase is committed to `main` before the next one starts.
 
+**Phase 0 — Modernization** *(done)*
+- [x] Rust edition 2024, resolver 3, stable toolchain pinned via `rust-toolchain.toml`
+- [x] Upgrade every dependency to current majors: `rustyline` 18, `clap` 4, `sqlparser` 0.61, `thiserror` 2, `env_logger` 0.11, `prettytable-rs` 0.10, `serde` / `log` latest
 
-- [ ] Implement Open command to load database with a command `.open`
-- [ ] Joins
-  - [ ] INNER JOIN (or sometimes called simple join)
-  - [ ] LEFT OUTER JOIN (or sometimes called LEFT JOIN)
-  - [ ] CROSS JOIN
-  - The RIGHT OUTER JOIN and FULL OUTER JOIN are not supported in SQLite.
-- [ ] WAL - Write Ahead Log Implementation
-- [ ] `Pager Module` 
-  - [ ] Implementing transactional ACID properties
-  - [ ] Concurrency
-  - [ ] Lock Manager
-- [ ] Composite Indexing - cost and performance gain analysis
-- [ ] Benchmarking vs SQLite for comparison
-- [ ] Server Client / Connection Manager
-- [ ] Different implementations of storage engines and data structures to optimize for different scenarios
-  - [ ] Write Heavy - `LSM Tree && SSTable`
-  - [ ] Read Heavy - `B-Tree`
+**Phase 1 — SQL execution surface** *(done)*
+- [x] CLI + rustyline REPL with history, syntax highlighting, bracket matching, line validation
+- [x] Parsing via `sqlparser` (SQLite dialect); typed `SQLRiteError` via `thiserror`
+- [x] `CREATE TABLE` with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; in-memory `BTreeMap` indexes on PK/UNIQUE columns
+- [x] `INSERT` with auto-ROWID for `INTEGER PRIMARY KEY`, UNIQUE enforcement, NULL padding for missing columns
+- [x] `SELECT` — projection, `WHERE`, `ORDER BY`, `LIMIT` (single-table, no joins yet)
+- [x] `UPDATE ... SET ... WHERE ...` with type + UNIQUE enforcement at write time
+- [x] `DELETE ... WHERE ...`
+- [x] Expression evaluator: `=`/`<>`/`<`/`<=`/`>`/`>=`, `AND`/`OR`/`NOT`, arithmetic `+`/`-`/`*`/`/`/`%`, string concat `||`, NULL-as-false in `WHERE`
+- [x] Replaced every `.unwrap()` panic on malformed input with typed errors
+
+**Phase 2 — On-disk persistence** *(in progress)*
+- [ ] Single-file database format — one `.sqlrite` file per database, closer to SQLite's model
+- [ ] Fixed 4 KiB pages with a page-0 header (magic, version, schema-root pointer)
+- [ ] Schema catalog + table data serialized to pages via `bincode`
+- [ ] `.open FILENAME` — create-or-load a database file
+- [ ] `.save FILENAME` — write current in-memory DB to disk (explicit for now; auto-save arrives with Phase 3's pager)
+- [ ] `.tables` — list tables in the current database
+
+**Phase 2.5 — Tauri 2.0 desktop app**
+- [ ] Cross-platform GUI wrapping the engine
+- [ ] File picker → open `.sqlrite` files
+- [ ] Table browser (schema + rows)
+- [ ] Query editor with result grid
+
+**Phase 3 — On-disk B-Tree**
+- [ ] Page-based B-Tree per table (keyed by ROWID), with split/merge and leaf/interior nodes
+- [ ] Secondary indexes as separate B-Trees
+- [ ] Pager module with page cache + dirty-page tracking → auto-save
+
+**Phase 4 — Durability and concurrency**
+- [ ] Write-Ahead Log (`<db>.sqlrite-wal`) with a checkpointer that merges the WAL back into the main file
+- [ ] OS file locks (`fs2` / `fd-lock`) so multiple processes can't corrupt each other
+- [ ] SQLite-style **multiple readers + single writer** via WAL mode
+- [ ] Transactional ACID properties
+
+**Phase 5 — Library + embedding**
+- [ ] Split into `lib` + `bin` crates; public `Connection` / `Statement` / `Rows` API
+- [ ] C FFI shim so non-Rust callers can embed the engine
+- [ ] **WASM** build (`wasm-pack`) so the engine runs in a browser
+
+**Phase 6 — AI-era extensions** *(research)*
+- [ ] Vector / embedding column type with an ANN index
+- [ ] Natural-language → SQL front-end that emits queries against this engine
+- [ ] Other agent-era ideas as they emerge
+
+**Possible extras** *(no committed phase)*
+- Joins (`INNER`, `LEFT OUTER`, `CROSS` — SQLite does not support `RIGHT`/`FULL OUTER`)
+- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`, `IS NULL`
+- Composite and expression indexes (with cost analysis)
+- Alternate storage engines — LSM/SSTable for write-heavy workloads alongside the B-Tree
+- Benchmarks against SQLite
 
 ### Contributing
 **Pull requests are warmly welcome!!!**
