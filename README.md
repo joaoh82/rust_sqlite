@@ -120,9 +120,9 @@ Not yet implemented: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LI
 |---|---|
 | `.help` | working |
 | `.exit` | working |
-| `.open FILENAME` | Phase 2 |
-| `.save FILENAME` | Phase 2 |
-| `.tables` | Phase 2 |
+| `.open FILENAME` | working — opens an existing `.sqlrite` file or starts a fresh DB that will be materialized on first `.save` |
+| `.save FILENAME` | working — writes the current in-memory DB to a paged file |
+| `.tables` | working |
 | `.read FILENAME` | later |
 | `.ast QUERY` | later |
 
@@ -145,24 +145,27 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] Expression evaluator: `=`/`<>`/`<`/`<=`/`>`/`>=`, `AND`/`OR`/`NOT`, arithmetic `+`/`-`/`*`/`/`/`%`, string concat `||`, NULL-as-false in `WHERE`
 - [x] Replaced every `.unwrap()` panic on malformed input with typed errors
 
-**Phase 2 — On-disk persistence** *(in progress)*
-- [ ] Single-file database format — one `.sqlrite` file per database, closer to SQLite's model
-- [ ] Fixed 4 KiB pages with a page-0 header (magic, version, schema-root pointer)
-- [ ] Schema catalog + table data serialized to pages via `bincode`
-- [ ] `.open FILENAME` — create-or-load a database file
-- [ ] `.save FILENAME` — write current in-memory DB to disk (explicit for now; auto-save arrives with Phase 3's pager)
-- [ ] `.tables` — list tables in the current database
+**Phase 2 — On-disk persistence** *(done)*
+- [x] Single-file database format — one `.sqlrite` file per database
+- [x] Fixed 4 KiB pages; page 0 carries a header (magic `SQLRiteFormat\0\0\0`, format version, page size, page count, schema-root page)
+- [x] Typed payload pages (schema-root / table-data / overflow) chained via `next`-page pointers; payloads up to 4089 bytes before spilling into overflow
+- [x] Schema catalog + per-table state serialized via `bincode` 2.0
+- [x] `.open FILENAME` — create-or-load a database file
+- [x] `.save FILENAME` — explicit flush of the in-memory DB to disk (auto-save arrives with Phase 3's pager)
+- [x] `.tables` — list tables in the current database
+- [x] Header written last during save, so a mid-save crash leaves the file recognizably unopenable
 
-**Phase 2.5 — Tauri 2.0 desktop app**
+**Phase 3 — On-disk B-Tree + auto-save pager** *(in progress, next)*
+- [ ] Page cache with dirty-page tracking; auto-save after every committed statement
+- [ ] Cell-based page layout (variable-length row records) replacing per-table bincode blobs
+- [ ] Page-based B-Tree per table keyed by ROWID, with split/merge and leaf/interior nodes
+- [ ] Secondary indexes as separate B-Trees (indexed_value, rowid)
+
+**Phase 2.5 — Tauri 2.0 desktop app** *(after Phase 3)*
 - [ ] Cross-platform GUI wrapping the engine
 - [ ] File picker → open `.sqlrite` files
 - [ ] Table browser (schema + rows)
 - [ ] Query editor with result grid
-
-**Phase 3 — On-disk B-Tree**
-- [ ] Page-based B-Tree per table (keyed by ROWID), with split/merge and leaf/interior nodes
-- [ ] Secondary indexes as separate B-Trees
-- [ ] Pager module with page cache + dirty-page tracking → auto-save
 
 **Phase 4 — Durability and concurrency**
 - [ ] Write-Ahead Log (`<db>.sqlrite-wal`) with a checkpointer that merges the WAL back into the main file
