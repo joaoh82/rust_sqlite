@@ -363,6 +363,27 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
                 };
                 Ok(Value::Bool(result))
             }
+            arith @ (BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo) => {
+                let l = eval_expr(left, table, rowid)?;
+                let r = eval_expr(right, table, rowid)?;
+                eval_arith(arith, &l, &r)
+            }
+            BinaryOperator::StringConcat => {
+                let l = eval_expr(left, table, rowid)?;
+                let r = eval_expr(right, table, rowid)?;
+                if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Text(format!(
+                    "{}{}",
+                    l.to_display_string(),
+                    r.to_display_string()
+                )))
+            }
             other => Err(SQLRiteError::NotImplemented(format!(
                 "binary operator {other:?} is not supported yet"
             ))),
@@ -370,6 +391,73 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
 
         other => Err(SQLRiteError::NotImplemented(format!(
             "unsupported expression in WHERE/projection: {other:?}"
+        ))),
+    }
+}
+
+/// Evaluates an integer/real arithmetic op. NULL on either side propagates.
+/// Mixed Integer/Real promotes to Real. Divide/Modulo by zero → error.
+fn eval_arith(op: &BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match (l, r) {
+        (Value::Integer(a), Value::Integer(b)) => match op {
+            BinaryOperator::Plus => Ok(Value::Integer(a.wrapping_add(*b))),
+            BinaryOperator::Minus => Ok(Value::Integer(a.wrapping_sub(*b))),
+            BinaryOperator::Multiply => Ok(Value::Integer(a.wrapping_mul(*b))),
+            BinaryOperator::Divide => {
+                if *b == 0 {
+                    Err(SQLRiteError::General("division by zero".to_string()))
+                } else {
+                    Ok(Value::Integer(a / b))
+                }
+            }
+            BinaryOperator::Modulo => {
+                if *b == 0 {
+                    Err(SQLRiteError::General("modulo by zero".to_string()))
+                } else {
+                    Ok(Value::Integer(a % b))
+                }
+            }
+            _ => unreachable!(),
+        },
+        // Anything involving a Real promotes both sides to f64.
+        (a, b) => {
+            let af = as_number(a)?;
+            let bf = as_number(b)?;
+            match op {
+                BinaryOperator::Plus => Ok(Value::Real(af + bf)),
+                BinaryOperator::Minus => Ok(Value::Real(af - bf)),
+                BinaryOperator::Multiply => Ok(Value::Real(af * bf)),
+                BinaryOperator::Divide => {
+                    if bf == 0.0 {
+                        Err(SQLRiteError::General("division by zero".to_string()))
+                    } else {
+                        Ok(Value::Real(af / bf))
+                    }
+                }
+                BinaryOperator::Modulo => {
+                    if bf == 0.0 {
+                        Err(SQLRiteError::General("modulo by zero".to_string()))
+                    } else {
+                        Ok(Value::Real(af % bf))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn as_number(v: &Value) -> Result<f64> {
+    match v {
+        Value::Integer(i) => Ok(*i as f64),
+        Value::Real(f) => Ok(*f),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        other => Err(SQLRiteError::General(format!(
+            "arithmetic on non-numeric value '{}'",
+            other.to_display_string()
         ))),
     }
 }

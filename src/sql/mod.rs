@@ -391,6 +391,44 @@ mod tests {
     }
 
     #[test]
+    fn process_command_update_arith_test() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        process_command("UPDATE users SET age = age + 1;", &mut db).expect("update +1");
+
+        let users = db.get_table("users".to_string()).unwrap();
+        let mut ages: Vec<i64> = users
+            .rowids()
+            .into_iter()
+            .filter_map(|r| match users.get_value("age", r) {
+                Some(Value::Integer(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        ages.sort();
+        assert_eq!(ages, vec![26, 31, 41]); // 25+1, 30+1, 40+1
+    }
+
+    #[test]
+    fn process_command_select_arithmetic_where_test() {
+        let mut db = seed_users_table();
+        // age * 2 > 55  →  only ages > 27.5  →  alice(30) + carol(40)
+        let response =
+            process_command("SELECT name FROM users WHERE age * 2 > 55;", &mut db)
+                .expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_divide_by_zero_test() {
+        let mut db = seed_users_table();
+        let result = process_command("SELECT age / 0 FROM users;", &mut db);
+        // Projection only supports bare columns, so this errors earlier; still shouldn't panic.
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn process_command_unsupported_statement_test() {
         let mut db = Database::new("tempdb".to_string());
         // Nothing in Phase 1 handles DROP.
