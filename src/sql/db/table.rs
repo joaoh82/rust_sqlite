@@ -136,6 +136,7 @@ impl Table {
     /// Returns an immutable reference of `sql::db::table::Column` if the table contains a
     /// column with the specified key as a column name.
     ///
+    #[allow(dead_code)]
     pub fn get_column(&mut self, column_name: String) -> Result<&Column> {
         if let Some(column) = self
             .columns
@@ -385,8 +386,8 @@ impl Table {
             ]);
         }
 
-        let lines = table.printstd();
-        Ok(lines)
+        table.printstd();
+        Ok(table.len() * 2 + 1)
     }
 
     /// Print the table data to standard output in a pretty formatted way

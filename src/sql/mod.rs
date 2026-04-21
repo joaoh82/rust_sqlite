@@ -54,7 +54,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 
     // Initialy only implementing some basic SQL Statements
     match query {
-        Statement::CreateTable { .. } => {
+        Statement::CreateTable(_) => {
             let create_query = CreateQuery::new(&query);
             match create_query {
                 Ok(payload) => {
@@ -81,7 +81,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 Err(err) => return Err(err),
             }
         }
-        Statement::Insert { .. } => {
+        Statement::Insert(_) => {
             let insert_query = InsertQuery::new(&query);
             match insert_query {
                 Ok(payload) => {
@@ -144,7 +144,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         }
         Statement::Query(_query) => message = String::from("SELECT Statement executed."),
         // Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
-        Statement::Delete { .. } => message = String::from("DELETE Statement executed."),
+        Statement::Delete(_) => message = String::from("DELETE Statement executed."),
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "SQL Statement not supported yet.".to_string(),

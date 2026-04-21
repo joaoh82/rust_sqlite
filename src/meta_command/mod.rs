@@ -2,6 +2,7 @@ use crate::error::{Result, SQLRiteError};
 
 use crate::repl::REPLHelper;
 use rustyline::Editor;
+use rustyline::history::DefaultHistory;
 use std::fmt;
 
 #[derive(Debug, PartialEq)]
@@ -37,7 +38,10 @@ impl MetaCommand {
     }
 }
 
-pub fn handle_meta_command(command: MetaCommand, repl: &mut Editor<REPLHelper>) -> Result<String> {
+pub fn handle_meta_command(
+    command: MetaCommand,
+    repl: &mut Editor<REPLHelper, DefaultHistory>,
+) -> Result<String> {
     match command {
         MetaCommand::Exit => {
             repl.append_history("history").unwrap();
@@ -54,70 +58,55 @@ pub fn handle_meta_command(command: MetaCommand, repl: &mut Editor<REPLHelper>) 
             ".ast <QUERY>     - Show the abstract syntax tree for QUERY.\n",
             ".exit            - Quits this application"
         )),
-        MetaCommand::Open(args) => Ok(format!("To be implemented: {}", args)),
-        MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(format!(
-            "Unknown command or invalid arguments. Enter '.help'"
-        ))),
+        MetaCommand::Open(args) => Ok(format!("To be implemented: {args}")),
+        MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(
+            "Unknown command or invalid arguments. Enter '.help'".to_string(),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repl::{get_config, REPLHelper};
+    use crate::repl::{REPLHelper, get_config};
+
+    fn new_editor() -> Editor<REPLHelper, DefaultHistory> {
+        let config = get_config();
+        let helper = REPLHelper::default();
+        let mut repl: Editor<REPLHelper, DefaultHistory> =
+            Editor::with_config(config).expect("failed to build rustyline editor");
+        repl.set_helper(Some(helper));
+        repl
+    }
 
     #[test]
     fn get_meta_command_exit_test() {
-        // Starting Rustyline with a default configuration
-        let config = get_config();
-
-        // Getting a new Rustyline Helper
-        let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
-        repl.set_helper(Some(helper));
+        let mut repl = new_editor();
 
         let inputed_command = MetaCommand::Help;
 
         let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_ok(), true);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn get_meta_command_open_test() {
-        // Starting Rustyline with a default configuration
-        let config = get_config();
-
-        // Getting a new Rustyline Helper
-        let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
-        repl.set_helper(Some(helper));
+        let mut repl = new_editor();
 
         let inputed_command = MetaCommand::Open(".open database.db".to_string());
 
         let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_ok(), true);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn get_meta_command_unknown_command_test() {
-        // Starting Rustyline with a default configuration
-        let config = get_config();
-
-        // Getting a new Rustyline Helper
-        let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
-        repl.set_helper(Some(helper));
+        let mut repl = new_editor();
 
         let inputed_command = MetaCommand::Unknown;
 
         let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -127,9 +116,9 @@ mod tests {
         let open = MetaCommand::Open(".open database.db".to_string());
         let unknown = MetaCommand::Unknown;
 
-        assert_eq!(format!("{}", exit), ".exit");
-        assert_eq!(format!("{}", help), ".help");
-        assert_eq!(format!("{}", open), ".open");
-        assert_eq!(format!("{}", unknown), "Unknown command");
+        assert_eq!(format!("{exit}"), ".exit");
+        assert_eq!(format!("{help}"), ".help");
+        assert_eq!(format!("{open}"), ".open");
+        assert_eq!(format!("{unknown}"), "Unknown command");
     }
 }

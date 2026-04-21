@@ -3,9 +3,8 @@ use crate::sql::*;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
 
-use rustyline::config::OutputStreamType;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
+use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::validate::Validator;
 use rustyline::validate::{ValidationContext, ValidationResult};
@@ -20,10 +19,11 @@ pub enum CommandType {
 }
 
 /// Returns the type of command inputed in the REPL
-pub fn get_command_type(command: &String) -> CommandType {
-    match command.starts_with(".") {
-        true => CommandType::MetaCommand(MetaCommand::new(command.to_owned())),
-        false => CommandType::SQLCommand(SQLCommand::new(command.to_owned())),
+pub fn get_command_type(command: &str) -> CommandType {
+    if command.starts_with('.') {
+        CommandType::MetaCommand(MetaCommand::new(command.to_owned()))
+    } else {
+        CommandType::SQLCommand(SQLCommand::new(command.to_owned()))
     }
 }
 
@@ -41,7 +41,7 @@ impl Default for REPLHelper {
     fn default() -> Self {
         Self {
             highlighter: MatchingBracketHighlighter::new(),
-            hinter: HistoryHinter {},
+            hinter: HistoryHinter::new(),
             colored_prompt: "".to_owned(),
         }
     }
@@ -68,7 +68,7 @@ impl Validator for REPLHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> Result<ValidationResult, ReadlineError> {
         use ValidationResult::{Incomplete, /*Invalid,*/ Valid};
         let input = ctx.input();
-        let result = if input.starts_with(".") {
+        let result = if input.starts_with('.') {
             Valid(None)
         } else if !input.ends_with(';') {
             Incomplete
@@ -106,8 +106,8 @@ impl Highlighter for REPLHelper {
 
     // Tells if line needs to be highlighted when a specific char is typed or when cursor is moved under a specific char.
     // Used to optimize refresh when a character is inserted or the cursor is moved.
-    fn highlight_char(&self, line: &str, pos: usize) -> bool {
-        self.highlighter.highlight_char(line, pos)
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        self.highlighter.highlight_char(line, pos, kind)
     }
 }
 
@@ -117,7 +117,6 @@ pub fn get_config() -> Config {
         .history_ignore_space(true)
         .completion_type(CompletionType::List)
         .edit_mode(EditMode::Emacs)
-        .output_stream(OutputStreamType::Stdout)
         .build()
 }
 

@@ -25,6 +25,7 @@ pub enum SQLRiteError {
 }
 
 /// Returns SQLRiteError::General error from String
+#[allow(dead_code)]
 pub fn sqlrite_error(message: &str) -> SQLRiteError {
     SQLRiteError::General(message.to_owned())
 }
