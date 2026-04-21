@@ -1,0 +1,410 @@
+//! Query executors — evaluate parsed SQL statements against the in-memory
+//! storage and produce formatted output.
+
+use std::cmp::Ordering;
+
+use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
+use sqlparser::ast::{
+    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Statement, TableFactor,
+    TableWithJoins, UnaryOperator, Update,
+};
+
+use crate::error::{Result, SQLRiteError};
+use crate::sql::db::database::Database;
+use crate::sql::db::table::{Table, Value};
+use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
+
+/// Executes a parsed `SelectQuery` against the database and returns a
+/// human-readable rendering of the result set (prettytable). Also returns
+/// the number of rows produced, for the top-level status message.
+pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usize)> {
+    let table = db
+        .get_table(query.table_name.clone())
+        .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
+
+    // Resolve projection to a concrete ordered column list.
+    let projected_cols: Vec<String> = match &query.projection {
+        Projection::All => table.column_names(),
+        Projection::Columns(cols) => {
+            for c in cols {
+                if !table.contains_column(c.to_string()) {
+                    return Err(SQLRiteError::Internal(format!(
+                        "Column '{c}' does not exist on table '{}'",
+                        query.table_name
+                    )));
+                }
+            }
+            cols.clone()
+        }
+    };
+
+    // Collect matching rowids by evaluating WHERE on each row.
+    let mut matching: Vec<i64> = Vec::new();
+    for rowid in table.rowids() {
+        if let Some(expr) = &query.selection {
+            if !eval_predicate(expr, table, rowid)? {
+                continue;
+            }
+        }
+        matching.push(rowid);
+    }
+
+    // Sort before applying LIMIT, matching SQL semantics.
+    if let Some(order) = &query.order_by {
+        sort_rowids(&mut matching, table, order)?;
+    }
+
+    if let Some(n) = query.limit {
+        matching.truncate(n);
+    }
+
+    // Render the result.
+    let mut print_table = PrintTable::new();
+    let header_cells: Vec<PrintCell> = projected_cols.iter().map(|c| PrintCell::new(c)).collect();
+    print_table.add_row(PrintRow::new(header_cells));
+
+    for rowid in &matching {
+        let cells: Vec<PrintCell> = projected_cols
+            .iter()
+            .map(|col| {
+                let display = table
+                    .get_value(col, *rowid)
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_else(|| "".to_string());
+                PrintCell::new(&display)
+            })
+            .collect();
+        print_table.add_row(PrintRow::new(cells));
+    }
+
+    let rendered = print_table.to_string();
+    Ok((rendered, matching.len()))
+}
+
+/// Executes a DELETE statement. Returns the number of rows removed.
+pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
+    let Statement::Delete(Delete {
+        from, selection, ..
+    }) = stmt
+    else {
+        return Err(SQLRiteError::Internal(
+            "execute_delete called on a non-DELETE statement".to_string(),
+        ));
+    };
+
+    let tables = match from {
+        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+    };
+    let table_name = extract_single_table_name(tables)?;
+
+    // Compute matching rowids with an immutable borrow, then mutate.
+    let matching: Vec<i64> = {
+        let table = db.get_table(table_name.clone()).map_err(|_| {
+            SQLRiteError::Internal(format!("Table '{table_name}' not found"))
+        })?;
+        let mut out = Vec::new();
+        for rowid in table.rowids() {
+            if let Some(expr) = selection {
+                if !eval_predicate(expr, table, rowid)? {
+                    continue;
+                }
+            }
+            out.push(rowid);
+        }
+        out
+    };
+
+    let table = db.get_table_mut(table_name)?;
+    for rowid in &matching {
+        table.delete_row(*rowid);
+    }
+    Ok(matching.len())
+}
+
+/// Executes an UPDATE statement. Returns the number of rows updated.
+pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
+    let Statement::Update(Update {
+        table,
+        assignments,
+        from,
+        selection,
+        ..
+    }) = stmt
+    else {
+        return Err(SQLRiteError::Internal(
+            "execute_update called on a non-UPDATE statement".to_string(),
+        ));
+    };
+
+    if from.is_some() {
+        return Err(SQLRiteError::NotImplemented(
+            "UPDATE ... FROM is not supported yet".to_string(),
+        ));
+    }
+
+    let table_name = extract_table_name(table)?;
+
+    // Resolve assignment targets to plain column names and verify they exist.
+    let mut parsed_assignments: Vec<(String, Expr)> = Vec::with_capacity(assignments.len());
+    {
+        let tbl = db.get_table(table_name.clone()).map_err(|_| {
+            SQLRiteError::Internal(format!("Table '{table_name}' not found"))
+        })?;
+        for a in assignments {
+            let col = match &a.target {
+                AssignmentTarget::ColumnName(name) => name
+                    .0
+                    .last()
+                    .map(|p| p.to_string())
+                    .ok_or_else(|| SQLRiteError::Internal("empty column name".to_string()))?,
+                AssignmentTarget::Tuple(_) => {
+                    return Err(SQLRiteError::NotImplemented(
+                        "tuple assignment targets are not supported".to_string(),
+                    ));
+                }
+            };
+            if !tbl.contains_column(col.clone()) {
+                return Err(SQLRiteError::Internal(format!(
+                    "UPDATE references unknown column '{col}'"
+                )));
+            }
+            parsed_assignments.push((col, a.value.clone()));
+        }
+    }
+
+    // Gather matching rowids + the new values to write for each assignment, under
+    // an immutable borrow.
+    let work: Vec<(i64, Vec<(String, Value)>)> = {
+        let tbl = db.get_table(table_name.clone())?;
+        let mut rows_to_update = Vec::new();
+        for rowid in tbl.rowids() {
+            if let Some(expr) = selection {
+                if !eval_predicate(expr, tbl, rowid)? {
+                    continue;
+                }
+            }
+            let mut values = Vec::with_capacity(parsed_assignments.len());
+            for (col, expr) in &parsed_assignments {
+                // UPDATE's RHS is evaluated in the context of the row being updated,
+                // so column references on the right resolve to the current row's values.
+                let v = eval_expr(expr, tbl, rowid)?;
+                values.push((col.clone(), v));
+            }
+            rows_to_update.push((rowid, values));
+        }
+        rows_to_update
+    };
+
+    let tbl = db.get_table_mut(table_name)?;
+    for (rowid, values) in &work {
+        for (col, v) in values {
+            tbl.set_value(col, *rowid, v.clone())?;
+        }
+    }
+    Ok(work.len())
+}
+
+fn extract_single_table_name(tables: &[TableWithJoins]) -> Result<String> {
+    if tables.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "multi-table DELETE is not supported yet".to_string(),
+        ));
+    }
+    extract_table_name(&tables[0])
+}
+
+fn extract_table_name(twj: &TableWithJoins) -> Result<String> {
+    if !twj.joins.is_empty() {
+        return Err(SQLRiteError::NotImplemented(
+            "JOIN is not supported yet".to_string(),
+        ));
+    }
+    match &twj.relation {
+        TableFactor::Table { name, .. } => Ok(name.to_string()),
+        _ => Err(SQLRiteError::NotImplemented(
+            "only plain table references are supported".to_string(),
+        )),
+    }
+}
+
+fn sort_rowids(rowids: &mut [i64], table: &Table, order: &OrderByClause) -> Result<()> {
+    if !table.contains_column(order.column.clone()) {
+        return Err(SQLRiteError::Internal(format!(
+            "ORDER BY references unknown column '{}'",
+            order.column
+        )));
+    }
+    rowids.sort_by(|a, b| {
+        let va = table.get_value(&order.column, *a);
+        let vb = table.get_value(&order.column, *b);
+        let ord = compare_values(va.as_ref(), vb.as_ref());
+        if order.ascending { ord } else { ord.reverse() }
+    });
+    Ok(())
+}
+
+fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, _) => Ordering::Less,
+        (_, None) => Ordering::Greater,
+        (Some(a), Some(b)) => match (a, b) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+            (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (Value::Integer(x), Value::Real(y)) => {
+                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+            }
+            (Value::Real(x), Value::Integer(y)) => {
+                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+            }
+            (Value::Text(x), Value::Text(y)) => x.cmp(y),
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            // Cross-type fallback: stringify and compare; keeps ORDER BY total.
+            (x, y) => x.to_display_string().cmp(&y.to_display_string()),
+        },
+    }
+}
+
+/// Returns `true` if the row at `rowid` matches the predicate expression.
+pub fn eval_predicate(expr: &Expr, table: &Table, rowid: i64) -> Result<bool> {
+    let v = eval_expr(expr, table, rowid)?;
+    match v {
+        Value::Bool(b) => Ok(b),
+        Value::Null => Ok(false), // SQL NULL in a WHERE is treated as false
+        Value::Integer(i) => Ok(i != 0),
+        other => Err(SQLRiteError::Internal(format!(
+            "WHERE clause must evaluate to boolean, got {}",
+            other.to_display_string()
+        ))),
+    }
+}
+
+fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
+    match expr {
+        Expr::Nested(inner) => eval_expr(inner, table, rowid),
+
+        Expr::Identifier(ident) => Ok(table
+            .get_value(&ident.value, rowid)
+            .unwrap_or(Value::Null)),
+
+        Expr::CompoundIdentifier(parts) => {
+            // Accept `table.col` — we only have one table in scope, so ignore the qualifier.
+            let col = parts
+                .last()
+                .map(|i| i.value.as_str())
+                .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?;
+            Ok(table.get_value(col, rowid).unwrap_or(Value::Null))
+        }
+
+        Expr::Value(v) => convert_literal(&v.value),
+
+        Expr::UnaryOp { op, expr } => {
+            let inner = eval_expr(expr, table, rowid)?;
+            match op {
+                UnaryOperator::Not => match inner {
+                    Value::Bool(b) => Ok(Value::Bool(!b)),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(SQLRiteError::Internal(format!(
+                        "NOT applied to non-boolean value: {}",
+                        other.to_display_string()
+                    ))),
+                },
+                UnaryOperator::Minus => match inner {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(SQLRiteError::Internal(format!(
+                        "unary minus on non-numeric value: {}",
+                        other.to_display_string()
+                    ))),
+                },
+                UnaryOperator::Plus => Ok(inner),
+                other => Err(SQLRiteError::NotImplemented(format!(
+                    "unary operator {other:?} is not supported"
+                ))),
+            }
+        }
+
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let l = eval_expr(left, table, rowid)?;
+                let r = eval_expr(right, table, rowid)?;
+                Ok(Value::Bool(as_bool(&l)? && as_bool(&r)?))
+            }
+            BinaryOperator::Or => {
+                let l = eval_expr(left, table, rowid)?;
+                let r = eval_expr(right, table, rowid)?;
+                Ok(Value::Bool(as_bool(&l)? || as_bool(&r)?))
+            }
+            cmp @ (BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq) => {
+                let l = eval_expr(left, table, rowid)?;
+                let r = eval_expr(right, table, rowid)?;
+                // Any comparison involving NULL is unknown → false in a WHERE.
+                if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let ord = compare_values(Some(&l), Some(&r));
+                let result = match cmp {
+                    BinaryOperator::Eq => ord == Ordering::Equal,
+                    BinaryOperator::NotEq => ord != Ordering::Equal,
+                    BinaryOperator::Lt => ord == Ordering::Less,
+                    BinaryOperator::LtEq => ord != Ordering::Greater,
+                    BinaryOperator::Gt => ord == Ordering::Greater,
+                    BinaryOperator::GtEq => ord != Ordering::Less,
+                    _ => unreachable!(),
+                };
+                Ok(Value::Bool(result))
+            }
+            other => Err(SQLRiteError::NotImplemented(format!(
+                "binary operator {other:?} is not supported yet"
+            ))),
+        },
+
+        other => Err(SQLRiteError::NotImplemented(format!(
+            "unsupported expression in WHERE/projection: {other:?}"
+        ))),
+    }
+}
+
+fn as_bool(v: &Value) -> Result<bool> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Null => Ok(false),
+        Value::Integer(i) => Ok(*i != 0),
+        other => Err(SQLRiteError::Internal(format!(
+            "expected boolean, got {}",
+            other.to_display_string()
+        ))),
+    }
+}
+
+fn convert_literal(v: &sqlparser::ast::Value) -> Result<Value> {
+    use sqlparser::ast::Value as AstValue;
+    match v {
+        AstValue::Number(n, _) => {
+            if let Ok(i) = n.parse::<i64>() {
+                Ok(Value::Integer(i))
+            } else if let Ok(f) = n.parse::<f64>() {
+                Ok(Value::Real(f))
+            } else {
+                Err(SQLRiteError::Internal(format!(
+                    "could not parse numeric literal '{n}'"
+                )))
+            }
+        }
+        AstValue::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
+        AstValue::Boolean(b) => Ok(Value::Bool(*b)),
+        AstValue::Null => Ok(Value::Null),
+        other => Err(SQLRiteError::NotImplemented(format!(
+            "unsupported literal value: {other:?}"
+        ))),
+    }
+}

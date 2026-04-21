@@ -1,9 +1,11 @@
+pub mod db;
+pub mod executor;
 pub mod parser;
 // pub mod tokenizer;
-pub mod db;
 
 use parser::create::CreateQuery;
 use parser::insert::InsertQuery;
+use parser::select::SelectQuery;
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
@@ -109,18 +111,14 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                                 columns.len()
                                             )));
                                         }
-                                        match db_table.validate_unique_constraint(&columns, value) {
-                                            Ok(()) => {
-                                                // No unique constraint violation, moving forward with inserting row
-                                                db_table.insert_row(&columns, &value);
-                                            }
-                                            Err(err) => {
-                                                return Err(SQLRiteError::Internal(format!(
-                                                    "Unique key constaint violation: {}",
-                                                    err
-                                                )))
-                                            }
-                                        }
+                                        db_table
+                                            .validate_unique_constraint(&columns, value)
+                                            .map_err(|err| {
+                                                SQLRiteError::Internal(format!(
+                                                    "Unique key constraint violation: {err}"
+                                                ))
+                                            })?;
+                                        db_table.insert_row(&columns, value)?;
                                     }
                                 }
                                 false => {
@@ -142,13 +140,34 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 
             message = String::from("INSERT Statement executed.")
         }
-        Statement::Query(_query) => message = String::from("SELECT Statement executed."),
-        // Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
-        Statement::Delete(_) => message = String::from("DELETE Statement executed."),
+        Statement::Query(_) => {
+            let select_query = SelectQuery::new(&query)?;
+            let (rendered, rows) = executor::execute_select(select_query, db)?;
+            // Print the result table above the status message so the REPL shows both.
+            print!("{rendered}");
+            message = format!(
+                "SELECT Statement executed. {rows} row{s} returned.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
+        Statement::Delete(_) => {
+            let rows = executor::execute_delete(&query, db)?;
+            message = format!(
+                "DELETE Statement executed. {rows} row{s} deleted.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
+        Statement::Update(_) => {
+            let rows = executor::execute_update(&query, db)?;
+            message = format!(
+                "UPDATE Statement executed. {rows} row{s} updated.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "SQL Statement not supported yet.".to_string(),
-            ))
+            ));
         }
     };
 
@@ -159,18 +178,68 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn process_command_select_test() {
-        let inputed_query = String::from("SELECT * from users;");
+    /// Builds a `users(id INTEGER PK, name TEXT, age INTEGER)` table populated
+    /// with three rows, for use in executor-level tests.
+    fn seed_users_table() -> Database {
         let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);",
+            &mut db,
+        )
+        .expect("create table");
+        process_command("INSERT INTO users (name, age) VALUES ('alice', 30);", &mut db)
+            .expect("insert alice");
+        process_command("INSERT INTO users (name, age) VALUES ('bob', 25);", &mut db)
+            .expect("insert bob");
+        process_command("INSERT INTO users (name, age) VALUES ('carol', 40);", &mut db)
+            .expect("insert carol");
+        db
+    }
 
-        let _ = match process_command(&inputed_query, &mut db) {
-            Ok(response) => assert_eq!(response, "SELECT Statement executed."),
-            Err(err) => {
-                eprintln!("Error: {}", err);
-                assert!(false)
-            }
-        };
+    #[test]
+    fn process_command_select_all_test() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT * FROM users;", &mut db).expect("select");
+        assert!(response.contains("3 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_where_test() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT name FROM users WHERE age > 25;", &mut db)
+            .expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_eq_string_test() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT name FROM users WHERE name = 'bob';", &mut db)
+            .expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn process_command_select_limit_test() {
+        let mut db = seed_users_table();
+        let response =
+            process_command("SELECT * FROM users ORDER BY age ASC LIMIT 2;", &mut db)
+                .expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_unknown_table_test() {
+        let mut db = Database::new("tempdb".to_string());
+        let result = process_command("SELECT * FROM nope;", &mut db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_command_select_unknown_column_test() {
+        let mut db = seed_users_table();
+        let result = process_command("SELECT height FROM users;", &mut db);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -243,28 +312,89 @@ mod tests {
     }
 
     #[test]
-    fn process_command_delete_test() {
-        let inputed_query = String::from("DELETE FROM users WHERE id=1;");
-        let mut db = Database::new("tempdb".to_string());
+    fn process_command_delete_where_test() {
+        let mut db = seed_users_table();
+        let response = process_command("DELETE FROM users WHERE name = 'bob';", &mut db)
+            .expect("delete");
+        assert!(response.contains("1 row deleted"));
 
-        let _ = match process_command(&inputed_query, &mut db) {
-            Ok(response) => assert_eq!(response, "DELETE Statement executed."),
-            Err(err) => {
-                eprintln!("Error: {}", err);
-                assert!(false)
-            }
-        };
+        let remaining = process_command("SELECT * FROM users;", &mut db).expect("select");
+        assert!(remaining.contains("2 rows returned"));
     }
 
     #[test]
-    fn process_command_not_implemented_test() {
-        let inputed_query = String::from("UPDATE users SET name='josh' where id=1;");
-        let mut db = Database::new("tempdb".to_string());
-        let expected = Err(SQLRiteError::NotImplemented(
-            "SQL Statement not supported yet.".to_string(),
-        ));
+    fn process_command_delete_all_test() {
+        let mut db = seed_users_table();
+        let response = process_command("DELETE FROM users;", &mut db).expect("delete");
+        assert!(response.contains("3 rows deleted"));
+    }
 
-        let result = process_command(&inputed_query, &mut db).map_err(|e| e);
-        assert_eq!(result, expected);
+    #[test]
+    fn process_command_update_where_test() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        let response = process_command("UPDATE users SET age = 99 WHERE name = 'bob';", &mut db)
+            .expect("update");
+        assert!(response.contains("1 row updated"));
+
+        // Confirm the cell was actually rewritten.
+        let users = db.get_table("users".to_string()).unwrap();
+        let bob_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("name", *r) == Some(Value::Text("bob".to_string())))
+            .expect("bob row must exist");
+        assert_eq!(users.get_value("age", bob_rowid), Some(Value::Integer(99)));
+    }
+
+    #[test]
+    fn process_command_update_unique_violation_test() {
+        let mut db = seed_users_table();
+        // `name` is not UNIQUE in the seed — reinforce with an explicit unique column.
+        process_command(
+            "CREATE TABLE tags (id INTEGER PRIMARY KEY, label TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO tags (label) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO tags (label) VALUES ('b');", &mut db).unwrap();
+
+        let result = process_command("UPDATE tags SET label = 'a' WHERE label = 'b';", &mut db);
+        assert!(result.is_err(), "expected UNIQUE violation, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_insert_type_mismatch_returns_error_test() {
+        // Previously this panicked in parse::<i32>().unwrap(); now it should return an error cleanly.
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let result = process_command("INSERT INTO items (qty) VALUES ('not a number');", &mut db);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_insert_missing_integer_returns_error_test() {
+        // Non-PK INTEGER without a value should error (not panic on "Null".parse()).
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let result = process_command("INSERT INTO items (id) VALUES (1);", &mut db);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_unsupported_statement_test() {
+        let mut db = Database::new("tempdb".to_string());
+        // Nothing in Phase 1 handles DROP.
+        let result = process_command("DROP TABLE users;", &mut db);
+        assert!(result.is_err());
     }
 }

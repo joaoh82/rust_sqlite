@@ -36,7 +36,6 @@ impl Database {
     /// Returns an immutable reference of `sql::db::table::Table` if the database contains a
     /// table with the specified key as a table name.
     ///
-    #[allow(dead_code)]
     pub fn get_table(&self, table_name: String) -> Result<&Table> {
         if let Some(table) = self.tables.get(&table_name) {
             Ok(table)
