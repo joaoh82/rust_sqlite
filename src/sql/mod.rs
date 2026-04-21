@@ -55,6 +55,16 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 
     let query = ast.pop().unwrap();
 
+    // Statements that mutate state — trigger auto-save on success. Read-only
+    // SELECTs skip the save entirely to avoid pointless file writes.
+    let is_write_statement = matches!(
+        &query,
+        Statement::CreateTable(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    );
+
     // Initialy only implementing some basic SQL Statements
     match query {
         Statement::CreateTable(_) => {
@@ -171,6 +181,16 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             ));
         }
     };
+
+    // Auto-save: if the database is backed by a file and the statement changed
+    // state, flush to disk before returning. A failed save surfaces as an error
+    // — the in-memory state already mutated, so the caller should know disk is
+    // out of sync.
+    if is_write_statement {
+        if let Some(path) = db.source_path.clone() {
+            pager::save_database(db, &path)?;
+        }
+    }
 
     Ok(message)
 }

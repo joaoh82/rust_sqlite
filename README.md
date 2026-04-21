@@ -120,8 +120,8 @@ Not yet implemented: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LI
 |---|---|
 | `.help` | working |
 | `.exit` | working |
-| `.open FILENAME` | working — opens an existing `.sqlrite` file or starts a fresh DB that will be materialized on first `.save` |
-| `.save FILENAME` | working — writes the current in-memory DB to a paged file |
+| `.open FILENAME` | working — opens an existing `.sqlrite` file or creates a fresh one; **auto-save is enabled from this point on** |
+| `.save FILENAME` | working — explicit flush (rarely needed once `.open` is in play) |
 | `.tables` | working |
 | `.read FILENAME` | later |
 | `.ast QUERY` | later |
@@ -155,11 +155,12 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] `.tables` — list tables in the current database
 - [x] Header written last during save, so a mid-save crash leaves the file recognizably unopenable
 
-**Phase 3 — On-disk B-Tree + auto-save pager** *(in progress, next)*
-- [ ] Page cache with dirty-page tracking; auto-save after every committed statement
-- [ ] Cell-based page layout (variable-length row records) replacing per-table bincode blobs
-- [ ] Page-based B-Tree per table keyed by ROWID, with split/merge and leaf/interior nodes
-- [ ] Secondary indexes as separate B-Trees (indexed_value, rowid)
+**Phase 3 — On-disk B-Tree + auto-save pager** *(in progress)*
+- [x] **3a — Auto-save**: every committing SQL statement (`CREATE` / `INSERT` / `UPDATE` / `DELETE`) against a file-backed DB auto-flushes; `.save` is now a rare manual flush
+- [ ] 3b — Pager abstraction: page cache with dirty-page tracking, so commits write only dirty pages instead of the whole file
+- [ ] 3c — Cell-based page layout (variable-length row records) replacing per-table bincode blobs
+- [ ] 3d — Page-based B-Tree per table keyed by ROWID, with split/merge and leaf/interior nodes
+- [ ] 3e — Secondary indexes as separate B-Trees (indexed_value, rowid)
 
 **Phase 2.5 — Tauri 2.0 desktop app** *(after Phase 3)*
 - [ ] Cross-platform GUI wrapping the engine

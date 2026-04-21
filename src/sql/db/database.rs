@@ -2,18 +2,33 @@ use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// The database is represented by this structure.assert_eq!
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Database {
     /// Name of this database. (schema name, not filename)
     pub db_name: String,
     /// HashMap of tables in this database
     pub tables: HashMap<String, Table>,
+    /// If `Some`, every committing SQL statement auto-flushes the DB to this
+    /// path. `None` → transient in-memory mode (the default; the REPL only
+    /// enters persistent mode after `.open FILE`). Skipped by serde so the
+    /// on-disk format stays oblivious to file paths.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
+}
+
+// Auto-derive wouldn't line up here because two `Database` values loaded from
+// different files could be semantically equal. Compare state only.
+impl PartialEq for Database {
+    fn eq(&self, other: &Self) -> bool {
+        self.db_name == other.db_name && self.tables == other.tables
+    }
 }
 
 impl Database {
-    /// Creates an empty `Database`
+    /// Creates an empty in-memory `Database`.
     ///
     /// # Examples
     ///
@@ -24,6 +39,7 @@ impl Database {
         Database {
             db_name,
             tables: HashMap::new(),
+            source_path: None,
         }
     }
 
@@ -122,7 +138,7 @@ mod tests {
         let table = db.get_table(String::from("contacts")).unwrap();
         assert_eq!(table.columns.len(), 4);
 
-        let mut table = db.get_table_mut(String::from("contacts")).unwrap();
+        let table = db.get_table_mut(String::from("contacts")).unwrap();
         table.last_rowid += 1;
         assert_eq!(table.columns.len(), 4);
         assert_eq!(table.last_rowid, 1);

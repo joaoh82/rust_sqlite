@@ -98,20 +98,26 @@ fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
         .unwrap_or("db")
         .to_string();
     if path.exists() {
-        let loaded = open_database(path, db_name)?;
+        let mut loaded = open_database(path, db_name)?;
         let table_count = loaded.tables.len();
+        loaded.source_path = Some(path.to_path_buf());
         *db = loaded;
         Ok(format!(
-            "Opened '{}' ({table_count} table{s} loaded).",
+            "Opened '{}' ({table_count} table{s} loaded). Auto-save enabled.",
             path.display(),
             s = if table_count == 1 { "" } else { "s" }
         ))
     } else {
         // Same behavior as SQLite: `.open` on a missing file creates a fresh
-        // DB that will be materialized on the first `.save`.
-        *db = Database::new(db_name);
+        // DB that will be materialized on the next committing statement.
+        let mut fresh = Database::new(db_name);
+        fresh.source_path = Some(path.to_path_buf());
+        // Touch the file with a valid empty DB so the path now exists and a
+        // subsequent `.open` finds it. This also catches permission errors early.
+        save_database(&fresh, path)?;
+        *db = fresh;
         Ok(format!(
-            "Opened '{}' (new database — use .save to persist).",
+            "Opened '{}' (new database). Auto-save enabled.",
             path.display()
         ))
     }
@@ -119,7 +125,14 @@ fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
 
 fn handle_save(path: &Path, db: &Database) -> Result<String> {
     save_database(db, path)?;
-    Ok(format!("Saved database to '{}'.", path.display()))
+    if db.source_path.as_deref() == Some(path) {
+        Ok(format!(
+            "Flushed database to '{}' (auto-save is already on).",
+            path.display()
+        ))
+    } else {
+        Ok(format!("Saved database to '{}'.", path.display()))
+    }
 }
 
 fn handle_tables(db: &Database) -> Result<String> {
@@ -239,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn open_missing_file_creates_empty_db() {
+    fn open_missing_file_creates_fresh_db_and_materializes_file() {
         let path = tmp_path("missing");
         let mut repl = new_editor();
         let mut db = Database::new("x".to_string());
@@ -248,7 +261,44 @@ mod tests {
             .expect("open");
         assert!(msg.contains("new database"));
         assert_eq!(db.tables.len(), 0);
-        // File should not have been created yet (save is explicit).
-        assert!(!path.exists());
+        // Auto-save expects a file to exist to auto-flush into, so open-of-missing
+        // touches the file with a valid empty DB.
+        assert!(path.exists());
+        assert_eq!(db.source_path.as_deref(), Some(path.as_path()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_save_persists_writes_without_explicit_save() {
+        use crate::sql::db::table::Value;
+
+        let path = tmp_path("autosave");
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+
+        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db)
+            .expect("open");
+
+        // The first write should auto-flush to disk.
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+
+        // Reopen the file from scratch in a fresh Database — no manual .save was called.
+        let fresh = crate::sql::pager::open_database(&path, "x".to_string())
+            .expect("open after auto-save");
+        let users = fresh.get_table("users".to_string()).expect("users table");
+        let rowids = users.rowids();
+        assert_eq!(rowids.len(), 1);
+        assert_eq!(
+            users.get_value("name", rowids[0]),
+            Some(Value::Text("alice".to_string()))
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
