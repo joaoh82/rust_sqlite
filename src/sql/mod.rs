@@ -185,11 +185,11 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     // Auto-save: if the database is backed by a file and the statement changed
     // state, flush to disk before returning. A failed save surfaces as an error
     // — the in-memory state already mutated, so the caller should know disk is
-    // out of sync.
-    if is_write_statement {
-        if let Some(path) = db.source_path.clone() {
-            pager::save_database(db, &path)?;
-        }
+    // out of sync. The Pager held on `db` diffs against its last-committed
+    // snapshot, so only pages whose bytes actually changed are written.
+    if is_write_statement && db.source_path.is_some() {
+        let path = db.source_path.clone().unwrap();
+        pager::save_database(db, &path)?;
     }
 
     Ok(message)

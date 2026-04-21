@@ -157,7 +157,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 
 **Phase 3 — On-disk B-Tree + auto-save pager** *(in progress)*
 - [x] **3a — Auto-save**: every committing SQL statement (`CREATE` / `INSERT` / `UPDATE` / `DELETE`) against a file-backed DB auto-flushes; `.save` is now a rare manual flush
-- [ ] 3b — Pager abstraction: page cache with dirty-page tracking, so commits write only dirty pages instead of the whole file
+- [x] **3b — Pager abstraction**: long-lived `Pager` holding a byte snapshot of every page on disk plus a staging area for the next commit; `commit` diffs staged vs. snapshot and writes only pages whose bytes actually changed; file truncates when the page count shrinks
 - [ ] 3c — Cell-based page layout (variable-length row records) replacing per-table bincode blobs
 - [ ] 3d — Page-based B-Tree per table keyed by ROWID, with split/merge and leaf/interior nodes
 - [ ] 3e — Secondary indexes as separate B-Trees (indexed_value, rowid)

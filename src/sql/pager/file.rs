@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::Result;
 use crate::sql::pager::header::{DbHeader, decode_header, encode_header};
-use crate::sql::pager::page::{PAGE_SIZE, PageType, decode_page, encode_page};
+use crate::sql::pager::page::PAGE_SIZE;
 
 pub struct FileStorage {
     file: File,
@@ -32,31 +32,35 @@ impl FileStorage {
         Ok(())
     }
 
-    pub fn read_page(&mut self, page_num: u32) -> Result<(PageType, u32, Vec<u8>)> {
-        self.file
-            .seek(SeekFrom::Start((page_num as u64) * (PAGE_SIZE as u64)))?;
-        let mut buf = [0u8; PAGE_SIZE];
-        self.file.read_exact(&mut buf)?;
-        decode_page(&buf)
-    }
-
-    pub fn write_page(
-        &mut self,
-        page_num: u32,
-        ty: PageType,
-        next: u32,
-        payload: &[u8],
-    ) -> Result<()> {
-        let buf = encode_page(ty, next, payload)?;
-        self.file
-            .seek(SeekFrom::Start((page_num as u64) * (PAGE_SIZE as u64)))?;
-        self.file.write_all(&buf)?;
-        Ok(())
-    }
-
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Low-level byte I/O helpers used by the `Pager` to bypass the per-page
+    /// encoding when it's managing its own raw buffers.
+
+    pub fn seek_to(&mut self, offset: u64) -> Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        Ok(())
+    }
+
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.file.read_exact(buf)?;
+        Ok(())
+    }
+
+    pub fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.file.write_all(buf)?;
+        Ok(())
+    }
+
+    /// Shrinks the backing file to `page_count` pages. Any bytes beyond the
+    /// new length are discarded.
+    pub fn truncate_to_pages(&mut self, page_count: u32) -> Result<()> {
+        self.file
+            .set_len((page_count as u64) * (PAGE_SIZE as u64))?;
         Ok(())
     }
 }

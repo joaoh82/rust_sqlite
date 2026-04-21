@@ -98,9 +98,8 @@ fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
         .unwrap_or("db")
         .to_string();
     if path.exists() {
-        let mut loaded = open_database(path, db_name)?;
+        let loaded = open_database(path, db_name)?;
         let table_count = loaded.tables.len();
-        loaded.source_path = Some(path.to_path_buf());
         *db = loaded;
         Ok(format!(
             "Opened '{}' ({table_count} table{s} loaded). Auto-save enabled.",
@@ -113,8 +112,9 @@ fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
         let mut fresh = Database::new(db_name);
         fresh.source_path = Some(path.to_path_buf());
         // Touch the file with a valid empty DB so the path now exists and a
-        // subsequent `.open` finds it. This also catches permission errors early.
-        save_database(&fresh, path)?;
+        // subsequent `.open` finds it. This also catches permission errors early
+        // and attaches the long-lived pager to the fresh database.
+        save_database(&mut fresh, path)?;
         *db = fresh;
         Ok(format!(
             "Opened '{}' (new database). Auto-save enabled.",
@@ -123,7 +123,7 @@ fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
     }
 }
 
-fn handle_save(path: &Path, db: &Database) -> Result<String> {
+fn handle_save(path: &Path, db: &mut Database) -> Result<String> {
     save_database(db, path)?;
     if db.source_path.as_deref() == Some(path) {
         Ok(format!(

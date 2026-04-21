@@ -48,39 +48,6 @@ impl PageType {
     }
 }
 
-/// Encodes a page of payload data into a `PAGE_SIZE`-byte buffer, ready to
-/// be written to disk at the page's offset.
-pub fn encode_page(ty: PageType, next: u32, payload: &[u8]) -> Result<[u8; PAGE_SIZE]> {
-    if payload.len() > PAYLOAD_PER_PAGE {
-        return Err(SQLRiteError::Internal(format!(
-            "page payload {} bytes exceeds max {PAYLOAD_PER_PAGE}",
-            payload.len()
-        )));
-    }
-    let mut buf = [0u8; PAGE_SIZE];
-    buf[0] = ty as u8;
-    buf[1..5].copy_from_slice(&next.to_le_bytes());
-    buf[5..7].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload.len()].copy_from_slice(payload);
-    Ok(buf)
-}
-
-/// Decodes a `PAGE_SIZE`-byte buffer into (page type, next-page, payload bytes).
-pub fn decode_page(buf: &[u8]) -> Result<(PageType, u32, Vec<u8>)> {
-    if buf.len() != PAGE_SIZE {
-        return Err(SQLRiteError::Internal(format!(
-            "page buffer length {} != PAGE_SIZE {PAGE_SIZE}",
-            buf.len()
-        )));
-    }
-    let ty = PageType::from_u8(buf[0])?;
-    let next = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-    let payload_len = u16::from_le_bytes(buf[5..7].try_into().unwrap()) as usize;
-    if payload_len > PAYLOAD_PER_PAGE {
-        return Err(SQLRiteError::Internal(format!(
-            "corrupt page: payload length {payload_len} exceeds max"
-        )));
-    }
-    let payload = buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_len].to_vec();
-    Ok((ty, next, payload))
-}
+// The actual encoding/decoding of a page into/out of a `PAGE_SIZE`-byte
+// buffer lives in `pager/mod.rs`; those helpers used to live here but were
+// inlined once the `Pager` took over raw byte I/O.

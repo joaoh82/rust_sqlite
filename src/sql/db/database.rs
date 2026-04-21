@@ -1,5 +1,6 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
+use crate::sql::pager::pager::Pager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,6 +18,12 @@ pub struct Database {
     /// on-disk format stays oblivious to file paths.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+    /// Long-lived pager attached when the database is file-backed. Keeps an
+    /// in-memory snapshot of every page so auto-saves can diff against the
+    /// last-committed state and skip rewriting unchanged pages. `None` means
+    /// "in-memory only" or "not yet opened". Not persisted by serde.
+    #[serde(skip)]
+    pub pager: Option<Pager>,
 }
 
 // Auto-derive wouldn't line up here because two `Database` values loaded from
@@ -40,6 +47,7 @@ impl Database {
             db_name,
             tables: HashMap::new(),
             source_path: None,
+            pager: None,
         }
     }
 
