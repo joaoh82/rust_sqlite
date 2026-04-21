@@ -1,5 +1,6 @@
 pub mod db;
 pub mod executor;
+pub mod pager;
 pub mod parser;
 // pub mod tokenizer;
 

@@ -81,7 +81,7 @@ fn main() -> rustyline::Result<()> {
                     CommandType::MetaCommand(cmd) => {
                         // handle_meta_command parses and executes the MetaCommand
                         // and returns a Result<String, SQLRiteError>
-                        match handle_meta_command(cmd, &mut repl) {
+                        match handle_meta_command(cmd, &mut repl, &mut db) {
                             Ok(response) => println!("{response}"),
                             Err(err) => eprintln!("An error occured: {err}"),
                         }
