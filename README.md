@@ -59,10 +59,17 @@ Rust-SQLite (SQLRite)
 ### CREATE TABLE and INSERT Statements
 [![asciicast](https://asciinema.org/a/406447.svg)](https://asciinema.org/a/406447)
 
+### Developer guide
+
+In-depth documentation lives under [`docs/`](docs/). Start at [`docs/_index.md`](docs/_index.md) — it navigates to:
+
+- [Getting started](docs/getting-started.md), [Using SQLRite](docs/usage.md), [Architecture](docs/architecture.md)
+- [Design decisions](docs/design-decisions.md), [Roadmap](docs/roadmap.md)
+- Internals: [File format](docs/file-format.md), [Pager](docs/pager.md), [Storage model](docs/storage-model.md), [SQL engine](docs/sql-engine.md)
+
 ### Requirements
 Before you begin, ensure you have met the following requirements:
 * Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
-* SQLite3
 
 ### Usage
 
