@@ -27,11 +27,16 @@ pub const PAYLOAD_PER_PAGE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
-    /// First page of the schema catalog blob.
+    /// Head page of the schema catalog chain.
     SchemaRoot = 1,
-    /// First page of a table's bincode blob.
-    TableData = 2,
-    /// Continuation page in a multi-page chain (schema or table).
+    /// Leaf page of a table — holds a slot directory and cells.
+    /// (Pre-Phase-3c this tag meant "first page of a table's bincode
+    /// blob"; the tag value is unchanged but the payload semantics changed
+    /// with the cell layout.)
+    TableLeaf = 2,
+    /// Continuation page: either a schema-catalog overflow from the
+    /// SchemaRoot chain, or the body of an oversized cell spilled out of
+    /// a table leaf.
     Overflow = 3,
 }
 
@@ -39,7 +44,7 @@ impl PageType {
     pub fn from_u8(v: u8) -> Result<PageType> {
         match v {
             1 => Ok(PageType::SchemaRoot),
-            2 => Ok(PageType::TableData),
+            2 => Ok(PageType::TableLeaf),
             3 => Ok(PageType::Overflow),
             other => Err(SQLRiteError::Internal(format!(
                 "unknown page type tag {other}"

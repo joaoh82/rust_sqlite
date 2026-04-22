@@ -199,6 +199,111 @@ impl Table {
         }
     }
 
+    /// Replays a single row at `rowid` when loading a table from disk. Takes
+    /// one typed value per column (in declaration order); `None` means the
+    /// stored cell carried a NULL for that column. Unlike `insert_row` this
+    /// trusts the on-disk state and does *not* re-check UNIQUE — we're
+    /// rebuilding a state that was already consistent when it was saved.
+    pub fn restore_row(&mut self, rowid: i64, values: Vec<Option<Value>>) -> Result<()> {
+        if values.len() != self.columns.len() {
+            return Err(SQLRiteError::Internal(format!(
+                "cell has {} values but table '{}' has {} columns",
+                values.len(),
+                self.tb_name,
+                self.columns.len()
+            )));
+        }
+
+        let column_names: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| c.column_name.clone())
+            .collect();
+
+        for (i, value) in values.into_iter().enumerate() {
+            let col_name = &column_names[i];
+            let rows_clone = Rc::clone(&self.rows);
+            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let cell = row_data.get_mut(col_name).ok_or_else(|| {
+                SQLRiteError::Internal(format!("Row storage missing for column '{col_name}'"))
+            })?;
+
+            let column = self
+                .columns
+                .iter_mut()
+                .find(|c| c.column_name == *col_name)
+                .ok_or_else(|| {
+                    SQLRiteError::Internal(format!("Column '{col_name}' not found"))
+                })?;
+
+            match (cell, value) {
+                (Row::Integer(map), Some(Value::Integer(v))) => {
+                    map.insert(rowid, v as i32);
+                    if let Index::Integer(idx) = &mut column.index {
+                        idx.insert(v as i32, rowid);
+                    }
+                }
+                (Row::Integer(_), None) => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "Integer column '{col_name}' cannot store NULL — corrupt cell?"
+                    )));
+                }
+                (Row::Text(map), Some(Value::Text(s))) => {
+                    if let Index::Text(idx) = &mut column.index {
+                        idx.insert(s.clone(), rowid);
+                    }
+                    map.insert(rowid, s);
+                }
+                (Row::Text(map), None) => {
+                    // Matches the on-insert convention: NULL in Text storage
+                    // is represented by the literal "Null" sentinel and not
+                    // added to the index.
+                    map.insert(rowid, "Null".to_string());
+                }
+                (Row::Real(map), Some(Value::Real(v))) => {
+                    map.insert(rowid, v as f32);
+                }
+                (Row::Real(_), None) => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "Real column '{col_name}' cannot store NULL — corrupt cell?"
+                    )));
+                }
+                (Row::Bool(map), Some(Value::Bool(v))) => {
+                    map.insert(rowid, v);
+                }
+                (Row::Bool(_), None) => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "Bool column '{col_name}' cannot store NULL — corrupt cell?"
+                    )));
+                }
+                (row, value) => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "Type mismatch restoring column '{col_name}': storage {row:?} vs value {value:?}"
+                    )));
+                }
+            }
+        }
+
+        if rowid > self.last_rowid {
+            self.last_rowid = rowid;
+        }
+        Ok(())
+    }
+
+    /// Extracts a row as an ordered `Vec<Option<Value>>` matching the column
+    /// declaration order. Returns `None` entries for columns that hold NULL.
+    /// Used by `save_database` to turn a table's in-memory state into cells.
+    pub fn extract_row(&self, rowid: i64) -> Vec<Option<Value>> {
+        self.columns
+            .iter()
+            .map(|c| match self.get_value(&c.column_name, rowid) {
+                Some(Value::Null) => None,
+                Some(v) => Some(v),
+                None => None,
+            })
+            .collect()
+    }
+
     /// Overwrites the cell at `(column, rowid)` with `new_val`. Enforces the
     /// column's datatype and UNIQUE constraint, and updates any index.
     ///

@@ -34,6 +34,7 @@
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::pager::cell::Cell;
+use crate::sql::pager::overflow::PagedEntry;
 use crate::sql::pager::page::PAYLOAD_PER_PAGE;
 
 /// Byte offsets of the two header fields inside the payload area.
@@ -181,33 +182,45 @@ impl TablePage {
         }
     }
 
-    /// Inserts `cell` in rowid order. Fails with `Internal("page full")`
-    /// if the cell plus its slot don't fit, and with `Internal("duplicate
-    /// rowid")` if a cell with the same rowid already lives on the page.
-    /// Callers (the B-Tree layer in Phase 3d, the overflow logic in 3c.3)
-    /// are expected to have checked `would_fit` before calling.
+    /// Inserts `cell` as a local entry in rowid order. See
+    /// [`TablePage::insert_entry`] for the lower-level primitive that also
+    /// accepts overflow pointers.
     pub fn insert(&mut self, cell: &Cell) -> Result<()> {
-        match self.find(cell.rowid)? {
-            Find::Found(_) => {
-                return Err(SQLRiteError::Internal(format!(
-                    "duplicate rowid {} — caller must delete before re-inserting",
-                    cell.rowid
-                )));
-            }
+        let encoded = cell.encode()?;
+        self.insert_entry(cell.rowid, &encoded)
+    }
+
+    /// Inserts either kind of paged entry. Delegates to
+    /// [`TablePage::insert_entry`] after encoding.
+    pub fn insert_paged_entry(&mut self, entry: &PagedEntry) -> Result<()> {
+        let encoded = entry.encode()?;
+        self.insert_entry(entry.rowid(), &encoded)
+    }
+
+    /// Inserts pre-encoded bytes at the slot that keeps the directory in
+    /// rowid order. Fails with `Internal("page full")` if the bytes plus a
+    /// new slot wouldn't fit, and with `Internal("duplicate rowid")` if a
+    /// cell or overflow pointer with the same rowid already lives on the
+    /// page. Callers should check `would_fit(encoded.len())` first — this
+    /// method asserts the fit.
+    pub fn insert_entry(&mut self, rowid: i64, encoded: &[u8]) -> Result<()> {
+        match self.find(rowid)? {
+            Find::Found(_) => Err(SQLRiteError::Internal(format!(
+                "duplicate rowid {rowid} — caller must delete before re-inserting"
+            ))),
             Find::NotFound(insert_at) => {
-                let encoded = cell.encode()?;
                 if !self.would_fit(encoded.len()) {
                     return Err(SQLRiteError::Internal(format!(
-                        "page full: cell of {} bytes + slot wouldn't fit in {} bytes of free space",
+                        "page full: entry of {} bytes + slot wouldn't fit in {} bytes of free space",
                         encoded.len(),
                         self.free_space()
                     )));
                 }
 
-                // Write cell content at the new cells_top.
+                // Write entry content at the new cells_top.
                 let new_cells_top = self.cells_top() - encoded.len();
                 self.buf[new_cells_top..new_cells_top + encoded.len()]
-                    .copy_from_slice(&encoded);
+                    .copy_from_slice(encoded);
                 self.set_cells_top(new_cells_top);
 
                 // Shift slot entries [insert_at..n) up by one to make room,
@@ -221,6 +234,14 @@ impl TablePage {
                 Ok(())
             }
         }
+    }
+
+    /// Decodes the paged entry at `slot`. Either a local cell or an
+    /// overflow pointer.
+    pub fn entry_at(&self, slot: usize) -> Result<PagedEntry> {
+        let offset = self.slot_offset(slot)?;
+        let (entry, _) = PagedEntry::decode(&self.buf[..], offset)?;
+        Ok(entry)
     }
 
     /// Removes the cell with `rowid`. Returns `Ok(true)` if it was found
