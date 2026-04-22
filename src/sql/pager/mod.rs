@@ -45,10 +45,9 @@ pub mod table_page;
 #[allow(dead_code)]
 pub mod varint;
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -344,10 +343,10 @@ fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
 
 /// Builds an empty in-memory `Table` given the declared columns.
 fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table {
-    let rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
+    let rows: Arc<Mutex<HashMap<String, Row>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut secondary_indexes: Vec<SecondaryIndex> = Vec::new();
     {
-        let mut map = rows.borrow_mut();
+        let mut map = rows.lock().expect("rows mutex poisoned");
         for col in &columns {
             let row = match col.datatype {
                 DataType::Integer => Row::Integer(BTreeMap::new()),

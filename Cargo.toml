@@ -1,10 +1,17 @@
+[workspace]
+# Root Cargo package (the engine crate) + the Tauri desktop app.
+# The engine is also the workspace root's own package for historical
+# compatibility with scripts that assume `cargo build` at the repo root
+# produces the REPL binary.
+members = [".", "desktop/src-tauri"]
+resolver = "3"
+
 [package]
 name = "sqlrite"
 version = "0.1.0"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
-resolver = "3"
 description = "Light version of SQLite developed with Rust"
 repository = "https://github.com/joaoh82/rust_sqlite"
 license = "MIT"
@@ -27,13 +34,14 @@ name = "sqlrite"
 path = "src/main.rs"
 
 [dependencies]
+# CLI
 rustyline = "18.0"
 rustyline-derive = "0.12"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["cargo"] }
+
+# Engine
 sqlparser = "0.61"
 thiserror = "2.0"
-serde = { version = "1.0", features = ["derive", "rc"] }
-bincode = { version = "2.0", features = ["serde"] }
 prettytable-rs = "0.10"

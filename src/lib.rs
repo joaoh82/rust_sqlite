@@ -28,3 +28,9 @@ pub use error::{Result, SQLRiteError};
 pub use sql::db::database::Database;
 pub use sql::pager::{MASTER_TABLE_NAME, open_database, save_database};
 pub use sql::process_command;
+
+// Re-export sqlparser so downstream crates (the Tauri desktop app, the
+// eventual WASM bindings) can reach into the AST without pulling a
+// second copy as a direct dep. Using `pub extern crate` so it's
+// namespaced under `sqlrite::sqlparser::…`.
+pub use ::sqlparser;

@@ -1,0 +1,32 @@
+[package]
+name = "sqlrite-desktop"
+version = "0.1.0"
+description = "SQLRite desktop app — Tauri 2 shell around the engine"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+# Binary target for the Tauri app. The actual entry point lives in
+# src/main.rs; we also expose a tiny lib for mobile (not wired up yet,
+# but Tauri 2's templates keep this shape so adding iOS/Android later is
+# a non-event).
+[[bin]]
+name = "sqlrite-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Engine lives at the workspace root; reference it by path. Version
+# pinning can wait for a proper release cut.
+sqlrite = { path = "../.." }
+
+tauri = { version = "2", features = [] }
+# Tauri 2 plugins must be opted into explicitly; the dialog plugin
+# powers the "Open…" / "Save As…" file pickers.
+tauri-plugin-dialog = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

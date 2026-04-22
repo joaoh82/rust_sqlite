@@ -1,18 +1,16 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::parser::create::CreateQuery;
-use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 
 /// SQLRite data types
 /// Mapped after SQLite Data Type Storage Classes and SQLite Affinity Type
 /// (Datatypes In SQLite Version 3)[https://www.sqlite.org/datatype3.html]
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub enum DataType {
     Integer,
     Text,
@@ -52,8 +50,13 @@ impl fmt::Display for DataType {
 }
 
 /// The schema for each SQL Table is represented in memory by
-/// following structure
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+/// following structure.
+///
+/// `rows` is `Arc<Mutex<...>>` rather than `Rc<RefCell<...>>` so `Table`
+/// (and by extension `Database`) is `Send + Sync` — the Tauri desktop
+/// app holds the engine in shared state behind a `Mutex<Database>`, and
+/// Tauri's state container requires its contents to be thread-safe.
+#[derive(Debug)]
 pub struct Table {
     /// Name of the table
     pub tb_name: String,
@@ -62,7 +65,7 @@ pub struct Table {
     /// Per-column row storage, keyed by column name. Every column's
     /// `Row::T(BTreeMap)` is keyed by rowid, so all columns share the same
     /// keyset after each write.
-    pub rows: Rc<RefCell<HashMap<String, Row>>>,
+    pub rows: Arc<Mutex<HashMap<String, Row>>>,
     /// Secondary indexes on this table (Phase 3e). One auto-created entry
     /// per UNIQUE or PRIMARY KEY column; explicit `CREATE INDEX` statements
     /// add more. Looking up an index: iterate by column name, or by index
@@ -81,7 +84,8 @@ impl Table {
         let columns = create_query.columns;
 
         let mut table_cols: Vec<Column> = vec![];
-        let table_rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
+        let table_rows: Arc<Mutex<HashMap<String, Row>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let mut secondary_indexes: Vec<SecondaryIndex> = Vec::new();
         for col in &columns {
             let col_name = &col.name;
@@ -105,8 +109,8 @@ impl Table {
                 DataType::Invalid | DataType::None => Row::None,
             };
             table_rows
-                .clone()
-                .borrow_mut()
+                .lock()
+                .expect("Table row storage mutex poisoned")
                 .insert(col.name.to_string(), row_storage);
 
             // Auto-create an index for every UNIQUE / PRIMARY KEY column,
@@ -184,7 +188,7 @@ impl Table {
         let Some(first) = self.columns.first() else {
             return vec![];
         };
-        let rows = self.rows.borrow();
+        let rows = self.rows.lock().expect("rows mutex poisoned");
         rows.get(&first.column_name)
             .map(|r| r.rowids())
             .unwrap_or_default()
@@ -192,7 +196,7 @@ impl Table {
 
     /// Reads a single cell at `(column, rowid)`.
     pub fn get_value(&self, column: &str, rowid: i64) -> Option<Value> {
-        let rows = self.rows.borrow();
+        let rows = self.rows.lock().expect("rows mutex poisoned");
         rows.get(column).and_then(|r| r.get(rowid))
     }
 
@@ -210,8 +214,8 @@ impl Table {
 
         // Remove from row storage.
         {
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let rows_clone = Arc::clone(&self.rows);
+            let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
             for col in &self.columns {
                 if let Some(r) = row_data.get_mut(&col.column_name) {
                     match r {
@@ -271,8 +275,8 @@ impl Table {
             // Write into the per-column row storage first (scoped borrow so
             // the secondary-index update below doesn't fight over `self`).
             {
-                let rows_clone = Rc::clone(&self.rows);
-                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let rows_clone = Arc::clone(&self.rows);
+                let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
                 let cell = row_data.get_mut(col_name).ok_or_else(|| {
                     SQLRiteError::Internal(format!(
                         "Row storage missing for column '{col_name}'"
@@ -406,8 +410,8 @@ impl Table {
         // Write into the column's Row, type-checking against the declared DataType.
         let declared = &self.columns[col_index].datatype;
         {
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let rows_clone = Arc::clone(&self.rows);
+            let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
             let cell = row_data.get_mut(column).ok_or_else(|| {
                 SQLRiteError::Internal(format!("Row storage missing for column '{column}'"))
             })?;
@@ -562,8 +566,8 @@ impl Table {
                 // the secondary index.
                 let val = next_rowid as i32;
                 let wrote_integer = {
-                    let rows_clone = Rc::clone(&self.rows);
-                    let mut row_data = rows_clone.as_ref().borrow_mut();
+                    let rows_clone = Arc::clone(&self.rows);
+                    let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
                     let table_col_data = row_data.get_mut(&self.primary_key).ok_or_else(|| {
                         SQLRiteError::Internal(format!(
                             "Row storage missing for primary key column '{}'",
@@ -626,8 +630,8 @@ impl Table {
             // Step 1: write into row storage and compute the typed Value
             // we'll hand to the secondary index (if any).
             let typed_value: Option<Value> = {
-                let rows_clone = Rc::clone(&self.rows);
-                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let rows_clone = Arc::clone(&self.rows);
+                let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
                 let table_col_data = row_data.get_mut(key).ok_or_else(|| {
                     SQLRiteError::Internal(format!("Row storage missing for column '{key}'"))
                 })?;
@@ -770,8 +774,8 @@ impl Table {
                 .collect::<Vec<PrintCell>>(),
         );
 
-        let rows_clone = Rc::clone(&self.rows);
-        let row_data = rows_clone.as_ref().borrow();
+        let rows_clone = Arc::clone(&self.rows);
+        let row_data = rows_clone.lock().expect("rows mutex poisoned");
         let first_col_data = row_data
             .get(&self.columns.first().unwrap().column_name)
             .unwrap();
@@ -807,7 +811,7 @@ impl Table {
 /// Per-column index state moved to `Table::secondary_indexes` in Phase 3e —
 /// a single `Column` describes the declared schema (name, type, constraints)
 /// and nothing more.
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub struct Column {
     pub column_name: String,
     pub datatype: DataType,
@@ -840,7 +844,7 @@ impl Column {
 ///
 /// This is an enum representing each of the available types organized in a BTreeMap
 /// data structure, using the ROWID and key and each corresponding type as value
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub enum Row {
     Integer(BTreeMap<i64, i32>),
     Text(BTreeMap<i64, String>),

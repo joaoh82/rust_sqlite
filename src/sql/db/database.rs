@@ -1,37 +1,25 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
 use crate::sql::pager::pager::Pager;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// The database is represented by this structure.assert_eq!
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 pub struct Database {
     /// Name of this database. (schema name, not filename)
     pub db_name: String,
     /// HashMap of tables in this database
     pub tables: HashMap<String, Table>,
-    /// If `Some`, every committing SQL statement auto-flushes the DB to this
-    /// path. `None` → transient in-memory mode (the default; the REPL only
-    /// enters persistent mode after `.open FILE`). Skipped by serde so the
-    /// on-disk format stays oblivious to file paths.
-    #[serde(skip)]
+    /// If `Some`, every committing SQL statement auto-flushes the DB to
+    /// this path. `None` → transient in-memory mode (the default; the
+    /// REPL only enters persistent mode after `.open FILE`).
     pub source_path: Option<PathBuf>,
-    /// Long-lived pager attached when the database is file-backed. Keeps an
-    /// in-memory snapshot of every page so auto-saves can diff against the
-    /// last-committed state and skip rewriting unchanged pages. `None` means
-    /// "in-memory only" or "not yet opened". Not persisted by serde.
-    #[serde(skip)]
+    /// Long-lived pager attached when the database is file-backed. Keeps
+    /// an in-memory snapshot of every page so auto-saves can diff
+    /// against the last-committed state and skip rewriting unchanged
+    /// pages. `None` means "in-memory only" or "not yet opened".
     pub pager: Option<Pager>,
-}
-
-// Auto-derive wouldn't line up here because two `Database` values loaded from
-// different files could be semantically equal. Compare state only.
-impl PartialEq for Database {
-    fn eq(&self, other: &Self) -> bool {
-        self.db_name == other.db_name && self.tables == other.tables
-    }
 }
 
 impl Database {

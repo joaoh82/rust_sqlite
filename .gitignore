@@ -4,3 +4,13 @@
 *.swp
 history
 *.sqlrite
+
+# Desktop app — frontend build output + deps
+desktop/node_modules
+desktop/dist
+desktop/src-tauri/target
+desktop/src-tauri/gen
+desktop/.vite
+
+# macOS
+.DS_Store

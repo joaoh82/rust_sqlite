@@ -18,15 +18,13 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::{DataType, Value};
 
 /// Declares who created the index. Persisted into `sqlrite_master.sql` so
 /// the text round-trips; auto-created indexes get a synthesized SQL form
 /// so the catalog stays uniform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexOrigin {
     /// Auto-created for a UNIQUE / PRIMARY KEY column at CREATE TABLE time.
     Auto,
@@ -37,7 +35,7 @@ pub enum IndexOrigin {
 /// One secondary index on a single column. Multi-column composite indexes
 /// are on the longer-term list; the `column_name` field stays singular
 /// for now.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct SecondaryIndex {
     /// Catalog name. For auto indexes: `sqlrite_autoindex_<table>_<col>`.
     /// For explicit indexes: the user-supplied identifier from CREATE INDEX.
@@ -51,7 +49,7 @@ pub struct SecondaryIndex {
 
 /// Typed map from value → list of rowids carrying that value. The rowid
 /// list is always non-empty; empty lists are pruned on remove.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum IndexEntries {
     Integer(BTreeMap<i64, Vec<i64>>),
     Text(BTreeMap<String, Vec<i64>>),
