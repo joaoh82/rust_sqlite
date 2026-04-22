@@ -203,23 +203,68 @@ button:disabled {
   border-bottom: 1px solid var(--border);
 }
 
+/* The gutter + textarea need identical font-size and line-height so the
+ * line numbers line up with each text row. Keep them in lockstep if you
+ * change the monospace metrics here. */
+.editor-surface {
+  display: flex;
+  background: var(--panel);
+  min-height: 140px;
+}
+
+.gutter {
+  flex: 0 0 auto;
+  min-width: 44px;
+  padding: 12px 8px 12px 10px;
+  background: var(--panel-2);
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: right;
+  user-select: none;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  /* Never grow beyond the textarea's visible height; scroll sync handles
+   * content that extends past. */
+  max-height: 100%;
+}
+
+.gutter .line-num {
+  /* Must match textarea's line-height exactly. */
+  line-height: 1.5;
+  height: calc(1em * 1.5);
+}
+
 .editor textarea {
+  flex: 1;
   background: var(--panel);
   color: var(--fg);
   border: none;
   padding: 12px 14px;
   font-family: var(--mono);
   font-size: 13px;
-  min-height: 120px;
+  line-height: 1.5;
+  min-height: 140px;
   resize: vertical;
   outline: none;
+  /* Tab-like indentation that matches the monospace cell width. */
+  tab-size: 4;
 }
 
 .editor-toolbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
   padding: 8px 12px;
   background: var(--panel);
+}
+
+.shortcut-hint {
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  user-select: none;
 }
 
 .output {

@@ -92,7 +92,10 @@ One Svelte component — [`App.svelte`](../desktop/src/App.svelte) — renders t
 
 - **Header**: product name, current DB path, **New…** and **Open…** buttons. "New…" uses the system save dialog to let you type a fresh filename; "Open…" uses the open dialog and refuses paths that don't exist. Both hand the final path to the backend's `open_database` command, which creates-if-missing and attaches the long-lived pager.
 - **Sidebar**: alphabetical list of user tables. Clicking one selects it and fetches up to 500 rows via `table_rows`. Below the list, the selected table's column list with flags (PK / UQ / NN).
-- **Main area**: textarea query editor (plain contenteditable would be nicer but needs a proper editor library later) + result grid. `Cmd/Ctrl + Enter` runs the query.
+- **Main area**: query editor (textarea with a line-number gutter) + result grid.
+  - **Line numbers**: rendered in a gutter on the left of the textarea; derived from the text content (`sql.split("\n").length`) and kept scroll-synced with the textarea via an `onscroll` handler. Font size and line height are locked between the gutter and the textarea so every line number aligns with its row.
+  - **Cmd/Ctrl + Enter** — run the query.
+  - **Cmd/Ctrl + /** — toggle SQL line comment (`-- `) on the current line or on every line of the selection. Matches VS Code / Sublime / IntelliJ convention.
 
 The textarea starts with a short comment-only placeholder so clicking Run before typing any SQL doesn't error.
 

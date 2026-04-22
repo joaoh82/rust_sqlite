@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
@@ -30,6 +30,15 @@
   let output = $state<CommandResult | null>(null);
   let errorMessage = $state<string | null>(null);
   let running = $state<boolean>(false);
+
+  // Editor refs and derived line numbers for the gutter. We derive a
+  // dense `[1, 2, …, n]` array so Svelte's {#each} iterates every slot
+  // — a sparse `Array(n)` would skip indices.
+  let textareaRef = $state<HTMLTextAreaElement | null>(null);
+  let gutterRef = $state<HTMLDivElement | null>(null);
+  let lineNumbers = $derived(
+    Array.from({ length: sql.split("\n").length }, (_, i) => i + 1)
+  );
 
   async function refreshTables() {
     try {
@@ -132,11 +141,78 @@
     }
   }
 
+  /**
+   * Toggles SQL line comments (`-- `) on the line(s) covered by the
+   * current selection. If every non-blank line in the range is already
+   * commented, the toggle removes the prefix; otherwise it adds one.
+   * Empty lines are left alone. Matches the VS Code / Sublime /
+   * IntelliJ convention.
+   */
+  async function toggleComment() {
+    const ta = textareaRef;
+    if (!ta) return;
+    const value = ta.value;
+    const selStart = ta.selectionStart;
+    const selEnd = ta.selectionEnd;
+
+    // Expand the selection outward to whole lines.
+    const lineStart = value.lastIndexOf("\n", selStart - 1) + 1;
+    let lineEnd = value.indexOf("\n", selEnd);
+    if (lineEnd === -1) lineEnd = value.length;
+
+    const block = value.slice(lineStart, lineEnd);
+    const lines = block.split("\n");
+
+    // A line "counts" for the toggle decision only if it has non-whitespace.
+    const meaningful = lines.filter((l) => l.trim().length > 0);
+    const allCommented =
+      meaningful.length > 0 &&
+      meaningful.every((l) => l.trimStart().startsWith("--"));
+
+    const toggled = lines.map((line) => {
+      if (line.trim().length === 0) return line;
+      if (allCommented) {
+        // Remove the first "-- " or "--" after any leading whitespace.
+        return line.replace(/^(\s*)-- ?/, "$1");
+      }
+      return "-- " + line;
+    });
+
+    const newBlock = toggled.join("\n");
+    const newValue = value.slice(0, lineStart) + newBlock + value.slice(lineEnd);
+
+    // Update the bound state; the textarea re-renders.
+    sql = newValue;
+
+    // Restore a sensible selection after Svelte flushes. We re-select the
+    // edited block so the user can hit Cmd/Ctrl+/ again to untoggle.
+    await tick();
+    if (textareaRef) {
+      textareaRef.focus();
+      textareaRef.selectionStart = lineStart;
+      textareaRef.selectionEnd = lineStart + newBlock.length;
+    }
+  }
+
+  /** Keeps the gutter scrolled in sync with the textarea. */
+  function onEditorScroll() {
+    if (textareaRef && gutterRef) {
+      gutterRef.scrollTop = textareaRef.scrollTop;
+    }
+  }
+
   function onKey(e: KeyboardEvent) {
     // Cmd/Ctrl+Enter runs the query.
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       onRunSql();
+      return;
+    }
+    // Cmd/Ctrl+/ toggles SQL line comment on the current line or selection.
+    if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+      e.preventDefault();
+      toggleComment();
+      return;
     }
   }
 
@@ -206,15 +282,25 @@
 
     <section class="main">
       <div class="editor">
-        <textarea
-          bind:value={sql}
-          onkeydown={onKey}
-          spellcheck="false"
-          placeholder="SELECT * FROM …;"
-        ></textarea>
+        <div class="editor-surface">
+          <div class="gutter" bind:this={gutterRef} aria-hidden="true">
+            {#each lineNumbers as n (n)}
+              <div class="line-num">{n}</div>
+            {/each}
+          </div>
+          <textarea
+            bind:this={textareaRef}
+            bind:value={sql}
+            onkeydown={onKey}
+            onscroll={onEditorScroll}
+            spellcheck="false"
+            placeholder="SELECT * FROM …;"
+          ></textarea>
+        </div>
         <div class="editor-toolbar">
+          <span class="shortcut-hint">Run: ⌘↵ · Comment: ⌘/</span>
           <button onclick={onRunSql} disabled={running}>
-            {running ? "Running…" : "Run (⌘↵)"}
+            {running ? "Running…" : "Run"}
           </button>
         </div>
       </div>

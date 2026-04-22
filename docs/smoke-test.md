@@ -350,6 +350,13 @@ Click **Open…**. Pick a `.sqlrite` file that already exists (e.g. the one crea
 
 If you try Open… on a file that doesn't exist, the dialog refuses to return; to create a fresh database, use New… instead.
 
+### 3.4c Editor gutter + comment toggle
+
+- **Line numbers**: the query textarea has a gutter on the left numbering each line. As you type multi-line SQL, the numbers update live. If the content exceeds the visible height and the textarea scrolls, the gutter scrolls in lockstep (no misalignment).
+- **Comment toggle**: place the cursor on any line and press **⌘ + /** (macOS) or **Ctrl + /** (Linux / Windows). The line gets a `-- ` prefix if it wasn't commented, or has it removed if it was. Select multiple lines and the toggle acts on all of them; a mix of commented and uncommented lines is treated as "not all commented" and adds `-- ` uniformly (matching VS Code / Sublime behavior).
+
+The editor toolbar shows the shortcuts (`Run: ⌘↵ · Comment: ⌘/`) as a reminder.
+
 ### 3.5 Create a table via the query editor
 
 Replace the textarea contents with:
@@ -439,6 +446,8 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"
 - [ ] In the desktop app: **Open…** button opens a file picker for existing `.sqlrite` files
 - [ ] In the desktop app: pressing Run on the default placeholder textarea doesn't error (it's comment-only)
+- [ ] In the desktop app: the editor gutter shows one line number per row of the query and stays aligned while scrolling
+- [ ] In the desktop app: **⌘/** (or Ctrl+/) on a line toggles its `-- ` comment; on a multi-line selection it toggles all of them
 - [ ] In the desktop app: CREATE TABLE via the editor updates the sidebar
 - [ ] In the desktop app: SELECT runs and populates the result grid
 
