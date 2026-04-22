@@ -19,10 +19,16 @@
 //! are written, so unchanged tables stay out of the auto-save path after the
 //! first write.
 
+// Phase 3c.1 modules — standalone codec; not yet wired into save/open.
+// The allow attributes go away in Phase 3c.4 when the codec is consumed.
+#[allow(dead_code)]
+pub mod cell;
 pub mod file;
 pub mod header;
 pub mod page;
 pub mod pager;
+#[allow(dead_code)]
+pub mod varint;
 
 use std::path::Path;
 
