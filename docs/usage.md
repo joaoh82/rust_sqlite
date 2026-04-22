@@ -3,11 +3,14 @@
 ## Launching
 
 ```bash
-cargo run                 # in-memory REPL, no persistence
-cargo run --release       # same, optimized build
+cargo run                           # in-memory REPL, no persistence
+cargo run -- mydb.sqlrite           # open (or create) mydb.sqlrite, auto-save enabled
+cargo run --release -- mydb.sqlrite # same, optimized build
 ```
 
-There are currently no CLI flags other than the standard `--help` / `--version` from `clap`. A positional "open this file on start" flag is on the informal roadmap.
+The positional `FILE` argument is equivalent to typing `.open FILE` right after the REPL starts — existing files are loaded, missing files are created. Without it, you land in a transient in-memory database.
+
+`--help` prints the meta-command list and the supported SQL surface inline; worth a read if you're new to the tool.
 
 ## Meta commands
 

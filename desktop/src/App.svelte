@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 
   type ColumnInfo = {
     name: string;
@@ -19,7 +19,14 @@
   let dbPath = $state<string | null>(null);
   let tables = $state<TableInfo[]>([]);
   let selected = $state<TableInfo | null>(null);
-  let sql = $state<string>("SELECT * FROM sqlrite_master;");
+  // A comment-only default so hitting Run right after launch doesn't error.
+  // Users can replace with real SQL; Cmd/Ctrl+Enter triggers Run.
+  let sql = $state<string>(
+    "-- Type a SQL statement and press Cmd/Ctrl+Enter to run.\n" +
+      "-- Example:\n" +
+      "--   CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n" +
+      "--   SELECT * FROM users;\n"
+  );
   let output = $state<CommandResult | null>(null);
   let errorMessage = $state<string | null>(null);
   let running = $state<boolean>(false);
@@ -32,6 +39,13 @@
     }
   }
 
+  /**
+   * Opens an existing `.sqlrite` file chosen via the system file picker.
+   * Creating a new file is a separate entry point — `onNewClick`, using
+   * the save dialog — because the default platform "Open" dialog either
+   * refuses to return a nonexistent path or silently creates an empty
+   * file the engine would reject.
+   */
   async function onOpenClick() {
     errorMessage = null;
     try {
@@ -44,16 +58,47 @@
         ],
       });
       if (!picked || typeof picked !== "string") return;
-      await invoke<TableInfo>("open_database", { path: picked });
-      dbPath = picked;
-      await refreshTables();
-      selected = tables[0] ?? null;
-      output = {
-        kind: "status",
-        message: `Opened ${picked}. ${tables.length} table${tables.length === 1 ? "" : "s"}.`,
-      };
+      await loadDatabase(picked);
     } catch (err) {
       errorMessage = String(err);
+    }
+  }
+
+  /**
+   * Creates a fresh `.sqlrite` file via the system save dialog and
+   * opens it. The backend's `open_database` already creates-if-missing,
+   * so we just hand it the path the user typed.
+   */
+  async function onNewClick() {
+    errorMessage = null;
+    try {
+      const picked = await saveFileDialog({
+        defaultPath: "untitled.sqlrite",
+        filters: [
+          { name: "SQLRite database", extensions: ["sqlrite"] },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (!picked || typeof picked !== "string") return;
+      await loadDatabase(picked);
+    } catch (err) {
+      errorMessage = String(err);
+    }
+  }
+
+  /** Shared success path for both Open and New. */
+  async function loadDatabase(path: string) {
+    await invoke<TableInfo>("open_database", { path });
+    dbPath = path;
+    await refreshTables();
+    selected = tables[0] ?? null;
+    if (selected) {
+      await onSelectTable(selected);
+    } else {
+      output = {
+        kind: "status",
+        message: `Opened ${path}. ${tables.length} table${tables.length === 1 ? "" : "s"}.`,
+      };
     }
   }
 
@@ -112,6 +157,7 @@
       {/if}
     </div>
     <div class="actions">
+      <button onclick={onNewClick}>New…</button>
       <button onclick={onOpenClick}>Open…</button>
     </div>
   </header>

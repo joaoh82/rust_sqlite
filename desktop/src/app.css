@@ -51,6 +51,11 @@ header {
   gap: 8px;
 }
 
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
 .logo {
   color: var(--accent);
   font-size: 18px;

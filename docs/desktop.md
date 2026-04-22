@@ -90,9 +90,11 @@ This is explicitly a stopgap. Phase 5's Cursor refactor will have the executor r
 
 One Svelte component — [`App.svelte`](../desktop/src/App.svelte) — renders three panes:
 
-- **Header**: product name, current DB path, "Open…" button.
+- **Header**: product name, current DB path, **New…** and **Open…** buttons. "New…" uses the system save dialog to let you type a fresh filename; "Open…" uses the open dialog and refuses paths that don't exist. Both hand the final path to the backend's `open_database` command, which creates-if-missing and attaches the long-lived pager.
 - **Sidebar**: alphabetical list of user tables. Clicking one selects it and fetches up to 500 rows via `table_rows`. Below the list, the selected table's column list with flags (PK / UQ / NN).
 - **Main area**: textarea query editor (plain contenteditable would be nicer but needs a proper editor library later) + result grid. `Cmd/Ctrl + Enter` runs the query.
+
+The textarea starts with a short comment-only placeholder so clicking Run before typing any SQL doesn't error.
 
 ### Styling
 
@@ -108,6 +110,7 @@ No external store — just `$state` runes inside the component. For a single-win
 - **Query history** — per-session only, dropped when the app exits
 - **Schema editing from the UI** — you can paste `CREATE TABLE` into the editor, but there's no form-based flow
 - **Indexes surfaced in the sidebar** — indexes exist on disk via `sqlrite_master`, they just aren't shown yet
+- **`sqlrite_master` exposed for read-only inspection** — the engine hides it from `db.tables`; selecting from it through the query editor errors with `Table 'sqlrite_master' not found`. A `.schema` meta-command (also missing from the REPL) would be the less-dangerous path to surface it
 - **Dark/light toggle** — dark only for now
 - **App icon** — a placeholder PNG; replace before bundling for distribution
 - **Error recovery after panic** — the Tauri app is a thin shell, so if the engine panics the whole window dies. The engine isn't supposed to panic on user input (Phase 1 made that a requirement), but a panic in the Tauri layer itself would take the app down.

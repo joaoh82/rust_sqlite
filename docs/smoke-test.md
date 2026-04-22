@@ -42,6 +42,14 @@ Use '.open FILENAME' to reopen on a persistent database.
 sqlrite>
 ```
 
+Also verify the help text is detailed:
+
+```bash
+cargo run --quiet --bin sqlrite -- --help
+```
+
+Should print the project description, the meta-command table, and a summary of supported SQL — not just `-h` / `-V` flags.
+
 ### 1.2 Meta commands
 
 ```
@@ -240,7 +248,39 @@ Cleanup:
 rm -f "$DB"
 ```
 
-### 2.5 Format-guard sanity
+### 2.5 CLI file argument (shortcut)
+
+The positional `FILE` argument is equivalent to `.open FILE` after launch:
+
+```bash
+DB=/tmp/smoke-cli.sqlrite && rm -f "$DB"
+cargo run --quiet --bin sqlrite -- "$DB"
+```
+
+The banner should say `Opened '/tmp/smoke-cli.sqlrite' — auto-save enabled.` (the file was just created), and the REPL prompt appears.
+
+```sql
+CREATE TABLE a (id INTEGER PRIMARY KEY, s TEXT);
+INSERT INTO a (s) VALUES ('hi');
+```
+
+```
+sqlrite> .exit
+```
+
+Relaunch with the same argument — data should still be there:
+
+```bash
+cargo run --quiet --bin sqlrite -- "$DB"
+```
+
+```sql
+SELECT * FROM a;
+```
+
+Expect 1 row. `.exit` and `rm -f "$DB"`.
+
+### 2.6 Format-guard sanity
 
 A file that isn't a SQLRite database should be rejected cleanly.
 
@@ -286,22 +326,29 @@ First launch compiles the Tauri backend (a few hundred crates; takes a minute or
 
 ### 3.3 Initial state
 
-- Header shows `◆ SQLRite — in-memory (no file)` on the left, `Open…` button on the right.
+- Header shows `◆ SQLRite — in-memory (no file)` on the left, `New…` and `Open…` buttons on the right.
 - Sidebar: `TABLES` heading followed by "No tables yet."
-- Main area: textarea with `SELECT * FROM sqlrite_master;` pre-filled, `Run (⌘↵)` button below.
+- Main area: textarea pre-filled with a comment-only placeholder (nothing that would error on Run), `Run (⌘↵)` button below.
 
-### 3.4 Open a database
+### 3.4a Create a new database
 
-Click **Open…**. In the file dialog, either:
-
-- Navigate to a `.sqlrite` file you created in Part 2, or
-- Type a new filename (e.g. `desktop-smoke.sqlrite`) and confirm — the engine creates it.
+Click **New…**. The native save dialog appears — type `desktop-smoke.sqlrite` (or any new name) and confirm. The engine creates the file on disk immediately.
 
 After the dialog closes:
 
-- Header shows the selected path.
-- Sidebar lists any existing tables. For a fresh file, "No tables yet."
-- The status line below the query editor shows `Opened /path/to/file.sqlrite. N tables.`
+- Header shows the chosen path.
+- Sidebar: "No tables yet." (fresh database).
+- Status line below the editor shows `Opened /path/to/file.sqlrite. 0 tables.`
+
+### 3.4b Open an existing database
+
+Click **Open…**. Pick a `.sqlrite` file that already exists (e.g. the one created in Part 2). After the dialog closes:
+
+- Header shows the path.
+- Sidebar lists the tables; if any exist, the first is auto-selected and its rows appear in the result grid.
+- Status line shows `Opened /path/to/file.sqlrite. N tables.` (or the first table's rows if auto-selected).
+
+If you try Open… on a file that doesn't exist, the dialog refuses to return; to create a fresh database, use New… instead.
 
 ### 3.5 Create a table via the query editor
 
@@ -377,7 +424,10 @@ When you want a fast before/after comparison for a change, run this condensed ch
 
 - [ ] `cargo build --workspace` → clean, zero warnings
 - [ ] `cargo test --workspace` → 123 tests pass (123 was the count as of Phase 2.5; update when new tests land)
+- [ ] `cargo run -- --help` prints the full description + meta-command table + SQL surface (not just `-h` / `-V`)
+- [ ] `cargo run -- somefile.sqlrite` on a non-existent path creates the file and enters the REPL with auto-save on
 - [ ] REPL launches, `.help` shows 5 commands
+- [ ] `.tables` in a populated DB prints one name per line
 - [ ] CREATE TABLE + INSERT + SELECT `*` work in memory
 - [ ] `SELECT ... WHERE col = literal` on a UNIQUE column returns the right row (index probe path)
 - [ ] UPDATE with arithmetic (`SET x = x + 1`) works
@@ -385,7 +435,10 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] `.open <new file>` → INSERT → `.exit` → `.open <same file>` → rows still there
 - [ ] Bad-magic file is rejected with a clear error
 - [ ] `cargo check -p sqlrite-desktop` compiles the Tauri crate
-- [ ] `cd desktop && npm run tauri dev` opens a window, Open… → file picker works
+- [ ] `cd desktop && npm run tauri dev` opens a window
+- [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"
+- [ ] In the desktop app: **Open…** button opens a file picker for existing `.sqlrite` files
+- [ ] In the desktop app: pressing Run on the default placeholder textarea doesn't error (it's comment-only)
 - [ ] In the desktop app: CREATE TABLE via the editor updates the sidebar
 - [ ] In the desktop app: SELECT runs and populates the result grid
 

@@ -6,6 +6,8 @@
 mod meta_command;
 mod repl;
 
+use std::path::PathBuf;
+
 use meta_command::handle_meta_command;
 use repl::{CommandType, REPLHelper, get_command_type, get_config};
 use sqlrite::{Database, process_command};
@@ -14,16 +16,53 @@ use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 
-use clap::{Command, crate_authors, crate_description, crate_name, crate_version};
+use clap::{Arg, Command, crate_authors, crate_name, crate_version};
+
+const ABOUT_SHORT: &str = "A small SQLite-like embedded database and REPL, written in Rust.";
+
+const ABOUT_LONG: &str = "\
+A small SQLite-like embedded database and REPL, written in Rust.
+
+Passing a FILE argument is equivalent to launching the REPL and then running
+`.open FILE` — existing files are loaded, missing files are created fresh.
+Without a FILE the REPL starts in transient in-memory mode.
+
+Once in the REPL, meta commands start with a dot:
+
+  .help                  Show the meta-command list
+  .open <FILENAME>       Open (or create) a .sqlrite database file
+  .save <FILENAME>       Write the current DB to FILENAME (rarely needed —
+                         once .open is in play, every write auto-saves)
+  .tables                List tables in the current database
+  .exit                  Quit
+
+Supported SQL: CREATE TABLE / CREATE [UNIQUE] INDEX / INSERT / SELECT /
+UPDATE / DELETE with WHERE, ORDER BY, LIMIT, arithmetic (+ - * / %),
+logical (AND / OR / NOT), string concat (||), and NULL-aware comparisons.
+Index-probe fast path activates for `WHERE col = literal` on indexed
+columns.
+
+For the full reference see docs/usage.md; for end-to-end testing walk
+through docs/smoke-test.md.";
 
 fn main() -> rustyline::Result<()> {
     env_logger::init();
 
-    let _matches = Command::new(crate_name!())
+    let matches = Command::new(crate_name!())
         .version(crate_version!())
         .author(crate_authors!())
-        .about(crate_description!())
+        .about(ABOUT_SHORT)
+        .long_about(ABOUT_LONG)
+        .arg(
+            Arg::new("FILE")
+                .help("Path to a .sqlrite database file. If it exists, it's opened; if not, it's created.")
+                .value_parser(clap::value_parser!(PathBuf))
+                .index(1),
+        )
+        .arg_required_else_help(false)
         .get_matches();
+
+    let initial_db_path = matches.get_one::<PathBuf>("FILE").cloned();
 
     // Starting Rustyline with a default configuration
     let config = get_config();
@@ -42,18 +81,32 @@ fn main() -> rustyline::Result<()> {
         println!("No previous history.");
     }
 
+    // Either open/create the requested file, or drop into a transient
+    // in-memory database (the legacy default when no FILE is given).
+    let mut db = match &initial_db_path {
+        Some(path) => match open_or_create(path) {
+            Ok(db) => db,
+            Err(err) => {
+                eprintln!("Could not open '{}': {err}", path.display());
+                Database::new("tempdb".to_string())
+            }
+        },
+        None => Database::new("tempdb".to_string()),
+    };
+
     // Friendly intro message for the user
+    let connection_line = match &initial_db_path {
+        Some(path) => format!("Opened '{}' — auto-save enabled.", path.display()),
+        None => "Connected to a transient in-memory database.\nUse '.open FILENAME' to reopen on a persistent database.".to_string(),
+    };
     println!(
-        "{} - {}\n{}{}{}{}",
+        "{} - {}\n{}{}{}",
         crate_name!(),
         crate_version!(),
         "Enter .exit to quit.\n",
         "Enter .help for usage hints.\n",
-        "Connected to a transient in-memory database.\n",
-        "Use '.open FILENAME' to reopen on a persistent database."
+        connection_line,
     );
-
-    let mut db = Database::new("tempdb".to_string());
 
     let prompt = "sqlrite> ";
 
@@ -102,4 +155,23 @@ fn main() -> rustyline::Result<()> {
     repl.append_history("history").unwrap();
 
     Ok(())
+}
+
+/// Equivalent to typing `.open FILE` at the REPL: load if present,
+/// materialize an empty DB on disk if missing. Attaches the long-lived
+/// Pager either way so subsequent writes auto-save.
+fn open_or_create(path: &std::path::Path) -> sqlrite::Result<Database> {
+    let db_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("db")
+        .to_string();
+    if path.exists() {
+        sqlrite::open_database(path, db_name)
+    } else {
+        let mut fresh = Database::new(db_name);
+        fresh.source_path = Some(path.to_path_buf());
+        sqlrite::save_database(&mut fresh, path)?;
+        Ok(fresh)
+    }
 }
