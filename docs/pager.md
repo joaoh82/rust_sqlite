@@ -144,6 +144,25 @@ The sort keeps the WAL append order deterministic and matches ascending-page ite
 3. `wal_cache` — committed WAL updates since the last checkpoint.
 4. `on_disk` — the frozen main-file snapshot.
 
+### Checkpointing (Phase 4d)
+
+`checkpoint()` folds accumulated WAL pages back into the main file and truncates the WAL. It fires automatically from `commit` once `Wal::frame_count() >= AUTO_CHECKPOINT_THRESHOLD_FRAMES` (currently 100) and can also be triggered explicitly. The sequence uses **two fsync barriers**, matching SQLite's ordering so no reordered writeback can expose a half-migrated file:
+
+1. Write every `wal_cache` data page at its `page_num * PAGE_SIZE` offset in the main file.
+2. **`fsync`** — data pages must hit stable storage *before* the header publishes them.
+3. Overwrite the main-file header with `current_header`.
+4. `set_len(page_count * PAGE_SIZE)` — shrink the main file if we dropped pages.
+5. **`fsync`** — header + truncate durable together. This is the checkpoint's commit point.
+6. `Wal::truncate()` — resets the sidecar to header-only, rolls the salt, bumps the checkpoint sequence.
+7. Drain `wal_cache` entries (minus page 0) into `on_disk`; drop on_disk entries past the new page count.
+
+**Crash safety.**
+- Crash between 1 and 2: data-page writes are buffered, header untouched — the main file still reads as its pre-checkpoint self. WAL is intact; retry rewrites the same bytes.
+- Crash between 2 and 5: data pages durable, header old. WAL still holds the authoritative bytes including page 0; next open overrides the stale header from wal_cache[0] and reads resolve correctly.
+- Crash between 5 and 6: main file fully migrated, WAL lingers. Next open sees wal_cache entries byte-identical to the main file; the next checkpoint cleans the stale WAL.
+
+`checkpoint()` returns the number of data pages written to the main file (excluding the header). Back-to-back checkpoints return 0 the second time. **`wal.truncate()` runs before the in-memory cache swap** so that a `wal.truncate` I/O failure leaves the Pager in a well-defined state (main file consistent on disk, stale WAL present, wal_cache still populated) rather than an uninspectable intermediate.
+
 ## How the diff earns its keep
 
 Consider an `UPDATE` that touches exactly one row in one table:
@@ -160,9 +179,8 @@ This only works because `save_database` iterates tables in sorted order — if t
 
 ## What it doesn't do (yet)
 
-- **No checkpointer.** The WAL grows without bound until the process exits (and even then the sidecar sits on disk). Phase 4d adds a checkpointer that flushes WAL frames back into the main file and truncates the log.
 - **No LRU eviction.** `on_disk` + `wal_cache` together grow with the page count. For a 1 GiB database, that's ~1 GiB of page cache. Bounded cache is future work.
-- **No free-page management.** When a table shrinks, the committed WAL state reflects the smaller page count but the main file's tail pages still linger until checkpoint. There's no free-list yet.
+- **No free-page management.** When a table shrinks, the main file's tail pages are truncated at checkpoint, but there's no free-list to reuse pages inside a grown file.
 - **No per-statement granularity.** The whole database is re-serialized on every commit; the diff keeps the *written* set small but the CPU cost of reserialization is unchanged.
 - **No shared/exclusive lock graduation.** One process, one open file handle — exclusive across the board. Phase 4e adds multi-reader / single-writer.
 - **No `BEGIN` / `COMMIT` / `ROLLBACK`.** Every mutating statement is its own transaction today. Phase 4f layers transactions on the WAL.
@@ -187,7 +205,13 @@ Unit tests in [`src/sql/pager/pager.rs`](../src/sql/pager/pager.rs):
 - `wal_replay_on_reopen_restores_committed_state` — end-to-end: close a Pager after a commit, reopen, verify every staged page comes back via WAL replay.
 - `two_commits_only_stage_the_delta` — two identical commits produce zero dirty data frames the second time (only the implicit commit frame).
 - `second_pager_on_same_file_is_rejected` — Phase 4a: exclusive lock rejects simultaneous openers.
+- **Phase 4d checkpoint suite:**
+  - `explicit_checkpoint_folds_wal_into_main_file_and_truncates_wal` — after checkpoint, main file holds the committed content, WAL is back to header-only.
+  - `checkpoint_is_idempotent` — back-to-back checkpoints: second is a no-op.
+  - `checkpoint_with_shrink_truncates_main_file` — a shrink-commit followed by checkpoint actually makes the main file smaller.
+  - `auto_checkpoint_fires_past_frame_threshold` — enough commits trigger auto-checkpoint; the WAL ends up empty on its own.
+  - `reopen_after_crash_mid_checkpoint_recovers_via_wal` — closing before checkpoint is equivalent to a crash mid-checkpoint; WAL replay restores the post-commit view.
 
-The 8 WAL-format tests live in [`src/sql/pager/wal.rs`](../src/sql/pager/wal.rs) and cover header / frame round-trips and torn-write recovery in isolation from the Pager.
+The 9 WAL-format tests live in [`src/sql/pager/wal.rs`](../src/sql/pager/wal.rs) and cover header / frame round-trips, torn-write recovery, and the orphan-dirty replay invariant in isolation from the Pager.
 
 Higher-level tests in [`src/sql/pager/mod.rs`](../src/sql/pager/mod.rs) cover round-tripping populated databases, rejecting garbage, and handling tables that span multiple pages.

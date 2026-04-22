@@ -26,6 +26,17 @@
 //! page count in its `commit_page_count` field. That frame is fsync'd.
 //! The main file is not touched.
 //!
+//! **Checkpoint flow (Phase 4d).** When the WAL accumulates past
+//! `AUTO_CHECKPOINT_THRESHOLD_FRAMES` frames (tracked on `Wal`), `commit`
+//! opportunistically folds them back into the main file: write every
+//! WAL-resident page at its proper offset, overwrite the main-file
+//! header, truncate the file to `page_count * PAGE_SIZE` bytes, `fsync`,
+//! then `Wal::truncate` the sidecar (which rolls the salt so any stale
+//! tail bytes from the old generation can't be misread as valid). Reads
+//! stay consistent if a crash hits mid-checkpoint — the WAL still holds
+//! the authoritative bytes until its header is rewritten, and the
+//! checkpointer is idempotent, so rerunning is safe.
+//!
 //! This matters because higher layers re-serialize the entire database on
 //! every auto-save. Without the diff, even a one-row UPDATE would append a
 //! frame for every page of every table. With the diff, unchanged tables —
@@ -75,16 +86,20 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     })
 }
 
+/// How many WAL frames may accumulate between auto-checkpoints before
+/// `commit` opportunistically folds them back into the main file. Kept
+/// low enough that the WAL stays bounded on write-heavy workloads;
+/// high enough that small bursts don't thrash the main file. SQLite
+/// defaults to 1000; our target DBs are smaller so 100 is plenty.
+const AUTO_CHECKPOINT_THRESHOLD_FRAMES: usize = 100;
+
 pub struct Pager {
-    /// Main-file I/O handle. After open/create, regular commits leave it
-    /// alone; only the Phase 4d checkpointer will reach back into it to
-    /// flush WAL frames and truncate the tail.
-    #[allow(dead_code)]
+    /// Main-file I/O handle. Regular commits leave it alone; the
+    /// checkpointer writes accumulated WAL pages back here.
     storage: FileStorage,
     current_header: DbHeader,
-    /// Byte snapshot of the main file as last checkpointed. Never changes
-    /// during regular commits — only the Phase 4d checkpointer mutates it
-    /// (and the corresponding main file) by flushing WAL frames here.
+    /// Byte snapshot of the main file as last checkpointed. The
+    /// checkpointer is the only thing that mutates it.
     on_disk: HashMap<u32, Box<[u8; PAGE_SIZE]>>,
     /// Pages queued for the next commit. `commit` drains this.
     staged: HashMap<u32, Box<[u8; PAGE_SIZE]>>,
@@ -297,7 +312,119 @@ impl Pager {
         self.wal_cache.insert(0, Box::new(page0));
 
         self.current_header = new_header;
+
+        // Keep the WAL bounded. Under write-heavy load, un-flushed frames
+        // accumulate; past the threshold we fold them back into the main
+        // file opportunistically so open doesn't have to replay an
+        // arbitrarily long log on the next start.
+        if self.wal.frame_count() >= AUTO_CHECKPOINT_THRESHOLD_FRAMES {
+            self.checkpoint()?;
+        }
+
         Ok(writes)
+    }
+
+    /// Folds all WAL-resident pages back into the main file and truncates
+    /// the WAL. Returns the number of data pages written to the main
+    /// file (excludes the header).
+    ///
+    /// **Crash safety — two fsync barriers.** The main-file writes happen
+    /// in two phases separated by a barrier, matching SQLite's checkpoint
+    /// ordering:
+    ///
+    /// 1. Write every `wal_cache` data page at its `page_num * PAGE_SIZE`
+    ///    offset in the main file.
+    /// 2. **`fsync`** — force those data pages to stable storage *before*
+    ///    the header publishes the new state. Without this barrier, a
+    ///    filesystem or disk-cache reordering could land the header first,
+    ///    leaving a main file that claims "N pages" over stale data.
+    /// 3. Rewrite the main-file header at offset 0. This is the
+    ///    checkpoint's "commit point" — after it hits disk the main file
+    ///    alone tells the truth.
+    /// 4. `set_len` shrinks the tail if `page_count` dropped.
+    /// 5. **`fsync`** — force the header + set_len durable.
+    /// 6. `Wal::truncate` resets the sidecar (rolls salt, writes new
+    ///    header, fsync). Running this *after* the main file is fully
+    ///    durable means a crash between 5 and 6 leaves a stale WAL over a
+    ///    current main file; readers still see the right bytes because
+    ///    wal_cache (replayed from the stale WAL on next open) would be
+    ///    byte-identical to what's in the main file. A retry of
+    ///    `checkpoint` then truncates cleanly.
+    ///
+    /// A crash between 1 and 2 can leave partial data-page writes, but
+    /// since the header hasn't moved yet, the main file still reads as
+    /// its pre-checkpoint self — the WAL is intact and authoritative,
+    /// and a retry rewrites the same bytes.
+    pub fn checkpoint(&mut self) -> Result<usize> {
+        // Nothing to flush? Skip the fsyncs and get out.
+        if self.wal.frame_count() == 0 && self.wal_cache.is_empty() {
+            return Ok(0);
+        }
+
+        // Step 1 — write every WAL-resident data page to the main file.
+        // Page 0 (header) is handled separately via write_header, and any
+        // pages past the new page count are skipped here (set_len will
+        // drop them when the file shrinks).
+        let page_count = self.current_header.page_count;
+        let mut pages: Vec<u32> = self
+            .wal_cache
+            .keys()
+            .copied()
+            .filter(|&n| n != 0 && n < page_count)
+            .collect();
+        pages.sort_unstable();
+        let written = pages.len();
+        for page_num in &pages {
+            let bytes = self
+                .wal_cache
+                .get(page_num)
+                .expect("iterated key must resolve");
+            self.storage
+                .seek_to((*page_num as u64) * (PAGE_SIZE as u64))?;
+            self.storage.write_all(bytes.as_ref())?;
+        }
+
+        // Step 2 — first durability barrier. Data pages must hit stable
+        // storage before the header publishes the new page count /
+        // schema root, or a reordered writeback could expose a
+        // half-migrated file on crash.
+        if written > 0 {
+            self.storage.flush()?;
+        }
+
+        // Step 3 — rewrite the main-file header. This is the checkpoint's
+        // atomic record.
+        self.storage.write_header(&self.current_header)?;
+
+        // Step 4 — shrink the main file if the committed page count is
+        // smaller than what the file physically holds.
+        self.storage.truncate_to_pages(page_count)?;
+
+        // Step 5 — second durability barrier. Makes header + set_len
+        // durable together before we touch the WAL.
+        self.storage.flush()?;
+
+        // Step 6 — reset the WAL sidecar. Runs before the in-memory
+        // cache swap so that if `wal.truncate` fails (disk full, EIO)
+        // we leave the in-memory state untouched rather than having
+        // wal_cache empty + on_disk updated + WAL un-truncated, which
+        // the Pager can't easily recover from on its own. Here a
+        // failure means the main file is already consistent on disk
+        // (steps 2 + 5 fsynced it); we just leave the stale WAL in
+        // place for the next checkpoint attempt.
+        self.wal.truncate()?;
+
+        // Promote wal_cache into on_disk and drop everything that's no
+        // longer live. Page 0 is special — it's never materialized in
+        // on_disk (we read it lazily via storage.read_header on open).
+        for (n, bytes) in self.wal_cache.drain().filter(|(n, _)| *n != 0) {
+            if n < page_count {
+                self.on_disk.insert(n, bytes);
+            }
+        }
+        self.on_disk.retain(|&n, _| n < page_count);
+
+        Ok(written)
     }
 }
 
@@ -591,6 +718,238 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second, 0, "no data frames should be re-appended");
+
+        cleanup(&path);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4d — Checkpointer
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn explicit_checkpoint_folds_wal_into_main_file_and_truncates_wal() {
+        use crate::sql::pager::wal::WAL_HEADER_SIZE;
+        let path = tmp_path("ckpt_explicit");
+        let mut p = Pager::create(&path).unwrap();
+
+        p.stage_page(2, make_page(0xA1));
+        p.stage_page(3, make_page(0xB2));
+        p.commit(DbHeader {
+            page_count: 4,
+            schema_root_page: 1,
+        })
+        .unwrap();
+
+        // Pre-checkpoint: WAL has frames, main file is still the initial size.
+        let wal = wal_path_for(&path);
+        assert!(std::fs::metadata(&wal).unwrap().len() > WAL_HEADER_SIZE as u64);
+
+        let written = p.checkpoint().unwrap();
+        assert_eq!(written, 2, "both data pages should flush to main file");
+
+        // WAL is now empty (just the header) with a rolled salt + bumped seq.
+        let wal_len = std::fs::metadata(&wal).unwrap().len();
+        assert_eq!(wal_len, WAL_HEADER_SIZE as u64);
+
+        // Main file is exactly page_count pages long.
+        let main_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(main_len, 4 * PAGE_SIZE as u64);
+
+        // Drop + reopen: main file alone must carry the latest content.
+        // (The WAL is empty, so any surviving correctness is on the main file.)
+        drop(p);
+        let p2 = Pager::open(&path).unwrap();
+        assert_eq!(p2.header().page_count, 4);
+        assert_eq!(p2.read_page(2).unwrap()[0], 0xA1);
+        assert_eq!(p2.read_page(3).unwrap()[0], 0xB2);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checkpoint_is_idempotent() {
+        // Two back-to-back checkpoints: the second must be a no-op and
+        // must not error. (The first drains wal_cache; the second sees
+        // nothing to do.)
+        let path = tmp_path("ckpt_idempotent");
+        let mut p = Pager::create(&path).unwrap();
+        p.stage_page(2, make_page(0x42));
+        p.commit(DbHeader {
+            page_count: 3,
+            schema_root_page: 1,
+        })
+        .unwrap();
+
+        let first = p.checkpoint().unwrap();
+        assert_eq!(first, 1);
+        let second = p.checkpoint().unwrap();
+        assert_eq!(second, 0, "second checkpoint should be a no-op");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checkpoint_with_shrink_truncates_main_file() {
+        // Grow to 5 pages, checkpoint; shrink to 3 pages, checkpoint.
+        // After the second checkpoint the main file must physically
+        // be 3 * PAGE_SIZE bytes — previous-tail pages are gone.
+        let path = tmp_path("ckpt_shrink");
+        let mut p = Pager::create(&path).unwrap();
+        p.stage_page(2, make_page(1));
+        p.stage_page(3, make_page(2));
+        p.stage_page(4, make_page(3));
+        p.commit(DbHeader {
+            page_count: 5,
+            schema_root_page: 1,
+        })
+        .unwrap();
+        p.checkpoint().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            5 * PAGE_SIZE as u64
+        );
+
+        // Shrink.
+        p.commit(DbHeader {
+            page_count: 3,
+            schema_root_page: 1,
+        })
+        .unwrap();
+        p.checkpoint().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * PAGE_SIZE as u64,
+            "main file should shrink to new page_count after checkpoint"
+        );
+        // Page 4 is gone both physically and logically.
+        assert!(p.read_page(4).is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn auto_checkpoint_fires_past_frame_threshold() {
+        // Do just enough commits to push the WAL past
+        // AUTO_CHECKPOINT_THRESHOLD_FRAMES. After the crossing commit,
+        // the WAL should be back to header-only (auto-checkpoint ran)
+        // while the main file carries every committed byte.
+        use crate::sql::pager::wal::WAL_HEADER_SIZE;
+        let path = tmp_path("ckpt_auto");
+        let mut p = Pager::create(&path).unwrap();
+
+        // Each commit appends: 1 dirty data frame + 1 commit frame for
+        // page 0 = 2 frames. So ceil(THRESHOLD / 2) commits gets us past
+        // the trigger.
+        let commits_needed = AUTO_CHECKPOINT_THRESHOLD_FRAMES.div_ceil(2);
+        for i in 0..commits_needed {
+            p.stage_page(2, make_page((i & 0xff) as u8));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+        }
+
+        // Auto-checkpoint must have fired at least once during that loop.
+        let wal_len = std::fs::metadata(wal_path_for(&path)).unwrap().len();
+        assert_eq!(
+            wal_len, WAL_HEADER_SIZE as u64,
+            "auto-checkpoint should have truncated the WAL"
+        );
+
+        // Last committed byte for page 2 is the latest (commits_needed - 1 & 0xff).
+        let expected = ((commits_needed - 1) & 0xff) as u8;
+        assert_eq!(p.read_page(2).unwrap()[0], expected);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reopen_after_crash_between_data_write_and_header_write_recovers_via_wal() {
+        // Simulates a crash between step 2 (data-page fsync) and step 3
+        // (header write) of `checkpoint`: the main file has new data
+        // pages but still carries the old header, AND the WAL still
+        // holds every committed frame. Next open must reconstruct the
+        // post-commit view via the WAL (wal_cache[0] overrides the stale
+        // main-file header).
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = tmp_path("ckpt_crash_mid_flush");
+        {
+            let mut p = Pager::create(&path).unwrap();
+            p.stage_page(2, make_page(0xEE));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+            // Manually write the committed page 2 into the main file at
+            // offset 2*PAGE_SIZE to simulate the first half of a
+            // checkpoint that only got as far as step 2. The header
+            // stays at the pre-commit state (page_count=2 from create).
+            // Drop the pager first so its exclusive lock releases.
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+            f.write_all(&make_page(0xEE)).unwrap();
+            f.sync_all().unwrap();
+            // NB: we didn't extend the file past its original length in
+            // the create-only state; the write_all grew it implicitly.
+            // The header at offset 0 is still the original "page_count=2".
+        }
+
+        // Reopen. Main-file header says 2 pages; WAL replay should
+        // override that to 3, and wal_cache[2] should shadow whatever
+        // the main file now holds for page 2 (which happens to be the
+        // same byte here — the point is the Pager doesn't depend on
+        // that coincidence).
+        let p2 = Pager::open(&path).unwrap();
+        assert_eq!(p2.header().page_count, 3);
+        assert_eq!(p2.read_page(2).unwrap()[0], 0xEE);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn auto_checkpoint_crosses_threshold_mid_loop() {
+        // Pins the exact-threshold semantics: `commit` must trigger a
+        // checkpoint as soon as the WAL's frame count hits the threshold,
+        // not later. Catches a regression where someone accidentally
+        // lowers it to `>` or bumps it into a different accounting.
+        let path = tmp_path("ckpt_threshold_crossing");
+        let mut p = Pager::create(&path).unwrap();
+        let commits_to_cross = AUTO_CHECKPOINT_THRESHOLD_FRAMES.div_ceil(2);
+        for i in 0..commits_to_cross - 1 {
+            p.stage_page(2, make_page((i & 0xff) as u8));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+        }
+        // One short of the threshold — WAL must not yet have been flushed.
+        let pre = std::fs::metadata(wal_path_for(&path)).unwrap().len();
+        assert!(
+            pre > crate::sql::pager::wal::WAL_HEADER_SIZE as u64,
+            "WAL should still carry frames right before the crossing commit"
+        );
+
+        // The crossing commit: this one's the trigger.
+        p.stage_page(2, make_page(0xff));
+        p.commit(DbHeader {
+            page_count: 3,
+            schema_root_page: 1,
+        })
+        .unwrap();
+        let post = std::fs::metadata(wal_path_for(&path)).unwrap().len();
+        assert_eq!(
+            post,
+            crate::sql::pager::wal::WAL_HEADER_SIZE as u64,
+            "WAL must be header-only right after the threshold-crossing commit"
+        );
 
         cleanup(&path);
     }

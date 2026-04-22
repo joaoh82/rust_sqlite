@@ -121,10 +121,11 @@ The `Pager` now owns both the main `.sqlrite` file and its `-wal` sidecar. Reads
 
 Five new Pager-level tests cover sidecar creation, main-file frozen-ness, shrink-via-bounds-check, WAL replay on reopen, and the diff staying effective (two identical commits produce zero dirty data frames).
 
-### Phase 4d — Checkpointer
+### ✅ Phase 4d — Checkpointer
 
-- Apply accumulated WAL frames back into the main file
-- Triggered opportunistically on commit past a threshold, or on `.save`
+`Pager::checkpoint()` folds every WAL-resident page back into the main file at its proper offset, then rewrites the header, `set_len`-truncates the tail, and calls `Wal::truncate` (which rolls the salt + bumps the checkpoint seq). **Two fsync barriers** flank the header write so no reordered writeback can expose a header over stale data pages — matching SQLite's checkpoint ordering. `wal.truncate()` runs before the in-memory cache swap so a truncate failure leaves the Pager in a well-defined state. Auto-fires from `commit` once the WAL passes `AUTO_CHECKPOINT_THRESHOLD_FRAMES` (currently 100) and is also callable explicitly.
+
+Six Pager-level tests pin the behaviour: explicit flush + WAL truncate, idempotency on repeat, shrink-then-checkpoint physically shrinks the main file, auto-threshold actually fires, the exact-threshold-crossing commit is the one that triggers, and a real mid-checkpoint crash (data pages on disk but header still stale) recovers via WAL replay.
 
 ### Phase 4e — Multi-reader / single-writer
 

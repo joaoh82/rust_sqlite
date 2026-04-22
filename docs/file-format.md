@@ -346,6 +346,21 @@ Rolling sum, `rotate_left(1) + byte`, over the first 12 header bytes plus the bo
 
 Rolled per checkpoint (Phase 4d). Prevents stale frames from an earlier generation of the WAL from being interpreted as valid after a truncate — their salt won't match the header's.
 
+### Checkpoint (Phase 4d)
+
+A checkpoint flushes accumulated WAL frames back into the main file and resets the sidecar. The order is:
+
+1. Write every WAL-resident data page at its proper offset in the main file.
+2. **`fsync`** — data pages durable before the header publishes them.
+3. Rewrite the main-file header.
+4. `set_len` to `page_count * PAGE_SIZE` (shrinks the tail if the DB got smaller).
+5. **`fsync`** — header + truncate durable together.
+6. `Wal::truncate` the sidecar (which rolls the salt, bumps the checkpoint seq, writes a fresh header, and fsyncs).
+
+**Atomicity.** The two fsync barriers are what make the checkpoint crash-safe: without step 2, a reordered writeback could land the new header over stale data pages. Any crash before step 5 leaves the main file in some intermediate state, but the WAL is still intact and authoritative; reopening replays the WAL on top. Any crash between 5 and 6 leaves the main file fully updated but the WAL lingers — reopening sees wal_cache entries that byte-match the main-file bytes, so reads resolve correctly, and the next checkpoint truncates the stale WAL cleanly. Either way, a checkpoint retry writes the same bytes (idempotent).
+
+**Triggering.** The `Pager` auto-fires a checkpoint from `commit` once the WAL frame count crosses `AUTO_CHECKPOINT_THRESHOLD_FRAMES` (currently 100). Callers can also invoke `Pager::checkpoint()` explicitly to force a flush (e.g. before shutdown).
+
 ## Process-level locking
 
 Starting with Phase 4a, every `Pager::open` / `Pager::create` takes a non-blocking OS **exclusive advisory lock** on the file (`fs2::FileExt::try_lock_exclusive` — `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on Windows). A second SQLRite process that tries to open the same file while another process already has it open fails immediately with:
