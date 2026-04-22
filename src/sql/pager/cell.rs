@@ -94,6 +94,22 @@ impl Cell {
         Ok(self.encode()?.len())
     }
 
+    /// Reads only the rowid out of an encoded cell, skipping the rest. Used
+    /// by binary search on a page's slot directory, where we need to order
+    /// cells but don't want to decode full bodies.
+    pub fn peek_rowid(buf: &[u8], pos: usize) -> Result<i64> {
+        let (_body_len, len_bytes) = varint::read_u64(buf, pos)?;
+        let (rowid, _) = varint::read_i64(buf, pos + len_bytes)?;
+        Ok(rowid)
+    }
+
+    /// Returns the total encoded length (including the `cell_length` prefix)
+    /// of the cell that starts at `buf[pos]`. Does not fully decode the body.
+    pub fn encoded_size_at(buf: &[u8], pos: usize) -> Result<usize> {
+        let (body_len, len_bytes) = varint::read_u64(buf, pos)?;
+        Ok(len_bytes + body_len as usize)
+    }
+
     /// Decodes a cell starting at `buf[pos]`. Returns `(cell, bytes_consumed)`.
     pub fn decode(buf: &[u8], pos: usize) -> Result<(Cell, usize)> {
         let (body_len, len_bytes) = varint::read_u64(buf, pos)?;
