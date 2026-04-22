@@ -5,7 +5,11 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │ cell_length    varint      total bytes *after* this field        │
+//! │ cell_length    varint      total bytes *after* this field,       │
+//! │                            including the kind tag below          │
+//! │ kind_tag       u8          0x01 = local cell (this module)       │
+//! │                            0x02 = overflow pointer (see          │
+//! │                            `OverflowRef` in `overflow.rs`)       │
 //! │ rowid          zigzag varint                                     │
 //! │ col_count      varint      number of declared columns            │
 //! │ null_bitmap    ⌈col_count/8⌉ bytes                               │
@@ -42,6 +46,12 @@ use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Value;
 use crate::sql::pager::varint;
 
+/// Cell kind tags — first byte of every cell's body after the length prefix.
+/// Readers dispatch on this to produce either a local [`Cell`] or an
+/// `OverflowRef` (in the sibling `overflow` module).
+pub const KIND_LOCAL: u8 = 0x01;
+pub const KIND_OVERFLOW: u8 = 0x02;
+
 /// Value type tag stored in each non-NULL value block.
 pub mod tag {
     pub const INTEGER: u8 = 0;
@@ -65,11 +75,15 @@ impl Cell {
         Self { rowid, values }
     }
 
-    /// Serializes the cell into freshly allocated bytes.
+    /// Serializes the cell into freshly allocated bytes. The encoding starts
+    /// with the shared `[cell_length | kind_tag]` prefix so readers can
+    /// dispatch to the right decoder; `kind_tag` is always `KIND_LOCAL`
+    /// for this type.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        // First encode everything after `cell_length` into a temporary buffer
-        // so we know its length before writing the length prefix.
+        // Build everything after `cell_length` first (kind_tag + body), so
+        // we can write the length prefix once we know the size.
         let mut body = Vec::new();
+        body.push(KIND_LOCAL);
         varint::write_i64(&mut body, self.rowid);
         varint::write_u64(&mut body, self.values.len() as u64);
         encode_null_bitmap(&mut body, &self.values);
@@ -94,23 +108,45 @@ impl Cell {
         Ok(self.encode()?.len())
     }
 
-    /// Reads only the rowid out of an encoded cell, skipping the rest. Used
-    /// by binary search on a page's slot directory, where we need to order
-    /// cells but don't want to decode full bodies.
+    /// Reads the rowid out of an encoded entry (either a local cell or an
+    /// overflow pointer), skipping the rest. Used by binary search on a
+    /// page's slot directory — both kinds have rowid at the same position
+    /// relative to the kind tag.
     pub fn peek_rowid(buf: &[u8], pos: usize) -> Result<i64> {
         let (_body_len, len_bytes) = varint::read_u64(buf, pos)?;
-        let (rowid, _) = varint::read_i64(buf, pos + len_bytes)?;
+        let body_start = pos + len_bytes;
+        // Skip the kind_tag byte.
+        if body_start >= buf.len() {
+            return Err(SQLRiteError::Internal(
+                "paged cell truncated before kind tag".to_string(),
+            ));
+        }
+        let (rowid, _) = varint::read_i64(buf, body_start + 1)?;
         Ok(rowid)
     }
 
     /// Returns the total encoded length (including the `cell_length` prefix)
-    /// of the cell that starts at `buf[pos]`. Does not fully decode the body.
+    /// of the cell-or-overflow-ref that starts at `buf[pos]`. Does not
+    /// fully decode the body.
     pub fn encoded_size_at(buf: &[u8], pos: usize) -> Result<usize> {
         let (body_len, len_bytes) = varint::read_u64(buf, pos)?;
         Ok(len_bytes + body_len as usize)
     }
 
-    /// Decodes a cell starting at `buf[pos]`. Returns `(cell, bytes_consumed)`.
+    /// Peeks the kind tag (`KIND_LOCAL` or `KIND_OVERFLOW`) of an entry
+    /// without full decode.
+    pub fn peek_kind(buf: &[u8], pos: usize) -> Result<u8> {
+        let (_body_len, len_bytes) = varint::read_u64(buf, pos)?;
+        let kind_pos = pos + len_bytes;
+        buf.get(kind_pos)
+            .copied()
+            .ok_or_else(|| SQLRiteError::Internal("paged cell truncated before kind tag".to_string()))
+    }
+
+    /// Decodes a local cell starting at `buf[pos]`. Returns
+    /// `(cell, bytes_consumed)`. Errors if the entry at `pos` is not a
+    /// local cell (e.g., it's an overflow pointer instead) — callers that
+    /// can't be sure should go through `PagedEntry::decode`.
     pub fn decode(buf: &[u8], pos: usize) -> Result<(Cell, usize)> {
         let (body_len, len_bytes) = varint::read_u64(buf, pos)?;
         let body_start = pos + len_bytes;
@@ -125,7 +161,18 @@ impl Cell {
         }
 
         let body = &buf[body_start..body_end];
-        let mut cur = 0usize;
+        if body.is_empty() {
+            return Err(SQLRiteError::Internal(
+                "paged cell body is empty (no kind tag)".to_string(),
+            ));
+        }
+        let kind_tag = body[0];
+        if kind_tag != KIND_LOCAL {
+            return Err(SQLRiteError::Internal(format!(
+                "Cell::decode called on non-local entry (kind_tag = {kind_tag:#x})"
+            )));
+        }
+        let mut cur = 1usize;
 
         let (rowid, n) = varint::read_i64(body, cur)?;
         cur += n;
@@ -368,21 +415,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_unknown_tag() {
-        // Construct a well-formed length prefix but stuff a nonsense tag.
-        //   cell_length varint = 4
-        //   rowid varint = 0
-        //   col_count varint = 1
-        //   null bitmap = 0 (column 0 is not null)
-        //   tag = 0xFE (bogus)
+    fn decode_rejects_unknown_value_tag() {
+        // Construct a well-formed local cell whose value block carries a
+        // bogus tag byte.
+        //   cell_length varint = 5
+        //   kind_tag               = 0x01 (local)
+        //   rowid varint           = 0
+        //   col_count varint       = 1
+        //   null bitmap            = 0 (column 0 is not null)
+        //   value tag              = 0xFE (bogus)
         let mut buf = Vec::new();
-        buf.push(4); // cell_length
-        buf.push(0); // rowid = 0
-        buf.push(1); // col_count = 1
-        buf.push(0); // null bitmap
-        buf.push(0xFE); // bad tag
+        buf.push(5);            // cell_length
+        buf.push(KIND_LOCAL);   // kind_tag
+        buf.push(0);            // rowid = 0
+        buf.push(1);            // col_count = 1
+        buf.push(0);            // null bitmap
+        buf.push(0xFE);         // bad value tag
         let err = Cell::decode(&buf, 0).unwrap_err();
         assert!(format!("{err}").contains("unknown value tag"));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_kind_tag() {
+        // Length prefix followed by the overflow kind tag. Cell::decode must
+        // refuse — this is what PagedEntry::decode is for.
+        let mut buf = Vec::new();
+        buf.push(1);            // cell_length = just the kind byte
+        buf.push(KIND_OVERFLOW);
+        let err = Cell::decode(&buf, 0).unwrap_err();
+        assert!(format!("{err}").contains("non-local"));
     }
 
     #[test]

@@ -19,13 +19,15 @@
 //! are written, so unchanged tables stay out of the auto-save path after the
 //! first write.
 
-// Phase 3c.1/3c.2 modules — standalone data layer; not yet wired into
+// Phase 3c.1–3c.3 modules — standalone data layer; not yet wired into
 // save/open. The allow attributes go away in Phase 3c.4 when the higher
 // layers actually call into these.
 #[allow(dead_code)]
 pub mod cell;
 pub mod file;
 pub mod header;
+#[allow(dead_code)]
+pub mod overflow;
 pub mod page;
 pub mod pager;
 #[allow(dead_code)]
