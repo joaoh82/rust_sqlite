@@ -59,6 +59,14 @@ Rust-SQLite (SQLRite)
 ### CREATE TABLE and INSERT Statements
 [![asciicast](https://asciinema.org/a/406447.svg)](https://asciinema.org/a/406447)
 
+### Desktop app
+
+A cross-platform Tauri 2.0 + Svelte 5 desktop GUI ships alongside the REPL (see [`desktop/`](desktop/) and [docs/desktop.md](docs/desktop.md) for details).
+
+![SQLRite Desktop](<images/SQLRite - Desktop.png> "The SQLRite desktop app")
+
+Launch it with `cd desktop && npm install && npm run tauri dev`. The header's New… / Open… / Save As… buttons cover the file lifecycle; the query editor has a live line-number gutter, `⌘/` (Ctrl+/) SQL comment toggle, and selection-aware Run (highlight a statement to run just that one).
+
 ### Developer guide
 
 In-depth documentation lives under [`docs/`](docs/). Start at [`docs/_index.md`](docs/_index.md) — it navigates to:

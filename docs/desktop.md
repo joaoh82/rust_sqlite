@@ -4,6 +4,10 @@ A Tauri 2.0 shell around the engine. Cross-platform (macOS / Linux / Windows) vi
 
 Lives under [`desktop/`](../desktop/).
 
+![SQLRite Desktop](<../images/SQLRite - Desktop.png> "The SQLRite desktop app")
+
+*Screenshot: the default three-pane layout — sidebar with tables and schema on the left, query editor with line numbers up top, result grid below. Header carries New… / Open… / Save As… and shows the active database path.*
+
 ## Running it
 
 Two prerequisites beyond the engine's toolchain:
