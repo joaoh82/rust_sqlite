@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "SQLRite"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "clap",
- "env_logger",
- "log",
- "prettytable-rs",
- "rustyline",
- "rustyline-derive",
- "serde",
- "sqlparser",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -628,6 +612,22 @@ checksum = "dbf5ea8d4d7c808e1af1cbabebca9a2abe603bcefc22294c5b95018d53200cb7"
 dependencies = [
  "log",
  "recursive",
+]
+
+[[package]]
+name = "sqlrite"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "clap",
+ "env_logger",
+ "log",
+ "prettytable-rs",
+ "rustyline",
+ "rustyline-derive",
+ "serde",
+ "sqlparser",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

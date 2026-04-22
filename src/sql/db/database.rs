@@ -40,7 +40,8 @@ impl Database {
     /// # Examples
     ///
     /// ```
-    /// let mut db = sql::db::database::Database::new("my_db".to_string());
+    /// use sqlrite::Database;
+    /// let mut db = Database::new("my_db".to_string());
     /// ```
     pub fn new(db_name: String) -> Self {
         Database {

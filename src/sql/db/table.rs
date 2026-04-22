@@ -690,11 +690,11 @@ impl Table {
         Ok(())
     }
 
-    /// Print the table schema to standard output in a pretty formatted way
+    /// Print the table schema to standard output in a pretty formatted way.
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let table = Table::new(payload);
     /// table.print_table_schema();
     ///
@@ -734,11 +734,11 @@ impl Table {
         Ok(table.len() * 2 + 1)
     }
 
-    /// Print the table data to standard output in a pretty formatted way
+    /// Print the table data to standard output in a pretty formatted way.
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let db_table = db.get_table_mut(table_name.to_string()).unwrap();
     /// db_table.print_table_data();
     ///

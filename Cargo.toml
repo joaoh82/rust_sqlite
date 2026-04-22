@@ -1,5 +1,5 @@
 [package]
-name = "SQLRite"
+name = "sqlrite"
 version = "0.1.0"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
@@ -11,6 +11,20 @@ license = "MIT"
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Library target — the engine. Used by the REPL binary below, by tests, and
+# by the Tauri desktop app under `desktop/src-tauri/`. Keep the lib's public
+# surface small (see `src/lib.rs`); the internals are versioned with
+# on-disk format changes, so consumers should stick to the re-exports.
+[lib]
+name = "sqlrite"
+path = "src/lib.rs"
+
+# Binary target — the interactive REPL. This is what `cargo run` builds by
+# default.
+[[bin]]
+name = "sqlrite"
+path = "src/main.rs"
 
 [dependencies]
 rustyline = "18.0"

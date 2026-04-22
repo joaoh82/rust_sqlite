@@ -1,15 +1,14 @@
-#[macro_use]
-extern crate prettytable;
+//! REPL binary — the `sqlrite` CLI.
+//!
+//! Thin wrapper around the [`sqlrite`] library: rustyline for input, the
+//! engine for parsing + execution + persistence.
 
-mod error;
 mod meta_command;
 mod repl;
-mod sql;
 
 use meta_command::handle_meta_command;
 use repl::{CommandType, REPLHelper, get_command_type, get_config};
-use sql::db::database::Database;
-use sql::process_command;
+use sqlrite::{Database, process_command};
 
 use rustyline::Editor;
 use rustyline::error::ReadlineError;

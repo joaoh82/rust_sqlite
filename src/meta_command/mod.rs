@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 
-use crate::error::{Result, SQLRiteError};
 use crate::repl::REPLHelper;
-use crate::sql::db::database::Database;
-use crate::sql::pager::{open_database, save_database};
+use sqlrite::error::{Result, SQLRiteError};
+use sqlrite::sql::db::database::Database;
+use sqlrite::sql::pager::{open_database, save_database};
 
 #[derive(Debug, PartialEq)]
 pub enum MetaCommand {
@@ -153,7 +153,7 @@ fn handle_tables(db: &Database) -> Result<String> {
 mod tests {
     use super::*;
     use crate::repl::{REPLHelper, get_config};
-    use crate::sql::process_command;
+    use sqlrite::process_command;
 
     fn new_editor() -> Editor<REPLHelper, DefaultHistory> {
         let config = get_config();
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn save_then_open_round_trips_through_meta_commands() {
-        use crate::sql::db::table::Value;
+        use sqlrite::sql::db::table::Value;
 
         let path = tmp_path("meta_roundtrip");
         let mut repl = new_editor();
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn auto_save_persists_writes_without_explicit_save() {
-        use crate::sql::db::table::Value;
+        use sqlrite::sql::db::table::Value;
 
         let path = tmp_path("autosave");
         let mut repl = new_editor();
@@ -289,7 +289,7 @@ mod tests {
         process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
 
         // Reopen the file from scratch in a fresh Database — no manual .save was called.
-        let fresh = crate::sql::pager::open_database(&path, "x".to_string())
+        let fresh = sqlrite::sql::pager::open_database(&path, "x".to_string())
             .expect("open after auto-save");
         let users = fresh.get_table("users".to_string()).expect("users table");
         let rowids = users.rowids();

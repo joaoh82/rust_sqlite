@@ -1,5 +1,5 @@
 use crate::meta_command::*;
-use crate::sql::*;
+use sqlrite::sql::SQLCommand;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
 
