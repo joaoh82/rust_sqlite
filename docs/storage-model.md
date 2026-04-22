@@ -175,13 +175,14 @@ This split keeps the executor type-agnostic — it just uses `Value` arithmetic 
 
 Full table scan, every time. Index-backed lookups are Phase 3+.
 
-## What Phase 3c changes
+## What Phase 3c changed — and what it didn't
 
-Phase 3c (cell-based storage) will:
+**Changed (on-disk).** Rows are no longer stored as one opaque `bincode` blob per table. Each row is serialized as a **cell** (length-prefixed, kind-tagged, null-bitmap + typed value blocks) and packed into `TableLeaf` pages behind a slot directory. Cells that don't fit spill into an overflow chain. The schema catalog is itself a table — `sqlrite_master` — stored in the same cell format. File format version is now 2. See [file-format.md](file-format.md) for the byte-level details.
 
-- Replace `Rc<RefCell<HashMap<String, Row>>>` with a page-oriented layout: each table is a set of pages, each page holds a sequence of variable-length row cells.
-- Let rows be read and written one at a time without re-serializing the whole table's bincode blob on every statement.
-- Give NULL a proper null-bitmap per cell, ending the `"Null"`-string hack.
-- Be the layer the B-Tree (3d) sits on top of.
+**Didn't change (in-memory).** The `Database` / `Table` / `Column` / `Row` / `Index` structures described in the sections above are still the runtime representation. On `save_database`, `Table::extract_row` turns each in-memory row into a `Cell`; on `open_database`, each `Cell` is decoded and its values are handed to `Table::restore_row`, which populates the per-column `BTreeMap`s and rebuilds the indexes.
 
-The `Database`, `Column`, `Index`, and `Value` abstractions will survive; the `Row` enum and the HashMap-of-BTreeMaps inside `Table` won't. Most executor code won't need to change — it already goes through `Table::rowids` and `Table::get_value`/`set_value`/etc, which can be reimplemented over the new storage.
+## What Phase 3d will change
+
+Phase 3d will replace today's linear "chain of `TableLeaf` pages" with a real B-Tree — leaves still hold cells, but interior pages route by rowid. That enables O(log N) point lookups instead of linear scans.
+
+Phase 3d (B-Tree) will also be where lazy loading enters the picture: instead of `open_database` walking every leaf and building the full in-memory `Row` BTreeMaps up front, the engine will fetch cells on demand. Most executor code stays the same — it already goes through `Table::rowids` and `Table::get_value` / `set_value`, which can be reimplemented to hit the pager directly.

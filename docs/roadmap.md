@@ -64,21 +64,21 @@ Split into sub-phases for manageable commits.
 
 See [Pager](pager.md).
 
-### Phase 3c — Cell-based page layout *(next)*
+### ✅ Phase 3c — Cell-based page layout *(done, file format v2)*
 
-Replace the per-table bincode blob with variable-length row cells packed into pages. Design questions (TBD):
+*Five commits: `af4d851`, `a87c05c`, `e10af65`, `c28f5c9`, `2c3171e`.*
 
-- Cell encoding (tag-then-value? length-prefixed? bincode per cell?)
-- Offset table at page end vs. fixed slot directory at page start
-- Overflow when a single row exceeds one page
-- NULL representation (null bitmap per cell?)
-- How the schema catalog itself is stored (still bincode? a real table?)
+Rows are now serialized as length-prefixed, kind-tagged cells and packed into `TableLeaf` pages with a SQLite-style slot directory. Cells that exceed ~1 KB spill into a chain of `Overflow` pages. The schema catalog itself is now an internal table named `sqlrite_master`.
 
-The existing page format (7-byte header, chaining via `next`) will survive. What changes is the content *inside* the payload area.
+- **3c.1** — varint (LEB128 + ZigZag) + cell codec (tag-then-value, null bitmap)
+- **3c.2** — `TablePage` with slot directory + binary-search rowid lookup + insert/delete
+- **3c.3** — overflow chains for oversized cells; kind-tagged cells to dispatch between local/overflow
+- **3c.4** — wire cell storage into `save_database` / `open_database`
+- **3c.5** — promote schema catalog to `sqlrite_master`, bump format version to 2
 
-### Phase 3d — Page-based B-Tree
+### Phase 3d — Page-based B-Tree *(next)*
 
-Real B-Tree per table, keyed by ROWID. Leaf pages hold cells (from 3c); interior pages hold child pointers and divider keys. Split on full page, merge on underflow.
+Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; interior pages (new `PageType::InteriorNode`) hold child-page pointers and divider keys. Split on full page, merge on underflow. Enables O(log N) point lookups by rowid instead of the current linear leaf-chain scan.
 
 ### Phase 3e — Secondary indexes
 
