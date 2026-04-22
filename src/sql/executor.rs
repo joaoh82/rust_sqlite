@@ -5,13 +5,14 @@ use std::cmp::Ordering;
 
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Update,
+    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, Statement,
+    TableFactor, TableWithJoins, UnaryOperator, Update,
 };
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
-use crate::sql::db::table::{Table, Value};
+use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
+use crate::sql::db::table::{DataType, Table, Value};
 use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
 
 /// Executes a parsed `SelectQuery` against the database and returns a
@@ -38,16 +39,25 @@ pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usiz
         }
     };
 
-    // Collect matching rowids by evaluating WHERE on each row.
-    let mut matching: Vec<i64> = Vec::new();
-    for rowid in table.rowids() {
-        if let Some(expr) = &query.selection {
-            if !eval_predicate(expr, table, rowid)? {
-                continue;
+    // Collect matching rowids. If the WHERE is the shape `col = literal`
+    // and `col` has a secondary index, probe the index for an O(log N)
+    // seek; otherwise fall back to the full table scan.
+    let matching = match select_rowids(table, query.selection.as_ref())? {
+        RowidSource::IndexProbe(rowids) => rowids,
+        RowidSource::FullScan => {
+            let mut out = Vec::new();
+            for rowid in table.rowids() {
+                if let Some(expr) = &query.selection {
+                    if !eval_predicate(expr, table, rowid)? {
+                        continue;
+                    }
+                }
+                out.push(rowid);
             }
+            out
         }
-        matching.push(rowid);
-    }
+    };
+    let mut matching = matching;
 
     // Sort before applying LIMIT, matching SQL semantics.
     if let Some(order) = &query.order_by {
@@ -102,16 +112,21 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
         let table = db.get_table(table_name.clone()).map_err(|_| {
             SQLRiteError::Internal(format!("Table '{table_name}' not found"))
         })?;
-        let mut out = Vec::new();
-        for rowid in table.rowids() {
-            if let Some(expr) = selection {
-                if !eval_predicate(expr, table, rowid)? {
-                    continue;
+        match select_rowids(table, selection.as_ref())? {
+            RowidSource::IndexProbe(rowids) => rowids,
+            RowidSource::FullScan => {
+                let mut out = Vec::new();
+                for rowid in table.rowids() {
+                    if let Some(expr) = selection {
+                        if !eval_predicate(expr, table, rowid)? {
+                            continue;
+                        }
+                    }
+                    out.push(rowid);
                 }
+                out
             }
-            out.push(rowid);
         }
-        out
     };
 
     let table = db.get_table_mut(table_name)?;
@@ -173,16 +188,27 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     }
 
     // Gather matching rowids + the new values to write for each assignment, under
-    // an immutable borrow.
+    // an immutable borrow. Uses the index-probe fast path when the WHERE is
+    // `col = literal` on an indexed column.
     let work: Vec<(i64, Vec<(String, Value)>)> = {
         let tbl = db.get_table(table_name.clone())?;
-        let mut rows_to_update = Vec::new();
-        for rowid in tbl.rowids() {
-            if let Some(expr) = selection {
-                if !eval_predicate(expr, tbl, rowid)? {
-                    continue;
+        let matched_rowids: Vec<i64> = match select_rowids(tbl, selection.as_ref())? {
+            RowidSource::IndexProbe(rowids) => rowids,
+            RowidSource::FullScan => {
+                let mut out = Vec::new();
+                for rowid in tbl.rowids() {
+                    if let Some(expr) = selection {
+                        if !eval_predicate(expr, tbl, rowid)? {
+                            continue;
+                        }
+                    }
+                    out.push(rowid);
                 }
+                out
             }
+        };
+        let mut rows_to_update = Vec::new();
+        for rowid in matched_rowids {
             let mut values = Vec::with_capacity(parsed_assignments.len());
             for (col, expr) in &parsed_assignments {
                 // UPDATE's RHS is evaluated in the context of the row being updated,
@@ -202,6 +228,144 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
         }
     }
     Ok(work.len())
+}
+
+/// Handles `CREATE INDEX [UNIQUE] <name> ON <table> (<column>)`. Single-
+/// column indexes only; multi-column / composite indexes are future work.
+/// Returns the (possibly synthesized) index name for the status message.
+pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<String> {
+    let Statement::CreateIndex(CreateIndex {
+        name,
+        table_name,
+        columns,
+        unique,
+        if_not_exists,
+        predicate,
+        ..
+    }) = stmt
+    else {
+        return Err(SQLRiteError::Internal(
+            "execute_create_index called on a non-CREATE-INDEX statement".to_string(),
+        ));
+    };
+
+    if predicate.is_some() {
+        return Err(SQLRiteError::NotImplemented(
+            "partial indexes (CREATE INDEX ... WHERE) are not supported yet".to_string(),
+        ));
+    }
+
+    if columns.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(format!(
+            "multi-column indexes are not supported yet ({} columns given)",
+            columns.len()
+        )));
+    }
+
+    let index_name = name
+        .as_ref()
+        .map(|n| n.to_string())
+        .ok_or_else(|| {
+            SQLRiteError::NotImplemented(
+                "anonymous CREATE INDEX (no name) is not supported — give it a name"
+                    .to_string(),
+            )
+        })?;
+
+    let table_name_str = table_name.to_string();
+    let column_name = match &columns[0].column.expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?,
+        other => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "CREATE INDEX only supports simple column references, got {other:?}"
+            )));
+        }
+    };
+
+    // Validate: table exists, column exists, type is indexable, name is unique.
+    let (datatype, existing_rowids_and_values): (DataType, Vec<(i64, Value)>) = {
+        let table = db.get_table(table_name_str.clone()).map_err(|_| {
+            SQLRiteError::General(format!(
+                "CREATE INDEX references unknown table '{table_name_str}'"
+            ))
+        })?;
+        if !table.contains_column(column_name.clone()) {
+            return Err(SQLRiteError::General(format!(
+                "CREATE INDEX references unknown column '{column_name}' on table '{table_name_str}'"
+            )));
+        }
+        let col = table
+            .columns
+            .iter()
+            .find(|c| c.column_name == column_name)
+            .expect("we just verified the column exists");
+        if table.index_by_name(&index_name).is_some() {
+            if *if_not_exists {
+                return Ok(index_name);
+            }
+            return Err(SQLRiteError::General(format!(
+                "index '{index_name}' already exists"
+            )));
+        }
+        let datatype = clone_datatype(&col.datatype);
+
+        // Snapshot (rowid, value) pairs so we can populate the index after
+        // it's attached. Doing this under the immutable borrow of the table
+        // means the mutable attach below can proceed without aliasing.
+        let mut pairs = Vec::new();
+        for rowid in table.rowids() {
+            if let Some(v) = table.get_value(&column_name, rowid) {
+                pairs.push((rowid, v));
+            }
+        }
+        (datatype, pairs)
+    };
+
+    // Build the index.
+    let mut idx = SecondaryIndex::new(
+        index_name.clone(),
+        table_name_str.clone(),
+        column_name.clone(),
+        &datatype,
+        *unique,
+        IndexOrigin::Explicit,
+    )?;
+
+    // Populate from the existing rows. UNIQUE violations here mean the
+    // existing data already breaks the new index's constraint — a common
+    // source of user confusion, so be explicit.
+    for (rowid, v) in &existing_rowids_and_values {
+        if *unique && idx.would_violate_unique(v) {
+            return Err(SQLRiteError::General(format!(
+                "cannot create UNIQUE index '{index_name}': column '{column_name}' \
+                 already contains the duplicate value {}",
+                v.to_display_string()
+            )));
+        }
+        idx.insert(v, *rowid)?;
+    }
+
+    // Attach to the table.
+    let table_mut = db.get_table_mut(table_name_str)?;
+    table_mut.secondary_indexes.push(idx);
+    Ok(index_name)
+}
+
+/// Cheap clone helper — `DataType` intentionally doesn't derive `Clone`
+/// because the enum has no ergonomic reason to be cloneable elsewhere.
+fn clone_datatype(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Integer => DataType::Integer,
+        DataType::Text => DataType::Text,
+        DataType::Real => DataType::Real,
+        DataType::Bool => DataType::Bool,
+        DataType::None => DataType::None,
+        DataType::Invalid => DataType::Invalid,
+    }
 }
 
 fn extract_single_table_name(tables: &[TableWithJoins]) -> Result<String> {
@@ -225,6 +389,86 @@ fn extract_table_name(twj: &TableWithJoins) -> Result<String> {
             "only plain table references are supported".to_string(),
         )),
     }
+}
+
+/// Tells the executor how to produce its candidate rowid list.
+enum RowidSource {
+    /// The WHERE was simple enough to probe a secondary index directly.
+    /// The `Vec` already contains exactly the rows the index matched;
+    /// no further WHERE evaluation is needed (the probe is precise).
+    IndexProbe(Vec<i64>),
+    /// No applicable index; caller falls back to walking `table.rowids()`
+    /// and evaluating the WHERE on each row.
+    FullScan,
+}
+
+/// Try to satisfy `WHERE` with an index probe. Currently supports the
+/// simplest shape: a single `col = literal` (or `literal = col`) where
+/// `col` is on a secondary index. AND/OR/range predicates fall back to
+/// full scan — those can be layered on later without changing the caller.
+fn select_rowids(table: &Table, selection: Option<&Expr>) -> Result<RowidSource> {
+    let Some(expr) = selection else {
+        return Ok(RowidSource::FullScan);
+    };
+    let Some((col, literal)) = try_extract_equality(expr) else {
+        return Ok(RowidSource::FullScan);
+    };
+    let Some(idx) = table.index_for_column(&col) else {
+        return Ok(RowidSource::FullScan);
+    };
+
+    // Convert the literal into a runtime Value. If the literal type doesn't
+    // match the column's index we still need correct semantics — evaluate
+    // the WHERE against every row. Fall back to full scan.
+    let literal_value = match convert_literal(&literal) {
+        Ok(v) => v,
+        Err(_) => return Ok(RowidSource::FullScan),
+    };
+
+    // Index lookup returns the full list of rowids matching this equality
+    // predicate. For unique indexes that's at most one; for non-unique it
+    // can be many.
+    let mut rowids = idx.lookup(&literal_value);
+    rowids.sort_unstable();
+    Ok(RowidSource::IndexProbe(rowids))
+}
+
+/// Recognizes `expr` as a simple equality on a column reference against a
+/// literal. Returns `(column_name, literal_value)` if the shape matches;
+/// `None` otherwise. Accepts both `col = literal` and `literal = col`.
+fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> {
+    // Peel off Nested parens so `WHERE (x = 1)` is recognized too.
+    let peeled = match expr {
+        Expr::Nested(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Expr::BinaryOp { left, op, right } = peeled else {
+        return None;
+    };
+    if !matches!(op, BinaryOperator::Eq) {
+        return None;
+    }
+    let col_from = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+            _ => None,
+        }
+    };
+    let literal_from = |e: &Expr| -> Option<sqlparser::ast::Value> {
+        if let Expr::Value(v) = e {
+            Some(v.value.clone())
+        } else {
+            None
+        }
+    };
+    if let (Some(c), Some(l)) = (col_from(left), literal_from(right)) {
+        return Some((c, l));
+    }
+    if let (Some(l), Some(c)) = (literal_from(left), col_from(right)) {
+        return Some((c, l));
+    }
+    None
 }
 
 fn sort_rowids(rowids: &mut [i64], table: &Table, order: &OrderByClause) -> Result<()> {

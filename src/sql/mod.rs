@@ -60,6 +60,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     let is_write_statement = matches!(
         &query,
         Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -180,6 +181,10 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 "UPDATE Statement executed. {rows} row{s} updated.",
                 s = if rows == 1 { "" } else { "s" }
             );
+        }
+        Statement::CreateIndex(_) => {
+            let name = executor::execute_create_index(&query, db)?;
+            message = format!("CREATE INDEX '{name}' executed.");
         }
         _ => {
             return Err(SQLRiteError::NotImplemented(
@@ -461,5 +466,93 @@ mod tests {
         // Nothing in Phase 1 handles DROP.
         let result = process_command("DROP TABLE users;", &mut db);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_index_adds_explicit_index() {
+        let mut db = seed_users_table();
+        let response = process_command("CREATE INDEX users_age_idx ON users (age);", &mut db)
+            .expect("create index");
+        assert!(response.contains("users_age_idx"));
+
+        // The index should now be attached to the users table.
+        let users = db.get_table("users".to_string()).unwrap();
+        let idx = users
+            .index_by_name("users_age_idx")
+            .expect("index should exist after CREATE INDEX");
+        assert_eq!(idx.column_name, "age");
+        assert!(!idx.is_unique);
+    }
+
+    #[test]
+    fn create_unique_index_rejects_duplicate_existing_values() {
+        let mut db = seed_users_table();
+        // `name` is already UNIQUE (auto-indexed); insert a duplicate-age row
+        // first so CREATE UNIQUE INDEX on age catches the conflict.
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 30);", &mut db).unwrap();
+        let result = process_command(
+            "CREATE UNIQUE INDEX users_age_unique ON users (age);",
+            &mut db,
+        );
+        assert!(result.is_err(), "expected unique-index failure, got {result:?}");
+    }
+
+    #[test]
+    fn where_eq_on_indexed_column_uses_index_probe() {
+        // Build a table big enough that a full scan would be expensive,
+        // then rely on the index-probe fast path. This test verifies
+        // correctness (right rows returned); the perf win is implicit.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, tag TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE INDEX big_tag_idx ON big (tag);", &mut db).unwrap();
+        for i in 1..=100 {
+            let tag = if i % 3 == 0 { "hot" } else { "cold" };
+            process_command(&format!("INSERT INTO big (tag) VALUES ('{tag}');"), &mut db)
+                .unwrap();
+        }
+        let response = process_command("SELECT id FROM big WHERE tag = 'hot';", &mut db)
+            .expect("select");
+        // 1..=100 has 33 multiples of 3.
+        assert!(
+            response.contains("33 rows returned"),
+            "response was {response:?}"
+        );
+    }
+
+    #[test]
+    fn where_eq_on_indexed_column_inside_parens_uses_index_probe() {
+        let mut db = seed_users_table();
+        let response = process_command(
+            "SELECT name FROM users WHERE (name = 'bob');",
+            &mut db,
+        )
+        .expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn where_eq_literal_first_side_uses_index_probe() {
+        let mut db = seed_users_table();
+        // `'bob' = name` should hit the same path as `name = 'bob'`.
+        let response = process_command(
+            "SELECT name FROM users WHERE 'bob' = name;",
+            &mut db,
+        )
+        .expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn non_equality_where_still_falls_back_to_full_scan() {
+        // Sanity: range predicates bypass the optimizer and the full-scan
+        // path still returns correct results.
+        let mut db = seed_users_table();
+        let response = process_command("SELECT name FROM users WHERE age > 28;", &mut db)
+            .expect("select");
+        assert!(response.contains("2 rows returned"));
     }
 }
