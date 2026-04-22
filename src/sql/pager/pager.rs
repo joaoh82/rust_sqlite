@@ -43,20 +43,24 @@
 //! whose encoded pages hash identically across saves — simply stay out of
 //! the WAL.
 //!
-//! **Locking (Phase 4a).** Every `Pager` takes an exclusive advisory lock
-//! on its main file and on its WAL sidecar (`fs2::FileExt::try_lock_exclusive`).
-//! If another SQLRite process is already holding either lock, `open` /
-//! `create` return a clean `database is already opened by another process`
-//! error instead of silently racing. Both locks are tied to their file
-//! descriptors and release automatically when the `Pager` drops. This is
-//! exclusive — one writer, no concurrent readers. Phase 4e upgrades to
-//! shared/exclusive modes.
+//! **Locking (Phase 4a → 4e).** Every `Pager` takes an advisory lock on
+//! its main file and on its WAL sidecar. The mode is driven by
+//! [`AccessMode`]:
+//!
+//! - `ReadWrite` → `flock(LOCK_EX)` — one writer, no other openers.
+//! - `ReadOnly`  → `flock(LOCK_SH)` — multiple readers coexist; any writer
+//!   is excluded.
+//!
+//! Both locks are tied to their file descriptors and release
+//! automatically when the `Pager` drops. On collision the opener gets
+//! a clean typed error rather than racing silently. POSIX flock is
+//! "multiple readers OR one writer", not both — true concurrent
+//! reader-and-writer access would need a shared-memory coordination
+//! file and read marks, which is not on the roadmap.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-
-use fs2::FileExt;
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::pager::file::FileStorage;
@@ -67,20 +71,53 @@ use crate::sql::pager::wal::Wal;
 /// Returns the WAL sidecar path for a main `.sqlrite` file: appends
 /// the `-wal` suffix to the full path (so `foo.sqlrite` pairs with
 /// `foo.sqlrite-wal`). Matches SQLite's convention.
-fn wal_path_for(main: &Path) -> PathBuf {
+pub(crate) fn wal_path_for(main: &Path) -> PathBuf {
     let mut os = main.as_os_str().to_owned();
     os.push("-wal");
     PathBuf::from(os)
 }
 
-/// Acquires an exclusive advisory lock on `file`, mapping the OS-level
-/// "lock held" error to a clean SQLRite error that mentions the path. On
-/// Unix this is `flock(LOCK_EX | LOCK_NB)`; on Windows, `LockFileEx` with
-/// `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY`.
-fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    file.try_lock_exclusive().map_err(|e| {
+/// How a `Pager` (or `Wal`) intends to use the file: mutating writes vs.
+/// consistent-snapshot reads. Drives the OS-level lock mode, and the
+/// Pager uses it to reject mutation attempts on read-only openers.
+///
+/// - `ReadWrite` takes `flock(LOCK_EX)` — one writer, no other openers.
+/// - `ReadOnly`  takes `flock(LOCK_SH)` — multiple readers can coexist;
+///   a writer is excluded.
+///
+/// This is POSIX-flock semantics, so "multiple readers AND one writer"
+/// isn't supported yet. True concurrent reader-writer access would need
+/// a shared-memory coordination file and read marks — that's deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// Acquires an advisory lock on `file`, mapping the OS-level "lock
+/// held" error to a clean SQLRite error. `Exclusive` on Unix is
+/// `flock(LOCK_EX | LOCK_NB)`; `Shared` is `flock(LOCK_SH | LOCK_NB)`.
+/// On Windows, `LockFileEx` with the corresponding flags.
+///
+/// We call fs2's trait methods fully qualified because `std::fs::File`
+/// gained its own `try_lock_*` inherent methods in Rust 1.84 with a
+/// different error type — qualifying nails down which one we mean.
+pub(crate) fn acquire_lock(file: &File, path: &Path, mode: AccessMode) -> Result<()> {
+    let res = match mode {
+        AccessMode::ReadWrite => fs2::FileExt::try_lock_exclusive(file),
+        AccessMode::ReadOnly => fs2::FileExt::try_lock_shared(file),
+    };
+    res.map_err(|e| {
+        let how = match mode {
+            AccessMode::ReadWrite => {
+                "is in use (another process has it open; readers and writers are exclusive)"
+            }
+            AccessMode::ReadOnly => {
+                "is locked for writing by another process (read-only open blocked until the writer closes)"
+            }
+        };
         SQLRiteError::General(format!(
-            "database '{}' is already opened by another process ({e})",
+            "database '{}' {how} ({e})",
             path.display()
         ))
     })
@@ -107,21 +144,52 @@ pub struct Pager {
     /// replaying the log, and kept in sync with each successful commit.
     /// Layered on top of `on_disk` for read resolution.
     wal_cache: HashMap<u32, Box<[u8; PAGE_SIZE]>>,
-    /// Write-ahead log sidecar. Holds every committed change since the
-    /// last checkpoint. Drops automatically with the `Pager`, releasing
-    /// its exclusive file lock.
-    wal: Wal,
+    /// Write-ahead log sidecar. Present on a read-write Pager; `None`
+    /// on a read-only Pager that either found no WAL on disk or doesn't
+    /// retain the handle after initial replay. Reads consult
+    /// `wal_cache` (already populated at open) either way.
+    wal: Option<Wal>,
+    /// `ReadWrite` allows `commit` / `checkpoint`; `ReadOnly` rejects
+    /// them with a typed error. `stage_page` stays open on both modes
+    /// (it only touches the in-memory `staged` map) — any staged bytes
+    /// simply never reach disk on a read-only Pager because `commit` is
+    /// the gate.
+    access_mode: AccessMode,
 }
 
 impl Pager {
-    /// Opens an existing database file and loads every page into the
-    /// `on_disk` snapshot, then opens (or creates) its `-wal` sidecar and
-    /// layers any committed frames into `wal_cache`. Returns `Err` if the
-    /// header is invalid, or if another SQLRite process already holds an
-    /// exclusive lock on either file.
+    /// Opens an existing database file for read-write access. Shorthand
+    /// for [`Pager::open_with_mode`] with [`AccessMode::ReadWrite`].
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        lock_exclusive(&file, path)?;
+        Self::open_with_mode(path, AccessMode::ReadWrite)
+    }
+
+    /// Opens an existing database file for read-only access — takes
+    /// a shared advisory lock that coexists with other readers but is
+    /// excluded by any writer. `commit` and `checkpoint` return a clean
+    /// error rather than panic; `stage_page` stays a no-op-to-disk
+    /// (bytes sit in the in-memory `staged` map that `commit` would
+    /// have drained).
+    ///
+    /// If the WAL sidecar doesn't exist, the open succeeds with an
+    /// empty `wal_cache` — a read-only caller can't materialize a
+    /// sidecar on its own, and a DB that never had WAL writes is fine
+    /// to read straight from the main file.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_with_mode(path, AccessMode::ReadOnly)
+    }
+
+    /// Opens an existing database file with the given access mode.
+    /// Loads every main-file page into `on_disk`, then opens the WAL
+    /// sidecar (read-only mode uses a shared lock and skips sidecar
+    /// creation; read-write creates the sidecar if missing) and layers
+    /// committed frames into `wal_cache`.
+    pub fn open_with_mode(path: &Path, mode: AccessMode) -> Result<Self> {
+        let file = match mode {
+            AccessMode::ReadWrite => OpenOptions::new().read(true).write(true).open(path)?,
+            AccessMode::ReadOnly => OpenOptions::new().read(true).open(path)?,
+        };
+        acquire_lock(&file, path, mode)?;
         let mut storage = FileStorage::new(file);
         let mut header = storage.read_header()?;
 
@@ -132,25 +200,52 @@ impl Pager {
             on_disk.insert(page_num, buf);
         }
 
-        // Open the WAL sidecar — create one if it doesn't exist yet, so a
-        // pre-WAL database file (Phase 4a / earlier) naturally gets a fresh
-        // empty WAL on first open under Phase 4c.
         let wal_path = wal_path_for(path);
-        let mut wal = if wal_path.exists() {
-            Wal::open(&wal_path)?
-        } else {
-            Wal::create(&wal_path)?
+        let (wal_handle, wal_cache) = match mode {
+            AccessMode::ReadWrite => {
+                // Create the sidecar if it's missing — a pre-Phase-4c
+                // file or a DB that was hand-deleted down to just the
+                // main file both need a fresh empty WAL to be writable.
+                let mut wal = if wal_path.exists() {
+                    Wal::open_with_mode(&wal_path, mode)?
+                } else {
+                    Wal::create(&wal_path)?
+                };
+                let mut cache: HashMap<u32, Box<[u8; PAGE_SIZE]>> = HashMap::new();
+                wal.load_committed_into(&mut cache)?;
+                (Some(wal), cache)
+            }
+            AccessMode::ReadOnly => {
+                // Read-only mustn't create files. If the sidecar is
+                // absent, treat the WAL as empty and serve reads from
+                // the main file alone.
+                if wal_path.exists() {
+                    let mut wal = Wal::open_with_mode(&wal_path, mode)?;
+                    let mut cache: HashMap<u32, Box<[u8; PAGE_SIZE]>> = HashMap::new();
+                    wal.load_committed_into(&mut cache)?;
+                    // We don't need to retain the WAL handle in
+                    // read-only mode — the cache is all reads need and
+                    // dropping the handle releases the shared lock on
+                    // the sidecar early. Keep it, though, so the lock
+                    // spans the whole Pager lifetime: a checkpointer
+                    // process grabbing LOCK_EX on the WAL while our
+                    // reader still has wal_cache loaded would be
+                    // correct for reads but surprising semantically.
+                    (Some(wal), cache)
+                } else {
+                    (None, HashMap::new())
+                }
+            }
         };
 
-        let mut wal_cache: HashMap<u32, Box<[u8; PAGE_SIZE]>> = HashMap::new();
-        wal.load_committed_into(&mut wal_cache)?;
-
         // If the WAL committed a new page 0, that frame's body is the
-        // up-to-date header — decode it and let it override what the main
-        // file's stale header says.
+        // up-to-date header — decode it and let it override what the
+        // main file's stale header says.
         if let Some(page0) = wal_cache.get(&0) {
             header = decode_header(page0.as_ref())?;
-        } else if let Some(committed_pc) = wal.last_commit_page_count() {
+        } else if let Some(w) = wal_handle.as_ref()
+            && let Some(committed_pc) = w.last_commit_page_count()
+        {
             // Belt-and-suspenders: even if the latest commit frame didn't
             // land on page 0 (shouldn't happen under the current commit
             // layout, but keeps us correct if that ever changes), trust
@@ -164,7 +259,8 @@ impl Pager {
             on_disk,
             staged: HashMap::new(),
             wal_cache,
-            wal,
+            wal: wal_handle,
+            access_mode: mode,
         })
     }
 
@@ -183,7 +279,7 @@ impl Pager {
             .create(true)
             .truncate(true)
             .open(path)?;
-        lock_exclusive(&file, path)?;
+        acquire_lock(&file, path, AccessMode::ReadWrite)?;
         let mut storage = FileStorage::new(file);
 
         let empty_master = TablePage::empty();
@@ -217,12 +313,28 @@ impl Pager {
             on_disk,
             staged: HashMap::new(),
             wal_cache: HashMap::new(),
-            wal,
+            wal: Some(wal),
+            access_mode: AccessMode::ReadWrite,
         })
     }
 
     pub fn header(&self) -> DbHeader {
         self.current_header
+    }
+
+    /// Returns the mode this Pager was opened in. Callers can use this
+    /// to bail out of a write path earlier than the Pager itself would.
+    pub fn access_mode(&self) -> AccessMode {
+        self.access_mode
+    }
+
+    fn require_writable(&self, op: &'static str) -> Result<()> {
+        if self.access_mode == AccessMode::ReadOnly {
+            return Err(SQLRiteError::General(format!(
+                "cannot {op}: database is opened read-only"
+            )));
+        }
+        Ok(())
     }
 
     /// Reads a page, preferring staged content, then the WAL-committed
@@ -270,6 +382,12 @@ impl Pager {
     /// Returns the number of dirty *data* frames appended (excluding the
     /// implicit page-0 commit frame that's always written).
     pub fn commit(&mut self, new_header: DbHeader) -> Result<usize> {
+        self.require_writable("commit")?;
+        let wal = self
+            .wal
+            .as_mut()
+            .expect("read-write Pager must carry a WAL handle");
+
         // Decide which staged pages carry bytes that aren't already live.
         // Effective committed state = wal_cache overlaid on on_disk.
         let staged = std::mem::take(&mut self.staged);
@@ -292,8 +410,7 @@ impl Pager {
         let writes = dirty.len();
 
         for (n, bytes) in &dirty {
-            self.wal
-                .append_frame(*n, bytes.as_ref(), None)?;
+            wal.append_frame(*n, bytes.as_ref(), None)?;
         }
 
         // Seal the transaction. The commit frame carries the new page 0
@@ -301,8 +418,8 @@ impl Pager {
         // commit_page_count field — together they're the single atomic
         // record that says "this is the new committed state".
         let page0 = encode_header(&new_header);
-        self.wal
-            .append_frame(0, &page0, Some(new_header.page_count))?;
+        wal.append_frame(0, &page0, Some(new_header.page_count))?;
+        let frame_count_after_commit = wal.frame_count();
 
         // Promote every frame we just wrote into wal_cache so subsequent
         // reads see the latest committed bytes without touching the WAL.
@@ -317,7 +434,7 @@ impl Pager {
         // accumulate; past the threshold we fold them back into the main
         // file opportunistically so open doesn't have to replay an
         // arbitrarily long log on the next start.
-        if self.wal.frame_count() >= AUTO_CHECKPOINT_THRESHOLD_FRAMES {
+        if frame_count_after_commit >= AUTO_CHECKPOINT_THRESHOLD_FRAMES {
             self.checkpoint()?;
         }
 
@@ -356,8 +473,18 @@ impl Pager {
     /// its pre-checkpoint self — the WAL is intact and authoritative,
     /// and a retry rewrites the same bytes.
     pub fn checkpoint(&mut self) -> Result<usize> {
+        self.require_writable("checkpoint")?;
+        // `require_writable` already guaranteed we're ReadWrite; in
+        // ReadWrite mode `wal` is always `Some` (it's only `None` for
+        // ReadOnly opens of a DB that had no sidecar on disk).
+        let wal_frame_count = self
+            .wal
+            .as_ref()
+            .map(|w| w.frame_count())
+            .unwrap_or(0);
+
         // Nothing to flush? Skip the fsyncs and get out.
-        if self.wal.frame_count() == 0 && self.wal_cache.is_empty() {
+        if wal_frame_count == 0 && self.wal_cache.is_empty() {
             return Ok(0);
         }
 
@@ -412,7 +539,10 @@ impl Pager {
         // failure means the main file is already consistent on disk
         // (steps 2 + 5 fsynced it); we just leave the stale WAL in
         // place for the next checkpoint attempt.
-        self.wal.truncate()?;
+        self.wal
+            .as_mut()
+            .expect("read-write Pager must carry a WAL handle")
+            .truncate()?;
 
         // Promote wal_cache into on_disk and drop everything that's no
         // longer live. Page 0 is special — it's never materialized in
@@ -438,12 +568,16 @@ fn read_raw_page(storage: &mut FileStorage, page_num: u32) -> Result<Box<[u8; PA
 impl std::fmt::Debug for Pager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pager")
+            .field("access_mode", &self.access_mode)
             .field("page_count", &self.current_header.page_count)
             .field("schema_root_page", &self.current_header.schema_root_page)
             .field("cached_pages", &self.on_disk.len())
             .field("staged_pages", &self.staged.len())
             .field("wal_pages", &self.wal_cache.len())
-            .field("wal_frames", &self.wal.frame_count())
+            .field(
+                "wal_frames",
+                &self.wal.as_ref().map(|w| w.frame_count()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -554,9 +688,10 @@ mod tests {
 
     #[test]
     fn second_pager_on_same_file_is_rejected() {
-        // Phase 4a regression: two simultaneous Pagers against the same
-        // file used to silently race. Now the second one must error out
-        // with a "already opened by another process" message.
+        // Phase 4a regression: two simultaneous read-write Pagers against
+        // the same file used to silently race. Now the second one must
+        // error out. Phase 4e reworded the lock-contention message; the
+        // stable substring we assert on is "in use".
         let path = tmp_path("lock_contention");
         let _first = Pager::create(&path).unwrap();
 
@@ -564,8 +699,8 @@ mod tests {
         assert!(second.is_err(), "expected lock-contention error, got Ok");
         let msg = format!("{}", second.unwrap_err());
         assert!(
-            msg.contains("already opened by another process"),
-            "error message should mention lock contention; got: {msg}"
+            msg.contains("in use"),
+            "error message should signal lock contention; got: {msg}"
         );
 
         // After the first Pager drops, both the main-file and WAL locks
@@ -861,6 +996,132 @@ mod tests {
         let expected = ((commits_needed - 1) & 0xff) as u8;
         assert_eq!(p.read_page(2).unwrap()[0], expected);
 
+        cleanup(&path);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4e — shared/exclusive lock modes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn two_read_only_openers_coexist() {
+        // Phase 4e: multiple read-only openers take shared locks and
+        // must not exclude each other.
+        let path = tmp_path("ro_coexist");
+        {
+            let mut p = Pager::create(&path).unwrap();
+            p.stage_page(2, make_page(0x55));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+        }
+
+        let reader1 = Pager::open_read_only(&path).unwrap();
+        let reader2 = Pager::open_read_only(&path).unwrap();
+        // Both see the committed content.
+        assert_eq!(reader1.read_page(2).unwrap()[0], 0x55);
+        assert_eq!(reader2.read_page(2).unwrap()[0], 0x55);
+        assert_eq!(reader1.access_mode(), AccessMode::ReadOnly);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_write_blocks_read_only_and_vice_versa() {
+        // A live exclusive lock blocks a shared-lock open, and a live
+        // shared lock blocks an exclusive-lock open. Both error messages
+        // mention that the database is in use.
+        let path = tmp_path("rw_vs_ro");
+        let _writer = Pager::create(&path).unwrap();
+
+        // Writer holds LOCK_EX — reader can't take LOCK_SH.
+        let reader_attempt = Pager::open_read_only(&path);
+        assert!(reader_attempt.is_err());
+        let msg = format!("{}", reader_attempt.unwrap_err());
+        assert!(
+            msg.contains("locked for writing"),
+            "read-only open while writer holds lock should mention writer; got: {msg}"
+        );
+
+        drop(_writer);
+
+        // Now a reader comes in; a second read-write must be rejected.
+        let _reader = Pager::open_read_only(&path).unwrap();
+        let writer_attempt = Pager::open(&path);
+        assert!(writer_attempt.is_err());
+        let msg = format!("{}", writer_attempt.unwrap_err());
+        assert!(
+            msg.contains("in use"),
+            "read-write open while reader holds lock should mention contention; got: {msg}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_pager_rejects_mutations() {
+        let path = tmp_path("ro_rejects");
+        {
+            // Seed with some content so an RO open has something to read.
+            let mut p = Pager::create(&path).unwrap();
+            p.stage_page(2, make_page(0x33));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+        }
+
+        let mut ro = Pager::open_read_only(&path).unwrap();
+        let commit_err = ro
+            .commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap_err();
+        assert!(
+            format!("{commit_err}").contains("read-only"),
+            "commit on RO pager should surface 'read-only'; got: {commit_err}"
+        );
+        let ckpt_err = ro.checkpoint().unwrap_err();
+        assert!(
+            format!("{ckpt_err}").contains("read-only"),
+            "checkpoint on RO pager should surface 'read-only'; got: {ckpt_err}"
+        );
+
+        // Reads still work.
+        assert_eq!(ro.read_page(2).unwrap()[0], 0x33);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_open_without_wal_sidecar_succeeds() {
+        // A file-backed DB whose -wal sidecar was deleted (or a Phase-
+        // 4a-vintage file predating Phase 4c) must still be openable
+        // read-only. The Pager serves reads straight from on_disk with
+        // an empty wal_cache.
+        let path = tmp_path("ro_no_wal");
+        {
+            let mut p = Pager::create(&path).unwrap();
+            p.stage_page(2, make_page(0x44));
+            p.commit(DbHeader {
+                page_count: 3,
+                schema_root_page: 1,
+            })
+            .unwrap();
+            // Force the WAL into the main file before we nuke it.
+            p.checkpoint().unwrap();
+        }
+        // Nuke the sidecar.
+        std::fs::remove_file(wal_path_for(&path)).unwrap();
+
+        let ro = Pager::open_read_only(&path).unwrap();
+        assert_eq!(ro.read_page(2).unwrap()[0], 0x44);
+        // No WAL materialized by a read-only open.
+        assert!(!wal_path_for(&path).exists());
         cleanup(&path);
     }
 

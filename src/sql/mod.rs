@@ -71,6 +71,17 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             | Statement::Delete(_)
     );
 
+    // Early-reject mutations on a read-only database before they touch
+    // in-memory state. Phase 4e: without this, a user running INSERT
+    // on a `--readonly` REPL would see the row appear in the printed
+    // table, and then the auto-save would fail — leaving the in-memory
+    // Database visibly diverged from disk.
+    if is_write_statement && db.is_read_only() {
+        return Err(SQLRiteError::General(
+            "cannot execute: database is opened read-only".to_string(),
+        ));
+    }
+
     // Initialy only implementing some basic SQL Statements
     match query {
         Statement::CreateTable(_) => {
@@ -573,5 +584,67 @@ mod tests {
         let response = process_command("SELECT name FROM users WHERE age > 28;", &mut db)
             .expect("select");
         assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn read_only_database_rejects_mutations_before_touching_state() {
+        // Phase 4e end-to-end: a `--readonly` caller that runs INSERT
+        // must error *before* the row is added to the in-memory table.
+        // Otherwise the user sees a rendered result table with the
+        // phantom row, followed by the auto-save error — UX rot and a
+        // state-drift risk.
+        use crate::sql::pager::open_database_read_only;
+
+        let mut seed = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut seed,
+        )
+        .unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('alpha');", &mut seed).unwrap();
+
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-ro-reject-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        crate::sql::pager::save_database(&mut seed, &path).unwrap();
+        drop(seed);
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        let notes_before = ro.get_table("notes".to_string()).unwrap().rowids().len();
+
+        for stmt in [
+            "INSERT INTO notes (body) VALUES ('beta');",
+            "UPDATE notes SET body = 'x';",
+            "DELETE FROM notes;",
+            "CREATE TABLE more (id INTEGER PRIMARY KEY);",
+            "CREATE INDEX notes_body ON notes (body);",
+        ] {
+            let err = process_command(stmt, &mut ro).unwrap_err();
+            assert!(
+                format!("{err}").contains("read-only"),
+                "stmt {stmt:?} should surface a read-only error; got: {err}"
+            );
+        }
+
+        // Nothing mutated: same row count as before, and SELECTs still work.
+        let notes_after = ro.get_table("notes".to_string()).unwrap().rowids().len();
+        assert_eq!(notes_before, notes_after);
+        let sel =
+            process_command("SELECT * FROM notes;", &mut ro).expect("select on RO must work");
+        assert!(sel.contains("1 row returned"));
+
+        // Cleanup.
+        drop(ro);
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
     }
 }

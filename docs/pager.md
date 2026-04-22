@@ -40,9 +40,9 @@ pub struct Pager {
 
 ### Opening an existing file
 
-`Pager::open(path)`:
+`Pager::open(path)` (read-write, shorthand for `open_with_mode(path, AccessMode::ReadWrite)`):
 
-1. Open the main file read-write, acquire the exclusive advisory lock (Phase 4a).
+1. Open the main file read-write, acquire the **exclusive** advisory lock (`flock(LOCK_EX)`).
 2. Read and verify page 0 (header) → initial `current_header`.
 3. For page numbers `1..page_count`, seek + read the page, store in `on_disk`.
 4. Open (or create, if missing) the `-wal` sidecar; acquire its exclusive lock.
@@ -51,6 +51,16 @@ pub struct Pager {
 7. `staged` starts empty.
 
 After open, the pager carries a complete snapshot of what's on disk plus every WAL-resident update since the last checkpoint. A pre-Phase-4c `.sqlrite` file (no sidecar) gets a fresh empty WAL on first open.
+
+### Opening read-only (Phase 4e)
+
+`Pager::open_read_only(path)` (shorthand for `open_with_mode(path, AccessMode::ReadOnly)`) takes a **shared** advisory lock (`flock(LOCK_SH)`) on the main file and on the WAL sidecar (if it exists). Multiple read-only openers coexist; any writer is excluded (POSIX flock). Differences from read-write open:
+
+- Main file opened read-only (no `write(true)` on `OpenOptions`).
+- WAL sidecar: **not created** if missing — a read-only caller must not materialize one. With an absent sidecar the Pager serves reads straight from `on_disk` with an empty `wal_cache`.
+- `stage_page` / `commit` / `checkpoint` all short-circuit with `General error: cannot commit: database is opened read-only` via the `require_writable` guard. The `wal` field is `Option<Wal>` and becomes `None` only on the "no sidecar" read-only path.
+
+Library-level callers use `sqlrite::open_database_read_only(path, name)`; the REPL exposes it as `--readonly` / `-r`.
 
 ### Creating a new file
 
@@ -182,7 +192,7 @@ This only works because `save_database` iterates tables in sorted order — if t
 - **No LRU eviction.** `on_disk` + `wal_cache` together grow with the page count. For a 1 GiB database, that's ~1 GiB of page cache. Bounded cache is future work.
 - **No free-page management.** When a table shrinks, the main file's tail pages are truncated at checkpoint, but there's no free-list to reuse pages inside a grown file.
 - **No per-statement granularity.** The whole database is re-serialized on every commit; the diff keeps the *written* set small but the CPU cost of reserialization is unchanged.
-- **No shared/exclusive lock graduation.** One process, one open file handle — exclusive across the board. Phase 4e adds multi-reader / single-writer.
+- **No concurrent reader-and-writer.** Phase 4e graduated to shared/exclusive lock modes (multi-reader *or* single-writer), but POSIX flock can't give us both at once. True concurrent access would need a shared-memory coordination file with read marks — not on the roadmap.
 - **No `BEGIN` / `COMMIT` / `ROLLBACK`.** Every mutating statement is its own transaction today. Phase 4f layers transactions on the WAL.
 
 ## Interaction with `Database`
@@ -211,6 +221,11 @@ Unit tests in [`src/sql/pager/pager.rs`](../src/sql/pager/pager.rs):
   - `checkpoint_with_shrink_truncates_main_file` — a shrink-commit followed by checkpoint actually makes the main file smaller.
   - `auto_checkpoint_fires_past_frame_threshold` — enough commits trigger auto-checkpoint; the WAL ends up empty on its own.
   - `reopen_after_crash_mid_checkpoint_recovers_via_wal` — closing before checkpoint is equivalent to a crash mid-checkpoint; WAL replay restores the post-commit view.
+- **Phase 4e shared/exclusive suite:**
+  - `two_read_only_openers_coexist` — two `open_read_only` calls on the same file succeed simultaneously.
+  - `read_write_blocks_read_only_and_vice_versa` — POSIX flock semantics: RO excludes RW and vice versa.
+  - `read_only_pager_rejects_mutations` — `commit` / `checkpoint` return typed errors; reads still work.
+  - `read_only_open_without_wal_sidecar_succeeds` — a deleted sidecar isn't recreated in RO mode; reads fall back to the main file.
 
 The 9 WAL-format tests live in [`src/sql/pager/wal.rs`](../src/sql/pager/wal.rs) and cover header / frame round-trips, torn-write recovery, and the orphan-dirty replay invariant in isolation from the Pager.
 

@@ -1,6 +1,6 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::table::Table;
-use crate::sql::pager::pager::Pager;
+use crate::sql::pager::pager::{AccessMode, Pager};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -66,6 +66,18 @@ impl Database {
         } else {
             Err(SQLRiteError::General(String::from("Table not found.")))
         }
+    }
+
+    /// Returns `true` if this database is attached to a file and that
+    /// file was opened in [`AccessMode::ReadOnly`]. In-memory databases
+    /// (no pager) and read-write file-backed databases both return
+    /// `false`. Callers use this to reject mutating SQL at the
+    /// dispatcher level so the in-memory tables don't drift away from
+    /// disk on a would-be INSERT / UPDATE / DELETE.
+    pub fn is_read_only(&self) -> bool {
+        self.pager
+            .as_ref()
+            .is_some_and(|p| p.access_mode() == AccessMode::ReadOnly)
     }
 }
 

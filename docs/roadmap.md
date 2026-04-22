@@ -127,10 +127,17 @@ Five new Pager-level tests cover sidecar creation, main-file frozen-ness, shrink
 
 Six Pager-level tests pin the behaviour: explicit flush + WAL truncate, idempotency on repeat, shrink-then-checkpoint physically shrinks the main file, auto-threshold actually fires, the exact-threshold-crossing commit is the one that triggers, and a real mid-checkpoint crash (data pages on disk but header still stale) recovers via WAL replay.
 
-### Phase 4e — Multi-reader / single-writer
+### ✅ Phase 4e — Multi-reader / single-writer
 
-- Graduate from exclusive-only to shared + exclusive lock modes
-- Read marks so checkpointer doesn't pull frames that active readers still depend on
+New `AccessMode { ReadWrite, ReadOnly }` enum drives the lock mode. `Pager::open_read_only` takes a shared advisory lock (`flock(LOCK_SH | LOCK_NB)`) on both the main file and the WAL sidecar; `Pager::open` / `Pager::create` stay exclusive. Multiple read-only openers coexist; any writer excludes all readers and vice versa — POSIX flock semantics.
+
+Library surface: `sqlrite::open_database_read_only(path, name)` mirrors `open_database`. Mutating operations on a read-only `Pager` (`stage_page`'s auto-save commit, explicit `commit`, `checkpoint`) return `General error: cannot commit: database is opened read-only` rather than panicking. Reads fall back cleanly to the main file when the WAL sidecar is absent — a read-only caller can't materialize one on its own.
+
+REPL gained a `--readonly` / `-r` flag: `sqlrite --readonly foo.sqlrite` opens with a shared lock; attempted writes surface the read-only error.
+
+**Read marks are not needed under this scoping.** With POSIX flock, a writer can't coexist with live readers, so the checkpointer is never asked to drop frames an active reader depends on. True concurrent reader + writer access requires a shared-memory coordination file; that's deferred as out-of-scope for Phase 4.
+
+Four Pager-level tests: two read-only openers coexist, RW-blocks-RO and RO-blocks-RW, RO pager rejects mutations with typed errors, RO open without a WAL sidecar succeeds.
 
 ### Phase 4f — Transactions
 

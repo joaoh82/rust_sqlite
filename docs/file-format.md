@@ -363,14 +363,20 @@ A checkpoint flushes accumulated WAL frames back into the main file and resets t
 
 ## Process-level locking
 
-Starting with Phase 4a, every `Pager::open` / `Pager::create` takes a non-blocking OS **exclusive advisory lock** on the file (`fs2::FileExt::try_lock_exclusive` — `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on Windows). A second SQLRite process that tries to open the same file while another process already has it open fails immediately with:
+Starting with Phase 4a, every `Pager::open` / `Pager::create` takes a non-blocking OS **advisory lock** on the file (`flock(LOCK_* | LOCK_NB)` on Unix, `LockFileEx(LOCKFILE_* | LOCKFILE_FAIL_IMMEDIATELY)` on Windows). The lock mode is driven by the `AccessMode` enum that Phase 4e introduced:
+
+- **`AccessMode::ReadWrite`** → `LOCK_EX` (exclusive). One writer, no other openers of any kind.
+- **`AccessMode::ReadOnly`**  → `LOCK_SH` (shared). Multiple read-only openers coexist; any writer is excluded.
+
+A second process that collides on mode gets a clean error:
 
 ```
-database '/path/to/file.sqlrite' is already opened by another process (…)
+database '/path/to/file.sqlrite' is in use (another process has it open; readers and writers are exclusive) (…)
+database '/path/to/file.sqlrite' is locked for writing by another process (read-only open blocked until the writer closes) (…)
 ```
 
-The lock is tied to the underlying `File` descriptor, so it releases automatically when the `Pager` drops — no explicit unlock call. Tests and application code therefore need to scope `Database` lifetimes (or explicitly `drop` them) when they want to reopen the same file for verification.
+Locks are tied to the underlying `File` descriptor, so they release automatically when the `Pager` drops — no explicit unlock call. Tests and application code therefore need to scope `Database` lifetimes (or explicitly `drop` them) when they want to reopen the same file for verification.
 
-Phase 4c extends this: the Pager also takes an exclusive lock on the `-wal` sidecar. Both locks live on the same `Pager`, so they release together when it drops.
+Phase 4c extends the write path to also lock the `-wal` sidecar; Phase 4e extends that further so read-only opens take a shared lock on the sidecar too (if it exists — a read-only opener must not create one). Both locks live on the same `Pager`, so they release together when it drops.
 
-**Single-writer-exclusive only**, for now. Phase 4e will upgrade to shared + exclusive lock modes so multiple readers can coexist with a single writer.
+**POSIX flock semantics are "multiple readers OR one writer", not both.** Writers can't coexist with readers; the checkpointer never has to avoid frames that active readers depend on. True concurrent reader + writer access would require a shared-memory coordination file (SQLite's `-shm`) with read marks — that's not on the current roadmap.

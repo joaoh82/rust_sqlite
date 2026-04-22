@@ -54,10 +54,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
-
 use crate::error::{Result, SQLRiteError};
 use crate::sql::pager::page::PAGE_SIZE;
+use crate::sql::pager::pager::{AccessMode, acquire_lock};
 
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_MAGIC: &[u8; 8] = b"SQLRWAL\0";
@@ -117,7 +116,8 @@ pub struct Wal {
 impl Wal {
     /// Creates a fresh WAL file, truncating any existing one. Writes the
     /// header synchronously so a subsequent `open` sees a valid file even
-    /// if the caller panics before appending any frames.
+    /// if the caller panics before appending any frames. Always takes an
+    /// exclusive lock — create is a write operation by definition.
     pub fn create(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -125,7 +125,7 @@ impl Wal {
             .create(true)
             .truncate(true)
             .open(path)?;
-        lock_exclusive(&file, path)?;
+        acquire_lock(&file, path, AccessMode::ReadWrite)?;
 
         let salt = random_salt();
         let header = WalHeader {
@@ -147,13 +147,25 @@ impl Wal {
         Ok(wal)
     }
 
-    /// Opens an existing WAL file. Walks every frame from the start,
-    /// validates checksums, and builds the in-memory `latest_frame` index.
-    /// A torn or corrupted frame is treated as the end of the log — its
-    /// bytes and anything after stay on disk but are ignored by reads.
+    /// Opens an existing WAL file with an exclusive lock (read-write).
+    /// Convenience wrapper around [`Wal::open_with_mode`].
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        lock_exclusive(&file, path)?;
+        Self::open_with_mode(path, AccessMode::ReadWrite)
+    }
+
+    /// Opens an existing WAL file with the given access mode. In
+    /// `ReadOnly` mode the file descriptor is opened read-only and the
+    /// advisory lock is shared — multiple read-only openers may coexist.
+    /// Walks every frame from the start, validates checksums, and builds
+    /// the in-memory `latest_frame` index. A torn or corrupted frame is
+    /// treated as the end of the log — its bytes and anything after stay
+    /// on disk but are ignored by reads.
+    pub fn open_with_mode(path: &Path, mode: AccessMode) -> Result<Self> {
+        let mut file = match mode {
+            AccessMode::ReadWrite => OpenOptions::new().read(true).write(true).open(path)?,
+            AccessMode::ReadOnly => OpenOptions::new().read(true).open(path)?,
+        };
+        acquire_lock(&file, path, mode)?;
 
         let header = read_header(&mut file)?;
         let mut wal = Self {
@@ -420,15 +432,6 @@ fn read_header(file: &mut File) -> Result<WalHeader> {
     Ok(WalHeader {
         salt,
         checkpoint_seq,
-    })
-}
-
-fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    file.try_lock_exclusive().map_err(|e| {
-        SQLRiteError::General(format!(
-            "WAL '{}' is already opened by another process ({e})",
-            path.display()
-        ))
     })
 }
 

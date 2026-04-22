@@ -139,11 +139,11 @@ Most of the above are straightforward frontend additions. The bigger shift is th
 
 ## Multi-process behavior
 
-As of Phase 4a the engine takes an **exclusive OS advisory lock** on the open `.sqlrite` file. One consequence worth knowing:
+Phase 4a introduced OS-level advisory locks on open databases; Phase 4e graduated them to shared-vs-exclusive modes. Consequences worth knowing:
 
-- If a REPL (`cargo run`) has a file open and you try to open the same file in the desktop app (or vice versa), the second open fails with `database '...' is already opened by another process`. The failure is clean — no data loss, just a surfaced error.
-- The desktop app holds the lock for the entire time a file is open; it releases on New…, Open… to a different path, or Save As… (which switches the active file).
-- Multi-reader / single-writer concurrency is coming in Phase 4e once WAL lands. Until then, single-writer-exclusive is the rule.
+- The desktop app opens files **read-write** (exclusive lock). If a REPL or another desktop instance already has the file open in the same mode, the second open fails with `database '...' is in use (another process has it open; readers and writers are exclusive)`. The failure is clean — no data loss, just a surfaced error.
+- A REPL launched with `--readonly` takes a **shared lock** on its file and can coexist with other read-only openers, but a writer (the desktop app, or a read-write REPL) still excludes them. POSIX flock semantics are "multiple readers OR one writer", not both simultaneously.
+- The desktop app holds its lock for the entire time a file is open; it releases on New…, Open… to a different path, or Save As… (which switches the active file).
 
 ## Troubleshooting
 

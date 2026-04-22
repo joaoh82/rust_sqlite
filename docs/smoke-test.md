@@ -295,14 +295,28 @@ In a second terminal while the first is still open:
 cargo run --quiet --bin sqlrite -- "$DB"
 ```
 
-The second one should fail during startup with:
+The second one should fail during startup with something like:
 
 ```
-Could not open '/tmp/smoke-lock.sqlrite': General error: database '...' is already opened by another process (...)
+Could not open '/tmp/smoke-lock.sqlrite': General error: database '...' is in use (another process has it open; readers and writers are exclusive) (...)
 Falling back to a transient in-memory database.
 ```
 
 … and then drop into a transient in-memory REPL (prompts "Connected to a transient in-memory database."). The first terminal is unaffected.
+
+#### 2.6a Multi-reader coexistence (Phase 4e)
+
+With the DB open in the first terminal (read-write), open a third and fourth terminal both running:
+
+```bash
+cargo run --quiet --bin sqlrite -- --readonly "$DB"
+```
+
+Both will fail until you `.exit` the read-write session (a writer excludes readers, POSIX flock). After the writer closes, both `--readonly` sessions should open simultaneously and can `SELECT * FROM notes;` concurrently. Any `INSERT` / `UPDATE` / `DELETE` attempt in either read-only REPL returns:
+
+```
+An error occured: General error: cannot commit: database is opened read-only
+```
 
 `.exit` both terminals and `rm -f "$DB"`.
 
@@ -510,7 +524,8 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] Duplicate INSERT on a UNIQUE column errors cleanly
 - [ ] `.open <new file>` → INSERT → `.exit` → `.open <same file>` → rows still there
 - [ ] Bad-magic file is rejected with a clear error
-- [ ] Opening the same file from two REPLs simultaneously rejects the second with a "already opened by another process" message and falls back to in-memory
+- [ ] Opening the same file from two read-write REPLs simultaneously rejects the second with an "in use" / "readers and writers are exclusive" message and falls back to in-memory
+- [ ] Two `--readonly` REPLs on the same file open simultaneously and both `SELECT` works; any `INSERT` in a `--readonly` REPL fails with "cannot commit: database is opened read-only"
 - [ ] `cargo check -p sqlrite-desktop` compiles the Tauri crate
 - [ ] `cd desktop && npm run tauri dev` opens a window
 - [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"

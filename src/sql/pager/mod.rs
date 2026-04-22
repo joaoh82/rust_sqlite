@@ -70,14 +70,38 @@ use crate::sql::pager::page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAYLOAD_PER_PAGE, Pag
 use crate::sql::pager::pager::Pager;
 use crate::sql::pager::table_page::TablePage;
 
+// Re-export so callers can spell `sql::pager::AccessMode` without
+// reaching into the `pager::pager::pager` submodule path.
+pub use crate::sql::pager::pager::AccessMode;
+
 /// Name of the internal catalog table. Reserved — user CREATEs of this
 /// name must be rejected upstream.
 pub const MASTER_TABLE_NAME: &str = "sqlrite_master";
 
-/// Opens a database file and reconstructs the in-memory `Database`,
-/// leaving the long-lived `Pager` attached for subsequent auto-save.
+/// Opens a database file in read-write mode. Shorthand for
+/// [`open_database_with_mode`] with [`AccessMode::ReadWrite`].
 pub fn open_database(path: &Path, db_name: String) -> Result<Database> {
-    let pager = Pager::open(path)?;
+    open_database_with_mode(path, db_name, AccessMode::ReadWrite)
+}
+
+/// Opens a database file in read-only mode. Acquires a shared OS-level
+/// advisory lock, so other read-only openers coexist but any writer is
+/// excluded. Attempts to mutate the returned `Database` (e.g. an
+/// `INSERT`, or a `save_database` call against it) bottom out in a
+/// `cannot commit: database is opened read-only` error from the Pager.
+pub fn open_database_read_only(path: &Path, db_name: String) -> Result<Database> {
+    open_database_with_mode(path, db_name, AccessMode::ReadOnly)
+}
+
+/// Opens a database file and reconstructs the in-memory `Database`,
+/// leaving the long-lived `Pager` attached for subsequent auto-save
+/// (read-write) or consistent-snapshot reads (read-only).
+pub fn open_database_with_mode(
+    path: &Path,
+    db_name: String,
+    mode: AccessMode,
+) -> Result<Database> {
+    let pager = Pager::open_with_mode(path, mode)?;
 
     // 1. Load sqlrite_master from the tree at header.schema_root_page.
     let mut master = build_empty_master_table();

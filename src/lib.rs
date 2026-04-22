@@ -10,7 +10,10 @@
 //!
 //! - [`Database`] — the in-memory state owning all tables
 //! - [`process_command`] — parse + execute one SQL statement
-//! - [`open_database`] / [`save_database`] — read from / write to a `.sqlrite` file
+//! - [`open_database`] / [`open_database_read_only`] / [`save_database`] —
+//!   read from / write to a `.sqlrite` file (Phase 4e introduced the
+//!   shared-lock read-only variant)
+//! - [`AccessMode`] — the enum driving exclusive vs shared lock acquisition
 //! - [`Result`] / [`SQLRiteError`] — the error surface
 //!
 //! Lower-level modules (`sql::pager`, `sql::executor`, etc.) remain
@@ -26,7 +29,10 @@ pub mod sql;
 
 pub use error::{Result, SQLRiteError};
 pub use sql::db::database::Database;
-pub use sql::pager::{MASTER_TABLE_NAME, open_database, save_database};
+pub use sql::pager::{
+    AccessMode, MASTER_TABLE_NAME, open_database, open_database_read_only,
+    open_database_with_mode, save_database,
+};
 pub use sql::process_command;
 
 // Re-export sqlparser so downstream crates (the Tauri desktop app, the

@@ -16,7 +16,7 @@ use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 
-use clap::{Arg, Command, crate_authors, crate_name, crate_version};
+use clap::{Arg, ArgAction, Command, crate_authors, crate_name, crate_version};
 
 const ABOUT_SHORT: &str = "A small SQLite-like embedded database and REPL, written in Rust.";
 
@@ -26,6 +26,11 @@ A small SQLite-like embedded database and REPL, written in Rust.
 Passing a FILE argument is equivalent to launching the REPL and then running
 `.open FILE` — existing files are loaded, missing files are created fresh.
 Without a FILE the REPL starts in transient in-memory mode.
+
+Add --readonly to open the FILE with a shared OS-level lock. Multiple
+read-only REPLs on the same file coexist; any write attempt returns a
+'database is opened read-only' error. Useful for poking at a DB while
+another process holds the writer lock.
 
 Once in the REPL, meta commands start with a dot:
 
@@ -59,10 +64,18 @@ fn main() -> rustyline::Result<()> {
                 .value_parser(clap::value_parser!(PathBuf))
                 .index(1),
         )
+        .arg(
+            Arg::new("readonly")
+                .long("readonly")
+                .short('r')
+                .help("Open the file with a shared lock (read-only). Coexists with other readers; any write returns an error. Requires FILE.")
+                .action(ArgAction::SetTrue),
+        )
         .arg_required_else_help(false)
         .get_matches();
 
     let initial_db_path = matches.get_one::<PathBuf>("FILE").cloned();
+    let read_only = matches.get_flag("readonly");
 
     // Starting Rustyline with a default configuration
     let config = get_config();
@@ -86,8 +99,13 @@ fn main() -> rustyline::Result<()> {
     // We track whether the open succeeded so the banner doesn't claim
     // "Opened …" when we actually fell back to in-memory after a lock
     // contention or other failure.
+    if read_only && initial_db_path.is_none() {
+        eprintln!("--readonly requires a FILE argument");
+        std::process::exit(1);
+    }
+
     let (mut db, opened_path): (Database, Option<&std::path::PathBuf>) = match &initial_db_path {
-        Some(path) => match open_or_create(path) {
+        Some(path) => match open_or_create(path, read_only) {
             Ok(db) => (db, Some(path)),
             Err(err) => {
                 eprintln!("Could not open '{}': {err}", path.display());
@@ -100,6 +118,7 @@ fn main() -> rustyline::Result<()> {
 
     // Friendly intro message for the user
     let connection_line = match opened_path {
+        Some(path) if read_only => format!("Opened '{}' (read-only).", path.display()),
         Some(path) => format!("Opened '{}' — auto-save enabled.", path.display()),
         None => "Connected to a transient in-memory database.\nUse '.open FILENAME' to reopen on a persistent database.".to_string(),
     };
@@ -164,13 +183,25 @@ fn main() -> rustyline::Result<()> {
 /// Equivalent to typing `.open FILE` at the REPL: load if present,
 /// materialize an empty DB on disk if missing. Attaches the long-lived
 /// Pager either way so subsequent writes auto-save.
-fn open_or_create(path: &std::path::Path) -> sqlrite::Result<Database> {
+///
+/// When `read_only` is set we take a shared advisory lock and never
+/// materialize a missing file — read-only mode must fail cleanly if
+/// the target doesn't exist rather than silently creating one.
+fn open_or_create(path: &std::path::Path, read_only: bool) -> sqlrite::Result<Database> {
     let db_name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("db")
         .to_string();
-    if path.exists() {
+    if read_only {
+        if !path.exists() {
+            return Err(sqlrite::SQLRiteError::General(format!(
+                "read-only open requested but '{}' does not exist",
+                path.display()
+            )));
+        }
+        sqlrite::open_database_read_only(path, db_name)
+    } else if path.exists() {
         sqlrite::open_database(path, db_name)
     } else {
         let mut fresh = Database::new(db_name);
