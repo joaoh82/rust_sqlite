@@ -39,6 +39,23 @@
   let lineNumbers = $derived(
     Array.from({ length: sql.split("\n").length }, (_, i) => i + 1)
   );
+  // True when the textarea has a non-empty selection — used to flip the
+  // Run button's label to "Run selection". `selectionchange` on the
+  // document fires for every kind of selection update (mouse, keyboard,
+  // programmatic), which covers all the cases a manual listener on
+  // keyup/mouseup/onselect would miss.
+  let hasSelection = $state(false);
+  $effect(() => {
+    const onSelChange = () => {
+      if (textareaRef && document.activeElement === textareaRef) {
+        hasSelection = textareaRef.selectionStart !== textareaRef.selectionEnd;
+      } else {
+        hasSelection = false;
+      }
+    };
+    document.addEventListener("selectionchange", onSelChange);
+    return () => document.removeEventListener("selectionchange", onSelChange);
+  });
 
   async function refreshTables() {
     try {
@@ -169,7 +186,16 @@
     running = true;
     errorMessage = null;
     try {
-      output = await invoke<CommandResult>("execute_sql", { sql });
+      // IDE-style behavior: if the user has a non-empty selection, run
+      // exactly that substring. Otherwise fall back to the full editor
+      // contents. Lets the user keep several statements in the textarea
+      // and execute them one-by-one, same as DataGrip / DBeaver / pgAdmin.
+      const ta = textareaRef;
+      const toRun =
+        ta && ta.selectionStart !== ta.selectionEnd
+          ? ta.value.slice(ta.selectionStart, ta.selectionEnd)
+          : sql;
+      output = await invoke<CommandResult>("execute_sql", { sql: toRun });
       // Any write statement may have mutated the schema; refresh sidebar.
       await refreshTables();
     } catch (err) {
@@ -337,9 +363,11 @@
           ></textarea>
         </div>
         <div class="editor-toolbar">
-          <span class="shortcut-hint">Run: ⌘↵ · Comment: ⌘/</span>
+          <span class="shortcut-hint">
+            Run: ⌘↵ · Comment: ⌘/{hasSelection ? " · selection only" : ""}
+          </span>
           <button onclick={onRunSql} disabled={running}>
-            {running ? "Running…" : "Run"}
+            {#if running}Running…{:else if hasSelection}Run selection{:else}Run{/if}
           </button>
         </div>
       </div>

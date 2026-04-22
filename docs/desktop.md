@@ -107,7 +107,7 @@ One Svelte component — [`App.svelte`](../desktop/src/App.svelte) — renders t
 - **Sidebar**: alphabetical list of user tables. Clicking one selects it and fetches up to 500 rows via `table_rows`. Below the list, the selected table's column list with flags (PK / UQ / NN).
 - **Main area**: query editor (textarea with a line-number gutter) + result grid.
   - **Line numbers**: rendered in a gutter on the left of the textarea; derived from the text content (`sql.split("\n").length`) and kept scroll-synced with the textarea via an `onscroll` handler. Font size and line height are locked between the gutter and the textarea so every line number aligns with its row.
-  - **Cmd/Ctrl + Enter** — run the query.
+  - **Cmd/Ctrl + Enter** — run the query. If the textarea has a non-empty selection, only the selected substring runs; otherwise the full editor contents run. Matches DataGrip / DBeaver / pgAdmin behavior. The Run button label flips to **Run selection** and the shortcut hint shows "selection only" when a selection is active so the state is visible without clicking.
   - **Cmd/Ctrl + /** — toggle SQL line comment (`-- `) on the current line or on every line of the selection. Matches VS Code / Sublime / IntelliJ convention.
 
 The textarea starts with a short comment-only placeholder so clicking Run before typing any SQL doesn't error.

@@ -378,6 +378,28 @@ If you started with a file-backed DB (`New…` or `Open…` earlier) and hit Sav
 
 The editor toolbar shows the shortcuts (`Run: ⌘↵ · Comment: ⌘/`) as a reminder.
 
+### 3.4e Run-selected-only
+
+Prep: put at least two statements in the editor, for example
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);
+INSERT INTO t (s) VALUES ('a');
+INSERT INTO t (s) VALUES ('b');
+SELECT * FROM t;
+```
+
+With no selection, clicking Run (or ⌘↵) runs *the whole editor*. Since the engine only accepts one statement per call, you'll see an error like `Expected a single query statement, but there are 4`. This is the intended behavior — it nudges users toward the selection-based flow.
+
+Now select just the last line (`SELECT * FROM t;`) — or double-click a line, or drag across it. Two things happen:
+
+- The Run button label flips to **Run selection**.
+- The shortcut hint appends "· selection only".
+
+Click Run (or ⌘↵). Only the SELECT executes. The result grid populates with whatever state `t` is in. Select a different statement, run it — it executes in isolation too.
+
+Selecting just a few characters works too; sqlparser doesn't care about leading/trailing whitespace, but it does need a complete statement. `SELECT *` without `FROM` would error.
+
 ### 3.5 Create a table via the query editor
 
 Replace the textarea contents with:
@@ -470,6 +492,7 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] In the desktop app: pressing Run on the default placeholder textarea doesn't error (it's comment-only)
 - [ ] In the desktop app: the editor gutter shows one line number per row of the query and stays aligned while scrolling
 - [ ] In the desktop app: **⌘/** (or Ctrl+/) on a line toggles its `-- ` comment; on a multi-line selection it toggles all of them
+- [ ] In the desktop app: selecting one of several statements and hitting Run executes only the selection; the Run button label flips to **Run selection**
 - [ ] In the desktop app: CREATE TABLE via the editor updates the sidebar
 - [ ] In the desktop app: SELECT runs and populates the result grid
 
