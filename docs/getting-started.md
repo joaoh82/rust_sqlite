@@ -85,11 +85,12 @@ See [Usage](usage.md) for the full list of supported SQL and meta-commands.
 
 ```
 rust_sqlite/
-├── Cargo.toml              Dependencies and crate metadata
+├── Cargo.toml              Workspace + engine crate
 ├── rust-toolchain.toml     Pinned stable Rust + rustfmt + clippy
 ├── README.md               Project overview (what/why/how)
 ├── docs/                   Developer guide (you are here)
 ├── src/
+│   ├── lib.rs              Library root — the public engine API
 │   ├── main.rs             Binary entry point, REPL loop
 │   ├── error.rs            SQLRiteError enum
 │   ├── repl/               rustyline integration, input validation
@@ -97,11 +98,27 @@ rust_sqlite/
 │   └── sql/
 │       ├── mod.rs          Top-level process_command dispatcher
 │       ├── parser/         sqlparser → internal SelectQuery / CreateQuery / InsertQuery
-│       ├── executor.rs     SELECT / UPDATE / DELETE execution; expression evaluator
-│       ├── db/             In-memory data model (Database, Table, Column, Row, Index)
+│       ├── executor.rs     SELECT / UPDATE / DELETE / CREATE INDEX execution
+│       ├── db/             In-memory data model (Database, Table, Column, Row,
+│       │                   SecondaryIndex)
 │       └── pager/          On-disk paged file format + Pager cache
+├── desktop/                Tauri 2.0 desktop app (see docs/desktop.md)
+│   ├── src/                Svelte 5 UI
+│   └── src-tauri/          Tauri backend; pulls in the engine by path
 └── samples/                Example SQL and reference ASTs
 ```
+
+## Running the desktop app
+
+A Tauri 2.0 desktop GUI lives under [`desktop/`](../desktop/). It needs Node.js in addition to the Rust toolchain:
+
+```bash
+cd desktop
+npm install
+npm run tauri dev
+```
+
+See [docs/desktop.md](desktop.md) for architecture + platform prerequisites.
 
 ## Next reading
 
@@ -109,3 +126,4 @@ rust_sqlite/
 - [SQL engine](sql-engine.md) to understand how a user query flows through the codebase
 - [Storage model](storage-model.md) to understand how rows are laid out in memory
 - [Pager](pager.md) to understand how the DB file is written to disk
+- [Desktop app](desktop.md) for the Tauri shell's architecture and troubleshooting

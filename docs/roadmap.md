@@ -91,14 +91,15 @@ Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; 
 - **3e.3** — Executor optimizer: `WHERE col = literal` (and `literal = col`, with optional outer parens) probes the matching index for an O(log N) lookup. Other predicate shapes still fall back to full scan.
 - **3e.4** — Persistence. File format v3 adds a `type` column to `sqlrite_master` (first position) distinguishing `'table'` rows from `'index'` rows. Each index persists as its own cell-based B-Tree; leaf cells use the new `KIND_INDEX` encoding `(rowid, value)`. Auto- and explicit-indexes travel the same on-disk path.
 
-## Phase 2.5 — Tauri 2.0 desktop app *(after Phase 3)*
+## ✅ Phase 2.5 — Tauri 2.0 desktop app *(done)*
 
-A cross-platform GUI wrapping the engine. Originally slated before Phase 3, deferred so the desktop app demos real-time saves (Phase 3's pager) rather than explicit-save-only.
+*Two commits: `4f5f211`, `741effb`.*
 
-- File picker → open `.sqlrite` files
-- Table browser (schema + rows grid)
-- Query editor with result grid
-- Written in TypeScript (web frontend) + a thin Tauri command layer that wraps the Rust engine
+- **2.5.1** — Engine split into lib + bin (pulled forward from Phase 5). `sqlrite` is now both a binary (the REPL) and a library consumable from external crates.
+- **2.5.2 / 2.5.3** — Tauri 2.0 workspace member under `desktop/src-tauri/`, Svelte 5 UI under `desktop/src/`. Four backend commands (`open_database` / `list_tables` / `table_rows` / `execute_sql`). Three-pane dark-themed UI: header with file picker, table-list sidebar with per-table schema, query editor + result grid. File persistence uses the engine's auto-save, so every query that mutates state hits disk before returning.
+- **Engine thread-safety** — Table's row storage migrated from `Rc<RefCell<_>>` to `Arc<Mutex<_>>` so `Database` is `Send + Sync` and can live in Tauri's shared state. Serde derives on engine storage types (dead since 3c.5) dropped at the same time; `serde` and `bincode` are no longer engine deps.
+
+Build / run: `cd desktop && npm install && npm run tauri dev`. See [docs/desktop.md](../docs/desktop.md) for details.
 
 ## Phase 4 — Durability + concurrency
 

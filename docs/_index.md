@@ -18,6 +18,7 @@ These documents go into the implementation of each subsystem.
 - [Pager](pager.md) — page cache, diffing commits, how `.open` / auto-save work under the hood
 - [Storage model](storage-model.md) — `Table`, `Column`, `Row`, `Index`, how rows are reassembled
 - [SQL engine](sql-engine.md) — parser → executor pipeline, expression evaluator, NULL handling
+- [Desktop app](desktop.md) — the Tauri 2.0 + Svelte shell under `desktop/`
 
 ## Project state
 

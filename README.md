@@ -170,11 +170,12 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **3d — B-Tree**: `InteriorNode` pages above the existing leaves; save rebuilds the tree bottom-up from the in-memory sorted rows; open descends to the leftmost leaf and scans forward via the sibling `next_page` chain. Interior cells share the `cell_length | kind_tag | body` prefix with local/overflow cells so binary search over slot directories works uniformly. Cursor / lazy-load reads deferred to Phase 5.
 - [x] **3e — Secondary indexes** *(format v3)*: UNIQUE/PRIMARY KEY columns get an auto-index named `sqlrite_autoindex_<table>_<col>` at CREATE TABLE time; `CREATE [UNIQUE] INDEX name ON table (col)` adds explicit single-column indexes. `sqlrite_master` gains a `type` column distinguishing `'table'` rows from `'index'` rows. Each index persists as its own cell-based B-Tree using `KIND_INDEX` cells `(rowid, value)`. Executor optimizer probes indexes for `WHERE col = literal` (and `literal = col`) instead of full-scanning.
 
-**Phase 2.5 — Tauri 2.0 desktop app** *(after Phase 3)*
-- [ ] Cross-platform GUI wrapping the engine
-- [ ] File picker → open `.sqlrite` files
-- [ ] Table browser (schema + rows)
-- [ ] Query editor with result grid
+**Phase 2.5 — Tauri 2.0 desktop app** *(done)*
+- [x] **Engine split into lib + bin** (pulled forward from Phase 5): `sqlrite` is now both a library and a binary. The Tauri app and the eventual WASM / FFI targets all import the engine as a regular Rust dependency.
+- [x] **Thread-safe engine**: `Table`'s row storage switched from `Rc<RefCell<_>>` to `Arc<Mutex<_>>` so `Database` is `Send + Sync` and can live inside Tauri's shared state. The serde derives on storage types (dead since 3c.5) dropped at the same time.
+- [x] **Workspace**: root `Cargo.toml` is now a Cargo workspace; `desktop/src-tauri/` is the second member.
+- [x] **Tauri 2.0 backend**: four commands (`open_database`, `list_tables`, `table_rows`, `execute_sql`) wrap the engine; results are tagged enums shipped to the UI via the JSON IPC bridge.
+- [x] **Svelte 5 frontend**: dark-themed three-pane layout — header with "Open…" file picker, sidebar with table list + schema, query editor with Cmd/Ctrl+Enter to run, result grid with sticky header.
 
 **Phase 4 — Durability and concurrency**
 - [ ] Write-Ahead Log (`<db>.sqlrite-wal`) with a checkpointer that merges the WAL back into the main file
