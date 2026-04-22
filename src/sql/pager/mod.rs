@@ -927,6 +927,15 @@ mod tests {
         p
     }
 
+    /// Phase 4c: every .sqlrite has a `-wal` sidecar now. Delete both so
+    /// `/tmp` doesn't accumulate orphan WALs across test runs.
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
     #[test]
     fn round_trip_preserves_schema_and_data() {
         let path = tmp_path("roundtrip");
@@ -953,7 +962,7 @@ mod tests {
         let notes = loaded.get_table("notes".to_string()).expect("notes table");
         assert_eq!(notes.rowids().len(), 1);
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -972,7 +981,7 @@ mod tests {
         let users = db2.get_table("users".to_string()).unwrap();
         assert_eq!(users.rowids().len(), 3);
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -981,7 +990,7 @@ mod tests {
         std::fs::write(&path, b"not a sqlrite database, just bytes").unwrap();
         let result = open_database(&path, "x".to_string());
         assert!(result.is_err());
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1002,7 +1011,7 @@ mod tests {
         let loaded = open_database(&path, "big".to_string()).unwrap();
         let things = loaded.get_table("things".to_string()).unwrap();
         assert_eq!(things.rowids().len(), 200);
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1028,7 +1037,7 @@ mod tests {
             Some(Value::Text(s)) => assert_eq!(s.len(), 10_000),
             other => panic!("expected Text, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1058,7 +1067,7 @@ mod tests {
         save_database(&mut seed_db(), &path).unwrap();
         let loaded = open_database(&path, "x".to_string()).unwrap();
         assert!(!loaded.tables.contains_key(MASTER_TABLE_NAME));
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1115,7 +1124,7 @@ mod tests {
             root_buf[0]
         );
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1149,7 +1158,7 @@ mod tests {
         assert_eq!(even_rowids.len(), 3);
         assert_eq!(odd_rowids.len(), 2);
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1177,7 +1186,7 @@ mod tests {
         assert_eq!(idx.lookup(&Value::Text("a@x".into())).len(), 1);
         assert_eq!(idx.lookup(&Value::Text("b@x".into())).len(), 1);
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -1242,6 +1251,6 @@ mod tests {
             "expected 3-level tree: root's leftmost child should also be InteriorNode",
         );
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 }

@@ -175,6 +175,15 @@ mod tests {
         p
     }
 
+    /// Phase 4c: every .sqlrite has a `-wal` sidecar now. Delete both so
+    /// `/tmp` doesn't accumulate orphan WALs across test runs.
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(PathBuf::from(wal));
+    }
+
     #[test]
     fn help_works() {
         let mut repl = new_editor();
@@ -248,7 +257,7 @@ mod tests {
             Some(Value::Text("alice".to_string()))
         );
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -266,7 +275,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(db.source_path.as_deref(), Some(path.as_path()));
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
     #[test]
@@ -303,6 +312,6 @@ mod tests {
             Some(Value::Text("alice".to_string()))
         );
 
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 }

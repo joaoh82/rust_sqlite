@@ -181,6 +181,25 @@ impl Wal {
         self.last_commit_page_count
     }
 
+    /// Bulk-loads every committed page from the WAL into `dest`. Used by
+    /// `Pager::open` to warm a WAL cache so subsequent reads don't have
+    /// to seek back into the WAL file. Uncommitted frames are skipped
+    /// (same rule as `read_page`).
+    pub fn load_committed_into(
+        &mut self,
+        dest: &mut HashMap<u32, Box<[u8; PAGE_SIZE]>>,
+    ) -> Result<()> {
+        // Snapshot the page numbers upfront so we don't hold a borrow of
+        // `self` while calling the mutating `read_page`.
+        let pages: Vec<u32> = self.latest_frame.keys().copied().collect();
+        for page_num in pages {
+            if let Some(body) = self.read_page(page_num)? {
+                dest.insert(page_num, body);
+            }
+        }
+        Ok(())
+    }
+
     /// Appends a new frame at the current end of file. `commit_page_count`
     /// of `None` writes a dirty (in-progress) frame; `Some(n)` writes a
     /// commit frame carrying the post-commit page count. On commit the
@@ -316,15 +335,29 @@ impl Wal {
     /// mismatch or bad checksum marks the end of the usable log (earlier
     /// frames are still valid). The last commit frame we successfully
     /// read defines `last_commit_offset`.
+    ///
+    /// Key invariant: `latest_frame` only holds offsets of *committed*
+    /// frames. Dirty frames belonging to an in-progress (or crashed)
+    /// transaction accumulate in a pending map and are promoted on the
+    /// commit frame that seals them — or discarded if the log ends before
+    /// a commit arrives. Without this, an orphan dirty frame for page N
+    /// would shadow the previous committed frame for page N, erasing it
+    /// from visibility.
     fn replay_frames(&mut self) -> Result<()> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
         let mut offset = WAL_HEADER_SIZE as u64;
+        let mut pending: HashMap<u32, u64> = HashMap::new();
         while offset + FRAME_SIZE as u64 <= file_len {
             match self.read_frame_at(offset) {
                 Ok((header, _body)) => {
-                    self.latest_frame.insert(header.page_num, offset);
                     self.frame_count += 1;
+                    pending.insert(header.page_num, offset);
                     if header.is_commit() {
+                        // Seal: promote all pending frames (including
+                        // this commit frame itself) into latest_frame.
+                        for (p, o) in pending.drain() {
+                            self.latest_frame.insert(p, o);
+                        }
                         self.last_commit_offset = offset + FRAME_SIZE as u64;
                         self.last_commit_page_count = Some(header.commit_page_count);
                     }
@@ -335,9 +368,8 @@ impl Wal {
                 Err(_) => break,
             }
         }
-        // Everything in latest_frame that points PAST the last commit
-        // barrier is uncommitted — but read_page already handles that at
-        // read time, so we don't need to filter here.
+        // Anything still in `pending` belongs to a transaction that never
+        // committed (crash, or a writer that died mid-append). Drop it.
         Ok(())
     }
 }
@@ -505,22 +537,42 @@ mod tests {
     }
 
     #[test]
-    fn uncommitted_frames_are_invisible_to_readers() {
-        // A dirty frame at the tail — no commit frame after it — must not
-        // show up in read_page. A later commit frame "retroactively"
-        // commits earlier dirty frames in SQLite's model; we match that.
+    fn orphan_dirty_tail_preserves_previous_commit() {
+        // A dirty frame at the tail with no commit frame following it
+        // belongs to a transaction that never sealed. The reader must
+        // fall back to the previous committed frame for that page rather
+        // than treating the page as absent — otherwise a crash mid-write
+        // would erase the page's last durable value.
         let p = tmp_wal("dirty_tail");
         let mut w = Wal::create(&p).unwrap();
-        w.append_frame(5, &page(50), Some(10)).unwrap();
-        w.append_frame(5, &page(51), None).unwrap(); // dirty — should be hidden
+        w.append_frame(5, &page(50), Some(10)).unwrap(); // committed V1
+        w.append_frame(5, &page(51), None).unwrap();     // orphan dirty V2
         drop(w);
 
         let mut w2 = Wal::open(&p).unwrap();
-        // latest_frame points at the dirty (later) offset, but read_page
-        // notices it's past the commit barrier and returns None.
-        assert_eq!(w2.read_page(5).unwrap(), None);
-        // frame_count still sees it as a valid frame on disk.
+        // latest_frame points at the committed offset, NOT the orphan's.
+        // read_page returns V1 — the orphan is invisible.
+        let got = w2
+            .read_page(5)
+            .unwrap()
+            .expect("committed V1 should still be visible");
+        assert_eq!(got.as_ref(), page(50).as_ref());
+        // Both frames are still present on disk; frame_count reflects that.
         assert_eq!(w2.frame_count(), 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn uncommitted_frame_for_untouched_page_returns_none() {
+        // Contrast with the previous test: a dirty frame for a page that
+        // was never committed has no fallback, so read_page returns None.
+        let p = tmp_wal("dirty_only");
+        let mut w = Wal::create(&p).unwrap();
+        w.append_frame(7, &page(70), None).unwrap(); // dirty, no commit
+        drop(w);
+
+        let mut w2 = Wal::open(&p).unwrap();
+        assert_eq!(w2.read_page(7).unwrap(), None);
         let _ = std::fs::remove_file(&p);
     }
 

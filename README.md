@@ -188,7 +188,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 **Phase 4 — Durability and concurrency** *(in progress)*
 - [x] **4a — Exclusive file lock**: `Pager::open` / `::create` takes an OS advisory lock (`fs2::try_lock_exclusive`); a second process on the same file gets a clean "already opened by another process" error. Lock releases automatically when the Pager drops.
 - [x] **4b — Write-Ahead Log (`<db>.sqlrite-wal`) file format + frame codec**: 32-byte WAL header (magic / version / page size / salt / checkpoint seq), 4112-byte frames carrying `(page_num, commit_page_count, salt, checksum, body)`. Rolling-sum checksum. Torn-write recovery: corrupt or partial trailing frames are silently truncated at the boundary. Standalone module; not wired yet.
-- [ ] 4c — WAL-aware Pager: writes append frames, reads consult WAL before main file
+- [x] **4c — WAL-aware Pager**: `Pager::open` / `::create` now own both the main file and its `-wal` sidecar. Reads resolve `staged → wal_cache → on_disk` with a page-count bounds check; commits append a WAL frame per dirty page plus a final commit frame carrying the new page 0 (encoded header). The main file stays frozen between checkpoints — reopening replays the WAL and the decoded page-0 frame overrides the (stale) main-file header.
 - [ ] 4d — Checkpointer: apply WAL frames back into the main file, truncate WAL
 - [ ] 4e — Multi-reader + single-writer via shared/exclusive locks + read marks
 - [ ] 4f — Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`)

@@ -115,11 +115,11 @@ Checksum is a rolling `rotate_left(1) + byte` sum over the first 12 header bytes
 
 Eight standalone tests cover: empty-WAL round trip, single commit frame, multi-frame latest-wins, uncommitted-frame invisibility, truncate-and-reopen, bad magic rejection, corrupt-body end-of-log detection, partial-trailing-frame handling. Not wired into the Pager yet — 4c's job.
 
-### Phase 4c — WAL-aware Pager
+### ✅ Phase 4c — WAL-aware Pager
 
-- Reads consult WAL first, fall back to the main file
-- Writes append frames to WAL instead of mutating the main file
-- Commit writes a "commit" marker frame + fsync
+The `Pager` now owns both the main `.sqlrite` file and its `-wal` sidecar. Reads consult `staged → wal_cache → on_disk` (with a page-count bounds check that hides logically-truncated pages); `commit` appends one WAL frame per dirty page and a final **commit frame** for page 0 whose body is the new encoded header and whose `commit_page_count` carries the post-commit page count. That commit frame is the only write that fsyncs. The main file is left completely untouched between checkpoints — a close / reopen round-trips the WAL via `Wal::load_committed_into`, and the decoded page-0 frame overrides the (stale) main-file header.
+
+Five new Pager-level tests cover sidecar creation, main-file frozen-ness, shrink-via-bounds-check, WAL replay on reopen, and the diff staying effective (two identical commits produce zero dirty data frames).
 
 ### Phase 4d — Checkpointer
 

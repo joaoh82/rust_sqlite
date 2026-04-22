@@ -284,9 +284,9 @@ These are not all enforced on open — we validate the header strictly and rely 
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL introduces a sibling file (`.sqlrite-wal`) rather than changing the main file format.
 
-## Write-Ahead Log (Phase 4b — standalone module; wiring in 4c)
+## Write-Ahead Log (Phase 4b — format; Phase 4c — wired into the Pager)
 
-A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page changes **before** they land in the main file. Readers consult the WAL first to get the latest view of a page; a periodic checkpointer (Phase 4d) applies the accumulated frames back into the main file and truncates the WAL.
+A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page changes **before** they land in the main file. Every `Pager::open` / `Pager::create` now opens (or creates) this sidecar alongside the main file. Reads resolve `staged → wal_cache → on_disk` so WAL-resident writes shadow the frozen main file, and commits append frames here instead of mutating the main file. A periodic checkpointer (Phase 4d) will apply the accumulated frames back into the main file and truncate the WAL.
 
 ### WAL header (first 32 bytes)
 
@@ -325,9 +325,18 @@ Each frame is `FRAME_HEADER_SIZE + PAGE_SIZE` = **4112 bytes**:
 
 ### Torn-write recovery
 
-On open the reader walks every frame from `WAL_HEADER_SIZE`, validating salt and checksum. The first invalid or incomplete frame marks the end of the usable log — its bytes and anything after stay on disk but are treated as nonexistent. Callers get a clean in-memory index of `(page → latest-committed-frame-offset)` and a `last_commit_offset` boundary; uncommitted frames (no commit frame after them) are invisible to reads.
+On open the reader walks every frame from `WAL_HEADER_SIZE`, validating salt and checksum. The first invalid or incomplete frame marks the end of the usable log — its bytes and anything after stay on disk but are treated as nonexistent. Callers get a clean in-memory index of `(page → latest-committed-frame-offset)` and a `last_commit_offset` boundary.
+
+Within that walk, dirty frames for an in-progress transaction accumulate in a pending map and are only promoted into the reader's index when a commit frame seals them. If the log ends before the commit arrives, the whole pending set is discarded — so an orphan dirty frame for page N never shadows the last committed frame for page N. That's the difference between "crash lost the last transaction" (fine) and "crash lost every page the last transaction touched" (catastrophic).
 
 This means a crash mid-write can leave a partial trailing frame, and the next open will still reconstruct a consistent view — as long as the last successful commit frame made it to disk (via `fsync`, which `append_frame` does only for commit frames).
+
+### Commit-frame convention (Phase 4c)
+
+The `Pager` always terminates a transaction with a commit frame for **page 0**. Its body is the freshly encoded database header (magic, format version, page size, page count, schema-root pointer) and its `commit_page_count` carries the post-commit page count. Two effects follow:
+
+- On reopen, after WAL replay, the Pager looks for page 0 in `wal_cache` and decodes it to override the main file's (stale) header. The main file's header only catches up when the checkpointer (Phase 4d) runs.
+- A new page count and a new schema-root pointer are persisted in the same atomic record as the last dirty data frame of the transaction, so there is no window where one is visible without the other.
 
 ### Checksum
 
@@ -347,4 +356,6 @@ database '/path/to/file.sqlrite' is already opened by another process (…)
 
 The lock is tied to the underlying `File` descriptor, so it releases automatically when the `Pager` drops — no explicit unlock call. Tests and application code therefore need to scope `Database` lifetimes (or explicitly `drop` them) when they want to reopen the same file for verification.
 
-**Single-writer-exclusive only**, for now. Phase 4e will upgrade to shared + exclusive lock modes once the WAL is in place so multiple readers can coexist with a single writer.
+Phase 4c extends this: the Pager also takes an exclusive lock on the `-wal` sidecar. Both locks live on the same `Pager`, so they release together when it drops.
+
+**Single-writer-exclusive only**, for now. Phase 4e will upgrade to shared + exclusive lock modes so multiple readers can coexist with a single writer.
