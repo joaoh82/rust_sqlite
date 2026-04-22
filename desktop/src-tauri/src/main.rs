@@ -86,6 +86,42 @@ fn open_database(path: String, state: State<'_, AppState>) -> Result<TableInfo, 
     Ok(snapshot_schema(&locked, &path))
 }
 
+/// Persists the current in-memory database to `path` and adopts that
+/// file as the new backing store — so subsequent writes auto-save there.
+/// Use case: the user started in transient in-memory mode, built up
+/// some schema, and now wants to keep it.
+///
+/// Differs from `open_database`, which wouldn't carry the in-memory
+/// tables forward: that one reloads from disk, overwriting whatever
+/// was live.
+///
+/// Differs from the REPL's `.save FILE` too: `.save` writes to a
+/// destination without switching the active source. For the desktop
+/// app, "Save As…" conventionally means "switch to this file", so
+/// we do the switch.
+#[tauri::command]
+fn save_database_as(path: String, state: State<'_, AppState>) -> Result<TableInfo, String> {
+    let p = PathBuf::from(&path);
+    let db_name = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("db")
+        .to_string();
+    let mut locked = state.db.lock().map_err(engine_err)?;
+
+    // 1. Flush the in-memory state to the new path. save_database writes
+    //    a full file and drops the pager it used; we reopen below to
+    //    attach a fresh pager that's now tied to this path.
+    sqlrite::save_database(&mut *locked, &p).map_err(engine_err)?;
+
+    // 2. Reopen: populates source_path + pager so every subsequent
+    //    committing statement auto-saves to this file.
+    let adopted = sqlrite::open_database(&p, db_name).map_err(engine_err)?;
+    *locked = adopted;
+
+    Ok(snapshot_schema(&locked, &path))
+}
+
 #[tauri::command]
 fn list_tables(state: State<'_, AppState>) -> Result<Vec<TableInfo>, String> {
     let locked = state.db.lock().map_err(engine_err)?;
@@ -261,6 +297,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             open_database,
+            save_database_as,
             list_tables,
             table_rows,
             execute_sql

@@ -63,6 +63,16 @@ Bundling is disabled in [`tauri.conf.json`](../desktop/src-tauri/tauri.conf.json
 
 The `Mutex` isn't a concurrency optimization — it's a correctness requirement. Tauri's `State<T>` demands `Send + Sync`, and the engine uses interior mutability (`Arc<Mutex<HashMap<String, Row>>>`) internally. Only one command at a time touches the database.
 
+### Commands
+
+| Command | What it does |
+|---|---|
+| `open_database(path)` | Load an existing `.sqlrite` file or create a fresh one at `path`. Replaces the in-memory state entirely. |
+| `save_database_as(path)` | Write the current in-memory state to `path` and **adopt** that path as the new auto-save target. Different from the REPL's `.save FILE`, which writes without adopting. |
+| `list_tables()` | Sidebar data — one entry per user table with column metadata. |
+| `table_rows(name, limit)` | Seed the result grid with up to `limit` rows from `name`. |
+| `execute_sql(sql)` | Run one SQL statement through `process_command`. Returns structured rows for SELECTs, a status string for everything else. |
+
 ### Command / response types
 
 Every command returns something serde-serializable. The reusable shape for statement output is a tagged enum:
@@ -90,7 +100,10 @@ This is explicitly a stopgap. Phase 5's Cursor refactor will have the executor r
 
 One Svelte component — [`App.svelte`](../desktop/src/App.svelte) — renders three panes:
 
-- **Header**: product name, current DB path, **New…** and **Open…** buttons. "New…" uses the system save dialog to let you type a fresh filename; "Open…" uses the open dialog and refuses paths that don't exist. Both hand the final path to the backend's `open_database` command, which creates-if-missing and attaches the long-lived pager.
+- **Header**: product name, current DB path, **New…** / **Open…** / **Save As…** buttons.
+  - **New…** uses the system save dialog to let you type a fresh filename; the backend's `open_database` creates-if-missing and attaches the long-lived pager.
+  - **Open…** uses the open dialog for existing files only; refuses paths that don't exist.
+  - **Save As…** writes the current in-memory or file-backed database to a chosen path and **adopts it** as the new auto-save target. Primary use case: user launched the app in transient in-memory mode, built up some schema, and now wants to keep it. Also works as "save a snapshot to a different file" while already file-backed — but note the adoption, so after Save As… every subsequent write lands in the newly-chosen file, not the original.
 - **Sidebar**: alphabetical list of user tables. Clicking one selects it and fetches up to 500 rows via `table_rows`. Below the list, the selected table's column list with flags (PK / UQ / NN).
 - **Main area**: query editor (textarea with a line-number gutter) + result grid.
   - **Line numbers**: rendered in a gutter on the left of the textarea; derived from the text content (`sql.split("\n").length`) and kept scroll-synced with the textarea via an `onscroll` handler. Font size and line height are locked between the gutter and the textarea so every line number aligns with its row.

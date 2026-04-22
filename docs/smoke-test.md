@@ -326,7 +326,7 @@ First launch compiles the Tauri backend (a few hundred crates; takes a minute or
 
 ### 3.3 Initial state
 
-- Header shows `◆ SQLRite — in-memory (no file)` on the left, `New…` and `Open…` buttons on the right.
+- Header shows `◆ SQLRite — in-memory (no file)` on the left, `New…` / `Open…` / `Save As…` buttons on the right.
 - Sidebar: `TABLES` heading followed by "No tables yet."
 - Main area: textarea pre-filled with a comment-only placeholder (nothing that would error on Run), `Run (⌘↵)` button below.
 
@@ -350,7 +350,28 @@ Click **Open…**. Pick a `.sqlrite` file that already exists (e.g. the one crea
 
 If you try Open… on a file that doesn't exist, the dialog refuses to return; to create a fresh database, use New… instead.
 
-### 3.4c Editor gutter + comment toggle
+### 3.4c Save As… (save an in-memory DB to a file)
+
+Start a fresh session (no file opened) and create some schema directly via the editor:
+
+```sql
+CREATE TABLE scratch (id INTEGER PRIMARY KEY, note TEXT);
+INSERT INTO scratch (note) VALUES ('in-memory row');
+```
+
+The sidebar should show `scratch`. Header still says "in-memory (no file)".
+
+Now click **Save As…**. The system save dialog appears — type `scratch.sqlrite` (or any name) and confirm. After the dialog closes:
+
+- Status line shows `Saved as /path/to/scratch.sqlrite. 1 table. Auto-save enabled.`
+- Header updates to show the new file path.
+- Clicking the `scratch` table in the sidebar still shows the row.
+
+Close the app and relaunch. Open the file you just saved — the row should still be there.
+
+If you started with a file-backed DB (`New…` or `Open…` earlier) and hit Save As…, the new path becomes the active one — subsequent writes go to the new file, not the original. The original stays on disk as a snapshot of whatever was there when you hit Save As….
+
+### 3.4d Editor gutter + comment toggle
 
 - **Line numbers**: the query textarea has a gutter on the left numbering each line. As you type multi-line SQL, the numbers update live. If the content exceeds the visible height and the textarea scrolls, the gutter scrolls in lockstep (no misalignment).
 - **Comment toggle**: place the cursor on any line and press **⌘ + /** (macOS) or **Ctrl + /** (Linux / Windows). The line gets a `-- ` prefix if it wasn't commented, or has it removed if it was. Select multiple lines and the toggle acts on all of them; a mix of commented and uncommented lines is treated as "not all commented" and adds `-- ` uniformly (matching VS Code / Sublime behavior).
@@ -445,6 +466,7 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] `cd desktop && npm run tauri dev` opens a window
 - [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"
 - [ ] In the desktop app: **Open…** button opens a file picker for existing `.sqlrite` files
+- [ ] In the desktop app: **Save As…** persists an in-memory DB to a new file and flips the header to that path
 - [ ] In the desktop app: pressing Run on the default placeholder textarea doesn't error (it's comment-only)
 - [ ] In the desktop app: the editor gutter shows one line number per row of the query and stays aligned while scrolling
 - [ ] In the desktop app: **⌘/** (or Ctrl+/) on a line toggles its `-- ` comment; on a multi-line selection it toggles all of them

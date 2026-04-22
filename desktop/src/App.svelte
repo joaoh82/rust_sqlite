@@ -95,6 +95,44 @@
     }
   }
 
+  /**
+   * Persists the current state — whether the DB is in-memory or already
+   * file-backed — to a new path and switches to it. "Switch" meaning the
+   * newly-saved file becomes the auto-save target for subsequent writes.
+   * The in-memory tables aren't cloned or diffed; the backend reloads
+   * from disk after the write, so what you see after Save As… is
+   * what's on disk.
+   */
+  async function onSaveAsClick() {
+    errorMessage = null;
+    try {
+      const picked = await saveFileDialog({
+        defaultPath: dbPath ?? "untitled.sqlrite",
+        filters: [
+          { name: "SQLRite database", extensions: ["sqlrite"] },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (!picked || typeof picked !== "string") return;
+      await invoke<TableInfo>("save_database_as", { path: picked });
+      dbPath = picked;
+      await refreshTables();
+      // Try to keep the same table selected if it's still there; fall
+      // back to the first table or clear the selection.
+      if (selected) {
+        selected = tables.find((t) => t.name === selected!.name) ?? tables[0] ?? null;
+      } else {
+        selected = tables[0] ?? null;
+      }
+      output = {
+        kind: "status",
+        message: `Saved as ${picked}. ${tables.length} table${tables.length === 1 ? "" : "s"}. Auto-save enabled.`,
+      };
+    } catch (err) {
+      errorMessage = String(err);
+    }
+  }
+
   /** Shared success path for both Open and New. */
   async function loadDatabase(path: string) {
     await invoke<TableInfo>("open_database", { path });
@@ -235,6 +273,7 @@
     <div class="actions">
       <button onclick={onNewClick}>New…</button>
       <button onclick={onOpenClick}>Open…</button>
+      <button onclick={onSaveAsClick}>Save As…</button>
     </div>
   </header>
 
