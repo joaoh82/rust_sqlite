@@ -121,6 +121,33 @@ Literals: integer numbers, real numbers, `'single-quoted strings'`, booleans (`T
 
 NULL handling follows SQL convention: any comparison or arithmetic involving NULL is unknown, which is treated as `false` in a `WHERE` clause. `NOT NULL` stays NULL. Division or modulo by zero returns a clean runtime error rather than a panic.
 
+## Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` work as expected:
+
+```sql
+BEGIN;
+INSERT INTO users (name) VALUES ('alice');
+INSERT INTO users (name) VALUES ('bob');
+-- both visible within this session, not yet on disk
+ROLLBACK;  -- discards both inserts
+```
+
+```sql
+BEGIN;
+UPDATE users SET age = age + 1;
+COMMIT;  -- flushes every accumulated change as a single WAL commit frame
+```
+
+Semantics worth knowing:
+
+- **Auto-save is suppressed** inside a transaction. Mutations stay in memory until `COMMIT`, which writes them to the WAL in one atomic batch (single commit frame sealing every page that changed).
+- **Rollback is snapshot-based.** `BEGIN` deep-clones the in-memory table state; `ROLLBACK` restores it. This is O(N) in data size at BEGIN time; worth knowing if you start a transaction on a huge DB and then roll back.
+- **Nested `BEGIN` is rejected** — no savepoints yet.
+- **`BEGIN` on a read-only database** (`sqlrite --readonly`) is rejected.
+- **Runtime errors mid-transaction do not auto-rollback.** If an `INSERT` fails inside a transaction (bad syntax, UNIQUE violation, etc.), you're still in the transaction; the caller decides whether to `ROLLBACK` or `COMMIT` whatever succeeded.
+- **COMMIT save failure auto-rolls-back.** If the disk write at COMMIT time fails (disk full, permission denied, etc.), SQLRite restores the pre-BEGIN snapshot and surfaces an error like `COMMIT failed — transaction rolled back: …`. Leaving the in-flight mutations in memory after a failed COMMIT would be unsafe — any subsequent non-transactional statement would auto-save them, silently publishing partial work to disk.
+
 ## Not yet supported
 
 - Joins (`INNER` / `LEFT OUTER` / `CROSS`)
@@ -130,7 +157,7 @@ NULL handling follows SQL convention: any comparison or arithmetic involving NUL
 - `LIKE`, `IN`, `IS NULL`
 - Expressions in the projection list
 - `OFFSET`, multi-column `ORDER BY`
-- Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`)
+- Savepoints (nested transactions)
 - Multiple databases in one process, attach/detach
 
 See [Roadmap](roadmap.md) for when these land.

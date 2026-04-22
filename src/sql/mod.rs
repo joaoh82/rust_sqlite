@@ -60,6 +60,48 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         return Ok("No statement to execute.".to_string());
     };
 
+    // Transaction boundary statements are routed to Database-level
+    // handlers before we even inspect the rest of the AST. They don't
+    // mutate table data directly, so they short-circuit the
+    // is_write_statement / auto-save path.
+    match &query {
+        Statement::StartTransaction { .. } => {
+            db.begin_transaction()?;
+            return Ok(String::from("BEGIN"));
+        }
+        Statement::Commit { .. } => {
+            if !db.in_transaction() {
+                return Err(SQLRiteError::General(
+                    "cannot COMMIT: no transaction is open".to_string(),
+                ));
+            }
+            // Flush accumulated in-memory changes to disk. If the save
+            // fails we auto-rollback the in-memory state to the
+            // pre-BEGIN snapshot and surface a combined error. Leaving
+            // the transaction open after a failed COMMIT would be
+            // unsafe: auto-save on any subsequent non-transactional
+            // statement would silently publish partial mid-transaction
+            // work. Auto-rollback keeps the disk-plus-memory pair
+            // coherent — the user loses their in-flight work on a disk
+            // error, but that's the only safe outcome.
+            if let Some(path) = db.source_path.clone() {
+                if let Err(save_err) = pager::save_database(db, &path) {
+                    let _ = db.rollback_transaction();
+                    return Err(SQLRiteError::General(format!(
+                        "COMMIT failed — transaction rolled back: {save_err}"
+                    )));
+                }
+            }
+            db.commit_transaction()?;
+            return Ok(String::from("COMMIT"));
+        }
+        Statement::Rollback { .. } => {
+            db.rollback_transaction()?;
+            return Ok(String::from("ROLLBACK"));
+        }
+        _ => {}
+    }
+
     // Statements that mutate state — trigger auto-save on success. Read-only
     // SELECTs skip the save entirely to avoid pointless file writes.
     let is_write_statement = matches!(
@@ -209,12 +251,17 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         }
     };
 
-    // Auto-save: if the database is backed by a file and the statement changed
-    // state, flush to disk before returning. A failed save surfaces as an error
-    // — the in-memory state already mutated, so the caller should know disk is
-    // out of sync. The Pager held on `db` diffs against its last-committed
-    // snapshot, so only pages whose bytes actually changed are written.
-    if is_write_statement && db.source_path.is_some() {
+    // Auto-save: if the database is backed by a file AND no explicit
+    // transaction is open AND the statement changed state, flush to
+    // disk before returning. Inside a `BEGIN … COMMIT` block the
+    // mutations accumulate in memory (protected by the ROLLBACK
+    // snapshot) and land on disk in one shot when COMMIT runs.
+    //
+    // A failed save surfaces as an error — the in-memory state already
+    // mutated, so the caller should know disk is out of sync. The
+    // Pager held on `db` diffs against its last-committed snapshot,
+    // so only pages whose bytes actually changed are written.
+    if is_write_statement && db.source_path.is_some() && !db.in_transaction() {
         let path = db.source_path.clone().unwrap();
         pager::save_database(db, &path)?;
     }
@@ -584,6 +631,451 @@ mod tests {
         let response = process_command("SELECT name FROM users WHERE age > 28;", &mut db)
             .expect("select");
         assert!(response.contains("2 rows returned"));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4f — Transactions (BEGIN / COMMIT / ROLLBACK)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rollback_restores_pre_begin_in_memory_state() {
+        // In-memory DB (no pager): BEGIN, insert a row, ROLLBACK.
+        // The row must disappear from the live tables HashMap.
+        let mut db = seed_users_table();
+        let before = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(before, 3);
+
+        process_command("BEGIN;", &mut db).expect("BEGIN");
+        assert!(db.in_transaction());
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('dan', 50);",
+            &mut db,
+        )
+        .expect("INSERT inside txn");
+        // Mid-transaction read sees the new row.
+        let mid = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(mid, 4);
+
+        process_command("ROLLBACK;", &mut db).expect("ROLLBACK");
+        assert!(!db.in_transaction());
+        let after = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(after, 3, "ROLLBACK should have restored the pre-BEGIN state");
+    }
+
+    #[test]
+    fn commit_keeps_mutations_and_clears_txn_flag() {
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).expect("BEGIN");
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('dan', 50);",
+            &mut db,
+        )
+        .expect("INSERT inside txn");
+        process_command("COMMIT;", &mut db).expect("COMMIT");
+        assert!(!db.in_transaction());
+        let after = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(after, 4);
+    }
+
+    #[test]
+    fn rollback_undoes_update_and_delete_side_by_side() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("UPDATE users SET age = 999;", &mut db).unwrap();
+        process_command("DELETE FROM users WHERE name = 'bob';", &mut db).unwrap();
+        // Mid-txn: one row gone, others have age=999.
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 2);
+        for r in users.rowids() {
+            assert_eq!(users.get_value("age", r), Some(Value::Integer(999)));
+        }
+
+        process_command("ROLLBACK;", &mut db).unwrap();
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 3);
+        // Original ages {30, 25, 40} — none should be 999.
+        for r in users.rowids() {
+            assert_ne!(users.get_value("age", r), Some(Value::Integer(999)));
+        }
+    }
+
+    #[test]
+    fn nested_begin_is_rejected() {
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        let err = process_command("BEGIN;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").contains("already open"),
+            "nested BEGIN should error; got: {err}"
+        );
+        // Still in the original transaction; a ROLLBACK clears it.
+        assert!(db.in_transaction());
+        process_command("ROLLBACK;", &mut db).unwrap();
+    }
+
+    #[test]
+    fn orphan_commit_and_rollback_are_rejected() {
+        let mut db = seed_users_table();
+        let commit_err = process_command("COMMIT;", &mut db).unwrap_err();
+        assert!(format!("{commit_err}").contains("no transaction"));
+        let rollback_err = process_command("ROLLBACK;", &mut db).unwrap_err();
+        assert!(format!("{rollback_err}").contains("no transaction"));
+    }
+
+    #[test]
+    fn error_inside_transaction_keeps_txn_open() {
+        // A bad INSERT inside a txn doesn't commit or abort automatically —
+        // the user can still ROLLBACK. SQLite's implicit-rollback behavior
+        // isn't modeled here.
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        let err = process_command("INSERT INTO nope (x) VALUES (1);", &mut db);
+        assert!(err.is_err());
+        assert!(db.in_transaction(), "txn should stay open after error");
+        process_command("ROLLBACK;", &mut db).unwrap();
+    }
+
+    /// Builds a file-backed Database at a unique temp path, with the
+    /// schema seeded and `source_path` set so subsequent process_command
+    /// calls auto-save. Returns (path, db). Drop the db before deleting
+    /// the files.
+    fn seed_file_backed(name: &str, schema: &str) -> (std::path::PathBuf, Database) {
+        use crate::sql::pager::{open_database, save_database};
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("sqlrite-txn-{name}-{pid}-{nanos}.sqlrite"));
+
+        // Seed the file, then reopen to get a source_path-attached db
+        // (save_database alone doesn't attach a fresh pager to a db
+        // whose source_path was None before the call).
+        {
+            let mut seed = Database::new("t".to_string());
+            process_command(schema, &mut seed).unwrap();
+            save_database(&mut seed, &p).unwrap();
+        }
+        let db = open_database(&p, "t".to_string()).unwrap();
+        (p, db)
+    }
+
+    fn cleanup_file(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    #[test]
+    fn begin_commit_rollback_round_trip_through_disk() {
+        // File-backed DB: commit inside a transaction must actually
+        // persist. ROLLBACK inside a *later* transaction must not
+        // un-do the previously-committed changes.
+        use crate::sql::pager::open_database;
+
+        let (path, mut db) = seed_file_backed(
+            "roundtrip",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+        );
+
+        // Transaction 1: insert two rows, commit.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('b');", &mut db).unwrap();
+        process_command("COMMIT;", &mut db).unwrap();
+
+        // Transaction 2: insert another, roll back.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('c');", &mut db).unwrap();
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        drop(db); // release pager lock
+
+        let reopened = open_database(&path, "t".to_string()).unwrap();
+        let notes = reopened.get_table("notes".to_string()).unwrap();
+        assert_eq!(notes.rowids().len(), 2, "committed rows should survive");
+
+        drop(reopened);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn write_inside_transaction_does_not_autosave() {
+        // File-backed DB: writes inside BEGIN/…/COMMIT must NOT hit
+        // the WAL until COMMIT. We prove it by checking the WAL file
+        // size before vs during the transaction.
+        let (path, mut db) = seed_file_backed(
+            "noas",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);",
+        );
+
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_path);
+        let frames_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO t (x) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO t (x) VALUES ('b');", &mut db).unwrap();
+
+        // Mid-transaction: WAL must be unchanged — no auto-save fired.
+        let frames_mid = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(
+            frames_before, frames_mid,
+            "WAL should not grow during an open transaction"
+        );
+
+        process_command("COMMIT;", &mut db).unwrap();
+
+        drop(db); // release pager lock
+        let fresh =
+            crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        assert_eq!(
+            fresh.get_table("t".to_string()).unwrap().rowids().len(),
+            2,
+            "COMMIT should have persisted both inserted rows"
+        );
+        drop(fresh);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn rollback_undoes_create_table() {
+        // Schema DDL inside a txn: ROLLBACK must make the new table
+        // disappear. The txn snapshot captures db.tables as of BEGIN,
+        // and ROLLBACK reassigns tables from that snapshot, so a table
+        // created mid-transaction has no entry in the snapshot.
+        let mut db = seed_users_table();
+        assert_eq!(db.tables.len(), 1);
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command(
+            "CREATE TABLE dropme (id INTEGER PRIMARY KEY, x TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO dropme (x) VALUES ('stuff');", &mut db).unwrap();
+        assert_eq!(db.tables.len(), 2);
+
+        process_command("ROLLBACK;", &mut db).unwrap();
+        assert_eq!(db.tables.len(), 1, "CREATE TABLE should have been rolled back");
+        assert!(db.get_table("dropme".to_string()).is_err());
+    }
+
+    #[test]
+    fn rollback_restores_secondary_index_state() {
+        // Phase 4f edge case: rolling back an INSERT on a UNIQUE-indexed
+        // column must also clean up the index, otherwise a re-insert of
+        // the same value would spuriously collide.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (email) VALUES ('a@x');", &mut db).unwrap();
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db).unwrap();
+        // Inside the txn: the index now contains both 'a@x' and 'b@x'.
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        // Re-inserting 'b@x' after rollback must succeed — if the index
+        // wasn't properly restored, it would think 'b@x' is still a
+        // collision and fail with a UNIQUE violation.
+        let reinsert =
+            process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db);
+        assert!(
+            reinsert.is_ok(),
+            "re-insert after rollback should succeed, got {reinsert:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_last_rowid_counter() {
+        // Rowids allocated inside a rolled-back transaction should be
+        // reusable. The snapshot restores Table::last_rowid, so the
+        // next insert picks up where the pre-BEGIN state left off.
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table(); // 3 rows, last_rowid = 3
+        let pre = db.get_table("users".to_string()).unwrap().last_rowid;
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('d', 50);",
+            &mut db,
+        )
+        .unwrap(); // would be rowid 4
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('e', 60);",
+            &mut db,
+        )
+        .unwrap(); // would be rowid 5
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        let post = db.get_table("users".to_string()).unwrap().last_rowid;
+        assert_eq!(pre, post, "last_rowid must roll back with the snapshot");
+
+        // Confirm: the next insert reuses rowid pre+1.
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('d', 50);",
+            &mut db,
+        )
+        .unwrap();
+        let users = db.get_table("users".to_string()).unwrap();
+        let d_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("name", *r) == Some(Value::Text("d".into())))
+            .expect("d row must exist");
+        assert_eq!(d_rowid, pre + 1);
+    }
+
+    #[test]
+    fn commit_on_in_memory_db_clears_txn_without_pager_call() {
+        // In-memory DB (no source_path): COMMIT must still work — just
+        // no disk flush. Covers the `if let Some(path) = …` branch
+        // where the guard falls through without calling save_database.
+        let mut db = seed_users_table(); // no source_path
+        assert!(db.source_path.is_none());
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('z', 99);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("COMMIT;", &mut db).unwrap();
+
+        assert!(!db.in_transaction());
+        assert_eq!(
+            db.get_table("users".to_string()).unwrap().rowids().len(),
+            4
+        );
+    }
+
+    #[test]
+    fn failed_commit_auto_rolls_back_in_memory_state() {
+        // Data-safety regression: on COMMIT save failure we must auto-
+        // rollback the in-memory state. Otherwise, any subsequent
+        // non-transactional statement would auto-save the partial
+        // mid-transaction work, silently publishing uncommitted
+        // changes to disk.
+        //
+        // We simulate a save failure by making the WAL sidecar path
+        // unavailable mid-transaction: after BEGIN, we take an
+        // exclusive OS lock on the WAL via a second File handle,
+        // forcing the next save to fail when it tries to append.
+        //
+        // Simpler repro: point source_path at a directory (not a file).
+        // `OpenOptions::open` will fail with EISDIR on save.
+        use crate::sql::pager::save_database;
+
+        // Seed a file-backed db.
+        let (path, mut db) = seed_file_backed(
+            "failcommit",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+        );
+
+        // Prime one committed row so we have a baseline.
+        process_command("INSERT INTO notes (body) VALUES ('before');", &mut db)
+            .unwrap();
+
+        // Open a new txn and add a row.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('inflight');", &mut db)
+            .unwrap();
+        assert_eq!(
+            db.get_table("notes".to_string()).unwrap().rowids().len(),
+            2,
+            "inflight row visible mid-txn"
+        );
+
+        // Swap source_path to a path that will fail on open. A
+        // directory is a reliable failure mode — Pager::open on a
+        // directory errors with an I/O error.
+        let orig_source = db.source_path.clone();
+        let orig_pager = db.pager.take();
+        db.source_path = Some(std::env::temp_dir());
+
+        let commit_result = process_command("COMMIT;", &mut db);
+        assert!(commit_result.is_err(), "commit must fail");
+        let err_str = format!("{}", commit_result.unwrap_err());
+        assert!(
+            err_str.contains("COMMIT failed") && err_str.contains("rolled back"),
+            "error must surface auto-rollback; got: {err_str}"
+        );
+
+        // Auto-rollback fired: the inflight row is gone, the txn flag
+        // is cleared, and a follow-up non-txn statement won't leak
+        // stale state.
+        assert!(!db.in_transaction(), "txn must be cleared after auto-rollback");
+        assert_eq!(
+            db.get_table("notes".to_string()).unwrap().rowids().len(),
+            1,
+            "inflight row must be rolled back"
+        );
+
+        // Restore the real source_path + pager and verify a clean
+        // subsequent write goes through.
+        db.source_path = orig_source;
+        db.pager = orig_pager;
+        process_command("INSERT INTO notes (body) VALUES ('after');", &mut db)
+            .unwrap();
+        drop(db);
+
+        // Reopen and assert only 'before' + 'after' landed on disk.
+        let reopened =
+            crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        let notes = reopened.get_table("notes".to_string()).unwrap();
+        assert_eq!(notes.rowids().len(), 2);
+        // Ensure no leaked save_database partial happened.
+        let _ = save_database; // silence unused-import lint if any
+        drop(reopened);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn begin_on_read_only_is_rejected() {
+        use crate::sql::pager::{open_database_read_only, save_database};
+
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-txn-ro-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        {
+            let mut seed = Database::new("t".to_string());
+            process_command(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY);",
+                &mut seed,
+            )
+            .unwrap();
+            save_database(&mut seed, &path).unwrap();
+        }
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        let err = process_command("BEGIN;", &mut ro).unwrap_err();
+        assert!(
+            format!("{err}").contains("read-only"),
+            "BEGIN on RO db should surface read-only; got: {err}"
+        );
+        assert!(!ro.in_transaction());
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
     }
 
     #[test]

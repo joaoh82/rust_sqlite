@@ -320,6 +320,50 @@ An error occured: General error: cannot commit: database is opened read-only
 
 `.exit` both terminals and `rm -f "$DB"`.
 
+### 2.6b Transactions (Phase 4f)
+
+With a fresh DB, verify `BEGIN` / `COMMIT` / `ROLLBACK` behave as expected:
+
+```bash
+TXN="/tmp/smoke-txn.sqlrite"
+rm -f "$TXN" "$TXN-wal"
+cargo run --quiet --bin sqlrite -- "$TXN"
+```
+
+```sql
+CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO items (name) VALUES ('alpha');
+BEGIN;
+INSERT INTO items (name) VALUES ('beta');
+SELECT * FROM items;           -- 2 rows, including 'beta'
+ROLLBACK;
+SELECT * FROM items;           -- back to 1 row, 'beta' is gone
+BEGIN;
+INSERT INTO items (name) VALUES ('gamma');
+COMMIT;
+SELECT * FROM items;           -- 2 rows: alpha + gamma
+.exit
+```
+
+Reopen and verify `alpha` and `gamma` both survived:
+
+```bash
+cargo run --quiet --bin sqlrite -- "$TXN"
+```
+
+```sql
+SELECT * FROM items;           -- alpha + gamma
+BEGIN;
+BEGIN;                          -- should error: "transaction is already open"
+ROLLBACK;                       -- clears the outer BEGIN
+COMMIT;                         -- should error: "no transaction is open"
+.exit
+```
+
+```bash
+rm -f "$TXN" "$TXN-wal"
+```
+
 ### 2.7 Format-guard sanity
 
 A file that isn't a SQLRite database should be rejected cleanly.
@@ -526,6 +570,8 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] Bad-magic file is rejected with a clear error
 - [ ] Opening the same file from two read-write REPLs simultaneously rejects the second with an "in use" / "readers and writers are exclusive" message and falls back to in-memory
 - [ ] Two `--readonly` REPLs on the same file open simultaneously and both `SELECT` works; any `INSERT` in a `--readonly` REPL fails with "cannot commit: database is opened read-only"
+- [ ] `BEGIN; INSERT …; ROLLBACK;` leaves the table unchanged; `BEGIN; INSERT …; COMMIT;` persists across `.exit`/reopen
+- [ ] `BEGIN; BEGIN;` errors on the second (nested) BEGIN; orphan `COMMIT` / `ROLLBACK` error cleanly
 - [ ] `cargo check -p sqlrite-desktop` compiles the Tauri crate
 - [ ] `cd desktop && npm run tauri dev` opens a window
 - [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"

@@ -139,10 +139,18 @@ REPL gained a `--readonly` / `-r` flag: `sqlrite --readonly foo.sqlrite` opens w
 
 Four Pager-level tests: two read-only openers coexist, RW-blocks-RO and RO-blocks-RW, RO pager rejects mutations with typed errors, RO open without a WAL sidecar succeeds.
 
-### Phase 4f — Transactions
+### ✅ Phase 4f — Transactions
 
-- `BEGIN` / `COMMIT` / `ROLLBACK` on top of the WAL
-- Uncommitted frames stay out of reader snapshots until commit
+`BEGIN` / `COMMIT` / `ROLLBACK` are now real statements, not the implicit per-statement transactions that every mutating SQL call used to run under.
+
+- **BEGIN** deep-clones the `Database`'s in-memory tables (`Table::deep_clone` rebuilds the `Arc<Mutex<HashMap>>` so snapshot and live state don't share a map) and stashes the clone on `db.txn`. Rejects nested begins and read-only databases.
+- **Auto-save suppressed** while `db.txn.is_some()` — statements mutate in memory but don't append WAL frames.
+- **COMMIT** calls `save_database` once, which appends all accumulated changes as a single WAL commit frame, then clears `db.txn`. A failed save **auto-rolls-back** the in-memory state — leaving it in place would let a subsequent non-transactional statement's auto-save silently publish partial mid-transaction work.
+- **ROLLBACK** restores `db.tables` from the snapshot and clears `db.txn`. Runtime errors inside a transaction (bad INSERT, UNIQUE violation) are not implicit rollbacks — the caller stays in the transaction until they explicitly `ROLLBACK` or `COMMIT`.
+
+Reader-side semantics fall out of this for free: we're still single-writer under Phase 4e's flock, so uncommitted in-memory changes aren't visible to other processes to begin with. The "uncommitted frames stay out of reader snapshots" clause from the original roadmap is a non-concern under POSIX flock — by design, no concurrent reader exists during an open transaction.
+
+Fourteen new tests under `src/sql/mod.rs` covering the happy paths, every rejection edge, and the trickier secondary-effects: rollback of `CREATE TABLE`, rollback of a secondary-index insert (followed by successful re-insert to prove the index was restored, not just the rows), `last_rowid` counter restoration, in-memory COMMIT without a pager, and the auto-rollback on a failed COMMIT save.
 
 ## Phase 5 — Library, embedding, WASM
 

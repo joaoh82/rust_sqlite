@@ -35,7 +35,7 @@ pub enum IndexOrigin {
 /// One secondary index on a single column. Multi-column composite indexes
 /// are on the longer-term list; the `column_name` field stays singular
 /// for now.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SecondaryIndex {
     /// Catalog name. For auto indexes: `sqlrite_autoindex_<table>_<col>`.
     /// For explicit indexes: the user-supplied identifier from CREATE INDEX.
@@ -49,7 +49,7 @@ pub struct SecondaryIndex {
 
 /// Typed map from value → list of rowids carrying that value. The rowid
 /// list is always non-empty; empty lists are pruned on remove.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IndexEntries {
     Integer(BTreeMap<i64, Vec<i64>>),
     Text(BTreeMap<String, Vec<i64>>),

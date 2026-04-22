@@ -193,7 +193,7 @@ This only works because `save_database` iterates tables in sorted order — if t
 - **No free-page management.** When a table shrinks, the main file's tail pages are truncated at checkpoint, but there's no free-list to reuse pages inside a grown file.
 - **No per-statement granularity.** The whole database is re-serialized on every commit; the diff keeps the *written* set small but the CPU cost of reserialization is unchanged.
 - **No concurrent reader-and-writer.** Phase 4e graduated to shared/exclusive lock modes (multi-reader *or* single-writer), but POSIX flock can't give us both at once. True concurrent access would need a shared-memory coordination file with read marks — not on the roadmap.
-- **No `BEGIN` / `COMMIT` / `ROLLBACK`.** Every mutating statement is its own transaction today. Phase 4f layers transactions on the WAL.
+- **Savepoints / nested transactions.** Phase 4f added top-level `BEGIN` / `COMMIT` / `ROLLBACK` (snapshot-based rollback, auto-save suppressed inside a transaction), but nested `BEGIN` is rejected — real savepoints aren't on the roadmap.
 
 ## Interaction with `Database`
 

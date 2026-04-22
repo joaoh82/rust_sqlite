@@ -10,7 +10,7 @@ use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 /// SQLRite data types
 /// Mapped after SQLite Data Type Storage Classes and SQLite Affinity Type
 /// (Datatypes In SQLite Version 3)[https://www.sqlite.org/datatype3.html]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum DataType {
     Integer,
     Text,
@@ -143,6 +143,29 @@ impl Table {
             secondary_indexes,
             last_rowid: 0,
             primary_key,
+        }
+    }
+
+    /// Deep-clones a `Table` for transaction snapshots (Phase 4f).
+    ///
+    /// The normal `Clone` derive would shallow-clone the `Arc<Mutex<_>>`
+    /// wrapping our row storage, leaving both copies sharing the same
+    /// inner map — mutating the snapshot would corrupt the live table
+    /// and vice versa. Instead we lock, clone the inner `HashMap`, and
+    /// wrap it in a fresh `Arc<Mutex<_>>`. Columns and indexes derive
+    /// `Clone` directly (all their fields are plain data).
+    pub fn deep_clone(&self) -> Self {
+        let cloned_rows: HashMap<String, Row> = {
+            let guard = self.rows.lock().expect("row mutex poisoned");
+            guard.clone()
+        };
+        Table {
+            tb_name: self.tb_name.clone(),
+            columns: self.columns.clone(),
+            rows: Arc::new(Mutex::new(cloned_rows)),
+            secondary_indexes: self.secondary_indexes.clone(),
+            last_rowid: self.last_rowid,
+            primary_key: self.primary_key.clone(),
         }
     }
 
@@ -811,7 +834,7 @@ impl Table {
 /// Per-column index state moved to `Table::secondary_indexes` in Phase 3e —
 /// a single `Column` describes the declared schema (name, type, constraints)
 /// and nothing more.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub struct Column {
     pub column_name: String,
     pub datatype: DataType,
@@ -844,7 +867,7 @@ impl Column {
 ///
 /// This is an enum representing each of the available types organized in a BTreeMap
 /// data structure, using the ROWID and key and each corresponding type as value
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Row {
     Integer(BTreeMap<i64, i32>),
     Text(BTreeMap<i64, String>),

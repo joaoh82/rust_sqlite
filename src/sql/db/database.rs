@@ -4,6 +4,16 @@ use crate::sql::pager::pager::{AccessMode, Pager};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Snapshot of the mutable in-memory state taken at `BEGIN` time so
+/// `ROLLBACK` can restore it. See `begin_transaction`, `rollback_transaction`.
+/// `tables` is deep-cloned (the `Table::deep_clone` helper reallocates
+/// the `Arc<Mutex<_>>` row storage so snapshot and live state don't
+/// share a map).
+#[derive(Debug)]
+pub struct TxnSnapshot {
+    pub(crate) tables: HashMap<String, Table>,
+}
+
 /// The database is represented by this structure.assert_eq!
 #[derive(Debug)]
 pub struct Database {
@@ -20,6 +30,12 @@ pub struct Database {
     /// against the last-committed state and skip rewriting unchanged
     /// pages. `None` means "in-memory only" or "not yet opened".
     pub pager: Option<Pager>,
+    /// Active transaction state (Phase 4f). `Some` between `BEGIN` and
+    /// the matching `COMMIT` / `ROLLBACK`. While set:
+    /// - auto-save is suppressed (mutations stay in-memory)
+    /// - nested `BEGIN` is rejected
+    /// - `ROLLBACK` restores `tables` from the snapshot
+    pub txn: Option<TxnSnapshot>,
 }
 
 impl Database {
@@ -37,6 +53,7 @@ impl Database {
             tables: HashMap::new(),
             source_path: None,
             pager: None,
+            txn: None,
         }
     }
 
@@ -78,6 +95,63 @@ impl Database {
         self.pager
             .as_ref()
             .is_some_and(|p| p.access_mode() == AccessMode::ReadOnly)
+    }
+
+    /// Returns `true` while a `BEGIN … COMMIT`/`ROLLBACK` block is open.
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    /// Starts a transaction: snapshots every table deep-cloned so that
+    /// a later `rollback_transaction` can restore the pre-BEGIN state.
+    /// Nested transactions are rejected — explicit savepoints are not
+    /// on this phase's roadmap. Errors on a read-only database.
+    pub fn begin_transaction(&mut self) -> Result<()> {
+        if self.in_transaction() {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN: a transaction is already open".to_string(),
+            ));
+        }
+        if self.is_read_only() {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN: database is opened read-only".to_string(),
+            ));
+        }
+        let snapshot = TxnSnapshot {
+            tables: self
+                .tables
+                .iter()
+                .map(|(k, v)| (k.clone(), v.deep_clone()))
+                .collect(),
+        };
+        self.txn = Some(snapshot);
+        Ok(())
+    }
+
+    /// Drops the transaction snapshot and returns it for the caller to
+    /// discard. The in-memory `tables` state is the new committed state;
+    /// the caller is responsible for flushing to disk via the pager.
+    /// Errors if no transaction is open.
+    pub fn commit_transaction(&mut self) -> Result<()> {
+        if self.txn.is_none() {
+            return Err(SQLRiteError::General(
+                "cannot COMMIT: no transaction is open".to_string(),
+            ));
+        }
+        self.txn = None;
+        Ok(())
+    }
+
+    /// Restores `tables` from the transaction snapshot and clears it.
+    /// Errors if no transaction is open.
+    pub fn rollback_transaction(&mut self) -> Result<()> {
+        let Some(snapshot) = self.txn.take() else {
+            return Err(SQLRiteError::General(
+                "cannot ROLLBACK: no transaction is open".to_string(),
+            ));
+        };
+        self.tables = snapshot.tables;
+        Ok(())
     }
 }
 
