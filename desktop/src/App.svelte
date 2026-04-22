@@ -168,13 +168,14 @@
       {#if tables.length === 0}
         <p class="muted">No tables yet.</p>
       {:else}
-        <ul>
+        <ul role="listbox" aria-label="Tables">
           {#each tables as t (t.name)}
             <li
               class:selected={selected?.name === t.name}
               onclick={() => onSelectTable(t)}
               onkeydown={(e) => e.key === "Enter" && onSelectTable(t)}
-              role="button"
+              role="option"
+              aria-selected={selected?.name === t.name}
               tabindex="0"
             >
               <span class="table-name">{t.name}</span>

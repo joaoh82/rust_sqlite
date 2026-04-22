@@ -53,7 +53,12 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         ))));
     }
 
-    let query = ast.pop().unwrap();
+    // Comment-only or whitespace-only input parses to an empty Vec<Statement>.
+    // Return a benign status rather than panicking on `pop().unwrap()`. Callers
+    // (REPL, Tauri app) treat this as a no-op with no disk write triggered.
+    let Some(query) = ast.pop() else {
+        return Ok("No statement to execute.".to_string());
+    };
 
     // Statements that mutate state — trigger auto-save on success. Read-only
     // SELECTs skip the save entirely to avoid pointless file writes.
@@ -466,6 +471,20 @@ mod tests {
         // Nothing in Phase 1 handles DROP.
         let result = process_command("DROP TABLE users;", &mut db);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_input_is_a_noop_not_a_panic() {
+        // Regression for: desktop app pre-fills the textarea with a
+        // comment-only placeholder, and hitting Run used to panic because
+        // sqlparser produced zero statements and pop().unwrap() exploded.
+        let mut db = Database::new("t".to_string());
+        for input in ["", "   ", "-- just a comment", "-- comment\n-- another"] {
+            let result = process_command(input, &mut db);
+            assert!(result.is_ok(), "input {input:?} should not error");
+            let msg = result.unwrap();
+            assert!(msg.contains("No statement"), "got: {msg:?}");
+        }
     }
 
     #[test]
