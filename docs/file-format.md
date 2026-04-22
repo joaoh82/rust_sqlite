@@ -282,7 +282,60 @@ These are not all enforced on open — we validate the header strictly and rely 
 - **v2** (Phases 3c / 3d) — cell-based storage and `sqlrite_master`. Phase 3d added interior pages without a version bump.
 - **v3** (Phase 3e, current) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
 
-The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL will introduce a sibling file (`.sqlrite-wal`) rather than changing the main file format.
+The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL introduces a sibling file (`.sqlrite-wal`) rather than changing the main file format.
+
+## Write-Ahead Log (Phase 4b — standalone module; wiring in 4c)
+
+A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page changes **before** they land in the main file. Readers consult the WAL first to get the latest view of a page; a periodic checkpointer (Phase 4d) applies the accumulated frames back into the main file and truncates the WAL.
+
+### WAL header (first 32 bytes)
+
+```
+┌────────┬────────┬─────────────────────────────────────────────────┐
+│ offset │ length │ content                                         │
+├────────┼────────┼─────────────────────────────────────────────────┤
+│     0  │    8   │ magic:  "SQLRWAL\0"                             │
+│     8  │    4   │ format version (u32 LE) = 1                     │
+│    12  │    4   │ page size      (u32 LE) = 4096                  │
+│    16  │    4   │ salt (u32 LE) — rolled each checkpoint          │
+│    20  │    4   │ checkpoint seq (u32 LE) — increments per ckpt   │
+│    24  │    8   │ reserved / zero                                 │
+└────────┴────────┴─────────────────────────────────────────────────┘
+```
+
+### Frames
+
+Each frame is `FRAME_HEADER_SIZE + PAGE_SIZE` = **4112 bytes**:
+
+```
+┌────────┬────────┬─────────────────────────────────────────────────┐
+│ offset │ length │ content                                         │
+├────────┼────────┼─────────────────────────────────────────────────┤
+│     0  │    4   │ page number (u32 LE)                            │
+│     4  │    4   │ commit-page-count (u32 LE)                      │
+│        │        │   0  = dirty frame (part of an open transaction)│
+│        │        │  >0  = commit frame; value = total page count   │
+│        │        │        in the main file after this transaction  │
+│     8  │    4   │ salt (u32 LE) — copied from WAL header          │
+│    12  │    4   │ checksum (u32 LE) — rolling sum over the first  │
+│        │        │   12 header bytes and the PAGE_SIZE body        │
+│    16  │ 4096   │ page body                                       │
+└────────┴────────┴─────────────────────────────────────────────────┘
+```
+
+### Torn-write recovery
+
+On open the reader walks every frame from `WAL_HEADER_SIZE`, validating salt and checksum. The first invalid or incomplete frame marks the end of the usable log — its bytes and anything after stay on disk but are treated as nonexistent. Callers get a clean in-memory index of `(page → latest-committed-frame-offset)` and a `last_commit_offset` boundary; uncommitted frames (no commit frame after them) are invisible to reads.
+
+This means a crash mid-write can leave a partial trailing frame, and the next open will still reconstruct a consistent view — as long as the last successful commit frame made it to disk (via `fsync`, which `append_frame` does only for commit frames).
+
+### Checksum
+
+Rolling sum, `rotate_left(1) + byte`, over the first 12 header bytes plus the body. Order-sensitive, catches bit flips and byte shuffles without needing a crypto-grade dep.
+
+### Salt
+
+Rolled per checkpoint (Phase 4d). Prevents stale frames from an earlier generation of the WAL from being interpreted as valid after a truncate — their salt won't match the header's.
 
 ## Process-level locking
 

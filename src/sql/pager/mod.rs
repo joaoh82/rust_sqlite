@@ -44,6 +44,8 @@ pub mod pager;
 pub mod table_page;
 #[allow(dead_code)]
 pub mod varint;
+#[allow(dead_code)]
+pub mod wal;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

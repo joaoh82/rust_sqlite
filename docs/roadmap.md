@@ -107,10 +107,13 @@ Build / run: `cd desktop && npm install && npm run tauri dev`. See [docs/desktop
 
 Every `Pager::open` / `Pager::create` takes a non-blocking OS exclusive advisory lock via `fs2::FileExt::try_lock_exclusive` — `flock(LOCK_EX \| LOCK_NB)` on Unix, `LockFileEx` on Windows. A second process attempting to open the same file gets a clean `database '…' is already opened by another process` error. The lock is tied to the `File` handle so it releases automatically when the `Pager` drops. No WAL yet — this is the single-writer-exclusive baseline that the rest of Phase 4 builds on.
 
-### Phase 4b — WAL file format *(next)*
+### ✅ Phase 4b — WAL file format
 
-- `.sqlrite-wal` sidecar with a hand-rolled frame format: each frame carries `(page_num u32, commit_flag u8, salt u32, page_size bytes)`
-- WAL header: magic + format version + page size + salt + checkpoint seq
+Standalone `src/sql/pager/wal.rs` module with a 32-byte WAL header (magic `"SQLRWAL\0"`, format version, page size, salt, checkpoint seq) and fixed-size frames of `FRAME_HEADER_SIZE + PAGE_SIZE = 4112` bytes: `(page_num u32, commit_page_count u32, salt u32, checksum u32, body PAGE_SIZE)`. A commit frame is one whose `commit_page_count > 0`; dirty frames carry `0` there.
+
+Checksum is a rolling `rotate_left(1) + byte` sum over the first 12 header bytes plus the body — order-sensitive, no external dep. On open the reader walks every frame from the start, validates checksum and salt, and builds a `(page_num → latest-committed-frame-offset)` map. Torn writes / partial trailing frames are silently truncated at the boundary; earlier valid frames survive.
+
+Eight standalone tests cover: empty-WAL round trip, single commit frame, multi-frame latest-wins, uncommitted-frame invisibility, truncate-and-reopen, bad magic rejection, corrupt-body end-of-log detection, partial-trailing-frame handling. Not wired into the Pager yet — 4c's job.
 
 ### Phase 4c — WAL-aware Pager
 
