@@ -106,8 +106,9 @@ sqlrite> DELETE FROM users WHERE age < 30;
 | Statement | Features |
 |---|---|
 | `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN` |
-| `INSERT INTO` | auto-ROWID for INTEGER PRIMARY KEY; UNIQUE enforcement; clean type errors (no panics) |
-| `SELECT` | `*` or column list, `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n` |
+| `CREATE [UNIQUE] INDEX` | single-column, named indexes; `IF NOT EXISTS` supported; persists as a dedicated cell-based B-Tree |
+| `INSERT INTO` | auto-ROWID for INTEGER PRIMARY KEY; UNIQUE enforcement via indexes; clean type errors (no panics) |
+| `SELECT` | `*` or column list, `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`. `WHERE col = literal` probes an index when one exists |
 | `UPDATE` | multi-column `SET`, `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
 
@@ -167,7 +168,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **3b — Pager abstraction**: long-lived `Pager` holding a byte snapshot of every page on disk plus a staging area for the next commit; `commit` diffs staged vs. snapshot and writes only pages whose bytes actually changed; file truncates when the page count shrinks
 - [x] **3c — Cell-based pages** *(format v2)*: rows stored as length-prefixed cells (tag-then-value encoding with null bitmap) in `TableLeaf` pages carrying a SQLite-style slot directory; oversized cells spill into an overflow page chain; the schema catalog itself is now a real table named `sqlrite_master` stored in the same cell format
 - [x] **3d — B-Tree**: `InteriorNode` pages above the existing leaves; save rebuilds the tree bottom-up from the in-memory sorted rows; open descends to the leftmost leaf and scans forward via the sibling `next_page` chain. Interior cells share the `cell_length | kind_tag | body` prefix with local/overflow cells so binary search over slot directories works uniformly. Cursor / lazy-load reads deferred to Phase 5.
-- [ ] 3e — Secondary indexes as separate B-Trees (indexed_value, rowid)
+- [x] **3e — Secondary indexes** *(format v3)*: UNIQUE/PRIMARY KEY columns get an auto-index named `sqlrite_autoindex_<table>_<col>` at CREATE TABLE time; `CREATE [UNIQUE] INDEX name ON table (col)` adds explicit single-column indexes. `sqlrite_master` gains a `type` column distinguishing `'table'` rows from `'index'` rows. Each index persists as its own cell-based B-Tree using `KIND_INDEX` cells `(rowid, value)`. Executor optimizer probes indexes for `WHERE col = literal` (and `literal = col`) instead of full-scanning.
 
 **Phase 2.5 — Tauri 2.0 desktop app** *(after Phase 3)*
 - [ ] Cross-platform GUI wrapping the engine

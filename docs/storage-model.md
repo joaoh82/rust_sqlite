@@ -189,6 +189,14 @@ Write path: **save rebuilds the tree bottom-up** from the in-memory sorted rows.
 
 Read path is still **eager-load**: `load_table_rows` walks every leaf and populates `Table`'s in-memory maps up front. A cursor abstraction that streams rows through the pager without materializing the whole table is deferred to Phase 5 (the library-API split), where the cost of the bigger refactor also buys us the public `Connection`/`Statement`/`Rows` API.
 
-## What Phase 3e will change
+## What Phase 3e changed
 
-Phase 3e adds secondary indexes — separate B-Trees keyed by `(indexed_value, rowid)` for every declared `UNIQUE` column, maintained alongside the primary table tree. Executor code gains an index-aware path for equality lookups (`WHERE col = ?` where `col` is unique).
+Phase 3e added secondary indexes. Every `UNIQUE` / `PRIMARY KEY` column auto-creates a `SecondaryIndex` at CREATE TABLE time (named `sqlrite_autoindex_<table>_<col>`); `CREATE [UNIQUE] INDEX name ON t (col)` adds explicit ones. `Column` is now a pure schema descriptor — the per-column BTreeMap moved to `Table::secondary_indexes`, where it's shared infrastructure between auto and explicit indexes.
+
+**On disk.** Every index persists as its own cell-based B-Tree using a new `KIND_INDEX` cell carrying `(value, original_rowid)`. `sqlrite_master` grew a `type` column distinguishing `'table'` rows from `'index'` rows (file format v3).
+
+**Executor.** The `WHERE col = literal` (and `literal = col`) shape now probes the matching index for an O(log N) lookup instead of scanning every row. Other predicate shapes still fall back to the full-scan path.
+
+## What Phase 3f / later phases will bring
+
+See [roadmap.md](roadmap.md) for the next phase (WAL and file locks in Phase 4, library + WASM in Phase 5). The cursor / lazy-load refactor is parked explicitly in Phase 5 — it touches the executor, every `Table` accessor, and needs cursor state threaded through, so it pairs naturally with the public `Connection` / `Statement` / `Rows` API.

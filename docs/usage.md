@@ -56,6 +56,18 @@ INSERT INTO <name> (col1, col2, ...) VALUES (v1, v2, ...);
 - Type-mismatched values return a typed error rather than panic
 - `UNIQUE` / `PRIMARY KEY` violations are rejected
 
+### `CREATE INDEX`
+
+```sql
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> (<column>);
+```
+
+- Single-column only — multi-column / composite indexes are future work
+- Integer and Text columns only (Real / Bool indexes aren't supported yet)
+- Anonymous indexes (no name) are rejected — give every index a name
+- `CREATE UNIQUE INDEX` fails if existing rows already carry duplicate values
+- Auto-created indexes: every `UNIQUE` and `PRIMARY KEY` column gets one at `CREATE TABLE` time, named `sqlrite_autoindex_<table>_<col>`
+
 ### `SELECT`
 
 ```sql
@@ -69,6 +81,7 @@ SELECT {*|col1, col2, ...} FROM <name>
 - Projection is `*` or a bare column list; expressions in the projection list aren't supported
 - `ORDER BY` takes exactly one column
 - `LIMIT` takes a non-negative integer literal; no `OFFSET` yet
+- **Optimizer**: `WHERE col = literal` (or `literal = col`) on an indexed column probes the index instead of scanning the whole table. AND / OR / range predicates still fall back to full scan.
 
 ### `UPDATE`
 

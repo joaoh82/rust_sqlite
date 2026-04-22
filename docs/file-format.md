@@ -4,7 +4,7 @@ A SQLRite database is a single file, by convention named `*.sqlrite`. The file i
 
 All multi-byte integers in this format are **little-endian**.
 
-The current on-disk format is **version 2** (Phase 3c). Files produced by earlier versions are rejected on open.
+The current on-disk format is **version 3** (Phase 3e). Files produced by earlier versions are rejected on open.
 
 ## Page 0 — the database header
 
@@ -15,7 +15,7 @@ The first 4096 bytes of every file are the header page. Only the first 28 bytes 
 │ offset │ length │ content                                         │
 ├────────┼────────┼─────────────────────────────────────────────────┤
 │     0  │   16   │ magic:  "SQLRiteFormat\0\0\0"                   │
-│    16  │    2   │ format version (u16 LE) = 2                     │
+│    16  │    2   │ format version (u16 LE) = 3                     │
 │    18  │    2   │ page size      (u16 LE) = 4096                  │
 │    20  │    4   │ total page count (u32 LE), includes page 0      │
 │    24  │    4   │ root page of sqlrite_master (u32 LE)            │
@@ -129,6 +129,7 @@ cell_length    varint          excludes itself; total bytes of kind_tag + body
 kind_tag       u8              0x01 = Local    (full row on a leaf)
                                0x02 = Overflow (pointer to spilled body)
                                0x03 = Interior (divider on an interior node)
+                               0x04 = Index    (one entry in an index leaf)
 body           variable        depends on kind_tag
 ```
 
@@ -189,12 +190,25 @@ child_page      u32 LE            page holding the subtree for rowids up to divi
 
 A rowid larger than every divider in the page routes to `rightmost_child` (from the payload header).
 
+### Index cell body
+
+Used only on the leaves of a secondary-index B-Tree. Each cell represents one `(indexed_value, rowid)` entry. The cell's rowid (the one `Cell::peek_rowid` sees, right after the kind tag) is the *base table* row's rowid — the value the index points at. The indexed value comes after, using the same tag-plus-body encoding as a `LocalCell` value block.
+
+```
+rowid           zigzag varint     base table row that carries this value
+value_tag       u8                0x00 Integer / 0x01 Real / 0x02 Text / 0x03 Bool
+value_body      variable          encoded per the Local cell's value-block rules
+```
+
+NULL values are never indexed — `SecondaryIndex::insert` skips them — so there's no null bitmap here; a non-null value is always present.
+
 ## The schema catalog: `sqlrite_master`
 
 The schema catalog is itself a table named `sqlrite_master`, stored in the same `TableLeaf` format as any user table. Its schema is hardcoded into the engine so the open path can bootstrap:
 
 ```sql
 CREATE TABLE sqlrite_master (
+  type        TEXT NOT NULL,
   name        TEXT PRIMARY KEY,
   sql         TEXT NOT NULL,
   rootpage    INTEGER NOT NULL,
@@ -202,12 +216,15 @@ CREATE TABLE sqlrite_master (
 );
 ```
 
-Each user table gets one row in `sqlrite_master`:
+There's one row per user table **and** one row per secondary index:
 
-- **name** — the table name
-- **sql** — the CREATE TABLE statement, synthesized on save from the in-memory column metadata, re-parsed on open via `sqlparser` to reconstruct the columns
-- **rootpage** — first `TableLeaf` page of the user table's row chain
-- **last_rowid** — the last rowid assigned to the user table (so auto-increment can pick up where it left off)
+- **type** — either `'table'` or `'index'`
+- **name** — the table or index name
+- **sql** — the `CREATE TABLE` / `CREATE INDEX` statement, synthesized on save from in-memory metadata and re-parsed on open via `sqlparser` to reconstruct the schema
+- **rootpage** — for a `'table'` row, the root of the table's B-Tree; for an `'index'` row, the root of the index's B-Tree
+- **last_rowid** — the last rowid assigned to the table (so auto-increment picks up where it left off); `0` for `'index'` rows (meaningless there)
+
+Save order is fixed for deterministic page numbers: every user table first (alphabetical), then every index (sorted by `(table, index_name)`), then `sqlrite_master` itself. Each `SecondaryIndex` produces its own `TableLeaf` chain whose cells are `KIND_INDEX` entries.
 
 The header's `schema_root_page` field points at the first `TableLeaf` of `sqlrite_master`.
 
@@ -261,6 +278,8 @@ These are not all enforced on open — we validate the header strictly and rely 
 
 ## Format evolution
 
-Version 2 is the current on-disk format. Phase 3c introduced cell-based rows and `sqlrite_master`; Phase 3d added `InteriorNode` pages on top of the existing leaves without bumping the version — files with single-leaf tables (root page is a `TableLeaf`) are identical to pre-3d v2 and still open.
+- **v1** (Phases 2 / 3a / 3b) — schema catalog and table data were opaque `bincode` blobs chained across typed payload pages.
+- **v2** (Phases 3c / 3d) — cell-based storage and `sqlrite_master`. Phase 3d added interior pages without a version bump.
+- **v3** (Phase 3e, current) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL will introduce a sibling file (`.sqlrite-wal`) rather than changing the main file format.
