@@ -181,8 +181,14 @@ Full table scan, every time. Index-backed lookups are Phase 3+.
 
 **Didn't change (in-memory).** The `Database` / `Table` / `Column` / `Row` / `Index` structures described in the sections above are still the runtime representation. On `save_database`, `Table::extract_row` turns each in-memory row into a `Cell`; on `open_database`, each `Cell` is decoded and its values are handed to `Table::restore_row`, which populates the per-column `BTreeMap`s and rebuilds the indexes.
 
-## What Phase 3d will change
+## What Phase 3d changed
 
-Phase 3d will replace today's linear "chain of `TableLeaf` pages" with a real B-Tree — leaves still hold cells, but interior pages route by rowid. That enables O(log N) point lookups instead of linear scans.
+Phase 3d put a real B-Tree on top of the leaf layer. The on-disk file now has `InteriorNode` pages above `TableLeaf` pages; `find_leftmost_leaf` during open descends the tree, then the existing sibling-chain walk delivers cells in rowid order. Interior cells use the same `cell_length | kind_tag | body` prefix as local/overflow cells, so binary search for a rowid works uniformly across all page kinds.
 
-Phase 3d (B-Tree) will also be where lazy loading enters the picture: instead of `open_database` walking every leaf and building the full in-memory `Row` BTreeMaps up front, the engine will fetch cells on demand. Most executor code stays the same — it already goes through `Table::rowids` and `Table::get_value` / `set_value`, which can be reimplemented to hit the pager directly.
+Write path: **save rebuilds the tree bottom-up** from the in-memory sorted rows. No in-place splits or merges — the whole tree is emitted fresh on every commit. That's the educational and engineering trade-off to stay compatible with the "Table lives in memory, save flushes a full snapshot" model. Deterministic build (tables sorted by name, rows by rowid) keeps the Pager's diff commit effective: unchanged tables produce byte-identical pages and aren't rewritten.
+
+Read path is still **eager-load**: `load_table_rows` walks every leaf and populates `Table`'s in-memory maps up front. A cursor abstraction that streams rows through the pager without materializing the whole table is deferred to Phase 5 (the library-API split), where the cost of the bigger refactor also buys us the public `Connection`/`Statement`/`Rows` API.
+
+## What Phase 3e will change
+
+Phase 3e adds secondary indexes — separate B-Trees keyed by `(indexed_value, rowid)` for every declared `UNIQUE` column, maintained alongside the primary table tree. Executor code gains an index-aware path for equality lookups (`WHERE col = ?` where `col` is unique).

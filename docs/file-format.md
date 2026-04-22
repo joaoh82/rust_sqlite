@@ -50,16 +50,22 @@ Every non-header page starts with a 7-byte header:
 
 | Tag | Variant | Meaning |
 |---|---|---|
-| `2` | `TableLeaf` | Holds a slot directory and a set of cells representing rows of a table. |
+| `2` | `TableLeaf` | Holds a slot directory and a set of cells representing rows of a table. Leaves for one table are linked by sibling `next_page` pointers. |
 | `3` | `Overflow` | Continuation page carrying the spilled body of a single oversized cell. |
+| `4` | `InteriorNode` | Interior B-Tree node. Holds a slot directory of divider cells routing to child pages plus a rightmost-child pointer in the payload header. |
 
 Tag `1` is reserved (it was `SchemaRoot` in format v1; unused in v2). Any other tag on open is a corruption error.
 
-For `TableLeaf` pages the `payload length` field in the per-page header is unused (set to 0) — the slot directory inside the payload self-describes. For `Overflow` pages it records how many payload bytes the page carries toward the chain.
+For `TableLeaf` and `InteriorNode` pages the `payload length` field in the per-page header is unused (set to 0) — the slot directory inside the payload self-describes. For `Overflow` pages it records how many payload bytes the page carries toward the chain.
 
 ### Chaining
 
-`TableLeaf` pages within a single table are linked via the per-page `next_page` field, forming a linear chain terminated by `next_page = 0`. An `Overflow`-tagged page is the start or continuation of a single oversized cell's spilled body.
+Each table is stored as a B-Tree:
+
+- **Leaves** (`TableLeaf` pages) are also linked pairwise via each page's `next_page` field, forming a **sibling chain** in ascending rowid order terminated by `next_page = 0`. This lets sequential scans skip the tree and walk leaves directly.
+- **Interior pages** (`InteriorNode`) sit above leaves, routing `find_by_rowid` queries down the tree. They don't use `next_page` (set to 0).
+
+An `Overflow`-tagged page is the start or continuation of a single oversized cell's spilled body. Overflow chains are independent of the tree — an `OverflowRef` on a leaf cell points at the chain's first page.
 
 ## TableLeaf payload layout
 
@@ -88,15 +94,45 @@ Inside the 4089-byte payload area of a `TableLeaf` page:
 
 Slots grow up from offset 4; cells grow down from offset 4089. Free space is whatever's between them.
 
+## InteriorNode payload layout
+
+An interior page adds a rightmost-child pointer between the `cells_top` field and the slot directory. Layout (4089 bytes):
+
+```
+┌────────┬────────┬─────────────────────────────────────────────────┐
+│ offset │ length │ content                                         │
+├────────┼────────┼─────────────────────────────────────────────────┤
+│     0  │    2   │ slot_count       (u16 LE)                       │
+│     2  │    2   │ cells_top        (u16 LE)                       │
+│     4  │    4   │ rightmost_child  (u32 LE)  child page number    │
+│        │        │                      for rowids larger than any │
+│        │        │                      divider on this page       │
+│     8  │ 2*n    │ slot[0]..slot[n-1]  each u16 LE, pointing at    │
+│        │        │                     a divider cell. Slots are   │
+│        │        │                     kept in divider_rowid-      │
+│        │        │                     ascending order.            │
+│   ...  │  ...   │ [free space]                                    │
+│ cells_ │ 4089 - │ divider cell bodies.                            │
+│  top   │ cells_ │                                                 │
+│        │ top    │                                                 │
+└────────┴────────┴─────────────────────────────────────────────────┘
+```
+
+An interior with N dividers points at N+1 children: `slot[i].child_page` owns rowids ≤ `slot[i].divider_rowid`, and `rightmost_child` owns everything past the last divider.
+
 ## Cell format
 
-A cell is one row. Two kinds exist, distinguished by a `kind_tag` byte right after the length prefix:
+A cell is length-prefixed; its body starts with a `kind_tag` byte:
 
 ```
 cell_length    varint          excludes itself; total bytes of kind_tag + body
-kind_tag       u8              0x01 = Local, 0x02 = Overflow
+kind_tag       u8              0x01 = Local    (full row on a leaf)
+                               0x02 = Overflow (pointer to spilled body)
+                               0x03 = Interior (divider on an interior node)
 body           variable        depends on kind_tag
 ```
+
+The shared prefix means `Cell::peek_rowid` works uniformly across all three kinds — useful for binary search over a page's slot directory without decoding full bodies.
 
 ### Local cell body
 
@@ -142,6 +178,17 @@ Reading an overflow cell:
 4. Concatenate — the result must equal `total_body_len` bytes, or the file is corrupt.
 5. Feed those bytes to `Cell::decode` (they are a complete, properly length-prefixed local cell).
 
+### Interior cell body
+
+Used only on `InteriorNode` pages. Each divider owns all rowids ≤ `divider_rowid`, which route to `child_page`:
+
+```
+divider_rowid   zigzag varint
+child_page      u32 LE            page holding the subtree for rowids up to divider_rowid
+```
+
+A rowid larger than every divider in the page routes to `rightmost_child` (from the payload header).
+
 ## The schema catalog: `sqlrite_master`
 
 The schema catalog is itself a table named `sqlrite_master`, stored in the same `TableLeaf` format as any user table. Its schema is hardcoded into the engine so the open path can bootstrap:
@@ -168,7 +215,7 @@ The header's `schema_root_page` field points at the first `TableLeaf` of `sqlrit
 
 ## Layout example
 
-A small database with two user tables — `users` (small) and `notes` (small):
+A small database with two user tables — `users` (small) and `notes` (small), each fitting in one leaf:
 
 ```
 page 0   header                                     ← page_count=4, schema_root=3
@@ -179,20 +226,24 @@ page 3   TableLeaf  sqlrite_master   next=0         ← 2 rows, one per table ab
 
 Table names are sorted alphabetically before writing (see [Design decisions §7](design-decisions.md#7-deterministic-page-number-ordering-when-saving)), so `notes` lands before `users`. `sqlrite_master` always comes last so user tables get stable page numbers across saves.
 
-If a table's rows exceed one leaf, the leaves chain:
+When a table outgrows one leaf, its leaves chain via sibling `next_page`, and an `InteriorNode` page at the top routes lookups down:
 
 ```
-page 0   header                                     ← page_count=8, schema_root=7
-page 1   TableLeaf  "big"  next=2                   ← first batch of cells
-page 2   TableLeaf  "big"  next=3                   ← more cells
-page 3   TableLeaf  "big"  next=0
-page 4   TableLeaf  "small"  next=0
-page 5   Overflow  next=6                           ← spilled cell body
-page 6   Overflow  next=0
-page 7   TableLeaf  sqlrite_master  next=0
+page 0   header                                     ← page_count=7, schema_root=6
+page 1   TableLeaf  "big"     next=2                ← rows 1..N1 (ascending rowid)
+page 2   TableLeaf  "big"     next=3                ← rows N1+1..N2
+page 3   TableLeaf  "big"     next=0                ← rows N2+1..N3   (end of chain)
+page 4   InteriorNode "big"   next=0                ← root of the "big" tree
+                                                      rightmost_child = page 3
+                                                      dividers: (rowid=N1 → 1),
+                                                                (rowid=N2 → 2)
+page 5   TableLeaf  sqlrite_master  next=0
+page 6   ... (unused in this example; see below)
 ```
 
-(Overflow pages can appear anywhere in the file; the page-number ordering above is conceptual.)
+A single-leaf table keeps its root pointing directly at the leaf — no interior layer is created. Taller trees (say, hundreds of leaves) grow an extra interior level: the root becomes an `InteriorNode` whose children are themselves `InteriorNode`s, each routing to a handful of leaves.
+
+Overflow pages live independently of the tree; an `OverflowRef` cell on a leaf carries the first overflow page number. They can appear anywhere in the file.
 
 ## Invariants
 
@@ -210,6 +261,6 @@ These are not all enforced on open — we validate the header strictly and rely 
 
 ## Format evolution
 
-Version 2 is the current on-disk format. It introduces cell-based rows and `sqlrite_master`.
+Version 2 is the current on-disk format. Phase 3c introduced cell-based rows and `sqlrite_master`; Phase 3d added `InteriorNode` pages on top of the existing leaves without bumping the version — files with single-leaf tables (root page is a `TableLeaf`) are identical to pre-3d v2 and still open.
 
-The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 3d (on-disk B-Tree) will add an `InteriorNode` page type (tag `4`) that sits *above* `TableLeaf` pages in a tree; leaf content stays in the current cell format. Format version bumps again when that lands.
+The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL will introduce a sibling file (`.sqlrite-wal`) rather than changing the main file format.

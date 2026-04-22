@@ -76,9 +76,11 @@ Rows are now serialized as length-prefixed, kind-tagged cells and packed into `T
 - **3c.4** — wire cell storage into `save_database` / `open_database`
 - **3c.5** — promote schema catalog to `sqlrite_master`, bump format version to 2
 
-### Phase 3d — Page-based B-Tree *(next)*
+### ✅ Phase 3d — Page-based B-Tree *(done)*
 
-Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; interior pages (new `PageType::InteriorNode`) hold child-page pointers and divider keys. Split on full page, merge on underflow. Enables O(log N) point lookups by rowid instead of the current linear leaf-chain scan.
+*Commit `be642e3`.*
+
+Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; interior pages (new `PageType::InteriorNode`, tag 4) hold child-page pointers and divider keys using the same `cell_length | kind_tag | body` prefix as local/overflow cells. Save rebuilds the tree bottom-up on every commit; open descends to the leftmost leaf and scans forward via the existing sibling `next_page` chain. No in-place splits or merges (vacuum is future work). Read path is still eager-load; the cursor / lazy-load refactor is deferred to Phase 5 alongside the library-API split.
 
 ### Phase 3e — Secondary indexes
 
@@ -105,6 +107,7 @@ A cross-platform GUI wrapping the engine. Originally slated before Phase 3, defe
 
 - Split into `lib` + `bin` crates
 - Public `Connection` / `Statement` / `Rows` API
+- **Cursor abstraction** (deferred from Phase 3d): stream rows through the B-Tree via the pager on demand instead of eagerly loading every row into the in-memory `Table`. Touches `Table::rowids`, `Table::get_value`, and the executor's row iteration. Naturally pairs with the public `Statement::query_iter` API
 - C FFI shim (`libsqlrite.so` / `libsqlrite.dylib`)
 - WASM build via `wasm-pack` so the engine runs in a browser
 

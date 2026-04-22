@@ -166,7 +166,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **3a — Auto-save**: every committing SQL statement (`CREATE` / `INSERT` / `UPDATE` / `DELETE`) against a file-backed DB auto-flushes; `.save` is now a rare manual flush
 - [x] **3b — Pager abstraction**: long-lived `Pager` holding a byte snapshot of every page on disk plus a staging area for the next commit; `commit` diffs staged vs. snapshot and writes only pages whose bytes actually changed; file truncates when the page count shrinks
 - [x] **3c — Cell-based pages** *(format v2)*: rows stored as length-prefixed cells (tag-then-value encoding with null bitmap) in `TableLeaf` pages carrying a SQLite-style slot directory; oversized cells spill into an overflow page chain; the schema catalog itself is now a real table named `sqlrite_master` stored in the same cell format
-- [ ] 3d — Page-based B-Tree per table keyed by ROWID, with split/merge and leaf/interior nodes
+- [x] **3d — B-Tree**: `InteriorNode` pages above the existing leaves; save rebuilds the tree bottom-up from the in-memory sorted rows; open descends to the leftmost leaf and scans forward via the sibling `next_page` chain. Interior cells share the `cell_length | kind_tag | body` prefix with local/overflow cells so binary search over slot directories works uniformly. Cursor / lazy-load reads deferred to Phase 5.
 - [ ] 3e — Secondary indexes as separate B-Trees (indexed_value, rowid)
 
 **Phase 2.5 — Tauri 2.0 desktop app** *(after Phase 3)*
