@@ -58,14 +58,12 @@ impl Pager {
         })
     }
 
-    /// Creates a fresh database file with an empty schema catalog and no
-    /// tables. The file has page 0 (header) + page 1 (empty schema-root).
+    /// Creates a fresh database file. Page 0 is the header; page 1 is an
+    /// empty `TableLeaf` that serves as the initial `sqlrite_master` root
+    /// (zero rows, no user tables yet).
     pub fn create(path: &Path) -> Result<Self> {
-        use bincode::config::standard;
-        use bincode::serde::encode_to_vec;
-
-        use crate::error::SQLRiteError;
         use crate::sql::pager::page::{PAGE_HEADER_SIZE, PageType};
+        use crate::sql::pager::table_page::TablePage;
 
         let file = OpenOptions::new()
             .read(true)
@@ -75,19 +73,12 @@ impl Pager {
             .open(path)?;
         let mut storage = FileStorage::new(file);
 
-        // Encode an empty schema catalog (Vec<(String, u32)>) and stash it on page 1.
-        let catalog: Vec<(String, u32)> = Vec::new();
-        let catalog_bytes = encode_to_vec(&catalog, standard()).map_err(|e| {
-            SQLRiteError::Internal(format!("bincode encode empty schema catalog: {e}"))
-        })?;
-
+        let empty_master = TablePage::empty();
         let mut page1 = Box::new([0u8; PAGE_SIZE]);
-        page1[0] = PageType::SchemaRoot as u8;
-        // next = 0 (no overflow)
+        page1[0] = PageType::TableLeaf as u8;
         page1[1..5].copy_from_slice(&0u32.to_le_bytes());
-        page1[5..7].copy_from_slice(&(catalog_bytes.len() as u16).to_le_bytes());
-        page1[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + catalog_bytes.len()]
-            .copy_from_slice(&catalog_bytes);
+        page1[5..7].copy_from_slice(&0u16.to_le_bytes());
+        page1[PAGE_HEADER_SIZE..].copy_from_slice(empty_master.as_bytes());
 
         let header = DbHeader {
             page_count: 2,

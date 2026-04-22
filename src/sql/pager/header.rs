@@ -11,7 +11,14 @@ use crate::sql::pager::page::PAGE_SIZE;
 pub const MAGIC: &[u8; 16] = b"SQLRiteFormat\0\0\0";
 
 /// On-disk format revision. Bump when the page layout changes incompatibly.
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// History:
+/// - Version 1 (Phases 2 / 3a / 3b): schema catalog and table data were
+///   opaque bincode blobs chained across typed payload pages.
+/// - Version 2 (Phases 3c.4 / 3c.5): tables are stored as chains of
+///   `TableLeaf` pages full of typed cells; the schema catalog is itself
+///   a table called `sqlrite_master`.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Parsed header. `page_count` includes page 0 itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -24,26 +24,27 @@ pub const PAGE_HEADER_SIZE: usize = 7;
 pub const PAYLOAD_PER_PAGE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 
 /// Identifies what kind of content a page holds.
+///
+/// Phase 3c retired the `SchemaRoot` tag (tag value `1`) because the
+/// schema catalog is now stored as a regular table (`sqlrite_master`)
+/// with leaf pages. Tag `1` remains reserved so future variants don't
+/// alias it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
-    /// Head page of the schema catalog chain.
-    SchemaRoot = 1,
     /// Leaf page of a table — holds a slot directory and cells.
-    /// (Pre-Phase-3c this tag meant "first page of a table's bincode
-    /// blob"; the tag value is unchanged but the payload semantics changed
-    /// with the cell layout.)
     TableLeaf = 2,
-    /// Continuation page: either a schema-catalog overflow from the
-    /// SchemaRoot chain, or the body of an oversized cell spilled out of
-    /// a table leaf.
+    /// Continuation page carrying the spilled body of an oversized cell.
     Overflow = 3,
 }
 
 impl PageType {
+    // Used by integrity-check paths and by the B-Tree interior-page logic
+    // that Phase 3d will add. Direct `page_buf[0] == TableLeaf as u8`
+    // compares are how current call sites check page types.
+    #[allow(dead_code)]
     pub fn from_u8(v: u8) -> Result<PageType> {
         match v {
-            1 => Ok(PageType::SchemaRoot),
             2 => Ok(PageType::TableLeaf),
             3 => Ok(PageType::Overflow),
             other => Err(SQLRiteError::Internal(format!(

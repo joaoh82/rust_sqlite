@@ -72,6 +72,12 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
             match create_query {
                 Ok(payload) => {
                     let table_name = payload.table_name.clone();
+                    if table_name == pager::MASTER_TABLE_NAME {
+                        return Err(SQLRiteError::General(format!(
+                            "'{}' is a reserved name used by the internal schema catalog",
+                            pager::MASTER_TABLE_NAME
+                        )));
+                    }
                     // Checking if table already exists, after parsing CREATE TABLE query
                     match db.contains_table(table_name.to_string()) {
                         true => {

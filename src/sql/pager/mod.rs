@@ -5,30 +5,30 @@
 //! a small per-page header (type tag + next-page pointer + payload length)
 //! followed by a payload of up to 4089 bytes.
 //!
-//! **Storage strategy (Phase 3c.4).**
+//! **Storage strategy (format version 2, Phase 3c.5).**
 //!
-//! - Each `Table`'s rows are stored as **cells** in a chain of `TableLeaf`
-//!   pages. Cell layout and slot directory are in `cell.rs` and
-//!   `table_page.rs`; cells that exceed the inline threshold spill into an
-//!   overflow chain via `overflow.rs`.
-//! - A `Table`'s schema (column metadata, primary key, last rowid) is still
-//!   serialized with `bincode` and stored alongside the per-table root page
-//!   in the schema catalog. Phase 3c.5 will promote the catalog itself to a
-//!   cell-stored internal table (`sqlrite_master`).
-//! - The schema catalog lives on its own page chain. Page 0's
-//!   `schema_root_page` field points to the first page.
+//! - Each `Table`'s rows live as **cells** in a chain of `TableLeaf` pages.
+//!   Cell layout and slot directory are in `cell.rs` / `table_page.rs`;
+//!   cells that exceed the inline threshold spill into an overflow chain
+//!   via `overflow.rs`.
+//! - The schema catalog is itself a regular table named `sqlrite_master`,
+//!   with one row per user table:
+//!       `(name TEXT PRIMARY KEY, sql TEXT NOT NULL,
+//!         rootpage INTEGER NOT NULL, last_rowid INTEGER NOT NULL)`
+//!   This is the SQLite-style approach: the schema of `sqlrite_master`
+//!   itself is hardcoded into the engine so the open path can bootstrap.
+//! - Page 0's `schema_root_page` field points at the first leaf of
+//!   `sqlrite_master`.
 //!
-//! **Pager.** Reads and writes go through [`Pager`], which keeps a long-lived
-//! in-memory snapshot of every page currently on disk plus a staging area
-//! for the next commit. On commit only pages whose bytes actually changed
-//! are written.
+//! **Format version.** Version 2 is not compatible with files produced by
+//! earlier commits. Opening a v1 file returns a clean error — users on
+//! old files have to regenerate them from CREATE/INSERT, as there's no
+//! production data to migrate yet.
 
 // Data-layer modules. Not every helper in these modules is used by save/open
-// yet — some exist for tests, some for the B-Tree layer in Phase 3d (which
-// will drive inserts and deletes against TablePages one at a time rather
-// than rebuilding them from scratch on each save). Module-level
-// #[allow(dead_code)] keeps the build quiet without dotting the modules
-// with per-item attributes.
+// yet — some exist for tests, some for the B-Tree layer in Phase 3d.
+// Module-level #[allow(dead_code)] keeps the build quiet without dotting
+// the modules with per-item attributes.
 #[allow(dead_code)]
 pub mod cell;
 pub mod file;
@@ -41,15 +41,18 @@ pub mod table_page;
 #[allow(dead_code)]
 pub mod varint;
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::rc::Rc;
 
-use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
-use serde::{Deserialize, Serialize};
+use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
-use crate::sql::db::table::{Column, Table, Value};
+use crate::sql::db::table::{Column, DataType, Row, Table, Value};
+use crate::sql::parser::create::CreateQuery;
 use crate::sql::pager::cell::Cell;
 use crate::sql::pager::header::DbHeader;
 use crate::sql::pager::overflow::{
@@ -59,52 +62,44 @@ use crate::sql::pager::page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAYLOAD_PER_PAGE, Pag
 use crate::sql::pager::pager::Pager;
 use crate::sql::pager::table_page::TablePage;
 
-/// Snapshot of a table's schema that round-trips through `bincode`. The
-/// schema catalog persists one of these per table, alongside the page
-/// number where the table's rows begin. This dodges needing to re-parse
-/// CREATE TABLE SQL on open (that's the 3c.5 approach for `sqlrite_master`).
-#[derive(Debug, Serialize, Deserialize)]
-struct TableSchema {
-    tb_name: String,
-    columns: Vec<Column>,
-    primary_key: String,
-    last_rowid: i64,
-}
+/// Name of the internal catalog table. Reserved — user CREATEs of this
+/// name must be rejected upstream.
+pub const MASTER_TABLE_NAME: &str = "sqlrite_master";
 
-/// One entry of the schema catalog.
-#[derive(Debug, Serialize, Deserialize)]
-struct CatalogEntry {
-    name: String,
-    schema: TableSchema,
-    /// First `TableLeaf` page of the table's row data. `0` means the table
-    /// has no row pages (an empty table we never allocated a leaf for —
-    /// but in practice we always allocate at least one empty leaf so the
-    /// load path doesn't have to special-case zero).
-    root_page: u32,
-}
-
-/// Reads a database file at `path` and reconstructs the in-memory `Database`,
-/// leaving the long-lived `Pager` attached to it so subsequent writes can
-/// auto-commit via `save_database`.
-///
-/// `db_name` is the logical database name; by convention the caller passes
-/// the file's stem.
+/// Opens a database file and reconstructs the in-memory `Database`,
+/// leaving the long-lived `Pager` attached for subsequent auto-save.
 pub fn open_database(path: &Path, db_name: String) -> Result<Database> {
     let pager = Pager::open(path)?;
 
-    let catalog_bytes = read_page_chain(&pager, pager.header().schema_root_page)?;
-    let (catalog_entries, _): (Vec<CatalogEntry>, _) =
-        decode_from_slice(&catalog_bytes, standard()).map_err(|e| {
-            SQLRiteError::Internal(format!("bincode decode schema catalog: {e}"))
-        })?;
+    // 1. Load sqlrite_master from the leaf chain at header.schema_root_page.
+    let mut master = build_empty_master_table();
+    load_table_rows(&pager, &mut master, pager.header().schema_root_page)?;
 
+    // 2. Each master row describes a user table. Re-parse its `sql` to
+    //    reconstruct the column list, then walk its rootpage chain.
     let mut db = Database::new(db_name);
-    for entry in catalog_entries {
-        let mut table = build_empty_table(entry.schema);
-        if entry.root_page != 0 {
-            load_table_rows(&pager, &mut table, entry.root_page)?;
+    for rowid in master.rowids() {
+        let name = take_text(&master, "name", rowid)?;
+        let sql = take_text(&master, "sql", rowid)?;
+        let rootpage = take_integer(&master, "rootpage", rowid)? as u32;
+        let last_rowid = take_integer(&master, "last_rowid", rowid)?;
+
+        let (parsed_name, columns) = parse_create_sql(&sql)?;
+        if parsed_name != name {
+            return Err(SQLRiteError::Internal(format!(
+                "sqlrite_master row '{name}' carries SQL for '{parsed_name}' — corrupt catalog?"
+            )));
         }
-        db.tables.insert(entry.name, table);
+        let mut table = build_empty_table(&name, columns, last_rowid);
+        if rootpage != 0 {
+            load_table_rows(&pager, &mut table, rootpage)?;
+        }
+        // restore_row may have advanced last_rowid past the stored value if
+        // the rows we loaded contain larger rowids; clamp back up either way.
+        if last_rowid > table.last_rowid {
+            table.last_rowid = last_rowid;
+        }
+        db.tables.insert(name, table);
     }
 
     db.source_path = Some(path.to_path_buf());
@@ -112,10 +107,8 @@ pub fn open_database(path: &Path, db_name: String) -> Result<Database> {
     Ok(db)
 }
 
-/// Persists `db` to disk. If `db.pager` is `Some` and was opened from `path`,
-/// reuse the long-lived pager so only pages with changed bytes are written.
-/// Otherwise open (or create) a fresh pager — used by `.save FILE` when the
-/// target is different from the currently-open file, and by tests.
+/// Persists `db` to disk. Same diff-commit behavior as before: only pages
+/// whose bytes actually changed get written.
 pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     let same_path = db.source_path.as_deref() == Some(path);
     let mut pager = if same_path {
@@ -134,42 +127,54 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
 
     // Page 0 is the header; payload pages start at 1.
     let mut next_free_page: u32 = 1;
-    let mut catalog_entries: Vec<CatalogEntry> = Vec::with_capacity(db.tables.len());
 
-    // Iterate tables in a deterministic order so the on-disk page numbers are
-    // stable across saves — required for diffing commits to skip unchanged pages.
+    // 1. Stage each user table's leaf chain, collecting (name, sql, root, last_rowid).
+    let mut master_rows: Vec<(String, String, u32, i64)> =
+        Vec::with_capacity(db.tables.len());
     let mut table_names: Vec<&String> = db.tables.keys().collect();
     table_names.sort();
     for name in table_names {
+        if name == MASTER_TABLE_NAME {
+            // Shouldn't happen (CREATE TABLE rejects the name), but guard
+            // against a programmer-reached state.
+            return Err(SQLRiteError::Internal(format!(
+                "user table cannot be named '{MASTER_TABLE_NAME}' (reserved)"
+            )));
+        }
         let table = &db.tables[name];
-        let root_page = next_free_page;
-        next_free_page = stage_table_rows(&mut pager, table, root_page)?;
-        catalog_entries.push(CatalogEntry {
-            name: name.clone(),
-            schema: TableSchema {
-                tb_name: table.tb_name.clone(),
-                columns: table.columns.iter().map(strip_runtime_index).collect(),
-                primary_key: table.primary_key.clone(),
-                last_rowid: table.last_rowid,
-            },
-            root_page,
-        });
+        let rootpage = next_free_page;
+        next_free_page = stage_table_rows(&mut pager, table, rootpage)?;
+        master_rows.push((
+            name.clone(),
+            table_to_create_sql(table),
+            rootpage,
+            table.last_rowid,
+        ));
     }
 
-    let catalog_bytes = encode_to_vec(&catalog_entries, standard()).map_err(|e| {
-        SQLRiteError::Internal(format!("bincode encode schema catalog: {e}"))
-    })?;
-    let schema_root_page = next_free_page;
-    next_free_page = stage_page_chain(
-        &mut pager,
-        &catalog_bytes,
-        PageType::SchemaRoot,
-        schema_root_page,
-    )?;
+    // 2. Build an in-memory sqlrite_master with one row per user table,
+    //    then stage it via the same code path.
+    let mut master = build_empty_master_table();
+    for (i, (name, sql, rootpage, last_rowid)) in master_rows.into_iter().enumerate() {
+        // Rowid is 1-based and sequential — deterministic so diffing
+        // commits stay byte-stable when nothing changes.
+        let rowid = (i as i64) + 1;
+        master.restore_row(
+            rowid,
+            vec![
+                Some(Value::Text(name)),
+                Some(Value::Text(sql)),
+                Some(Value::Integer(rootpage as i64)),
+                Some(Value::Integer(last_rowid)),
+            ],
+        )?;
+    }
+    let master_root = next_free_page;
+    next_free_page = stage_table_rows(&mut pager, &master, master_root)?;
 
     pager.commit(DbHeader {
         page_count: next_free_page,
-        schema_root_page,
+        schema_root_page: master_root,
     })?;
 
     if same_path {
@@ -178,52 +183,96 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Emits a freshly-rebuilt `Column` that doesn't carry a populated index —
-/// the index is a runtime structure, rebuilt by `restore_row` as cells are
-/// read back. Saving the runtime index doubles storage cost for no gain.
-fn strip_runtime_index(c: &Column) -> Column {
-    use crate::sql::db::table::Index;
-    let empty_index = match c.index {
-        Index::Integer(_) => Index::Integer(std::collections::BTreeMap::new()),
-        Index::Text(_) => Index::Text(std::collections::BTreeMap::new()),
-        Index::None => Index::None,
-    };
-    Column {
-        column_name: c.column_name.clone(),
-        datatype: match c.datatype {
-            crate::sql::db::table::DataType::Integer => {
-                crate::sql::db::table::DataType::Integer
-            }
-            crate::sql::db::table::DataType::Text => crate::sql::db::table::DataType::Text,
-            crate::sql::db::table::DataType::Real => crate::sql::db::table::DataType::Real,
-            crate::sql::db::table::DataType::Bool => crate::sql::db::table::DataType::Bool,
-            crate::sql::db::table::DataType::None => crate::sql::db::table::DataType::None,
-            crate::sql::db::table::DataType::Invalid => {
-                crate::sql::db::table::DataType::Invalid
-            }
-        },
-        is_pk: c.is_pk,
-        not_null: c.not_null,
-        is_unique: c.is_unique,
-        is_indexed: c.is_indexed,
-        index: empty_index,
+// -------------------------------------------------------------------------
+// sqlrite_master — hardcoded catalog table schema
+
+fn build_empty_master_table() -> Table {
+    let columns = vec![
+        Column::new("name".into(), "text".into(), true, true, true),
+        Column::new("sql".into(), "text".into(), false, true, false),
+        Column::new("rootpage".into(), "integer".into(), false, true, false),
+        Column::new("last_rowid".into(), "integer".into(), false, true, false),
+    ];
+    build_empty_table(MASTER_TABLE_NAME, columns, 0)
+}
+
+/// Reads a required Text column from a known-good catalog row.
+fn take_text(table: &Table, col: &str, rowid: i64) -> Result<String> {
+    match table.get_value(col, rowid) {
+        Some(Value::Text(s)) => Ok(s),
+        other => Err(SQLRiteError::Internal(format!(
+            "sqlrite_master column '{col}' at rowid {rowid}: expected Text, got {other:?}"
+        ))),
     }
 }
 
-/// Builds an empty in-memory `Table` from a deserialized `TableSchema`.
-/// Every declared column gets a fresh empty row BTreeMap — subsequent
-/// calls to `restore_row` populate them.
-fn build_empty_table(schema: TableSchema) -> Table {
-    use crate::sql::db::table::{DataType, Row};
-    use std::cell::RefCell;
-    use std::collections::{BTreeMap, HashMap};
-    use std::rc::Rc;
+/// Reads a required Integer column from a known-good catalog row.
+fn take_integer(table: &Table, col: &str, rowid: i64) -> Result<i64> {
+    match table.get_value(col, rowid) {
+        Some(Value::Integer(v)) => Ok(v),
+        other => Err(SQLRiteError::Internal(format!(
+            "sqlrite_master column '{col}' at rowid {rowid}: expected Integer, got {other:?}"
+        ))),
+    }
+}
 
-    let rows: Rc<RefCell<HashMap<String, Row>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+// -------------------------------------------------------------------------
+// CREATE-TABLE SQL synthesis and re-parsing
+
+/// Synthesizes a CREATE TABLE SQL string that recreates the table's schema.
+/// Deterministic: same schema → same SQL, so diffing commits stay stable.
+fn table_to_create_sql(table: &Table) -> String {
+    let mut parts = Vec::with_capacity(table.columns.len());
+    for c in &table.columns {
+        let ty = match c.datatype {
+            DataType::Integer => "INTEGER",
+            DataType::Text => "TEXT",
+            DataType::Real => "REAL",
+            DataType::Bool => "BOOLEAN",
+            DataType::None | DataType::Invalid => "TEXT",
+        };
+        let mut piece = format!("{} {}", c.column_name, ty);
+        if c.is_pk {
+            piece.push_str(" PRIMARY KEY");
+        } else {
+            if c.is_unique {
+                piece.push_str(" UNIQUE");
+            }
+            if c.not_null {
+                piece.push_str(" NOT NULL");
+            }
+        }
+        parts.push(piece);
+    }
+    format!("CREATE TABLE {} ({});", table.tb_name, parts.join(", "))
+}
+
+/// Reverses `table_to_create_sql`: feeds the SQL back through `sqlparser`
+/// and produces our internal column list. Returns `(table_name, columns)`.
+fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
+    let stmt = ast.pop().ok_or_else(|| {
+        SQLRiteError::Internal("sqlrite_master row held an empty SQL string".to_string())
+    })?;
+    let create = CreateQuery::new(&stmt)?;
+    let columns = create
+        .columns
+        .into_iter()
+        .map(|pc| Column::new(pc.name, pc.datatype, pc.is_pk, pc.not_null, pc.is_unique))
+        .collect();
+    Ok((create.table_name, columns))
+}
+
+// -------------------------------------------------------------------------
+// In-memory table (re)construction
+
+/// Builds an empty in-memory `Table` given the declared columns.
+fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table {
+    let rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
     {
         let mut map = rows.borrow_mut();
-        for col in &schema.columns {
+        for col in &columns {
             let row = match col.datatype {
                 DataType::Integer => Row::Integer(BTreeMap::new()),
                 DataType::Text => Row::Text(BTreeMap::new()),
@@ -235,18 +284,27 @@ fn build_empty_table(schema: TableSchema) -> Table {
         }
     }
 
+    let primary_key = columns
+        .iter()
+        .find(|c| c.is_pk)
+        .map(|c| c.column_name.clone())
+        .unwrap_or_else(|| "-1".to_string());
+
     Table {
-        tb_name: schema.tb_name,
-        columns: schema.columns,
+        tb_name: name.to_string(),
+        columns,
         rows,
         indexes: HashMap::new(),
-        last_rowid: schema.last_rowid,
-        primary_key: schema.primary_key,
+        last_rowid,
+        primary_key,
     }
 }
 
-/// Walks the leaf-page chain starting at `root_page`, decoding every
-/// paged entry and calling `Table::restore_row` for each row.
+// -------------------------------------------------------------------------
+// Leaf-chain read / write
+
+/// Walks the leaf chain starting at `root_page`, decoding every cell and
+/// calling `Table::restore_row` for each row.
 fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<()> {
     let mut current = root_page;
     while current != 0 {
@@ -279,21 +337,15 @@ fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<(
                     c
                 }
             };
-            let values: Vec<Option<Value>> = cell.values;
-            table.restore_row(cell.rowid, values)?;
+            table.restore_row(cell.rowid, cell.values)?;
         }
         current = next_leaf;
     }
     Ok(())
 }
 
-/// Stages a table's row data as a chain of `TableLeaf` pages, starting at
-/// `start_page`. Large rows overflow into `Overflow`-typed pages interleaved
-/// in page-number order. Returns the first page number *after* the chain.
-///
-/// An empty table still consumes one (empty) leaf page so the catalog can
-/// point at a real page and the load loop doesn't have to handle the
-/// zero-page edge case.
+/// Stages a table's row data as a chain of `TableLeaf` pages starting at
+/// `start_page`. Returns the first free page number after the chain.
 fn stage_table_rows(
     pager: &mut Pager,
     table: &Table,
@@ -301,10 +353,6 @@ fn stage_table_rows(
 ) -> Result<u32> {
     let mut current_leaf = TablePage::empty();
     let mut current_leaf_page = start_page;
-    // We'll use (current_leaf_page + 1) onward for overflow pages allocated
-    // while packing this leaf. Once we commit the current leaf (either by
-    // starting a new one or at end-of-table), we jump past all its overflow
-    // pages and the leaf page itself.
     let mut next_free_page = start_page + 1;
 
     for rowid in table.rowids() {
@@ -312,24 +360,20 @@ fn stage_table_rows(
         let local_cell = Cell::new(rowid, values);
         let local_bytes = local_cell.encode()?;
 
-        let (entry_bytes, _overflow_pages_used) = if local_bytes.len() > OVERFLOW_THRESHOLD {
-            // Write the full cell bytes to the overflow chain; the
-            // OverflowRef's `total_body_len` counts those same bytes.
+        let entry_bytes = if local_bytes.len() > OVERFLOW_THRESHOLD {
             let overflow_start = next_free_page;
             next_free_page = write_overflow_chain(pager, &local_bytes, overflow_start)?;
-            let oref = OverflowRef {
+            OverflowRef {
                 rowid,
                 total_body_len: local_bytes.len() as u64,
                 first_overflow_page: overflow_start,
-            };
-            (oref.encode(), next_free_page - overflow_start)
+            }
+            .encode()
         } else {
-            (local_bytes, 0)
+            local_bytes
         };
 
         if !current_leaf.would_fit(entry_bytes.len()) {
-            // Commit the current leaf pointing at the next leaf we're about
-            // to open, then start fresh.
             let next_leaf_page_num = next_free_page;
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
             current_leaf = TablePage::empty();
@@ -337,9 +381,6 @@ fn stage_table_rows(
             next_free_page += 1;
 
             if !current_leaf.would_fit(entry_bytes.len()) {
-                // A single entry that won't fit in an empty page is a
-                // programming error — even very large cells go through
-                // OverflowRef (a few tens of bytes).
                 return Err(SQLRiteError::Internal(format!(
                     "entry of {} bytes exceeds empty-page capacity {}",
                     entry_bytes.len(),
@@ -350,7 +391,6 @@ fn stage_table_rows(
         current_leaf.insert_entry(rowid, &entry_bytes)?;
     }
 
-    // Final leaf: next_page = 0 (end of chain).
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
     Ok(next_free_page)
 }
@@ -360,88 +400,11 @@ fn emit_leaf(pager: &mut Pager, page_num: u32, leaf: &TablePage, next_leaf: u32)
     let mut buf = [0u8; PAGE_SIZE];
     buf[0] = PageType::TableLeaf as u8;
     buf[1..5].copy_from_slice(&next_leaf.to_le_bytes());
-    // For leaf pages the legacy `payload_len` field isn't used by readers —
-    // the slot directory self-describes. Set it to 0 by convention.
+    // For leaf pages the legacy `payload_len` field isn't used — the slot
+    // directory self-describes. Zero it by convention.
     buf[5..7].copy_from_slice(&0u16.to_le_bytes());
     buf[PAGE_HEADER_SIZE..].copy_from_slice(leaf.as_bytes());
     pager.stage_page(page_num, buf);
-}
-
-/// Stages `payload` as a chain of pages starting at `start_page`. The first
-/// page carries `head_type`; continuations are `PageType::Overflow`. Used
-/// for the schema-catalog bincode blob — tables go through
-/// [`stage_table_rows`] instead.
-fn stage_page_chain(
-    pager: &mut Pager,
-    payload: &[u8],
-    head_type: PageType,
-    start_page: u32,
-) -> Result<u32> {
-    if payload.is_empty() {
-        pager.stage_page(start_page, encode_payload_page(head_type, 0, &[])?);
-        return Ok(start_page + 1);
-    }
-    let mut remaining = payload;
-    let mut current_page = start_page;
-    let mut first = true;
-    while !remaining.is_empty() {
-        let chunk_len = remaining.len().min(PAYLOAD_PER_PAGE);
-        let (chunk, rest) = remaining.split_at(chunk_len);
-        let next = if rest.is_empty() { 0 } else { current_page + 1 };
-        let page_type = if first { head_type } else { PageType::Overflow };
-        pager.stage_page(current_page, encode_payload_page(page_type, next, chunk)?);
-        current_page += 1;
-        first = false;
-        remaining = rest;
-    }
-    Ok(current_page)
-}
-
-/// Reassembles a chained payload by following `next` pointers. Used for
-/// the schema catalog; table rows are walked cell-by-cell instead.
-fn read_page_chain(pager: &Pager, start_page: u32) -> Result<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::new();
-    let mut current = start_page;
-    loop {
-        let raw = pager.read_page(current).ok_or_else(|| {
-            SQLRiteError::Internal(format!("page {current} is missing from pager cache"))
-        })?;
-        let (_ty, next, payload_len) = decode_page_header(raw)?;
-        out.extend_from_slice(&raw[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload_len]);
-        if next == 0 {
-            break;
-        }
-        current = next;
-    }
-    Ok(out)
-}
-
-/// Builds a `PAGE_SIZE`-byte buffer ready to hand to the pager.
-fn encode_payload_page(ty: PageType, next: u32, payload: &[u8]) -> Result<[u8; PAGE_SIZE]> {
-    if payload.len() > PAYLOAD_PER_PAGE {
-        return Err(SQLRiteError::Internal(format!(
-            "page payload {} bytes exceeds max {PAYLOAD_PER_PAGE}",
-            payload.len()
-        )));
-    }
-    let mut buf = [0u8; PAGE_SIZE];
-    buf[0] = ty as u8;
-    buf[1..5].copy_from_slice(&next.to_le_bytes());
-    buf[5..7].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + payload.len()].copy_from_slice(payload);
-    Ok(buf)
-}
-
-fn decode_page_header(buf: &[u8; PAGE_SIZE]) -> Result<(PageType, u32, usize)> {
-    let ty = PageType::from_u8(buf[0])?;
-    let next = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-    let payload_len = u16::from_le_bytes(buf[5..7].try_into().unwrap()) as usize;
-    if payload_len > PAYLOAD_PER_PAGE {
-        return Err(SQLRiteError::Internal(format!(
-            "corrupt page: payload length {payload_len} exceeds max"
-        )));
-    }
-    Ok((ty, next, payload_len))
 }
 
 #[cfg(test)]
@@ -541,8 +504,6 @@ mod tests {
             &mut db,
         )
         .unwrap();
-        // Each row body is ~200 chars; one leaf page (~4 KiB usable) holds
-        // roughly 15–20 of these, so 200 rows forces multiple leaves.
         for i in 0..200 {
             let body = "x".repeat(200);
             let q = format!("INSERT INTO things (data) VALUES ('row-{i}-{body}');");
@@ -564,7 +525,6 @@ mod tests {
             &mut db,
         )
         .unwrap();
-        // Single row bigger than OVERFLOW_THRESHOLD: triggers write_overflow_chain.
         let body = "A".repeat(10_000);
         process_command(&format!("INSERT INTO docs (body) VALUES ('{body}');"), &mut db)
             .unwrap();
@@ -579,6 +539,36 @@ mod tests {
             Some(Value::Text(s)) => assert_eq!(s.len(), 10_000),
             other => panic!("expected Text, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_sql_synthesis_round_trips() {
+        // Build a table via CREATE, then verify table_to_create_sql +
+        // parse_create_sql reproduce an equivalent column list.
+        let mut db = Database::new("x".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT UNIQUE, note TEXT NOT NULL);",
+            &mut db,
+        )
+        .unwrap();
+        let t = db.get_table("t".to_string()).unwrap();
+        let sql = table_to_create_sql(t);
+        let (name, cols) = parse_create_sql(&sql).unwrap();
+        assert_eq!(name, "t");
+        assert_eq!(cols.len(), 3);
+        assert!(cols[0].is_pk);
+        assert!(cols[1].is_unique);
+        assert!(cols[2].not_null);
+    }
+
+    #[test]
+    fn sqlrite_master_is_not_exposed_as_a_user_table() {
+        // After open, the public db.tables map should not list the master.
+        let path = tmp_path("no_master");
+        save_database(&mut seed_db(), &path).unwrap();
+        let loaded = open_database(&path, "x".to_string()).unwrap();
+        assert!(!loaded.tables.contains_key(MASTER_TABLE_NAME));
         let _ = std::fs::remove_file(&path);
     }
 }
