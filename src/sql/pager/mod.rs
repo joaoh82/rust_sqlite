@@ -26,13 +26,15 @@
 //! production data to migrate yet.
 
 // Data-layer modules. Not every helper in these modules is used by save/open
-// yet — some exist for tests, some for the B-Tree layer in Phase 3d.
+// yet — some exist for tests, some for future maintenance operations.
 // Module-level #[allow(dead_code)] keeps the build quiet without dotting
 // the modules with per-item attributes.
 #[allow(dead_code)]
 pub mod cell;
 pub mod file;
 pub mod header;
+#[allow(dead_code)]
+pub mod interior_page;
 pub mod overflow;
 pub mod page;
 pub mod pager;
@@ -55,6 +57,7 @@ use crate::sql::db::table::{Column, DataType, Row, Table, Value};
 use crate::sql::parser::create::CreateQuery;
 use crate::sql::pager::cell::Cell;
 use crate::sql::pager::header::DbHeader;
+use crate::sql::pager::interior_page::{InteriorCell, InteriorPage};
 use crate::sql::pager::overflow::{
     OVERFLOW_THRESHOLD, OverflowRef, PagedEntry, read_overflow_chain, write_overflow_chain,
 };
@@ -142,8 +145,8 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
             )));
         }
         let table = &db.tables[name];
-        let rootpage = next_free_page;
-        next_free_page = stage_table_rows(&mut pager, table, rootpage)?;
+        let (rootpage, new_next) = stage_table_btree(&mut pager, table, next_free_page)?;
+        next_free_page = new_next;
         master_rows.push((
             name.clone(),
             table_to_create_sql(table),
@@ -169,8 +172,8 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
             ],
         )?;
     }
-    let master_root = next_free_page;
-    next_free_page = stage_table_rows(&mut pager, &master, master_root)?;
+    let (master_root, master_next) = stage_table_btree(&mut pager, &master, next_free_page)?;
+    next_free_page = master_next;
 
     pager.commit(DbHeader {
         page_count: next_free_page,
@@ -303,10 +306,17 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
 // -------------------------------------------------------------------------
 // Leaf-chain read / write
 
-/// Walks the leaf chain starting at `root_page`, decoding every cell and
-/// calling `Table::restore_row` for each row.
+/// Walks a table's B-Tree from `root_page`, following the leftmost-child
+/// chain down to the first leaf, then iterating leaves via their sibling
+/// `next_page` pointers. Every cell is decoded and replayed into `table`.
+///
+/// Open-path note: we eagerly materialize the entire table into `Table`'s
+/// in-memory maps. Phase 5 will introduce a `Cursor` that hits the pager
+/// on demand so queries can stream through the tree without a full upfront
+/// load.
 fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<()> {
-    let mut current = root_page;
+    let first_leaf = find_leftmost_leaf(pager, root_page)?;
+    let mut current = first_leaf;
     while current != 0 {
         let page_buf = pager.read_page(current).ok_or_else(|| {
             SQLRiteError::Internal(format!("missing leaf page {current}"))
@@ -344,41 +354,97 @@ fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<(
     Ok(())
 }
 
-/// Stages a table's row data as a chain of `TableLeaf` pages starting at
-/// `start_page`. Returns the first free page number after the chain.
-fn stage_table_rows(
+/// Descends from `root_page` through `InteriorNode` pages, always taking
+/// the leftmost child, until a `TableLeaf` is reached. Returns that leaf's
+/// page number. A root that's already a leaf is returned as-is.
+fn find_leftmost_leaf(pager: &Pager, root_page: u32) -> Result<u32> {
+    let mut current = root_page;
+    loop {
+        let page_buf = pager.read_page(current).ok_or_else(|| {
+            SQLRiteError::Internal(format!("missing page {current} during tree descent"))
+        })?;
+        match page_buf[0] {
+            t if t == PageType::TableLeaf as u8 => return Ok(current),
+            t if t == PageType::InteriorNode as u8 => {
+                let payload: &[u8; PAYLOAD_PER_PAGE] =
+                    (&page_buf[PAGE_HEADER_SIZE..]).try_into().map_err(|_| {
+                        SQLRiteError::Internal("interior payload slice size".to_string())
+                    })?;
+                let interior = InteriorPage::from_bytes(payload);
+                current = interior.leftmost_child()?;
+            }
+            other => {
+                return Err(SQLRiteError::Internal(format!(
+                    "unexpected page type {other} during tree descent at page {current}"
+                )));
+            }
+        }
+    }
+}
+
+/// Stages a table's B-Tree starting at `start_page`. Returns
+/// `(root_page, next_free_page)`. Builds bottom-up:
+///
+/// 1. Pack all row cells into `TableLeaf` pages, chaining them via each
+///    leaf's `next_page` sibling pointer (for fast sequential scans).
+/// 2. If the table fits in a single leaf, that leaf is the root.
+/// 3. Otherwise, group leaves into `InteriorNode` pages; recurse up the
+///    tree until one root remains.
+///
+/// Deterministic: same in-memory rows → same pages at same offsets, so
+/// the Pager's diff commit still skips unchanged tables.
+fn stage_table_btree(
     pager: &mut Pager,
     table: &Table,
     start_page: u32,
-) -> Result<u32> {
+) -> Result<(u32, u32)> {
+    let (leaves, mut next_free_page) = stage_leaves(pager, table, start_page)?;
+    if leaves.len() == 1 {
+        return Ok((leaves[0].0, next_free_page));
+    }
+    let mut level: Vec<(u32, i64)> = leaves;
+    while level.len() > 1 {
+        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
+        next_free_page = new_next_free;
+        level = next_level;
+    }
+    Ok((level[0].0, next_free_page))
+}
+
+/// Packs the table's rows into a sibling-linked chain of `TableLeaf` pages.
+/// Returns each leaf's `(page_number, max_rowid)` (used by the next level
+/// up to build divider cells) and the first free page after the chain
+/// including any overflow pages allocated for oversized cells.
+fn stage_leaves(
+    pager: &mut Pager,
+    table: &Table,
+    start_page: u32,
+) -> Result<(Vec<(u32, i64)>, u32)> {
+    let mut leaves: Vec<(u32, i64)> = Vec::new();
     let mut current_leaf = TablePage::empty();
     let mut current_leaf_page = start_page;
+    let mut current_max_rowid: Option<i64> = None;
     let mut next_free_page = start_page + 1;
 
     for rowid in table.rowids() {
-        let values = table.extract_row(rowid);
-        let local_cell = Cell::new(rowid, values);
-        let local_bytes = local_cell.encode()?;
-
-        let entry_bytes = if local_bytes.len() > OVERFLOW_THRESHOLD {
-            let overflow_start = next_free_page;
-            next_free_page = write_overflow_chain(pager, &local_bytes, overflow_start)?;
-            OverflowRef {
-                rowid,
-                total_body_len: local_bytes.len() as u64,
-                first_overflow_page: overflow_start,
-            }
-            .encode()
-        } else {
-            local_bytes
-        };
+        let entry_bytes = build_row_entry(pager, table, rowid, &mut next_free_page)?;
 
         if !current_leaf.would_fit(entry_bytes.len()) {
+            // Commit the current leaf. Its sibling next_page is the page
+            // number where the new leaf will go — which is next_free_page
+            // right now (no overflow pages have been allocated between
+            // this decision and the new leaf's allocation below).
             let next_leaf_page_num = next_free_page;
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
+            leaves.push((
+                current_leaf_page,
+                current_max_rowid.unwrap_or(i64::MIN),
+            ));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
             next_free_page += 1;
+            // current_max_rowid is reassigned by the insert below; no need
+            // to zero it out here.
 
             if !current_leaf.would_fit(entry_bytes.len()) {
                 return Err(SQLRiteError::Internal(format!(
@@ -389,10 +455,90 @@ fn stage_table_rows(
             }
         }
         current_leaf.insert_entry(rowid, &entry_bytes)?;
+        current_max_rowid = Some(rowid);
     }
 
+    // Final leaf: sibling next_page = 0 (end of chain).
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
-    Ok(next_free_page)
+    leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+    Ok((leaves, next_free_page))
+}
+
+/// Encodes a single row's on-leaf entry — either the local cell bytes, or
+/// an `OverflowRef` pointing at a freshly-allocated overflow chain if the
+/// encoded cell exceeded the inline threshold. Advances `next_free_page`
+/// past any overflow pages used.
+fn build_row_entry(
+    pager: &mut Pager,
+    table: &Table,
+    rowid: i64,
+    next_free_page: &mut u32,
+) -> Result<Vec<u8>> {
+    let values = table.extract_row(rowid);
+    let local_cell = Cell::new(rowid, values);
+    let local_bytes = local_cell.encode()?;
+    if local_bytes.len() > OVERFLOW_THRESHOLD {
+        let overflow_start = *next_free_page;
+        *next_free_page = write_overflow_chain(pager, &local_bytes, overflow_start)?;
+        Ok(OverflowRef {
+            rowid,
+            total_body_len: local_bytes.len() as u64,
+            first_overflow_page: overflow_start,
+        }
+        .encode())
+    } else {
+        Ok(local_bytes)
+    }
+}
+
+/// Builds one level of `InteriorNode` pages above the given children.
+/// Each interior packs as many dividers as will fit; the last child
+/// assigned to an interior becomes its `rightmost_child`. Returns the
+/// emitted interior pages as `(page_number, max_rowid_in_subtree)` so the
+/// next level can build on top of them.
+fn stage_interior_level(
+    pager: &mut Pager,
+    children: &[(u32, i64)],
+    start_page: u32,
+) -> Result<(Vec<(u32, i64)>, u32)> {
+    let mut next_level: Vec<(u32, i64)> = Vec::new();
+    let mut next_free_page = start_page;
+    let mut idx = 0usize;
+
+    while idx < children.len() {
+        let interior_page_num = next_free_page;
+        next_free_page += 1;
+
+        // Seed the interior with the first unassigned child as its
+        // rightmost. As we add more children, the previous rightmost
+        // graduates to being a divider and the new arrival takes over
+        // as rightmost.
+        let (mut rightmost_child_page, mut rightmost_child_max) = children[idx];
+        idx += 1;
+        let mut interior = InteriorPage::empty(rightmost_child_page);
+
+        while idx < children.len() {
+            let new_divider_cell = InteriorCell {
+                divider_rowid: rightmost_child_max,
+                child_page: rightmost_child_page,
+            };
+            let new_divider_bytes = new_divider_cell.encode();
+            if !interior.would_fit(new_divider_bytes.len()) {
+                break;
+            }
+            interior.insert_divider(rightmost_child_max, rightmost_child_page)?;
+            let (next_child_page, next_child_max) = children[idx];
+            interior.set_rightmost_child(next_child_page);
+            rightmost_child_page = next_child_page;
+            rightmost_child_max = next_child_max;
+            idx += 1;
+        }
+
+        emit_interior(pager, interior_page_num, &interior);
+        next_level.push((interior_page_num, rightmost_child_max));
+    }
+
+    Ok((next_level, next_free_page))
 }
 
 /// Wraps a `TablePage` in the 7-byte page header and hands it to the pager.
@@ -404,6 +550,18 @@ fn emit_leaf(pager: &mut Pager, page_num: u32, leaf: &TablePage, next_leaf: u32)
     // directory self-describes. Zero it by convention.
     buf[5..7].copy_from_slice(&0u16.to_le_bytes());
     buf[PAGE_HEADER_SIZE..].copy_from_slice(leaf.as_bytes());
+    pager.stage_page(page_num, buf);
+}
+
+/// Wraps an `InteriorPage` in the 7-byte page header. Interior pages
+/// don't use `next_page` (there's no sibling chain between interiors);
+/// `payload_len` is also unused (the slot directory self-describes).
+fn emit_interior(pager: &mut Pager, page_num: u32, interior: &InteriorPage) {
+    let mut buf = [0u8; PAGE_SIZE];
+    buf[0] = PageType::InteriorNode as u8;
+    buf[1..5].copy_from_slice(&0u32.to_le_bytes());
+    buf[5..7].copy_from_slice(&0u16.to_le_bytes());
+    buf[PAGE_HEADER_SIZE..].copy_from_slice(interior.as_bytes());
     pager.stage_page(page_num, buf);
 }
 
@@ -569,6 +727,128 @@ mod tests {
         save_database(&mut seed_db(), &path).unwrap();
         let loaded = open_database(&path, "x".to_string()).unwrap();
         assert!(!loaded.tables.contains_key(MASTER_TABLE_NAME));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multi_leaf_table_produces_an_interior_root() {
+        // 200 fat rows force the table into multiple leaves, which means
+        // save_database must build at least one InteriorNode above them.
+        // The test verifies the round-trip works and confirms the root is
+        // indeed an interior page (not a leaf) by reading the page type
+        // directly out of the open pager.
+        let path = tmp_path("multi_leaf_interior");
+        let mut db = Database::new("big".to_string());
+        process_command(
+            "CREATE TABLE things (id INTEGER PRIMARY KEY, data TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        for i in 0..200 {
+            let body = "x".repeat(200);
+            let q = format!("INSERT INTO things (data) VALUES ('row-{i}-{body}');");
+            process_command(&q, &mut db).unwrap();
+        }
+        save_database(&mut db, &path).unwrap();
+
+        // Confirm the round-trip preserved all 200 rows.
+        let loaded = open_database(&path, "big".to_string()).unwrap();
+        let things = loaded.get_table("things".to_string()).unwrap();
+        assert_eq!(things.rowids().len(), 200);
+
+        // Peek at `things`'s root page via the pager attached to the
+        // loaded DB and check it's an InteriorNode, not a leaf.
+        let pager = loaded.pager.as_ref().expect("loaded DB should have a pager");
+        // sqlrite_master's row for `things` holds its root page. Easiest
+        // way to find it: walk the leaf chain by using find_leftmost_leaf
+        // and then hop one level up. Simpler: read the master, scan for
+        // the "things" row, look up rootpage.
+        let mut master = build_empty_master_table();
+        load_table_rows(pager, &mut master, pager.header().schema_root_page).unwrap();
+        let things_root = master
+            .rowids()
+            .into_iter()
+            .find_map(|r| match master.get_value("name", r) {
+                Some(Value::Text(s)) if s == "things" => match master.get_value("rootpage", r) {
+                    Some(Value::Integer(p)) => Some(p as u32),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("things should appear in sqlrite_master");
+        let root_buf = pager.read_page(things_root).unwrap();
+        assert_eq!(
+            root_buf[0],
+            PageType::InteriorNode as u8,
+            "expected a multi-leaf table to have an interior root, got tag {}",
+            root_buf[0]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deep_tree_round_trips() {
+        // Force a 3-level tree by bypassing process_command (which prints
+        // the full table on every INSERT, making large bulk loads O(N^2)
+        // in I/O). We build the Table directly via restore_row.
+        use crate::sql::db::table::Column as TableColumn;
+
+        let path = tmp_path("deep_tree");
+        let mut db = Database::new("deep".to_string());
+        let columns = vec![
+            TableColumn::new("id".into(), "integer".into(), true, true, true),
+            TableColumn::new("s".into(), "text".into(), false, true, false),
+        ];
+        let mut table = build_empty_table("t", columns, 0);
+        // ~900-byte rows → ~4 rows per leaf. 6000 rows → ~1500 leaves,
+        // which with interior fanout ~400 needs 2 interior levels (3-level
+        // tree total, counting leaves).
+        for i in 1..=6_000i64 {
+            let body = "q".repeat(900);
+            table
+                .restore_row(
+                    i,
+                    vec![Some(Value::Integer(i)), Some(Value::Text(format!("r-{i}-{body}")))],
+                )
+                .unwrap();
+        }
+        db.tables.insert("t".to_string(), table);
+        save_database(&mut db, &path).unwrap();
+
+        let loaded = open_database(&path, "deep".to_string()).unwrap();
+        let t = loaded.get_table("t".to_string()).unwrap();
+        assert_eq!(t.rowids().len(), 6_000);
+
+        // Confirm the tree actually grew past 2 levels — i.e., the root's
+        // leftmost child is itself an interior page, not a leaf.
+        let pager = loaded.pager.as_ref().unwrap();
+        let mut master = build_empty_master_table();
+        load_table_rows(pager, &mut master, pager.header().schema_root_page).unwrap();
+        let t_root = master
+            .rowids()
+            .into_iter()
+            .find_map(|r| match master.get_value("name", r) {
+                Some(Value::Text(s)) if s == "t" => match master.get_value("rootpage", r) {
+                    Some(Value::Integer(p)) => Some(p as u32),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("t in sqlrite_master");
+        let root_buf = pager.read_page(t_root).unwrap();
+        assert_eq!(root_buf[0], PageType::InteriorNode as u8);
+        let root_payload: &[u8; PAYLOAD_PER_PAGE] =
+            (&root_buf[PAGE_HEADER_SIZE..]).try_into().unwrap();
+        let root_interior = InteriorPage::from_bytes(root_payload);
+        let child = root_interior.leftmost_child().unwrap();
+        let child_buf = pager.read_page(child).unwrap();
+        assert_eq!(
+            child_buf[0],
+            PageType::InteriorNode as u8,
+            "expected 3-level tree: root's leftmost child should also be InteriorNode",
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }

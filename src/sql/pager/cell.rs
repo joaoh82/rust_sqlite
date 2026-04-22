@@ -47,10 +47,15 @@ use crate::sql::db::table::Value;
 use crate::sql::pager::varint;
 
 /// Cell kind tags — first byte of every cell's body after the length prefix.
-/// Readers dispatch on this to produce either a local [`Cell`] or an
-/// `OverflowRef` (in the sibling `overflow` module).
+/// Readers dispatch on this to produce one of:
+/// - a local [`Cell`] (this module) — a full row on a leaf page
+/// - an `OverflowRef` (in the sibling `overflow` module) — a pointer to a
+///   spilled cell body on a leaf page
+/// - an `InteriorCell` (in `interior_page`) — a divider on an interior
+///   tree node pointing at a child page
 pub const KIND_LOCAL: u8 = 0x01;
 pub const KIND_OVERFLOW: u8 = 0x02;
+pub const KIND_INTERIOR: u8 = 0x03;
 
 /// Value type tag stored in each non-NULL value block.
 pub mod tag {

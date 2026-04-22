@@ -36,17 +36,20 @@ pub enum PageType {
     TableLeaf = 2,
     /// Continuation page carrying the spilled body of an oversized cell.
     Overflow = 3,
+    /// Interior B-Tree node — holds a slot directory of dividers pointing
+    /// at child pages plus a rightmost-child pointer in the payload header.
+    InteriorNode = 4,
 }
 
 impl PageType {
-    // Used by integrity-check paths and by the B-Tree interior-page logic
-    // that Phase 3d will add. Direct `page_buf[0] == TableLeaf as u8`
+    // Used by integrity-check paths. Direct `page_buf[0] == TableLeaf as u8`
     // compares are how current call sites check page types.
     #[allow(dead_code)]
     pub fn from_u8(v: u8) -> Result<PageType> {
         match v {
             2 => Ok(PageType::TableLeaf),
             3 => Ok(PageType::Overflow),
+            4 => Ok(PageType::InteriorNode),
             other => Err(SQLRiteError::Internal(format!(
                 "unknown page type tag {other}"
             ))),
