@@ -119,6 +119,14 @@ impl TablePage {
         cell_encoded_size.saturating_add(SLOT_SIZE) <= self.free_space()
     }
 
+    /// Raw byte offset, within the payload, where the cell for `slot`
+    /// begins. Used by readers that decode the cell body with a type
+    /// other than `PagedEntry` — e.g., index-cell leaves carry
+    /// `IndexCell`s instead of row cells.
+    pub fn slot_offset_raw(&self, slot: usize) -> Result<usize> {
+        self.slot_offset(slot)
+    }
+
     fn slot_offset(&self, slot: usize) -> Result<usize> {
         if slot >= self.slot_count() {
             return Err(SQLRiteError::Internal(format!(

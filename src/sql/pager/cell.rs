@@ -56,6 +56,7 @@ use crate::sql::pager::varint;
 pub const KIND_LOCAL: u8 = 0x01;
 pub const KIND_OVERFLOW: u8 = 0x02;
 pub const KIND_INTERIOR: u8 = 0x03;
+pub const KIND_INDEX: u8 = 0x04;
 
 /// Value type tag stored in each non-NULL value block.
 pub mod tag {
@@ -235,7 +236,7 @@ fn is_null(bitmap: &[u8], col: usize) -> bool {
     bitmap.get(byte).is_some_and(|b| (b >> bit) & 1 == 1)
 }
 
-fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
+pub(super) fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
     match value {
         Value::Integer(i) => {
             out.push(tag::INTEGER);
@@ -264,7 +265,7 @@ fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
+pub(super) fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
     let tag = *buf.get(pos).ok_or_else(|| {
         SQLRiteError::Internal(format!("value block truncated at offset {pos}"))
     })?;

@@ -34,6 +34,8 @@ pub mod cell;
 pub mod file;
 pub mod header;
 #[allow(dead_code)]
+pub mod index_cell;
+#[allow(dead_code)]
 pub mod interior_page;
 pub mod overflow;
 pub mod page;
@@ -58,6 +60,7 @@ use crate::sql::db::table::{Column, DataType, Row, Table, Value};
 use crate::sql::parser::create::CreateQuery;
 use crate::sql::pager::cell::Cell;
 use crate::sql::pager::header::DbHeader;
+use crate::sql::pager::index_cell::IndexCell;
 use crate::sql::pager::interior_page::{InteriorCell, InteriorPage};
 use crate::sql::pager::overflow::{
     OVERFLOW_THRESHOLD, OverflowRef, PagedEntry, read_overflow_chain, write_overflow_chain,
@@ -75,40 +78,74 @@ pub const MASTER_TABLE_NAME: &str = "sqlrite_master";
 pub fn open_database(path: &Path, db_name: String) -> Result<Database> {
     let pager = Pager::open(path)?;
 
-    // 1. Load sqlrite_master from the leaf chain at header.schema_root_page.
+    // 1. Load sqlrite_master from the tree at header.schema_root_page.
     let mut master = build_empty_master_table();
     load_table_rows(&pager, &mut master, pager.header().schema_root_page)?;
 
-    // 2. Each master row describes a user table. Re-parse its `sql` to
-    //    reconstruct the column list, then walk its rootpage chain.
+    // 2. Two passes over master rows: first build every user table, then
+    //    attach secondary indexes. Indexes need their base table to exist
+    //    before we can populate them. Auto-indexes are created at table
+    //    build time so we only have to load explicit indexes from disk
+    //    (but we also reload the auto-index CONTENT because Table::new
+    //    built it empty).
     let mut db = Database::new(db_name);
+    let mut index_rows: Vec<IndexCatalogRow> = Vec::new();
+
     for rowid in master.rowids() {
+        let ty = take_text(&master, "type", rowid)?;
         let name = take_text(&master, "name", rowid)?;
         let sql = take_text(&master, "sql", rowid)?;
         let rootpage = take_integer(&master, "rootpage", rowid)? as u32;
         let last_rowid = take_integer(&master, "last_rowid", rowid)?;
 
-        let (parsed_name, columns) = parse_create_sql(&sql)?;
-        if parsed_name != name {
-            return Err(SQLRiteError::Internal(format!(
-                "sqlrite_master row '{name}' carries SQL for '{parsed_name}' — corrupt catalog?"
-            )));
+        match ty.as_str() {
+            "table" => {
+                let (parsed_name, columns) = parse_create_sql(&sql)?;
+                if parsed_name != name {
+                    return Err(SQLRiteError::Internal(format!(
+                        "sqlrite_master row '{name}' carries SQL for '{parsed_name}' — corrupt catalog?"
+                    )));
+                }
+                let mut table = build_empty_table(&name, columns, last_rowid);
+                if rootpage != 0 {
+                    load_table_rows(&pager, &mut table, rootpage)?;
+                }
+                if last_rowid > table.last_rowid {
+                    table.last_rowid = last_rowid;
+                }
+                db.tables.insert(name, table);
+            }
+            "index" => {
+                index_rows.push(IndexCatalogRow {
+                    name,
+                    sql,
+                    rootpage,
+                });
+            }
+            other => {
+                return Err(SQLRiteError::Internal(format!(
+                    "sqlrite_master row '{name}' has unknown type '{other}'"
+                )));
+            }
         }
-        let mut table = build_empty_table(&name, columns, last_rowid);
-        if rootpage != 0 {
-            load_table_rows(&pager, &mut table, rootpage)?;
-        }
-        // restore_row may have advanced last_rowid past the stored value if
-        // the rows we loaded contain larger rowids; clamp back up either way.
-        if last_rowid > table.last_rowid {
-            table.last_rowid = last_rowid;
-        }
-        db.tables.insert(name, table);
+    }
+
+    // Second pass: attach each index to its table.
+    for row in index_rows {
+        attach_index(&mut db, &pager, row)?;
     }
 
     db.source_path = Some(path.to_path_buf());
     db.pager = Some(pager);
     Ok(db)
+}
+
+/// Catalog row for a secondary index — deferred until after every table is
+/// loaded so the index's base table exists by the time we populate it.
+struct IndexCatalogRow {
+    name: String,
+    sql: String,
+    rootpage: u32,
 }
 
 /// Persists `db` to disk. Same diff-commit behavior as before: only pages
@@ -132,15 +169,14 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     // Page 0 is the header; payload pages start at 1.
     let mut next_free_page: u32 = 1;
 
-    // 1. Stage each user table's leaf chain, collecting (name, sql, root, last_rowid).
-    let mut master_rows: Vec<(String, String, u32, i64)> =
-        Vec::with_capacity(db.tables.len());
+    // 1. Stage each user table's B-Tree, collecting master-row info.
+    //    `kind` is "table" or "index" — master has one row per each.
+    let mut master_rows: Vec<CatalogEntry> = Vec::new();
+
     let mut table_names: Vec<&String> = db.tables.keys().collect();
     table_names.sort();
     for name in table_names {
         if name == MASTER_TABLE_NAME {
-            // Shouldn't happen (CREATE TABLE rejects the name), but guard
-            // against a programmer-reached state.
             return Err(SQLRiteError::Internal(format!(
                 "user table cannot be named '{MASTER_TABLE_NAME}' (reserved)"
             )));
@@ -148,28 +184,51 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
         let table = &db.tables[name];
         let (rootpage, new_next) = stage_table_btree(&mut pager, table, next_free_page)?;
         next_free_page = new_next;
-        master_rows.push((
-            name.clone(),
-            table_to_create_sql(table),
+        master_rows.push(CatalogEntry {
+            kind: "table".into(),
+            name: name.clone(),
+            sql: table_to_create_sql(table),
             rootpage,
-            table.last_rowid,
-        ));
+            last_rowid: table.last_rowid,
+        });
     }
 
-    // 2. Build an in-memory sqlrite_master with one row per user table,
-    //    then stage it via the same code path.
+    // 2. Stage each secondary index's B-Tree. Indexes persist in a
+    //    deterministic order: sorted by (owning_table, index_name).
+    let mut index_entries: Vec<(&Table, &SecondaryIndex)> = Vec::new();
+    for table in db.tables.values() {
+        for idx in &table.secondary_indexes {
+            index_entries.push((table, idx));
+        }
+    }
+    index_entries.sort_by(|(ta, ia), (tb, ib)| {
+        ta.tb_name.cmp(&tb.tb_name).then(ia.name.cmp(&ib.name))
+    });
+    for (_table, idx) in index_entries {
+        let (rootpage, new_next) = stage_index_btree(&mut pager, idx, next_free_page)?;
+        next_free_page = new_next;
+        master_rows.push(CatalogEntry {
+            kind: "index".into(),
+            name: idx.name.clone(),
+            sql: idx.synthesized_sql(),
+            rootpage,
+            last_rowid: 0,
+        });
+    }
+
+    // 3. Build an in-memory sqlrite_master with one row per table or index,
+    //    then stage it via the same tree-build path.
     let mut master = build_empty_master_table();
-    for (i, (name, sql, rootpage, last_rowid)) in master_rows.into_iter().enumerate() {
-        // Rowid is 1-based and sequential — deterministic so diffing
-        // commits stay byte-stable when nothing changes.
+    for (i, entry) in master_rows.into_iter().enumerate() {
         let rowid = (i as i64) + 1;
         master.restore_row(
             rowid,
             vec![
-                Some(Value::Text(name)),
-                Some(Value::Text(sql)),
-                Some(Value::Integer(rootpage as i64)),
-                Some(Value::Integer(last_rowid)),
+                Some(Value::Text(entry.kind)),
+                Some(Value::Text(entry.name)),
+                Some(Value::Text(entry.sql)),
+                Some(Value::Integer(entry.rootpage as i64)),
+                Some(Value::Integer(entry.last_rowid)),
             ],
         )?;
     }
@@ -187,11 +246,23 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build material for a single row in sqlrite_master.
+struct CatalogEntry {
+    kind: String, // "table" or "index"
+    name: String,
+    sql: String,
+    rootpage: u32,
+    last_rowid: i64,
+}
+
 // -------------------------------------------------------------------------
 // sqlrite_master — hardcoded catalog table schema
 
 fn build_empty_master_table() -> Table {
+    // Phase 3e: `type` is the first column, matching SQLite's convention.
+    // It distinguishes `'table'` rows from `'index'` rows.
     let columns = vec![
+        Column::new("type".into(), "text".into(), false, true, false),
         Column::new("name".into(), "text".into(), true, true, true),
         Column::new("sql".into(), "text".into(), false, true, false),
         Column::new("rootpage".into(), "integer".into(), false, true, false),
@@ -333,6 +404,243 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
 /// in-memory maps. Phase 5 will introduce a `Cursor` that hits the pager
 /// on demand so queries can stream through the tree without a full upfront
 /// load.
+/// Re-parses `CREATE INDEX` SQL from sqlrite_master and restores the
+/// index on its base table by walking the tree of index cells at
+/// `rootpage`. The base table is expected to already be in `db.tables`.
+fn attach_index(db: &mut Database, pager: &Pager, row: IndexCatalogRow) -> Result<()> {
+    let (table_name, column_name, is_unique) = parse_create_index_sql(&row.sql)?;
+
+    let table = db.get_table_mut(table_name.clone()).map_err(|_| {
+        SQLRiteError::Internal(format!(
+            "index '{}' references unknown table '{table_name}' (sqlrite_master out of sync?)",
+            row.name
+        ))
+    })?;
+    let datatype = table
+        .columns
+        .iter()
+        .find(|c| c.column_name == column_name)
+        .map(|c| clone_datatype(&c.datatype))
+        .ok_or_else(|| {
+            SQLRiteError::Internal(format!(
+                "index '{}' references unknown column '{column_name}' on '{table_name}'",
+                row.name
+            ))
+        })?;
+
+    // An auto-index on this column may already exist (built by
+    // build_empty_table for UNIQUE/PK columns). If the names match, reuse
+    // the slot instead of adding a duplicate entry.
+    let existing_slot = table
+        .secondary_indexes
+        .iter()
+        .position(|i| i.name == row.name);
+    let idx = match existing_slot {
+        Some(i) => {
+            // Drain any entries that may have been populated during table
+            // restore_row calls — we're about to repopulate from the
+            // persisted tree.
+            table.secondary_indexes.remove(i)
+        }
+        None => SecondaryIndex::new(
+            row.name.clone(),
+            table_name.clone(),
+            column_name.clone(),
+            &datatype,
+            is_unique,
+            IndexOrigin::Explicit,
+        )?,
+    };
+    let mut idx = idx;
+    // Wipe any stale entries from the auto path so the load is idempotent.
+    let is_unique_flag = idx.is_unique;
+    let origin = idx.origin;
+    idx = SecondaryIndex::new(
+        idx.name,
+        idx.table_name,
+        idx.column_name,
+        &datatype,
+        is_unique_flag,
+        origin,
+    )?;
+
+    // Populate from the index tree's cells.
+    load_index_rows(pager, &mut idx, row.rootpage)?;
+
+    table.secondary_indexes.push(idx);
+    Ok(())
+}
+
+/// Walks the leaves of an index B-Tree rooted at `root_page` and inserts
+/// every `(value, rowid)` pair into `idx`.
+fn load_index_rows(pager: &Pager, idx: &mut SecondaryIndex, root_page: u32) -> Result<()> {
+    if root_page == 0 {
+        return Ok(());
+    }
+    let first_leaf = find_leftmost_leaf(pager, root_page)?;
+    let mut current = first_leaf;
+    while current != 0 {
+        let page_buf = pager.read_page(current).ok_or_else(|| {
+            SQLRiteError::Internal(format!("missing index leaf page {current}"))
+        })?;
+        if page_buf[0] != PageType::TableLeaf as u8 {
+            return Err(SQLRiteError::Internal(format!(
+                "page {current} tagged {} but expected TableLeaf (index)",
+                page_buf[0]
+            )));
+        }
+        let next_leaf = u32::from_le_bytes(page_buf[1..5].try_into().unwrap());
+        let payload: &[u8; PAYLOAD_PER_PAGE] = (&page_buf[PAGE_HEADER_SIZE..])
+            .try_into()
+            .map_err(|_| SQLRiteError::Internal("index leaf payload size".to_string()))?;
+        let leaf = TablePage::from_bytes(payload);
+
+        for slot in 0..leaf.slot_count() {
+            // Slots on an index page hold KIND_INDEX cells; decode directly.
+            let offset = leaf.slot_offset_raw(slot)?;
+            let (ic, _) = IndexCell::decode(leaf.as_bytes(), offset)?;
+            idx.insert(&ic.value, ic.rowid)?;
+        }
+        current = next_leaf;
+    }
+    Ok(())
+}
+
+/// Minimal recognizer for the synthesized-or-user `CREATE INDEX` SQL we
+/// store in sqlrite_master. Returns `(table_name, column_name, is_unique)`.
+///
+/// Uses sqlparser so user-supplied SQL with extra whitespace, case, etc.
+/// still works; the only shape we accept is single-column indexes.
+fn parse_create_index_sql(sql: &str) -> Result<(String, String, bool)> {
+    use sqlparser::ast::{CreateIndex, Expr, Statement};
+
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
+    let Some(Statement::CreateIndex(CreateIndex {
+        table_name,
+        columns,
+        unique,
+        ..
+    })) = ast.pop()
+    else {
+        return Err(SQLRiteError::Internal(format!(
+            "sqlrite_master index row's SQL isn't a CREATE INDEX: {sql}"
+        )));
+    };
+    if columns.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "multi-column indexes aren't supported yet".to_string(),
+        ));
+    }
+    let col = match &columns[0].column.expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_default(),
+        other => {
+            return Err(SQLRiteError::Internal(format!(
+                "unsupported indexed column expression: {other:?}"
+            )));
+        }
+    };
+    Ok((table_name.to_string(), col, unique))
+}
+
+/// Cheap clone helper — `DataType` doesn't derive `Clone` elsewhere.
+fn clone_datatype(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Integer => DataType::Integer,
+        DataType::Text => DataType::Text,
+        DataType::Real => DataType::Real,
+        DataType::Bool => DataType::Bool,
+        DataType::None => DataType::None,
+        DataType::Invalid => DataType::Invalid,
+    }
+}
+
+/// Stages an index's B-Tree at `start_page`. Each leaf cell is a
+/// `KIND_INDEX` entry carrying `(original_rowid, value)`. Returns
+/// `(root_page, next_free_page)`.
+///
+/// The tree's shape matches a regular table's — leaves chained via
+/// `next_page`, optional interior layer above. `Cell::peek_rowid` works
+/// uniformly for index cells (same prefix as local cells), so the
+/// existing slot directory and binary search carry over.
+fn stage_index_btree(
+    pager: &mut Pager,
+    idx: &SecondaryIndex,
+    start_page: u32,
+) -> Result<(u32, u32)> {
+    // Build the leaves.
+    let (leaves, mut next_free_page) = stage_index_leaves(pager, idx, start_page)?;
+    if leaves.len() == 1 {
+        return Ok((leaves[0].0, next_free_page));
+    }
+    let mut level: Vec<(u32, i64)> = leaves;
+    while level.len() > 1 {
+        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
+        next_free_page = new_next_free;
+        level = next_level;
+    }
+    Ok((level[0].0, next_free_page))
+}
+
+/// Packs the index's (value, rowid) entries into a sibling-chained run
+/// of `TableLeaf` pages. Iteration order matches `SecondaryIndex::iter_entries`
+/// (ascending value; rowids in insertion order within a value), which is
+/// also ascending by the "cell rowid" carried in each IndexCell (the
+/// original row's rowid) — so Cell::peek_rowid + the slot directory's
+/// rowid ordering stays consistent.
+fn stage_index_leaves(
+    pager: &mut Pager,
+    idx: &SecondaryIndex,
+    start_page: u32,
+) -> Result<(Vec<(u32, i64)>, u32)> {
+    let mut leaves: Vec<(u32, i64)> = Vec::new();
+    let mut current_leaf = TablePage::empty();
+    let mut current_leaf_page = start_page;
+    let mut current_max_rowid: Option<i64> = None;
+    let mut next_free_page = start_page + 1;
+
+    // Sort the entries by original rowid so the in-page slot directory,
+    // which binary-searches by rowid, stays valid. (iter_entries orders by
+    // value; we reorder here for B-Tree correctness.)
+    let mut entries: Vec<(Value, i64)> = idx.iter_entries().collect();
+    entries.sort_by_key(|(_, r)| *r);
+
+    for (value, rowid) in entries {
+        let cell = IndexCell::new(rowid, value);
+        let entry_bytes = cell.encode()?;
+
+        if !current_leaf.would_fit(entry_bytes.len()) {
+            let next_leaf_page_num = next_free_page;
+            emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
+            leaves.push((
+                current_leaf_page,
+                current_max_rowid.unwrap_or(i64::MIN),
+            ));
+            current_leaf = TablePage::empty();
+            current_leaf_page = next_leaf_page_num;
+            next_free_page += 1;
+
+            if !current_leaf.would_fit(entry_bytes.len()) {
+                return Err(SQLRiteError::Internal(format!(
+                    "index entry of {} bytes exceeds empty-page capacity {}",
+                    entry_bytes.len(),
+                    current_leaf.free_space()
+                )));
+            }
+        }
+        current_leaf.insert_entry(rowid, &entry_bytes)?;
+        current_max_rowid = Some(rowid);
+    }
+
+    emit_leaf(pager, current_leaf_page, &current_leaf, 0);
+    leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+    Ok((leaves, next_free_page))
+}
+
 fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<()> {
     let first_leaf = find_leftmost_leaf(pager, root_page)?;
     let mut current = first_leaf;
@@ -802,6 +1110,68 @@ mod tests {
             "expected a multi-leaf table to have an interior root, got tag {}",
             root_buf[0]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn explicit_index_persists_across_save_and_open() {
+        let path = tmp_path("idx_persist");
+        let mut db = Database::new("idx".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, tag TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        for i in 1..=5 {
+            let tag = if i % 2 == 0 { "odd" } else { "even" };
+            process_command(&format!("INSERT INTO users (tag) VALUES ('{tag}');"), &mut db)
+                .unwrap();
+        }
+        process_command("CREATE INDEX users_tag_idx ON users (tag);", &mut db).unwrap();
+        save_database(&mut db, &path).unwrap();
+
+        let loaded = open_database(&path, "idx".to_string()).unwrap();
+        let users = loaded.get_table("users".to_string()).unwrap();
+        let idx = users
+            .index_by_name("users_tag_idx")
+            .expect("explicit index should survive save/open");
+        assert_eq!(idx.column_name, "tag");
+        assert!(!idx.is_unique);
+        // 5 rows: rowids 2, 4 are "odd" (i % 2 == 0 when i is 2 or 4) — 2 entries;
+        // rowids 1, 3, 5 are "even" (i % 2 != 0) — 3 entries.
+        let even_rowids = idx.lookup(&Value::Text("even".into()));
+        let odd_rowids = idx.lookup(&Value::Text("odd".into()));
+        assert_eq!(even_rowids.len(), 3);
+        assert_eq!(odd_rowids.len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_indexes_for_unique_columns_survive_save_open() {
+        let path = tmp_path("auto_idx_persist");
+        let mut db = Database::new("a".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (email) VALUES ('a@x');", &mut db).unwrap();
+        process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db).unwrap();
+        save_database(&mut db, &path).unwrap();
+
+        let loaded = open_database(&path, "a".to_string()).unwrap();
+        let users = loaded.get_table("users".to_string()).unwrap();
+        // Every UNIQUE column auto-creates an index; the load path populated
+        // it from the persisted entries.
+        let auto_name = SecondaryIndex::auto_name("users", "email");
+        let idx = users
+            .index_by_name(&auto_name)
+            .expect("auto index should be restored");
+        assert!(idx.is_unique);
+        assert_eq!(idx.lookup(&Value::Text("a@x".into())).len(), 1);
+        assert_eq!(idx.lookup(&Value::Text("b@x".into())).len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }

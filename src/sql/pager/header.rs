@@ -15,10 +15,14 @@ pub const MAGIC: &[u8; 16] = b"SQLRiteFormat\0\0\0";
 /// History:
 /// - Version 1 (Phases 2 / 3a / 3b): schema catalog and table data were
 ///   opaque bincode blobs chained across typed payload pages.
-/// - Version 2 (Phases 3c.4 / 3c.5): tables are stored as chains of
-///   `TableLeaf` pages full of typed cells; the schema catalog is itself
-///   a table called `sqlrite_master`.
-pub const FORMAT_VERSION: u16 = 2;
+/// - Version 2 (Phases 3c / 3d): tables are stored as cell-based B-Trees;
+///   the schema catalog is itself a table called `sqlrite_master` with
+///   four columns `(name, sql, rootpage, last_rowid)`.
+/// - Version 3 (Phase 3e): `sqlrite_master` gains a `type` column
+///   (first), distinguishing `'table'` and `'index'` rows; secondary
+///   indexes persist as their own cell-based B-Trees whose cells use
+///   the new `KIND_INDEX` format.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Parsed header. `page_count` includes page 0 itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
