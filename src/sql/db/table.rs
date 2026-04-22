@@ -1,4 +1,5 @@
 use crate::error::{Result, SQLRiteError};
+use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::parser::create::CreateQuery;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -56,15 +57,20 @@ impl fmt::Display for DataType {
 pub struct Table {
     /// Name of the table
     pub tb_name: String,
-    /// HashMap with information about each column
+    /// Schema for each column, in declaration order.
     pub columns: Vec<Column>,
-    /// HashMap with information about each row
+    /// Per-column row storage, keyed by column name. Every column's
+    /// `Row::T(BTreeMap)` is keyed by rowid, so all columns share the same
+    /// keyset after each write.
     pub rows: Rc<RefCell<HashMap<String, Row>>>,
-    /// HashMap of SQL indexes on this table.
-    pub indexes: HashMap<String, String>,
-    /// ROWID of most recent insert
+    /// Secondary indexes on this table (Phase 3e). One auto-created entry
+    /// per UNIQUE or PRIMARY KEY column; explicit `CREATE INDEX` statements
+    /// add more. Looking up an index: iterate by column name, or by index
+    /// name via `Table::index_by_name`.
+    pub secondary_indexes: Vec<SecondaryIndex>,
+    /// ROWID of most recent insert.
     pub last_rowid: i64,
-    /// PRIMARY KEY Column name, if table does not have PRIMARY KEY this would be -1
+    /// PRIMARY KEY column name, or "-1" if the table has no PRIMARY KEY.
     pub primary_key: String,
 }
 
@@ -76,6 +82,7 @@ impl Table {
 
         let mut table_cols: Vec<Column> = vec![];
         let table_rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
+        let mut secondary_indexes: Vec<SecondaryIndex> = Vec::new();
         for col in &columns {
             let col_name = &col.name;
             if col.is_pk {
@@ -89,42 +96,72 @@ impl Table {
                 col.is_unique,
             ));
 
-            match DataType::new(col.datatype.to_string()) {
-                DataType::Integer => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::Integer(BTreeMap::new())),
-                DataType::Real => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::Real(BTreeMap::new())),
-                DataType::Text => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::Text(BTreeMap::new())),
-                DataType::Bool => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::Bool(BTreeMap::new())),
-                DataType::Invalid => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::None),
-                DataType::None => table_rows
-                    .clone()
-                    .borrow_mut()
-                    .insert(col.name.to_string(), Row::None),
+            let dt = DataType::new(col.datatype.to_string());
+            let row_storage = match dt {
+                DataType::Integer => Row::Integer(BTreeMap::new()),
+                DataType::Real => Row::Real(BTreeMap::new()),
+                DataType::Text => Row::Text(BTreeMap::new()),
+                DataType::Bool => Row::Bool(BTreeMap::new()),
+                DataType::Invalid | DataType::None => Row::None,
             };
+            table_rows
+                .clone()
+                .borrow_mut()
+                .insert(col.name.to_string(), row_storage);
+
+            // Auto-create an index for every UNIQUE / PRIMARY KEY column,
+            // but only for types we know how to index. Real / Bool UNIQUE
+            // columns fall back to the linear scan path in
+            // validate_unique_constraint — same behavior as before 3e.
+            if (col.is_pk || col.is_unique) && matches!(dt, DataType::Integer | DataType::Text) {
+                let name = SecondaryIndex::auto_name(&table_name, &col.name);
+                match SecondaryIndex::new(
+                    name,
+                    table_name.clone(),
+                    col.name.clone(),
+                    &dt,
+                    true,
+                    IndexOrigin::Auto,
+                ) {
+                    Ok(idx) => secondary_indexes.push(idx),
+                    Err(_) => {
+                        // Unreachable given the matches! guard above, but
+                        // the builder returns Result so we keep the arm.
+                    }
+                }
+            }
         }
 
         Table {
             tb_name: table_name,
             columns: table_cols,
             rows: table_rows,
-            indexes: HashMap::new(),
+            secondary_indexes,
             last_rowid: 0,
-            primary_key: primary_key,
+            primary_key,
         }
+    }
+
+    /// Finds an auto- or explicit-index entry for a given column. Returns
+    /// `None` if the column isn't indexed.
+    pub fn index_for_column(&self, column: &str) -> Option<&SecondaryIndex> {
+        self.secondary_indexes
+            .iter()
+            .find(|i| i.column_name == column)
+    }
+
+    fn index_for_column_mut(&mut self, column: &str) -> Option<&mut SecondaryIndex> {
+        self.secondary_indexes
+            .iter_mut()
+            .find(|i| i.column_name == column)
+    }
+
+    /// Finds a secondary index by its own name (e.g., `sqlrite_autoindex_users_email`
+    /// or a user-provided CREATE INDEX name). Used by Phase 3e.2 to look up
+    /// explicit indexes when DROP INDEX lands.
+    #[allow(dead_code)]
+    pub fn index_by_name(&self, name: &str) -> Option<&SecondaryIndex> {
+        self.secondary_indexes.iter().find(|i| i.name == name)
     }
 
     /// Returns a `bool` informing if a `Column` with a specific name exists or not
@@ -160,8 +197,18 @@ impl Table {
     }
 
     /// Removes the row identified by `rowid` from every column's storage and
-    /// from every column's index.
+    /// from every secondary index entry.
     pub fn delete_row(&mut self, rowid: i64) {
+        // Snapshot the values we're about to delete so we can strip them
+        // from secondary indexes by (value, rowid) before the row storage
+        // disappears.
+        let per_column_values: Vec<(String, Option<Value>)> = self
+            .columns
+            .iter()
+            .map(|c| (c.column_name.clone(), self.get_value(&c.column_name, rowid)))
+            .collect();
+
+        // Remove from row storage.
         {
             let rows_clone = Rc::clone(&self.rows);
             let mut row_data = rows_clone.as_ref().borrow_mut();
@@ -185,16 +232,14 @@ impl Table {
                 }
             }
         }
-        // Drop any index entries that pointed at this rowid.
-        for col in &mut self.columns {
-            match &mut col.index {
-                Index::Integer(idx) => {
-                    idx.retain(|_k, v| *v != rowid);
+
+        // Strip secondary-index entries. Non-indexed columns just don't
+        // show up in secondary_indexes and are no-ops here.
+        for (col_name, value) in per_column_values {
+            if let Some(idx) = self.index_for_column_mut(&col_name) {
+                if let Some(v) = value {
+                    idx.remove(&v, rowid);
                 }
-                Index::Text(idx) => {
-                    idx.retain(|_k, v| *v != rowid);
-                }
-                Index::None => {}
             }
         }
     }
@@ -222,64 +267,65 @@ impl Table {
 
         for (i, value) in values.into_iter().enumerate() {
             let col_name = &column_names[i];
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
-            let cell = row_data.get_mut(col_name).ok_or_else(|| {
-                SQLRiteError::Internal(format!("Row storage missing for column '{col_name}'"))
-            })?;
 
-            let column = self
-                .columns
-                .iter_mut()
-                .find(|c| c.column_name == *col_name)
-                .ok_or_else(|| {
-                    SQLRiteError::Internal(format!("Column '{col_name}' not found"))
+            // Write into the per-column row storage first (scoped borrow so
+            // the secondary-index update below doesn't fight over `self`).
+            {
+                let rows_clone = Rc::clone(&self.rows);
+                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let cell = row_data.get_mut(col_name).ok_or_else(|| {
+                    SQLRiteError::Internal(format!(
+                        "Row storage missing for column '{col_name}'"
+                    ))
                 })?;
 
-            match (cell, value) {
-                (Row::Integer(map), Some(Value::Integer(v))) => {
-                    map.insert(rowid, v as i32);
-                    if let Index::Integer(idx) = &mut column.index {
-                        idx.insert(v as i32, rowid);
+                match (cell, &value) {
+                    (Row::Integer(map), Some(Value::Integer(v))) => {
+                        map.insert(rowid, *v as i32);
+                    }
+                    (Row::Integer(_), None) => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Integer column '{col_name}' cannot store NULL — corrupt cell?"
+                        )));
+                    }
+                    (Row::Text(map), Some(Value::Text(s))) => {
+                        map.insert(rowid, s.clone());
+                    }
+                    (Row::Text(map), None) => {
+                        // Matches the on-insert convention: NULL in Text
+                        // storage is represented by the literal "Null"
+                        // sentinel and not added to the index.
+                        map.insert(rowid, "Null".to_string());
+                    }
+                    (Row::Real(map), Some(Value::Real(v))) => {
+                        map.insert(rowid, *v as f32);
+                    }
+                    (Row::Real(_), None) => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Real column '{col_name}' cannot store NULL — corrupt cell?"
+                        )));
+                    }
+                    (Row::Bool(map), Some(Value::Bool(v))) => {
+                        map.insert(rowid, *v);
+                    }
+                    (Row::Bool(_), None) => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Bool column '{col_name}' cannot store NULL — corrupt cell?"
+                        )));
+                    }
+                    (row, v) => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Type mismatch restoring column '{col_name}': storage {row:?} vs value {v:?}"
+                        )));
                     }
                 }
-                (Row::Integer(_), None) => {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Integer column '{col_name}' cannot store NULL — corrupt cell?"
-                    )));
-                }
-                (Row::Text(map), Some(Value::Text(s))) => {
-                    if let Index::Text(idx) = &mut column.index {
-                        idx.insert(s.clone(), rowid);
-                    }
-                    map.insert(rowid, s);
-                }
-                (Row::Text(map), None) => {
-                    // Matches the on-insert convention: NULL in Text storage
-                    // is represented by the literal "Null" sentinel and not
-                    // added to the index.
-                    map.insert(rowid, "Null".to_string());
-                }
-                (Row::Real(map), Some(Value::Real(v))) => {
-                    map.insert(rowid, v as f32);
-                }
-                (Row::Real(_), None) => {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Real column '{col_name}' cannot store NULL — corrupt cell?"
-                    )));
-                }
-                (Row::Bool(map), Some(Value::Bool(v))) => {
-                    map.insert(rowid, v);
-                }
-                (Row::Bool(_), None) => {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Bool column '{col_name}' cannot store NULL — corrupt cell?"
-                    )));
-                }
-                (row, value) => {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Type mismatch restoring column '{col_name}': storage {row:?} vs value {value:?}"
-                    )));
+            }
+
+            // Maintain the secondary index (if any). NULL values are skipped
+            // by `insert`, matching the "NULL is not indexed" convention.
+            if let Some(v) = &value {
+                if let Some(idx) = self.index_for_column_mut(col_name) {
+                    idx.insert(v, rowid)?;
                 }
             }
         }
@@ -305,7 +351,8 @@ impl Table {
     }
 
     /// Overwrites the cell at `(column, rowid)` with `new_val`. Enforces the
-    /// column's datatype and UNIQUE constraint, and updates any index.
+    /// column's datatype and UNIQUE constraint, and updates any secondary
+    /// index.
     ///
     /// Returns `Err` if the column doesn't exist, the value type is incompatible,
     /// or writing would violate UNIQUE.
@@ -322,73 +369,87 @@ impl Table {
             return Ok(());
         }
 
-        // Enforce UNIQUE: scan other rows for the same new value.
+        // Enforce UNIQUE. Prefer an O(log N) index probe if we have one;
+        // fall back to a full column scan otherwise (Real/Bool UNIQUE
+        // columns, which don't get auto-indexed).
         if self.columns[col_index].is_unique && !matches!(new_val, Value::Null) {
-            for other in self.rowids() {
-                if other == rowid {
-                    continue;
+            if let Some(idx) = self.index_for_column(column) {
+                for other in idx.lookup(&new_val) {
+                    if other != rowid {
+                        return Err(SQLRiteError::General(format!(
+                            "UNIQUE constraint violated for column '{column}'"
+                        )));
+                    }
                 }
-                if self.get_value(column, other).as_ref() == Some(&new_val) {
+            } else {
+                for other in self.rowids() {
+                    if other == rowid {
+                        continue;
+                    }
+                    if self.get_value(column, other).as_ref() == Some(&new_val) {
+                        return Err(SQLRiteError::General(format!(
+                            "UNIQUE constraint violated for column '{column}'"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Drop the old index entry before writing the new value, so the
+        // post-write index insert doesn't clash with the previous state.
+        if let Some(old) = current {
+            if let Some(idx) = self.index_for_column_mut(column) {
+                idx.remove(&old, rowid);
+            }
+        }
+
+        // Write into the column's Row, type-checking against the declared DataType.
+        let declared = &self.columns[col_index].datatype;
+        {
+            let rows_clone = Rc::clone(&self.rows);
+            let mut row_data = rows_clone.as_ref().borrow_mut();
+            let cell = row_data.get_mut(column).ok_or_else(|| {
+                SQLRiteError::Internal(format!("Row storage missing for column '{column}'"))
+            })?;
+
+            match (cell, &new_val, declared) {
+                (Row::Integer(m), Value::Integer(v), _) => {
+                    m.insert(rowid, *v as i32);
+                }
+                (Row::Real(m), Value::Real(v), _) => {
+                    m.insert(rowid, *v as f32);
+                }
+                (Row::Real(m), Value::Integer(v), _) => {
+                    m.insert(rowid, *v as f32);
+                }
+                (Row::Text(m), Value::Text(v), _) => {
+                    m.insert(rowid, v.clone());
+                }
+                (Row::Bool(m), Value::Bool(v), _) => {
+                    m.insert(rowid, *v);
+                }
+                // NULL writes: store the sentinel "Null" string for Text; for other
+                // types we leave storage as-is since those BTreeMaps can't hold NULL today.
+                (Row::Text(m), Value::Null, _) => {
+                    m.insert(rowid, "Null".to_string());
+                }
+                (_, new, dt) => {
                     return Err(SQLRiteError::General(format!(
-                        "UNIQUE constraint violated for column '{column}'"
+                        "Type mismatch: cannot assign {} to column '{column}' of type {dt}",
+                        new.to_display_string()
                     )));
                 }
             }
         }
 
-        // Drop the old index entry (if any) for this rowid.
-        match &mut self.columns[col_index].index {
-            Index::Integer(idx) => {
-                idx.retain(|_k, v| *v != rowid);
-            }
-            Index::Text(idx) => {
-                idx.retain(|_k, v| *v != rowid);
-            }
-            Index::None => {}
-        }
-
-        // Write into the column's Row, type-checking against the declared DataType.
-        let declared = &self.columns[col_index].datatype;
-        let rows_clone = Rc::clone(&self.rows);
-        let mut row_data = rows_clone.as_ref().borrow_mut();
-        let cell = row_data.get_mut(column).ok_or_else(|| {
-            SQLRiteError::Internal(format!("Row storage missing for column '{column}'"))
-        })?;
-
-        match (cell, &new_val, declared) {
-            (Row::Integer(m), Value::Integer(v), _) => {
-                m.insert(rowid, *v as i32);
-                if let Index::Integer(idx) = &mut self.columns[col_index].index {
-                    idx.insert(*v as i32, rowid);
-                }
-            }
-            (Row::Real(m), Value::Real(v), _) => {
-                m.insert(rowid, *v as f32);
-            }
-            (Row::Real(m), Value::Integer(v), _) => {
-                m.insert(rowid, *v as f32);
-            }
-            (Row::Text(m), Value::Text(v), _) => {
-                m.insert(rowid, v.clone());
-                if let Index::Text(idx) = &mut self.columns[col_index].index {
-                    idx.insert(v.clone(), rowid);
-                }
-            }
-            (Row::Bool(m), Value::Bool(v), _) => {
-                m.insert(rowid, *v);
-            }
-            // NULL writes: store the sentinel "Null" string for Text; for other
-            // types we leave storage as-is since those BTreeMaps can't hold NULL today.
-            (Row::Text(m), Value::Null, _) => {
-                m.insert(rowid, "Null".to_string());
-            }
-            (_, new, dt) => {
-                return Err(SQLRiteError::General(format!(
-                    "Type mismatch: cannot assign {} to column '{column}' of type {dt}",
-                    new.to_display_string()
-                )));
+        // Maintain the secondary index, if any. NULL values are skipped by
+        // insert per convention.
+        if !matches!(new_val, Value::Null) {
+            if let Some(idx) = self.index_for_column_mut(column) {
+                idx.insert(&new_val, rowid)?;
             }
         }
+
         Ok(())
     }
 
@@ -410,56 +471,70 @@ impl Table {
         }
     }
 
-    /// Returns an mutable reference of `sql::db::table::Column` if the table contains a
-    /// column with the specified key as a column name.
-    ///
-    pub fn get_column_mut<'a>(&mut self, column_name: String) -> Result<&mut Column> {
-        for elem in self.columns.iter_mut() {
-            if elem.column_name == column_name {
-                return Ok(elem);
-            }
-        }
-        Err(SQLRiteError::General(String::from("Column not found.")))
-    }
-
-    /// Validates if columns and values being inserted violate the UNIQUE constraint
-    /// As a reminder the PRIMARY KEY column automatically also is a UNIQUE column.
-    ///
+    /// Validates if columns and values being inserted violate the UNIQUE constraint.
+    /// PRIMARY KEY columns are automatically UNIQUE. Uses the corresponding
+    /// secondary index when one exists (O(log N) lookup); falls back to a
+    /// linear scan for indexable-but-not-indexed situations (e.g. a Real
+    /// UNIQUE column — Real isn't in the auto-indexed set).
     pub fn validate_unique_constraint(
         &mut self,
         cols: &Vec<String>,
         values: &Vec<String>,
     ) -> Result<()> {
         for (idx, name) in cols.iter().enumerate() {
-            let column = self.get_column_mut(name.to_string())?;
+            let column = self
+                .columns
+                .iter()
+                .find(|c| &c.column_name == name)
+                .ok_or_else(|| SQLRiteError::General(format!("Column '{name}' not found")))?;
             if !column.is_unique {
                 continue;
             }
+            let datatype = &column.datatype;
             let val = &values[idx];
-            match &column.index {
-                Index::Integer(index) => {
-                    let parsed = val.parse::<i32>().map_err(|_| {
-                        SQLRiteError::General(format!(
-                            "Type mismatch: expected INTEGER for column '{name}', got '{val}'"
-                        ))
-                    })?;
-                    if index.contains_key(&parsed) {
-                        return Err(SQLRiteError::General(format!(
-                            "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
-                        )));
-                    }
-                }
-                Index::Text(index) => {
-                    if index.contains_key(val) {
-                        return Err(SQLRiteError::General(format!(
-                            "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
-                        )));
-                    }
-                }
-                Index::None => {
-                    return Err(SQLRiteError::General(format!(
-                        "UNIQUE column '{name}' has no index"
+
+            // Parse the string value into a runtime Value according to the
+            // declared column type. If parsing fails the caller's insert
+            // would also fail with the same error; surface it here so we
+            // don't emit a misleading "unique OK" on bad input.
+            let parsed = match datatype {
+                DataType::Integer => val.parse::<i64>().map(Value::Integer).map_err(|_| {
+                    SQLRiteError::General(format!(
+                        "Type mismatch: expected INTEGER for column '{name}', got '{val}'"
+                    ))
+                })?,
+                DataType::Text => Value::Text(val.clone()),
+                DataType::Real => val.parse::<f64>().map(Value::Real).map_err(|_| {
+                    SQLRiteError::General(format!(
+                        "Type mismatch: expected REAL for column '{name}', got '{val}'"
+                    ))
+                })?,
+                DataType::Bool => val.parse::<bool>().map(Value::Bool).map_err(|_| {
+                    SQLRiteError::General(format!(
+                        "Type mismatch: expected BOOL for column '{name}', got '{val}'"
+                    ))
+                })?,
+                DataType::None | DataType::Invalid => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "column '{name}' has an unsupported datatype"
                     )));
+                }
+            };
+
+            if let Some(secondary) = self.index_for_column(name) {
+                if secondary.would_violate_unique(&parsed) {
+                    return Err(SQLRiteError::General(format!(
+                        "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
+                    )));
+                }
+            } else {
+                // No secondary index (Real / Bool UNIQUE). Linear scan.
+                for other in self.rowids() {
+                    if self.get_value(name, other).as_ref() == Some(&parsed) {
+                        return Err(SQLRiteError::General(format!(
+                            "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
+                        )));
+                    }
                 }
             }
         }
@@ -479,27 +554,34 @@ impl Table {
     pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<String>) -> Result<()> {
         let mut next_rowid = self.last_rowid + 1;
 
-        // Auto-assign INTEGER PRIMARY KEY when it's not supplied by the user;
-        // otherwise use the supplied value as the new rowid (and reject non-ints).
+        // Auto-assign INTEGER PRIMARY KEY when the user omits it; otherwise
+        // adopt the supplied value as the new rowid.
         if self.primary_key != "-1" {
             if !cols.iter().any(|col| col == &self.primary_key) {
-                let rows_clone = Rc::clone(&self.rows);
-                let mut row_data = rows_clone.as_ref().borrow_mut();
-                let table_col_data = row_data.get_mut(&self.primary_key).ok_or_else(|| {
-                    SQLRiteError::Internal(format!(
-                        "Row storage missing for primary key column '{}'",
-                        self.primary_key
-                    ))
-                })?;
-
-                let column_headers = self.get_column_mut(self.primary_key.to_string())?;
-                let col_index = column_headers.get_mut_index();
-
-                if let Row::Integer(tree) = table_col_data {
-                    let val = next_rowid as i32;
-                    tree.insert(next_rowid, val);
-                    if let Index::Integer(index) = col_index {
-                        index.insert(val, next_rowid);
+                // Write the auto-assigned PK into row storage, then sync
+                // the secondary index.
+                let val = next_rowid as i32;
+                let wrote_integer = {
+                    let rows_clone = Rc::clone(&self.rows);
+                    let mut row_data = rows_clone.as_ref().borrow_mut();
+                    let table_col_data = row_data.get_mut(&self.primary_key).ok_or_else(|| {
+                        SQLRiteError::Internal(format!(
+                            "Row storage missing for primary key column '{}'",
+                            self.primary_key
+                        ))
+                    })?;
+                    match table_col_data {
+                        Row::Integer(tree) => {
+                            tree.insert(next_rowid, val);
+                            true
+                        }
+                        _ => false, // non-integer PK: auto-assign is a no-op
+                    }
+                };
+                if wrote_integer {
+                    let pk = self.primary_key.clone();
+                    if let Some(idx) = self.index_for_column_mut(&pk) {
+                        idx.insert(&Value::Integer(val as i64), next_rowid)?;
                     }
                 }
             } else {
@@ -541,57 +623,66 @@ impl Table {
                 continue;
             }
 
-            let rows_clone = Rc::clone(&self.rows);
-            let mut row_data = rows_clone.as_ref().borrow_mut();
-            let table_col_data = row_data.get_mut(key).ok_or_else(|| {
-                SQLRiteError::Internal(format!("Row storage missing for column '{key}'"))
-            })?;
+            // Step 1: write into row storage and compute the typed Value
+            // we'll hand to the secondary index (if any).
+            let typed_value: Option<Value> = {
+                let rows_clone = Rc::clone(&self.rows);
+                let mut row_data = rows_clone.as_ref().borrow_mut();
+                let table_col_data = row_data.get_mut(key).ok_or_else(|| {
+                    SQLRiteError::Internal(format!("Row storage missing for column '{key}'"))
+                })?;
 
-            let column_headers = self.get_column_mut(key.to_string())?;
-            let col_index = column_headers.get_mut_index();
-
-            match table_col_data {
-                Row::Integer(tree) => {
-                    let parsed = val.parse::<i32>().map_err(|_| {
-                        SQLRiteError::General(format!(
-                            "Type mismatch: expected INTEGER for column '{key}', got '{val}'"
-                        ))
-                    })?;
-                    tree.insert(next_rowid, parsed);
-                    if let Index::Integer(index) = col_index {
-                        index.insert(parsed, next_rowid);
+                match table_col_data {
+                    Row::Integer(tree) => {
+                        let parsed = val.parse::<i32>().map_err(|_| {
+                            SQLRiteError::General(format!(
+                                "Type mismatch: expected INTEGER for column '{key}', got '{val}'"
+                            ))
+                        })?;
+                        tree.insert(next_rowid, parsed);
+                        Some(Value::Integer(parsed as i64))
                     }
-                }
-                Row::Text(tree) => {
-                    tree.insert(next_rowid, val.to_string());
-                    if let Index::Text(index) = col_index {
-                        // Never index the NULL sentinel — it isn't a real value and
-                        // would collide across rows with missing data.
+                    Row::Text(tree) => {
+                        tree.insert(next_rowid, val.to_string());
+                        // "Null" sentinel stays out of the index — it isn't a
+                        // real user value.
                         if val != "Null" {
-                            index.insert(val.to_string(), next_rowid);
+                            Some(Value::Text(val.to_string()))
+                        } else {
+                            None
                         }
                     }
+                    Row::Real(tree) => {
+                        let parsed = val.parse::<f32>().map_err(|_| {
+                            SQLRiteError::General(format!(
+                                "Type mismatch: expected REAL for column '{key}', got '{val}'"
+                            ))
+                        })?;
+                        tree.insert(next_rowid, parsed);
+                        Some(Value::Real(parsed as f64))
+                    }
+                    Row::Bool(tree) => {
+                        let parsed = val.parse::<bool>().map_err(|_| {
+                            SQLRiteError::General(format!(
+                                "Type mismatch: expected BOOL for column '{key}', got '{val}'"
+                            ))
+                        })?;
+                        tree.insert(next_rowid, parsed);
+                        Some(Value::Bool(parsed))
+                    }
+                    Row::None => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Column '{key}' has no row storage"
+                        )));
+                    }
                 }
-                Row::Real(tree) => {
-                    let parsed = val.parse::<f32>().map_err(|_| {
-                        SQLRiteError::General(format!(
-                            "Type mismatch: expected REAL for column '{key}', got '{val}'"
-                        ))
-                    })?;
-                    tree.insert(next_rowid, parsed);
-                }
-                Row::Bool(tree) => {
-                    let parsed = val.parse::<bool>().map_err(|_| {
-                        SQLRiteError::General(format!(
-                            "Type mismatch: expected BOOL for column '{key}', got '{val}'"
-                        ))
-                    })?;
-                    tree.insert(next_rowid, parsed);
-                }
-                Row::None => {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Column '{key}' has no row storage"
-                    )));
+            };
+
+            // Step 2: maintain the secondary index (if any). insert() is a
+            // no-op for Value::Null and cheap for other value kinds.
+            if let Some(v) = typed_value {
+                if let Some(idx) = self.index_for_column_mut(key) {
+                    idx.insert(&v, next_rowid)?;
                 }
             }
         }
@@ -711,25 +802,18 @@ impl Table {
     }
 }
 
-/// The schema for each SQL column in every table is represented in memory
-/// by following structure
+/// The schema for each SQL column in every table.
+///
+/// Per-column index state moved to `Table::secondary_indexes` in Phase 3e —
+/// a single `Column` describes the declared schema (name, type, constraints)
+/// and nothing more.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct Column {
-    /// Name of the column
     pub column_name: String,
-    /// Datatype of column
     pub datatype: DataType,
-    /// Value representing if column is PRIMARY KEY
     pub is_pk: bool,
-    /// Value representing if column was declared with the NOT NULL Constraint
     pub not_null: bool,
-    /// Value representing if column was declared with the UNIQUE Constraint
     pub is_unique: bool,
-    /// Value representing if column is Indexed or not
-    pub is_indexed: bool,
-    /// BtreeMap mapping the index to a payload value on the corresponding Row
-    /// Mapped using a ROWID
-    pub index: Index,
 }
 
 impl Column {
@@ -741,38 +825,14 @@ impl Column {
         is_unique: bool,
     ) -> Self {
         let dt = DataType::new(datatype);
-        let index = match dt {
-            DataType::Integer => Index::Integer(BTreeMap::new()),
-            DataType::Bool => Index::None,
-            DataType::Text => Index::Text(BTreeMap::new()),
-            DataType::Real => Index::None,
-            DataType::Invalid => Index::None,
-            DataType::None => Index::None,
-        };
-
         Column {
             column_name: name,
             datatype: dt,
             is_pk,
             not_null,
             is_unique,
-            is_indexed: if is_pk { true } else { false },
-            index,
         }
     }
-
-    pub fn get_mut_index(&mut self) -> &mut Index {
-        return &mut self.index;
-    }
-}
-
-/// The schema for each SQL column index in every table is represented in memory
-/// by following structure
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
-pub enum Index {
-    Integer(BTreeMap<i32, i64>),
-    Text(BTreeMap<String, i64>),
-    None,
 }
 
 /// The schema for each SQL row in every table is represented in memory

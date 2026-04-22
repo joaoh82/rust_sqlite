@@ -53,6 +53,7 @@ use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
+use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::db::table::{Column, DataType, Row, Table, Value};
 use crate::sql::parser::create::CreateQuery;
 use crate::sql::pager::cell::Cell;
@@ -273,6 +274,7 @@ fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
 /// Builds an empty in-memory `Table` given the declared columns.
 fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table {
     let rows: Rc<RefCell<HashMap<String, Row>>> = Rc::new(RefCell::new(HashMap::new()));
+    let mut secondary_indexes: Vec<SecondaryIndex> = Vec::new();
     {
         let mut map = rows.borrow_mut();
         for col in &columns {
@@ -284,6 +286,23 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
                 _ => Row::None,
             };
             map.insert(col.column_name.clone(), row);
+
+            // Auto-create UNIQUE/PK indexes so the restored table has the
+            // same shape Table::new would have built from fresh SQL.
+            if (col.is_pk || col.is_unique)
+                && matches!(col.datatype, DataType::Integer | DataType::Text)
+            {
+                if let Ok(idx) = SecondaryIndex::new(
+                    SecondaryIndex::auto_name(name, &col.column_name),
+                    name.to_string(),
+                    col.column_name.clone(),
+                    &col.datatype,
+                    true,
+                    IndexOrigin::Auto,
+                ) {
+                    secondary_indexes.push(idx);
+                }
+            }
         }
     }
 
@@ -297,7 +316,7 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
         tb_name: name.to_string(),
         columns,
         rows,
-        indexes: HashMap::new(),
+        secondary_indexes,
         last_rowid,
         primary_key,
     }
