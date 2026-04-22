@@ -283,3 +283,15 @@ These are not all enforced on open — we validate the header strictly and rely 
 - **v3** (Phase 3e, current) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL will introduce a sibling file (`.sqlrite-wal`) rather than changing the main file format.
+
+## Process-level locking
+
+Starting with Phase 4a, every `Pager::open` / `Pager::create` takes a non-blocking OS **exclusive advisory lock** on the file (`fs2::FileExt::try_lock_exclusive` — `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on Windows). A second SQLRite process that tries to open the same file while another process already has it open fails immediately with:
+
+```
+database '/path/to/file.sqlrite' is already opened by another process (…)
+```
+
+The lock is tied to the underlying `File` descriptor, so it releases automatically when the `Pager` drops — no explicit unlock call. Tests and application code therefore need to scope `Database` lifetimes (or explicitly `drop` them) when they want to reopen the same file for verification.
+
+**Single-writer-exclusive only**, for now. Phase 4e will upgrade to shared + exclusive lock modes once the WAL is in place so multiple readers can coexist with a single writer.

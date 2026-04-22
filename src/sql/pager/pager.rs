@@ -15,15 +15,39 @@
 //! every auto-save. Without the diff, even a one-row UPDATE rewrites every
 //! page of every table. With the diff, unchanged tables — whose bincode blob
 //! hashes identically across saves — simply stay on disk.
+//!
+//! **Locking (Phase 4a).** Every `Pager` takes an exclusive advisory lock
+//! on its backing file (`fs2::FileExt::try_lock_exclusive`). If another
+//! SQLRite process is already holding the lock, `open` / `create` return a
+//! clean `database is already opened by another process` error instead of
+//! silently racing. The lock is tied to the file descriptor and released
+//! automatically when the `Pager` drops. This is exclusive — one writer,
+//! no concurrent readers. Phase 4e upgrades to shared/exclusive modes
+//! once WAL is in.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use crate::error::Result;
+use fs2::FileExt;
+
+use crate::error::{Result, SQLRiteError};
 use crate::sql::pager::file::FileStorage;
 use crate::sql::pager::header::{DbHeader, encode_header};
 use crate::sql::pager::page::PAGE_SIZE;
+
+/// Acquires an exclusive advisory lock on `file`, mapping the OS-level
+/// "lock held" error to a clean SQLRite error that mentions the path. On
+/// Unix this is `flock(LOCK_EX | LOCK_NB)`; on Windows, `LockFileEx` with
+/// `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY`.
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    file.try_lock_exclusive().map_err(|e| {
+        SQLRiteError::General(format!(
+            "database '{}' is already opened by another process ({e})",
+            path.display()
+        ))
+    })
+}
 
 pub struct Pager {
     storage: FileStorage,
@@ -37,9 +61,12 @@ pub struct Pager {
 
 impl Pager {
     /// Opens an existing database file and loads every page into the
-    /// `on_disk` snapshot. Returns `Err` if the header is invalid.
+    /// `on_disk` snapshot. Returns `Err` if the header is invalid, or
+    /// if another SQLRite process already holds an exclusive lock on
+    /// the file.
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        lock_exclusive(&file, path)?;
         let mut storage = FileStorage::new(file);
         let header = storage.read_header()?;
 
@@ -71,6 +98,7 @@ impl Pager {
             .create(true)
             .truncate(true)
             .open(path)?;
+        lock_exclusive(&file, path)?;
         let mut storage = FileStorage::new(file);
 
         let empty_master = TablePage::empty();
@@ -264,6 +292,32 @@ mod tests {
         assert_eq!(p2.read_page(2).unwrap()[0], 0xAA);
         assert_eq!(p2.read_page(3).unwrap()[0], 0xBB);
         assert_eq!(p2.read_page(4).unwrap()[0], 0xDD);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn second_pager_on_same_file_is_rejected() {
+        // Phase 4a regression: two simultaneous Pagers against the same
+        // file used to silently race. Now the second one must error out
+        // with a "already opened by another process" message.
+        let path = tmp_path("lock_contention");
+        let _first = Pager::create(&path).unwrap();
+
+        let second = Pager::open(&path);
+        assert!(second.is_err(), "expected lock-contention error, got Ok");
+        let msg = format!("{}", second.unwrap_err());
+        assert!(
+            msg.contains("already opened by another process"),
+            "error message should mention lock contention; got: {msg}"
+        );
+
+        // After the first Pager drops, the lock releases and a fresh
+        // open succeeds — confirming the lock is tied to Pager lifetime,
+        // not leaked across instances.
+        drop(_first);
+        let third = Pager::open(&path);
+        assert!(third.is_ok(), "reopen after drop should succeed: {third:?}");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -45,3 +45,8 @@ clap = { version = "4.6", features = ["cargo"] }
 sqlparser = "0.61"
 thiserror = "2.0"
 prettytable-rs = "0.10"
+# Cross-platform advisory file locks. Phase 4a uses it to take an
+# exclusive lock on an open .sqlrite so two processes can't stomp on
+# each other. Phase 4e will graduate to shared + exclusive modes once
+# WAL is in.
+fs2 = "0.4"

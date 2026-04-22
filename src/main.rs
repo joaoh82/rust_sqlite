@@ -83,19 +83,23 @@ fn main() -> rustyline::Result<()> {
 
     // Either open/create the requested file, or drop into a transient
     // in-memory database (the legacy default when no FILE is given).
-    let mut db = match &initial_db_path {
+    // We track whether the open succeeded so the banner doesn't claim
+    // "Opened …" when we actually fell back to in-memory after a lock
+    // contention or other failure.
+    let (mut db, opened_path): (Database, Option<&std::path::PathBuf>) = match &initial_db_path {
         Some(path) => match open_or_create(path) {
-            Ok(db) => db,
+            Ok(db) => (db, Some(path)),
             Err(err) => {
                 eprintln!("Could not open '{}': {err}", path.display());
-                Database::new("tempdb".to_string())
+                eprintln!("Falling back to a transient in-memory database.");
+                (Database::new("tempdb".to_string()), None)
             }
         },
-        None => Database::new("tempdb".to_string()),
+        None => (Database::new("tempdb".to_string()), None),
     };
 
     // Friendly intro message for the user
-    let connection_line = match &initial_db_path {
+    let connection_line = match opened_path {
         Some(path) => format!("Opened '{}' — auto-save enabled.", path.display()),
         None => "Connected to a transient in-memory database.\nUse '.open FILENAME' to reopen on a persistent database.".to_string(),
     };

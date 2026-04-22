@@ -101,13 +101,37 @@ Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; 
 
 Build / run: `cd desktop && npm install && npm run tauri dev`. See [docs/desktop.md](../docs/desktop.md) for details.
 
-## Phase 4 — Durability + concurrency
+## Phase 4 — Durability + concurrency *(in progress)*
 
-- Write-Ahead Log in `<db>.sqlrite-wal`
-- Checkpointer that merges the WAL back into the main file
-- OS file locks (`fs2` or `fd-lock`) so multiple processes can't corrupt each other
-- SQLite-style **multiple readers + single writer** via WAL mode
-- Transactional ACID properties, `BEGIN` / `COMMIT` / `ROLLBACK`
+### ✅ Phase 4a — Exclusive file lock
+
+Every `Pager::open` / `Pager::create` takes a non-blocking OS exclusive advisory lock via `fs2::FileExt::try_lock_exclusive` — `flock(LOCK_EX \| LOCK_NB)` on Unix, `LockFileEx` on Windows. A second process attempting to open the same file gets a clean `database '…' is already opened by another process` error. The lock is tied to the `File` handle so it releases automatically when the `Pager` drops. No WAL yet — this is the single-writer-exclusive baseline that the rest of Phase 4 builds on.
+
+### Phase 4b — WAL file format *(next)*
+
+- `.sqlrite-wal` sidecar with a hand-rolled frame format: each frame carries `(page_num u32, commit_flag u8, salt u32, page_size bytes)`
+- WAL header: magic + format version + page size + salt + checkpoint seq
+
+### Phase 4c — WAL-aware Pager
+
+- Reads consult WAL first, fall back to the main file
+- Writes append frames to WAL instead of mutating the main file
+- Commit writes a "commit" marker frame + fsync
+
+### Phase 4d — Checkpointer
+
+- Apply accumulated WAL frames back into the main file
+- Triggered opportunistically on commit past a threshold, or on `.save`
+
+### Phase 4e — Multi-reader / single-writer
+
+- Graduate from exclusive-only to shared + exclusive lock modes
+- Read marks so checkpointer doesn't pull frames that active readers still depend on
+
+### Phase 4f — Transactions
+
+- `BEGIN` / `COMMIT` / `ROLLBACK` on top of the WAL
+- Uncommitted frames stay out of reader snapshots until commit
 
 ## Phase 5 — Library, embedding, WASM
 

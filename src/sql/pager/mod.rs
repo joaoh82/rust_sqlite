@@ -959,9 +959,12 @@ mod tests {
         let path = tmp_path("after_load");
         save_database(&mut seed_db(), &path).unwrap();
 
-        let mut db = open_database(&path, "test".to_string()).unwrap();
-        process_command("INSERT INTO users (name, age) VALUES ('carol', 40);", &mut db).unwrap();
-        save_database(&mut db, &path).unwrap();
+        {
+            let mut db = open_database(&path, "test".to_string()).unwrap();
+            process_command("INSERT INTO users (name, age) VALUES ('carol', 40);", &mut db)
+                .unwrap();
+            save_database(&mut db, &path).unwrap();
+        } // db drops → its exclusive lock releases before we reopen below.
 
         let db2 = open_database(&path, "test".to_string()).unwrap();
         let users = db2.get_table("users".to_string()).unwrap();

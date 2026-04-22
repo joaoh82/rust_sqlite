@@ -171,7 +171,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] `.tables` — list tables in the current database
 - [x] Header written last during save, so a mid-save crash leaves the file recognizably unopenable
 
-**Phase 3 — On-disk B-Tree + auto-save pager** *(in progress)*
+**Phase 3 — On-disk B-Tree + auto-save pager** *(done)*
 - [x] **3a — Auto-save**: every committing SQL statement (`CREATE` / `INSERT` / `UPDATE` / `DELETE`) against a file-backed DB auto-flushes; `.save` is now a rare manual flush
 - [x] **3b — Pager abstraction**: long-lived `Pager` holding a byte snapshot of every page on disk plus a staging area for the next commit; `commit` diffs staged vs. snapshot and writes only pages whose bytes actually changed; file truncates when the page count shrinks
 - [x] **3c — Cell-based pages** *(format v2)*: rows stored as length-prefixed cells (tag-then-value encoding with null bitmap) in `TableLeaf` pages carrying a SQLite-style slot directory; oversized cells spill into an overflow page chain; the schema catalog itself is now a real table named `sqlrite_master` stored in the same cell format
@@ -185,11 +185,13 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **Tauri 2.0 backend**: four commands (`open_database`, `list_tables`, `table_rows`, `execute_sql`) wrap the engine; results are tagged enums shipped to the UI via the JSON IPC bridge.
 - [x] **Svelte 5 frontend**: dark-themed three-pane layout — header with "Open…" file picker, sidebar with table list + schema, query editor with Cmd/Ctrl+Enter to run, result grid with sticky header.
 
-**Phase 4 — Durability and concurrency**
-- [ ] Write-Ahead Log (`<db>.sqlrite-wal`) with a checkpointer that merges the WAL back into the main file
-- [ ] OS file locks (`fs2` / `fd-lock`) so multiple processes can't corrupt each other
-- [ ] SQLite-style **multiple readers + single writer** via WAL mode
-- [ ] Transactional ACID properties
+**Phase 4 — Durability and concurrency** *(in progress)*
+- [x] **4a — Exclusive file lock**: `Pager::open` / `::create` takes an OS advisory lock (`fs2::try_lock_exclusive`); a second process on the same file gets a clean "already opened by another process" error. Lock releases automatically when the Pager drops.
+- [ ] 4b — Write-Ahead Log (`<db>.sqlrite-wal`) file format + frame codec
+- [ ] 4c — WAL-aware Pager: writes append frames, reads consult WAL before main file
+- [ ] 4d — Checkpointer: apply WAL frames back into the main file, truncate WAL
+- [ ] 4e — Multi-reader + single-writer via shared/exclusive locks + read marks
+- [ ] 4f — Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`)
 
 **Phase 5 — Library + embedding**
 - [ ] Split into `lib` + `bin` crates; public `Connection` / `Statement` / `Rows` API

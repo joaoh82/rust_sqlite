@@ -280,7 +280,33 @@ SELECT * FROM a;
 
 Expect 1 row. `.exit` and `rm -f "$DB"`.
 
-### 2.6 Format-guard sanity
+### 2.6 Concurrent-open sanity (Phase 4a)
+
+Two REPLs against the same file should no longer silently race. Start the first session and leave it at the prompt (do NOT `.exit`):
+
+```bash
+DB=/tmp/smoke-lock.sqlrite && rm -f "$DB"
+cargo run --quiet --bin sqlrite -- "$DB"
+```
+
+In a second terminal while the first is still open:
+
+```bash
+cargo run --quiet --bin sqlrite -- "$DB"
+```
+
+The second one should fail during startup with:
+
+```
+Could not open '/tmp/smoke-lock.sqlrite': General error: database '...' is already opened by another process (...)
+Falling back to a transient in-memory database.
+```
+
+… and then drop into a transient in-memory REPL (prompts "Connected to a transient in-memory database."). The first terminal is unaffected.
+
+`.exit` both terminals and `rm -f "$DB"`.
+
+### 2.7 Format-guard sanity
 
 A file that isn't a SQLRite database should be rejected cleanly.
 
@@ -484,6 +510,7 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] Duplicate INSERT on a UNIQUE column errors cleanly
 - [ ] `.open <new file>` → INSERT → `.exit` → `.open <same file>` → rows still there
 - [ ] Bad-magic file is rejected with a clear error
+- [ ] Opening the same file from two REPLs simultaneously rejects the second with a "already opened by another process" message and falls back to in-memory
 - [ ] `cargo check -p sqlrite-desktop` compiles the Tauri crate
 - [ ] `cd desktop && npm run tauri dev` opens a window
 - [ ] In the desktop app: **New…** button opens a save dialog; picking a fresh filename creates the file and shows "0 tables"

@@ -288,6 +288,10 @@ mod tests {
         .unwrap();
         process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
 
+        // Drop the first Database so its exclusive lock releases before we
+        // reopen the same file for verification.
+        drop(db);
+
         // Reopen the file from scratch in a fresh Database — no manual .save was called.
         let fresh = sqlrite::sql::pager::open_database(&path, "x".to_string())
             .expect("open after auto-save");

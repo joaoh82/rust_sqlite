@@ -137,6 +137,14 @@ No external store — just `$state` runes inside the component. For a single-win
 
 Most of the above are straightforward frontend additions. The bigger shift is the cursor API — see [Roadmap](roadmap.md) Phase 5.
 
+## Multi-process behavior
+
+As of Phase 4a the engine takes an **exclusive OS advisory lock** on the open `.sqlrite` file. One consequence worth knowing:
+
+- If a REPL (`cargo run`) has a file open and you try to open the same file in the desktop app (or vice versa), the second open fails with `database '...' is already opened by another process`. The failure is clean — no data loss, just a surfaced error.
+- The desktop app holds the lock for the entire time a file is open; it releases on New…, Open… to a different path, or Save As… (which switches the active file).
+- Multi-reader / single-writer concurrency is coming in Phase 4e once WAL lands. Until then, single-writer-exclusive is the rule.
+
 ## Troubleshooting
 
 - **`npm run tauri dev` hangs at "Compiling tauri…"**: first build is slow (several hundred deps). Subsequent builds are incremental.
