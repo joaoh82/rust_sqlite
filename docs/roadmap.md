@@ -397,9 +397,17 @@ Products whose publish jobs land in later phases (desktop, Python, Node.js, WASM
 
 > **v0.1.1 canary retrospective** *(2026-04-22)* — first publish attempt failed on `cargo publish` with a 403 because the `sqlrite` crate name on crates.io is owned by an unrelated RAG-SQLite project. Renamed the package to `sqlrite-engine` (lib / bin names unchanged, so `use sqlrite::…` still works for consumers). Tags `sqlrite-v0.1.1` / `sqlrite-ffi-v0.1.1` / `v0.1.1` stay on main per the never-reuse-a-tag policy; the next canary cuts `v0.1.2` under the new crate name.
 
-### Phase 6e — Desktop publish
+> **v0.1.2 canary success** *(2026-04-23)* — end-to-end pipeline validated. `sqlrite-engine 0.1.2` landed on crates.io; `sqlrite-v0.1.2` / `sqlrite-ffi-v0.1.2` / `v0.1.2` GitHub Releases all live. One hiccup: GitHub's squash-merge default title (`release: v0.1.2 (#18)`) didn't match `detect`'s anchored regex, so the auto-trigger skipped and we kicked `release.yml` via `workflow_dispatch` as a manual fallback. [PR #19](https://github.com/joaoh82/rust_sqlite/pull/19) fixes that by stripping `(#N)` before the regex test — future canaries auto-publish without the manual kick.
 
-Adds `publish-desktop` job to `release.yml`. `tauri-action` builds for Linux (AppImage + deb), macOS (dmg universal), Windows (msi). Unsigned — signing is Phase 6.1.
+### ✅ Phase 6e — Desktop publish
+
+Adds `publish-desktop` job to `release.yml`. [`tauri-apps/tauri-action@v0`](https://github.com/tauri-apps/tauri-action) builds for Linux (AppImage + deb, x86_64 on ubuntu-22.04 for broad glibc compat), macOS (dmg, aarch64 — matching the publish-ffi matrix), Windows (msi, x86_64). Unsigned — signing is Phase 6.1.
+
+Icons are pre-generated via `npx tauri icon desktop/src-tauri/icons/icon.png` and committed to `desktop/src-tauri/icons/` (one source PNG → .icns + .ico + size-specific PNGs + mobile assets). That keeps CI deterministic and saves ~10s per matrix cell; the tradeoff is that changing `icon.png` requires re-running `tauri icon` locally and committing the regenerated assets.
+
+Release assets land on the `sqlrite-desktop-vX.Y.Z` GitHub Release with a body that explains the unsigned-installer warnings (macOS Gatekeeper / Windows SmartScreen) and how to bypass them until Phase 6.1 lands.
+
+Follow-ups: macOS universal (x86_64 + aarch64 lipo'd — adds one Rust target build + `lipo` step), Linux aarch64 AppImage (adds one matrix cell on `ubuntu-24.04-arm`).
 
 ### Phase 6f — Python SDK publish
 
