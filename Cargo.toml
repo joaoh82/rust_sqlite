@@ -4,7 +4,7 @@
 # engine is also the workspace root's own package for historical
 # compatibility with scripts that assume `cargo build` at the repo
 # root produces the REPL binary.
-members = [".", "desktop/src-tauri", "sqlrite-ffi", "sdk/python"]
+members = [".", "desktop/src-tauri", "sqlrite-ffi", "sdk/python", "sdk/nodejs"]
 resolver = "3"
 
 [package]

@@ -142,11 +142,30 @@ The Python binding wraps the Rust `Connection` directly (not via the C FFI) — 
 
 Full API tour: [`sdk/python/README.md`](../sdk/python/README.md); runnable walkthrough: [`examples/python/hello.py`](../examples/python/hello.py).
 
-### Node.js / Go / WASM (Phases 5d – 5g)
+### Node.js (Phase 5d) ✅
 
-Still to come. Each SDK's README will show the language-idiomatic API; see [`examples/{nodejs,go,wasm}/`](../examples/) as those land.
+`sdk/nodejs/` — napi-rs 2.x (N-API v9, Node 18+), `better-sqlite3`-style sync API:
 
-**Node.js** and **Go** both bind against the C ABI documented above (napi-rs for Node's `.node` module; cgo for Go's `database/sql` driver). **WASM** uses `wasm-pack` to compile the Rust engine to the browser directly; the shipped package is `sqlrite-wasm` on npm.
+```js
+import { Database } from 'sqlrite';
+
+const db = new Database('foo.sqlrite');
+db.prepare("INSERT INTO users (name) VALUES ('alice')").run();
+for (const row of db.prepare('SELECT id, name FROM users').all()) {
+  console.log(row); // { id: 1, name: 'alice' } — object per row
+}
+db.close();
+```
+
+Unlike the C SDK, the Node.js binding wraps the Rust `Connection` directly (via napi-rs, no C FFI hop). Prebuilt `.node` binaries shipped per platform in Phase 6e — no `node-gyp` install step. TypeScript definitions (`index.d.ts`) auto-generated from the Rust source.
+
+Full API tour: [`sdk/nodejs/README.md`](../sdk/nodejs/README.md); runnable walkthrough: [`examples/nodejs/hello.mjs`](../examples/nodejs/hello.mjs).
+
+### Go / WASM (Phases 5e – 5g)
+
+Still to come. Each SDK's README will show the language-idiomatic API; see [`examples/{go,wasm}/`](../examples/) as those land.
+
+**Go** binds against the C ABI documented above via cgo + the `database/sql` driver contract. **WASM** uses `wasm-pack` to compile the Rust engine to the browser directly; the shipped package is `sqlrite-wasm` on npm.
 
 A fix in the Rust engine propagates through one wrapper update per language rather than four separate binding rewrites.
 

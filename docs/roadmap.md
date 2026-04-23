@@ -223,18 +223,34 @@ Landed:
 
 Phase 6e will publish wheels to PyPI via `maturin-action` (manylinux x86_64/aarch64, macOS universal, Windows x86_64).
 
-### Phase 5d — Node.js SDK
+### ✅ Phase 5d — Node.js SDK
 
-`sqlrite` (or `@sqlrite/engine`) on npm. Built with `napi-rs` so Node.js users get a prebuilt `.node` binary (no `node-gyp` compile dance). Shape inspired by `better-sqlite3`'s sync API:
+`sqlrite` module shipped via new `sdk/nodejs/` workspace crate (napi-rs 2.x, N-API v9 / Node 18+). Prebuilt `.node` binaries per platform — no `node-gyp` install dance. Shape follows `better-sqlite3`:
 
 ```js
 import { Database } from 'sqlrite';
+
 const db = new Database('foo.sqlrite');
-db.prepare("INSERT INTO users (name) VALUES (?)").run('alice');
-const rows = db.prepare("SELECT * FROM users").all();
+db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+db.prepare("INSERT INTO users (name) VALUES ('alice')").run();
+const rows = db.prepare("SELECT id, name FROM users").all();
+// → [{ id: 1, name: 'alice' }]
 ```
 
-Examples in `examples/nodejs/`.
+Landed:
+
+- `Database` class with `new Database(path)` / `Database.openReadOnly(path)` / `":memory:"`, `exec()`, `prepare()`, `close()`, `inTransaction` / `readonly` getters.
+- `Statement` class with `run(params?)`, `get(params?)`, `all(params?)`, `iterate(params?)`, `columns()`. Rows come back as plain JS objects keyed by column name.
+- `RunResult` object (`{ changes, lastInsertRowid }`) — both 0 for now since the engine doesn't track those at the public API layer; shape reserved so upgrading doesn't break callers.
+- Auto-generated `index.d.ts` TypeScript definitions from the Rust source via napi-rs.
+- Sync API, not async — engine is in-process and most ops finish in microseconds.
+- Wraps the Rust `Connection` directly (not via the C FFI).
+- Parameter binding accepts `undefined` / `null` / `[]` for forward compat; non-empty arrays throw until Phase 5a.2.
+- 11 Node.js integration tests using Node 18+'s built-in `node:test` runner covering CRUD, transactions, file-backed persistence, read-only rejection, error paths, closed-DB rejection, `columns()`, `get`/`all`/`iterate`.
+- `examples/nodejs/hello.mjs` runnable walkthrough.
+- `sdk/nodejs/README.md` — install, quickstart, API table, status.
+
+Phase 6e will publish prebuilt binaries to npm via the napi-rs GitHub Action (Linux x86_64/aarch64, macOS universal, Windows x86_64).
 
 ### Phase 5e — Go SDK
 

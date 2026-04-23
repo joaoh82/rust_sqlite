@@ -22,5 +22,12 @@ __pycache__
 sdk/python/*.egg-info
 sdk/python/dist
 
+# Node.js SDK build artifacts + deps
+sdk/nodejs/node_modules
+sdk/nodejs/*.node
+# napi-rs auto-generates these per-build; source of truth is src/lib.rs.
+sdk/nodejs/index.js
+sdk/nodejs/index.d.ts
+
 # macOS
 .DS_Store

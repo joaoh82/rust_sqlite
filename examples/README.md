@@ -9,7 +9,7 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 | Rust     | ✅ Phase 5a       | crates.io (Phase 6c) | [`rust/`](rust/)     |
 | C (FFI)  | ✅ Phase 5b       | GitHub Releases (Phase 6d) | [`c/`](c/)           |
 | Python   | ✅ Phase 5c       | PyPI (Phase 6e)      | [`python/`](python/) |
-| Node.js  | 🚧 Phase 5d       | npm (Phase 6e)       | _coming soon_ |
+| Node.js  | ✅ Phase 5d       | npm (Phase 6e)       | [`nodejs/`](nodejs/) |
 | Go       | 🚧 Phase 5e       | Go modules (Phase 6e)| _coming soon_ |
 | WASM     | 🚧 Phase 5g       | npm as `sqlrite-wasm` (Phase 6e) | _coming soon_ |
 
@@ -45,6 +45,20 @@ python examples/python/hello.py
 ```
 
 Mirrors the Rust quickstart shape via the DB-API: `sqlrite.connect(":memory:")` → `cursor.execute` → iterate tuples, plus a BEGIN/ROLLBACK block. See [`python/hello.py`](python/hello.py) and [`sdk/python/README.md`](../sdk/python/README.md) for the full API tour.
+
+## Running the Node.js sample
+
+```bash
+# One-time: build the .node binding.
+cd sdk/nodejs
+npm install
+npm run build
+
+# Then from the repo root:
+node examples/nodejs/hello.mjs
+```
+
+Mirrors the `better-sqlite3` shape: `new Database(":memory:")` → `db.prepare(sql).all()` returning row objects, plus a BEGIN/ROLLBACK block with the `inTransaction` getter. See [`nodejs/hello.mjs`](nodejs/hello.mjs) and [`sdk/nodejs/README.md`](../sdk/nodejs/README.md) for the full API tour.
 
 ## Design notes
 
