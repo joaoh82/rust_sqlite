@@ -4,9 +4,10 @@
 # merge commit. A `workflow_dispatch` fallback lets a human re-run
 # the publish side manually when the auto-trigger needs a kick.
 #
-# Phase 6d scope: tag-all + publish-crate + publish-ffi + finalize.
-# Phase 6e–6i add publish-desktop / publish-python / publish-nodejs /
-# publish-wasm / publish-go as separate jobs to this same file.
+# Phase 6d: tag-all + publish-crate + publish-ffi + finalize.
+# Phase 6e adds publish-desktop.
+# Phases 6f–6i add publish-python / publish-nodejs / publish-wasm /
+# publish-go as separate jobs to this same file.
 #
 # Design doc: docs/release-plan.md.
 # One-time registry / branch-protection setup: docs/release-secrets.md.
@@ -84,14 +85,14 @@ jobs:
   # BEFORE any publish step so a bad version number (e.g., tag
   # already exists for some reason) aborts the whole release cleanly.
   #
-  # Phase 6d only tags products whose publish jobs exist:
-  #   - sqlrite-v<V>       (Rust engine)
-  #   - sqlrite-ffi-v<V>   (C FFI prebuilt binaries)
-  #   - v<V>               (umbrella)
+  # As of Phase 6e, we tag:
+  #   - sqlrite-v<V>           (Rust engine)
+  #   - sqlrite-ffi-v<V>       (C FFI prebuilt binaries)
+  #   - sqlrite-desktop-v<V>   (Tauri desktop installers)
+  #   - v<V>                   (umbrella)
   #
   # Later phases add sqlrite-py-v<V>, sqlrite-node-v<V>,
-  # sqlrite-wasm-v<V>, sdk/go/v<V>, sqlrite-desktop-v<V> as their
-  # publish jobs come online.
+  # sqlrite-wasm-v<V>, sdk/go/v<V> as their publish jobs come online.
   #
   # Idempotent on re-run: if a tag already exists (partial-failure
   # scenario where publish-crate succeeded but publish-ffi failed,
@@ -119,6 +120,7 @@ jobs:
           TAGS=(
             "sqlrite-v$V"
             "sqlrite-ffi-v$V"
+            "sqlrite-desktop-v$V"
             "v$V"
           )
           for tag in "${TAGS[@]}"; do
@@ -282,6 +284,123 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Step 3c: build the Tauri desktop app for each supported platform
+  # and upload the installers to the `sqlrite-desktop-v<V>` GitHub
+  # Release. (Phase 6e.)
+  #
+  # Matrix mirrors publish-ffi's — same three OS families, same
+  # "aarch64 on macOS, x86_64 elsewhere" choice. The actual installer
+  # formats per platform come from Tauri's bundler, not the matrix:
+  #   - ubuntu-22.04 → AppImage + .deb           (x86_64)
+  #   - macos-latest → .dmg                       (aarch64)
+  #   - windows-latest → .msi                     (x86_64)
+  #
+  # ubuntu-22.04 (not ubuntu-latest) is deliberate: AppImage links
+  # glibc at build time, so building on 22.04 (glibc 2.35) yields
+  # an AppImage that runs on any distro with glibc ≥ 2.35 — which
+  # covers everything shipped since 2022. Building on ubuntu-latest
+  # (24.04, glibc 2.39) would produce an AppImage that refuses to
+  # launch on Debian 12 / Ubuntu 22.04 and older.
+  #
+  # macOS universal (x86_64 + aarch64 lipo'd together) + Linux
+  # aarch64 desktop are follow-ups — same MVP-simplicity reasoning
+  # as publish-ffi. Apple Silicon is the majority of Mac downloads
+  # and x86_64 Linux is the majority of Linux downloads, so this
+  # covers 95%+ of users on day one.
+  #
+  # Installers ship **unsigned** — Phase 6.1 wires up Apple
+  # Developer ID + Windows code-signing cert. Unsigned installers
+  # trigger the expected "unidentified developer" / SmartScreen
+  # warnings; the release body explains how to bypass them.
+  publish-desktop:
+    name: Publish desktop (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos-aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-desktop-${{ matrix.platform }}
+          workspaces: './ -> target'
+
+      # Linux-only: Tauri's webview backend is webkit2gtk, which
+      # isn't preinstalled on GitHub runners. libayatana-appindicator
+      # / librsvg2 / patchelf are the rest of the standard Tauri
+      # Linux build kit. Matches the `desktop-build` job in ci.yml.
+      - name: Install Tauri Linux deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: npm ci
+        working-directory: desktop
+        run: npm ci
+
+      # Icons (icon.ico, icon.icns, size-specific PNGs for Linux,
+      # mobile assets) are pre-generated in the repo via `npx tauri
+      # icon src-tauri/icons/icon.png` and committed to
+      # `desktop/src-tauri/icons/`. That keeps CI deterministic and
+      # saves ~10s per matrix cell; the tradeoff is that anyone
+      # changing `icon.png` needs to re-run `tauri icon` locally and
+      # commit the regenerated assets (PR review catches this).
+
+      # tauri-action does: frontend build (via beforeBuildCommand) →
+      # `cargo tauri build` → bundle installers per platform → upload
+      # each installer to the target GitHub Release. It reads
+      # tauri.conf.json for bundle config, so flipping `bundle.active`
+      # from `false` to `true` there is what actually causes installers
+      # to get produced. `tagName` is templated so the action doesn't
+      # create its own tag — we already did that in `tag-all`.
+      - name: Build + upload installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: sqlrite-desktop-v${{ needs.detect.outputs.version }}
+          releaseName: Desktop v${{ needs.detect.outputs.version }}
+          releaseBody: |
+            SQLRite desktop app — unsigned installers for Linux (AppImage + deb), macOS (dmg, aarch64), Windows (msi).
+
+            **⚠️ Unsigned installers**: macOS shows "SQLRite can't be opened because it is from an unidentified developer" — right-click → Open → Open to bypass. Windows SmartScreen blocks on first run — click "More info" → "Run anyway". Code signing lands in Phase 6.1.
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          releaseDraft: false
+          prerelease: false
+          projectPath: desktop
+          # tauri-action's default is to create the release if it
+          # doesn't exist. Since we want the release to aggregate
+          # artifacts across all three matrix jobs, the first job
+          # to finish creates it; the other two upload additional
+          # files to the same release. (action is idempotent on
+          # this — it uses `tagName` as the identity key.)
+
+  # ---------------------------------------------------------------------------
   # Step 4: create the umbrella GitHub Release. Runs after all
   # publish-* jobs succeed. Uses GitHub's native auto-generated
   # release notes so the changelog is "everything between the
@@ -289,7 +408,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi]
+    needs: [detect, publish-crate, publish-ffi, publish-desktop]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -309,8 +428,9 @@ jobs:
 
             - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }})
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
 
-            _Python / Node.js / WASM / Go / desktop SDKs land as their publish jobs come online (Phases 6e–6i)._
+            _Python / Node.js / WASM / Go SDKs land as their publish jobs come online (Phases 6f–6i)._
 
             ---
 

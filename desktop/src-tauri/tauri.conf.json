@@ -26,10 +26,17 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "SQLRite — a small embeddable SQLite clone",
+    "longDescription": "SQLRite is a small, embeddable SQLite-inspired database engine written in Rust. This desktop app provides a GUI for browsing and querying SQLRite databases.",
     "icon": [
-      "icons/icon.png"
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
     ]
   }
 }
