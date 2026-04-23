@@ -102,6 +102,7 @@ pub enum AccessMode {
 /// We call fs2's trait methods fully qualified because `std::fs::File`
 /// gained its own `try_lock_*` inherent methods in Rust 1.84 with a
 /// different error type — qualifying nails down which one we mean.
+#[cfg(feature = "file-locks")]
 pub(crate) fn acquire_lock(file: &File, path: &Path, mode: AccessMode) -> Result<()> {
     let res = match mode {
         AccessMode::ReadWrite => fs2::FileExt::try_lock_exclusive(file),
@@ -121,6 +122,18 @@ pub(crate) fn acquire_lock(file: &File, path: &Path, mode: AccessMode) -> Result
             path.display()
         ))
     })
+}
+
+/// No-op variant for builds without the `file-locks` feature (most
+/// notably the WASM SDK, where `fs2` doesn't compile against
+/// wasm32-unknown-unknown). The Pager still refuses to touch a
+/// read-only open via `AccessMode`, but there's no OS-level
+/// multi-process coordination — the caller is trusted to avoid
+/// conflicting opens. Fine for WASM, where file-backed opens
+/// aren't exposed in the MVP anyway.
+#[cfg(not(feature = "file-locks"))]
+pub(crate) fn acquire_lock(_file: &File, _path: &Path, _mode: AccessMode) -> Result<()> {
+    Ok(())
 }
 
 /// How many WAL frames may accumulate between auto-checkpoints before

@@ -285,23 +285,40 @@ Prerequisites for building from source: `cargo build --release -p sqlrite-ffi` t
 
 Phase 6e also tags `sdk/go/v*.*.*` so `go get github.com/joaoh82/rust_sqlite/sdk/go@v0.1.0` resolves via Go's module proxy — no central registry push needed for Go.
 
-### Phase 5f — Rust crate polish
+### Phase 5f — Rust crate polish *(deferred — Phase 6c companion)*
 
-The Rust library is already shippable — this sub-phase adds crate metadata, docs.rs config, a `Connection`-oriented quickstart, and prep for the `cargo publish` step that lands in Phase 6. Examples in `examples/rust/` (or promoted from 5a).
+The Rust library is already shippable — this sub-phase adds crate metadata, docs.rs config, a `Connection`-oriented quickstart, and prep for the `cargo publish` step. Deferred because it's mostly metadata work that makes more sense alongside the actual publish workflow in Phase 6c. Examples under `examples/rust/` already exist from Phase 5a.
 
-### Phase 5g — WASM build
+### ✅ Phase 5g — WASM build
 
-`wasm-pack build` with both `web` and `bundler` targets. The engine runs entirely in-memory in the browser for the MVP (no file locks, no WAL sidecar — those don't translate to a tab's sandbox). A minimal HTML demo under `examples/wasm/` shows:
+New `sdk/wasm/` crate (standalone, not in the Cargo workspace — wasm-only crates trip `cargo build --workspace` on native hosts). Compiles the Rust engine straight to `wasm32-unknown-unknown` via `wasm-bindgen`. Engine runs entirely in the browser tab.
 
 ```js
-import init, { Connection } from 'sqlrite-wasm';
+import init, { Database } from 'sqlrite-wasm';
 await init();
-const conn = Connection.open_in_memory();
-conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-const rows = conn.query("SELECT * FROM users");
+
+const db = new Database();
+db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+db.exec("INSERT INTO users (name) VALUES ('alice')");
+const rows = db.query("SELECT id, name FROM users");
+// → [{ id: 1, name: 'alice' }]
 ```
 
-OPFS-backed persistence is a later concern.
+Landed:
+
+- **Feature-gated engine**: root crate's `rustyline` / `rustyline-derive` / `clap` / `env_logger` moved behind a `cli` feature (default-on), `fs2` behind a `file-locks` feature (default-on). WASM depends with `default-features = false` so neither pulls in. `[[bin]]` has `required-features = ["cli"]` so a minimal build skips the REPL entirely. Pager's `acquire_lock` stubs out to a no-op under `#[cfg(not(feature = "file-locks"))]`.
+- **`Database` class** exposed via wasm-bindgen: `new Database()` (in-memory only), `exec(sql)`, `query(sql) → Array<Object>`, `columns(sql) → Array<string>`, `inTransaction` / `readonly` getters, `free()` for explicit GC.
+- **Rows as plain JS objects** in projection order — `serde_wasm_bindgen::Serializer::serialize_maps_as_objects(true)` + `serde_json`'s `preserve_order` feature. Matches the Node.js SDK shape so callers don't have to learn a different row format.
+- **Panic hook** (default-on feature) routes Rust panics to `console.error` with a real stack trace; costs ~4 KiB.
+- **Three build targets** via `wasm-pack build --target {web,bundler,nodejs}`. Release profile tuned for size (`opt-level = "z"`, LTO, single codegen unit, stripped debuginfo). `.wasm` ~1.8 MB uncompressed / ~500 KB gzipped.
+- **Browser demo** at `examples/wasm/` with a self-contained HTML SQL console. `make build && make serve` spins it up on `localhost:8080`.
+
+**Scope of MVP:**
+- In-memory only. OPFS-backed persistence is a natural follow-up — browser file locks + WAL don't map to a tab sandbox.
+- No prepared-statement object at the JS boundary; `db.query(sql)` is one-shot. The engine still does prepare/execute internally.
+- Parameter binding deferred to 5a.2 (same as every other SDK).
+
+Phase 6e will publish `sqlrite-wasm` to npm via `wasm-pack publish` on `v*` tag push.
 
 ## Phase 6 — Release engineering + CI/CD
 

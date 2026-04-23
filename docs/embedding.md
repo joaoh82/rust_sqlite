@@ -184,9 +184,30 @@ Unlike the Python and Node.js bindings, Go goes through the C ABI — cgo is Go'
 
 Full API tour: [`sdk/go/README.md`](../sdk/go/README.md); runnable walkthrough: [`examples/go/hello.go`](../examples/go/hello.go).
 
-### WASM (Phase 5g)
+### WASM (Phase 5g) ✅
 
-Still to come. `wasm-pack` compiles the Rust engine straight to the browser (no FFI hop — WebAssembly is the target directly). The shipped package is `sqlrite-wasm` on npm; `examples/wasm/` lands alongside it.
+`sdk/wasm/` — `wasm-bindgen` compiles the Rust engine directly to `wasm32-unknown-unknown`. The whole database runs in a browser tab:
+
+```js
+import init, { Database } from 'sqlrite-wasm';
+await init();
+
+const db = new Database();
+db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+db.exec("INSERT INTO users (name) VALUES ('alice')");
+const rows = db.query("SELECT id, name FROM users");
+// → [{ id: 1, name: 'alice' }]
+```
+
+**In-memory only** in the MVP — file-backed mode needs OS file locks and a `-wal` sidecar that don't exist in a tab's sandbox. OPFS-backed persistence is a natural follow-up.
+
+Build locally via `wasm-pack build --target web --release` (or `bundler` / `nodejs`). Phase 6e publishes `sqlrite-wasm` to npm via `wasm-pack publish` on `v*` tag push.
+
+The root engine crate is feature-gated (`cli` for rustyline/clap/env_logger; `file-locks` for fs2) so `default-features = false` strips out everything that wouldn't compile on `wasm32-unknown-unknown`.
+
+Full API tour: [`sdk/wasm/README.md`](../sdk/wasm/README.md); runnable browser demo: [`examples/wasm/`](../examples/wasm/) (`cd examples/wasm && make` spins up a local SQL console).
+
+---
 
 A fix in the Rust engine propagates through one wrapper update per language rather than four separate binding rewrites.
 

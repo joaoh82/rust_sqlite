@@ -11,7 +11,7 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 | Python   | ✅ Phase 5c       | PyPI (Phase 6e)      | [`python/`](python/) |
 | Node.js  | ✅ Phase 5d       | npm (Phase 6e)       | [`nodejs/`](nodejs/) |
 | Go       | ✅ Phase 5e       | Go modules (Phase 6e)| [`go/`](go/)         |
-| WASM     | 🚧 Phase 5g       | npm as `sqlrite-wasm` (Phase 6e) | _coming soon_ |
+| WASM     | ✅ Phase 5g       | npm as `sqlrite-wasm` (Phase 6e) | [`wasm/`](wasm/)     |
 
 See [docs/roadmap.md](../docs/roadmap.md) for what each sub-phase delivers.
 
@@ -72,6 +72,19 @@ go run hello.go
 ```
 
 Uses the standard library's `database/sql` API — `sql.Open("sqlrite", ":memory:")` → `db.Query` + `rows.Scan(&id, &name)` into typed Go vars, plus a `db.Begin() / tx.Rollback()` block. See [`go/hello.go`](go/hello.go) and [`sdk/go/README.md`](../sdk/go/README.md) for the full API tour.
+
+## Running the WASM demo
+
+```bash
+cd examples/wasm
+make          # builds sdk/wasm via wasm-pack, then starts a local server
+```
+
+Opens `http://localhost:8080` with a tiny SQL console embedded in a single HTML page — `CREATE TABLE` / `INSERT` / `SELECT` all run client-side via the compiled WebAssembly module. No server backend.
+
+The demo pre-fills the textarea with a `users` table + three inserts + a `SELECT ... ORDER BY age DESC`. Hit **Run** and you'll see the JSON result appear in the output pane. **Reset DB** drops the handle and spins up a fresh in-memory DB.
+
+See [`wasm/index.html`](wasm/index.html) and [`sdk/wasm/README.md`](../sdk/wasm/README.md) for the full API tour and build options (`--target web` / `bundler` / `nodejs`).
 
 ## Design notes
 

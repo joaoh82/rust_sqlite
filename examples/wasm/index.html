@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>SQLRite in a browser tab</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.5;
+        color: #1d1d1f;
+      }
+      h1 {
+        font-size: 1.5rem;
+      }
+      textarea {
+        width: 100%;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 0.9rem;
+        padding: 0.5rem;
+        border: 1px solid #d2d2d7;
+        border-radius: 6px;
+        min-height: 8rem;
+      }
+      button {
+        margin: 0.5rem 0.3rem 0.5rem 0;
+        padding: 0.4rem 0.9rem;
+        background: #0071e3;
+        color: white;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #e5e5ea;
+        color: #1d1d1f;
+      }
+      pre {
+        background: #f5f5f7;
+        padding: 0.75rem;
+        border-radius: 6px;
+        overflow-x: auto;
+        font-size: 0.85rem;
+      }
+      .status {
+        color: #515154;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>SQLRite in a browser tab</h1>
+    <p>
+      The full SQLRite engine compiled to WebAssembly. Everything runs in this
+      tab — no server. State lives in memory; refreshing the page wipes it.
+    </p>
+
+    <h2>SQL console</h2>
+    <textarea id="sql">
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+INSERT INTO users (name, age) VALUES ('alice', 30);
+INSERT INTO users (name, age) VALUES ('bob', 25);
+INSERT INTO users (name, age) VALUES ('carol', 40);
+SELECT id, name, age FROM users ORDER BY age DESC;</textarea
+    >
+    <div>
+      <button id="run">Run</button>
+      <button id="reset" class="secondary">Reset DB</button>
+      <span class="status" id="status"></span>
+    </div>
+
+    <h3>Result</h3>
+    <pre id="out">(run a query to see output)</pre>
+
+    <script type="module">
+      // wasm-pack's `--target web` build is imported directly as a
+      // JS module. `init()` fetches the `.wasm` file and wires up
+      // the shared memory; nothing else can run until that resolves.
+      import init, { Database } from "./pkg/sqlrite_wasm.js";
+
+      const out = document.getElementById("out");
+      const status = document.getElementById("status");
+      const sqlTextarea = document.getElementById("sql");
+
+      await init();
+      let db = new Database();
+      status.textContent = `sqlrite-wasm ready (in-memory)`;
+
+      document.getElementById("run").onclick = () => {
+        const input = sqlTextarea.value.trim();
+        if (!input) return;
+        // Split on `;` so we can run a whole script. Only the last
+        // statement's result (if it was a SELECT) is rendered —
+        // matches how most SQL consoles behave.
+        const statements = input
+          .split(";")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+
+        let lastResult = null;
+        let lastIsQuery = false;
+        try {
+          for (const stmt of statements) {
+            const isQuery = /^\s*select\b/i.test(stmt);
+            if (isQuery) {
+              lastResult = db.query(stmt);
+              lastIsQuery = true;
+            } else {
+              db.exec(stmt);
+              lastIsQuery = false;
+            }
+          }
+        } catch (err) {
+          out.textContent = `Error: ${err}`;
+          return;
+        }
+
+        if (lastIsQuery) {
+          out.textContent = JSON.stringify(lastResult, null, 2);
+        } else {
+          out.textContent = `(${statements.length} statement${statements.length === 1 ? "" : "s"} executed)`;
+        }
+      };
+
+      document.getElementById("reset").onclick = () => {
+        db.free();
+        db = new Database();
+        out.textContent = "(reset — fresh in-memory DB)";
+      };
+    </script>
+  </body>
+</html>

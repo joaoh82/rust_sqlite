@@ -35,5 +35,12 @@ sdk/nodejs/index.d.ts
 sdk/go/go.sum
 examples/go/go.sum
 
+# WASM SDK build outputs (wasm-pack writes here; the source of
+# truth is src/lib.rs + Cargo.toml).
+sdk/wasm/pkg
+sdk/wasm/pkg-node
+sdk/wasm/target
+examples/wasm/pkg
+
 # macOS
 .DS_Store

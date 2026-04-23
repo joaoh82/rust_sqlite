@@ -1,9 +1,14 @@
 [workspace]
 # Root Cargo package (the engine crate) + the Tauri desktop app + the
-# C FFI shim + the language-SDK wrappers (Python, Node.js, …). The
-# engine is also the workspace root's own package for historical
+# C FFI shim + the language-SDK wrappers (Python, Node.js, WASM …).
+# The engine is also the workspace root's own package for historical
 # compatibility with scripts that assume `cargo build` at the repo
 # root produces the REPL binary.
+#
+# Note: sdk/wasm isn't a workspace member because its target is
+# wasm32-unknown-unknown. `cargo build --workspace` on a native host
+# would fail on a wasm-only crate; wasm-pack drives that build
+# separately.
 members = [".", "desktop/src-tauri", "sqlrite-ffi", "sdk/python", "sdk/nodejs"]
 resolver = "3"
 
@@ -28,11 +33,14 @@ license = "MIT"
 name = "sqlrite"
 path = "src/lib.rs"
 
-# Binary target — the interactive REPL. This is what `cargo run` builds by
-# default.
+# Binary target — the interactive REPL. Needs the `cli` feature
+# (default-on) so rustyline/clap/env_logger are pulled in; a
+# `--no-default-features` build (e.g. for WASM or a minimal
+# embedding) skips the bin entirely via `required-features`.
 [[bin]]
 name = "sqlrite"
 path = "src/main.rs"
+required-features = ["cli"]
 
 # Phase 5a quickstart — the canonical "how do I use this as a library?"
 # walkthrough. Run with `cargo run --example quickstart`. Lives under
@@ -43,20 +51,35 @@ path = "src/main.rs"
 name = "quickstart"
 path = "examples/rust/quickstart.rs"
 
-[dependencies]
-# CLI
-rustyline = "18.0"
-rustyline-derive = "0.12"
-log = "0.4"
-env_logger = "0.11"
-clap = { version = "4.6", features = ["cargo"] }
+[features]
+# Default build includes everything: the REPL binary (cli) and
+# POSIX/Windows advisory file locks on the Pager (file-locks).
+# Disabled per-feature for embeddings that don't need them —
+# notably the WASM SDK, which builds the engine with
+# `default-features = false` so rustyline, clap, env_logger, and
+# fs2 don't try to compile against wasm32-unknown-unknown (none of
+# them support that target).
+default = ["cli", "file-locks"]
+cli = ["dep:rustyline", "dep:rustyline-derive", "dep:env_logger", "dep:clap"]
+file-locks = ["dep:fs2"]
 
-# Engine
+[dependencies]
+# Always-on engine deps — pure-Rust and wasm-compatible.
+log = "0.4"
 sqlparser = "0.61"
 thiserror = "2.0"
 prettytable-rs = "0.10"
-# Cross-platform advisory file locks. Phase 4a uses it to take an
-# exclusive lock on an open .sqlrite so two processes can't stomp on
-# each other. Phase 4e will graduate to shared + exclusive modes once
-# WAL is in.
-fs2 = "0.4"
+
+# CLI-only deps (feature-gated). `optional = true` + the `cli`
+# feature above means these only land in the dep graph when
+# something enables the feature.
+rustyline = { version = "18.0", optional = true }
+rustyline-derive = { version = "0.12", optional = true }
+env_logger = { version = "0.11", optional = true }
+clap = { version = "4.6", features = ["cargo"], optional = true }
+
+# Cross-platform advisory file locks. Used by the Pager for
+# single-writer exclusion (Phase 4a → 4e). Feature-gated because
+# fs2 wraps POSIX flock / Windows LockFileEx — neither exists on
+# wasm32-unknown-unknown.
+fs2 = { version = "0.4", optional = true }
