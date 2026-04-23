@@ -1,4 +1,4 @@
-use sqlparser::ast::{ColumnOption, DataType, Statement};
+use sqlparser::ast::{ColumnOption, CreateTable, DataType, Statement};
 
 use crate::error::{Result, SQLRiteError};
 
@@ -33,16 +33,12 @@ impl CreateQuery {
     pub fn new(statement: &Statement) -> Result<CreateQuery> {
         match statement {
             // Confirming the Statement is sqlparser::ast:Statement::CreateTable
-            Statement::CreateTable {
+            Statement::CreateTable(CreateTable {
                 name,
                 columns,
-                constraints: _constraints,
-                with_options: _with_options,
-                external: _external,
-                file_format: _file_format,
-                location: _location,
+                constraints,
                 ..
-            } => {
+            }) => {
                 let table_name = name;
                 let mut parsed_columns: Vec<ParsedColumn> = vec![];
 
@@ -62,18 +58,23 @@ impl CreateQuery {
                     // Parsing each column for it data type
                     // For now only accepting basic data types
                     let datatype = match &col.data_type {
-                        DataType::SmallInt(_) => "Integer",
-                        DataType::Int(_) => "Integer",
-                        DataType::BigInt(_) => "Integer",
+                        DataType::TinyInt(_)
+                        | DataType::SmallInt(_)
+                        | DataType::Int2(_)
+                        | DataType::Int(_)
+                        | DataType::Int4(_)
+                        | DataType::Int8(_)
+                        | DataType::Integer(_)
+                        | DataType::BigInt(_) => "Integer",
                         DataType::Boolean => "Bool",
                         DataType::Text => "Text",
                         DataType::Varchar(_bytes) => "Text",
                         DataType::Real => "Real",
                         DataType::Float(_precision) => "Real",
-                        DataType::Double => "Real",
-                        DataType::Decimal(_precision1, _precision2) => "Real",
-                        _ => {
-                            eprintln!("not matched on custom type");
+                        DataType::Double(_) => "Real",
+                        DataType::Decimal(_) => "Real",
+                        other => {
+                            eprintln!("not matched on custom type: {other:?}");
                             "Invalid"
                         }
                     };
@@ -85,22 +86,27 @@ impl CreateQuery {
                     // chekcing if column is NULLABLE
                     let mut not_null: bool = false;
                     for column_option in &col.options {
-                        match column_option.option {
-                            ColumnOption::Unique { is_primary } => {
-                                // For now, only Integer and Text types can be PRIMERY KEY and Unique
+                        match &column_option.option {
+                            ColumnOption::PrimaryKey(_) => {
+                                // For now, only Integer and Text types can be PRIMARY KEY and Unique
                                 // Therefore Indexed.
                                 if datatype != "Real" && datatype != "Bool" {
-                                    is_pk = is_primary;
-                                    if is_primary {
-                                        // Checks if table being created already has a PRIMARY KEY, if so, returns an error
-                                        if parsed_columns.iter().any(|col| col.is_pk == true) {
-                                            return Err(SQLRiteError::Internal(format!(
-                                                "Table '{}' has more than one primary key",
-                                                &table_name
-                                            )));
-                                        }
-                                        not_null = true;
+                                    // Checks if table being created already has a PRIMARY KEY, if so, returns an error
+                                    if parsed_columns.iter().any(|col| col.is_pk) {
+                                        return Err(SQLRiteError::Internal(format!(
+                                            "Table '{}' has more than one primary key",
+                                            &table_name
+                                        )));
                                     }
+                                    is_pk = true;
+                                    is_unique = true;
+                                    not_null = true;
+                                }
+                            }
+                            ColumnOption::Unique(_) => {
+                                // For now, only Integer and Text types can be UNIQUE
+                                // Therefore Indexed.
+                                if datatype != "Real" && datatype != "Bool" {
                                     is_unique = true;
                                 }
                             }
@@ -121,16 +127,16 @@ impl CreateQuery {
                 }
                 // TODO: Handle constraints,
                 // Default value and others.
-                for constraint in _constraints {
-                    println!("{:?}", constraint);
+                for constraint in constraints {
+                    println!("{constraint:?}");
                 }
-                return Ok(CreateQuery {
+                Ok(CreateQuery {
                     table_name: table_name.to_string(),
                     columns: parsed_columns,
-                });
+                })
             }
 
-            _ => return Err(SQLRiteError::Internal("Error parsing query".to_string())),
+            _ => Err(SQLRiteError::Internal("Error parsing query".to_string())),
         }
     }
 }
@@ -160,20 +166,14 @@ mod tests {
         let query = ast.pop().unwrap();
 
         // Initialy only implementing some basic SQL Statements
-        match query {
-            Statement::CreateTable { .. } => {
-                let result = CreateQuery::new(&query);
-                match result {
-                    Ok(payload) => {
-                        assert_eq!(payload.table_name, expected_table_name);
-                    }
-                    Err(_) => assert!(
-                        false,
-                        "an error occured during parsing CREATE TABLE Statement"
-                    ),
+        if let Statement::CreateTable(_) = query {
+            let result = CreateQuery::new(&query);
+            match result {
+                Ok(payload) => {
+                    assert_eq!(payload.table_name, expected_table_name);
                 }
+                Err(_) => panic!("an error occured during parsing CREATE TABLE Statement"),
             }
-            _ => (),
-        };
+        }
     }
 }

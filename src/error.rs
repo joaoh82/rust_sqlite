@@ -10,7 +10,7 @@ pub type Result<T> = result::Result<T, SQLRiteError>;
 
 /// SQLRiteError is an enum with all the standardized errors available for returning
 ///
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum SQLRiteError {
     #[error("Not Implemented error: {0}")]
     NotImplemented(String),
@@ -22,9 +22,29 @@ pub enum SQLRiteError {
     UnknownCommand(String),
     #[error("SQL error: {0:?}")]
     SqlError(#[from] ParserError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// `std::io::Error` has no `PartialEq`, so we implement one by value-of-message.
+// Used by existing tests that compare error variants.
+impl PartialEq for SQLRiteError {
+    fn eq(&self, other: &Self) -> bool {
+        use SQLRiteError::*;
+        match (self, other) {
+            (NotImplemented(a), NotImplemented(b)) => a == b,
+            (General(a), General(b)) => a == b,
+            (Internal(a), Internal(b)) => a == b,
+            (UnknownCommand(a), UnknownCommand(b)) => a == b,
+            (SqlError(a), SqlError(b)) => format!("{a:?}") == format!("{b:?}"),
+            (Io(a), Io(b)) => a.kind() == b.kind() && a.to_string() == b.to_string(),
+            _ => false,
+        }
+    }
 }
 
 /// Returns SQLRiteError::General error from String
+#[allow(dead_code)]
 pub fn sqlrite_error(message: &str) -> SQLRiteError {
     SQLRiteError::General(message.to_owned())
 }

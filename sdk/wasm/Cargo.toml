@@ -1,0 +1,67 @@
+# Explicitly declare this crate its own workspace root — Cargo
+# refuses to fall back to the parent Cargo.toml's workspace if we
+# aren't listed in `members`, and we intentionally aren't (see
+# ../../Cargo.toml). The empty `[workspace]` table is the
+# one-liner escape hatch.
+[workspace]
+
+[package]
+name = "sqlrite-wasm"
+version = "0.1.0"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "WebAssembly build of the SQLRite embedded database engine. Runs entirely in the browser via wasm-pack / wasm-bindgen."
+repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
+
+# Deliberately NOT in the root workspace (see the note in
+# ../../Cargo.toml). A wasm-only crate in the workspace would fail
+# every `cargo build --workspace` invocation on native hosts. Build
+# this one through `wasm-pack build` in this directory.
+
+[lib]
+# `cdylib` is what wasm-pack consumes — wasm-bindgen emits the JS
+# glue alongside the `.wasm` artifact. `rlib` lets us `cargo build`
+# the crate as a regular Rust library for linting / tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Engine as a path dep. `default-features = false` disables both
+# `cli` (rustyline + clap + env_logger — not wasm-safe) and
+# `file-locks` (fs2 — doesn't exist on wasm32-unknown-unknown).
+sqlrite = { path = "../..", default-features = false }
+
+# wasm-bindgen + friends. `serde-serialize` on wasm-bindgen gives
+# us `serde_wasm_bindgen` interop for structured row objects.
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` swaps `serde_json::Map`'s inner storage from
+# BTreeMap (alphabetical) to IndexMap (insertion order). Without
+# this, row objects come across with their keys sorted, not in
+# projection order — surprising for SELECT callers.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde-wasm-bindgen = "0.6"
+
+# Keep the binary small — panics log to `console.error` and abort
+# the WASM instance. Without this, a panic would bubble up as a
+# generic trap with no stack trace.
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+# Wire the panic hook on by default — tiny binary-size cost
+# (~4 KiB) in exchange for readable stack traces in the browser
+# devtools console on bugs. Disable for absolute-minimum bundles.
+default = ["panic-hook"]
+panic-hook = ["dep:console_error_panic_hook"]
+
+# Release-profile tuning for WASM: optimize for size (`opt-level = "z"`),
+# LTO, and strip debug symbols. Lives here rather than in the
+# workspace root because wasm-pack invokes cargo standalone on this
+# crate (it isn't a workspace member).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "debuginfo"

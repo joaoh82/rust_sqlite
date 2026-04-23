@@ -1,0 +1,38 @@
+[package]
+name = "sqlrite-ffi"
+version = "0.1.0"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "C-compatible FFI shim around the SQLRite embedded database engine. Ships libsqlrite.{so,dylib,dll} plus a generated sqlrite.h for any language with a C FFI."
+repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
+
+# Three crate types:
+# - cdylib:    `libsqlrite_c.{so,dylib,dll}` for dynamic linking by other
+#              languages (Python/Node.js/Go SDKs + the C examples).
+# - staticlib: `libsqlrite_c.a` for callers that prefer static linking.
+# - rlib:      lets Rust callers (the FFI crate's own tests, downstream Rust
+#              workspaces) depend on this crate directly.
+#
+# Named `sqlrite_c` rather than `sqlrite` so the rlib's crate name doesn't
+# collide with the root `sqlrite` crate (rustdoc gets unhappy when two rlibs
+# in the build graph share a crate name). Users linking against the shared
+# library reference it as `-lsqlrite_c`.
+[lib]
+name = "sqlrite_c"
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# The engine we're wrapping. Taken from the workspace root via a path dep so
+# the FFI layer always tracks HEAD — no version-lock drift between the two.
+sqlrite = { path = ".." }
+
+# Build-time C header generation. `cbindgen` walks this crate's extern "C"
+# declarations and emits `sqlrite.h`. We invoke it from build.rs so callers
+# that depend on the cdylib get a generated header on `cargo build`, and a
+# `cargo run -p sqlrite-ffi --bin regenerate-header` escape hatch writes it
+# back into the repo for consumers who just want the file.
+[build-dependencies]
+cbindgen = "0.29"

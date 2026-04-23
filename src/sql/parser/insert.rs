@@ -1,4 +1,4 @@
-use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value, Values};
+use sqlparser::ast::{Expr, Insert, SetExpr, Statement, Value, Values};
 
 use crate::error::{Result, SQLRiteError};
 
@@ -14,72 +14,66 @@ pub struct InsertQuery {
 
 impl InsertQuery {
     pub fn new(statement: &Statement) -> Result<InsertQuery> {
-        #[allow(unused_assignments)]
-        let mut tname: Option<String> = None;
+        let tname: Option<String>;
         let mut columns: Vec<String> = vec![];
         let mut all_values: Vec<Vec<String>> = vec![];
 
         match statement {
-            Statement::Insert {
-                table_name,
+            Statement::Insert(Insert {
+                table,
                 columns: cols,
                 source,
                 ..
-            } => {
-                tname = Some(table_name.to_string());
+            }) => {
+                tname = Some(table.to_string());
                 for col in cols {
                     columns.push(col.to_string());
                 }
 
-                match &**source {
-                    Query {
-                        body,
-                        order_by: _order_by,
-                        limit: _limit,
-                        offset: _offset,
-                        fetch: _fetch,
-                        ..
-                    } => {
-                        if let SetExpr::Values(values) = body {
-                            #[allow(irrefutable_let_patterns)]
-                            if let Values(expressions) = values {
-                                for i in expressions {
-                                    let mut value_set: Vec<String> = vec![];
-                                    for e in i {
-                                        match e {
-                                            Expr::Value(v) => match v {
-                                                Value::Number(n, _) => {
-                                                    value_set.push(n.to_string());
-                                                }
-                                                Value::Boolean(b) => match *b {
-                                                    true => value_set.push("true".to_string()),
-                                                    false => value_set.push("false".to_string()),
-                                                },
-                                                Value::SingleQuotedString(sqs) => {
-                                                    value_set.push(sqs.to_string());
-                                                }
-                                                Value::Null => {
-                                                    value_set.push("Null".to_string());
-                                                }
-                                                _ => {}
-                                            },
-                                            Expr::Identifier(i) => {
-                                                value_set.push(i.to_string());
-                                            }
-                                            _ => {}
+                let source = source.as_ref().ok_or_else(|| {
+                    SQLRiteError::Internal(
+                        "INSERT statement is missing a source expression".to_string(),
+                    )
+                })?;
+
+                if let SetExpr::Values(Values { rows, .. }) = source.body.as_ref() {
+                    for row in rows {
+                        let mut value_set: Vec<String> = vec![];
+                        for e in row {
+                            match e {
+                                Expr::Value(v) => match &v.value {
+                                    Value::Number(n, _) => {
+                                        value_set.push(n.to_string());
+                                    }
+                                    Value::Boolean(b) => {
+                                        if *b {
+                                            value_set.push("true".to_string());
+                                        } else {
+                                            value_set.push("false".to_string());
                                         }
                                     }
-                                    all_values.push(value_set);
+                                    Value::SingleQuotedString(sqs) => {
+                                        value_set.push(sqs.to_string());
+                                    }
+                                    Value::Null => {
+                                        value_set.push("Null".to_string());
+                                    }
+                                    _ => {}
+                                },
+                                Expr::Identifier(i) => {
+                                    value_set.push(i.to_string());
                                 }
+                                _ => {}
                             }
                         }
+                        all_values.push(value_set);
                     }
                 }
             }
             _ => {
                 return Err(SQLRiteError::Internal(
                     "Error parsing insert query".to_string(),
-                ))
+                ));
             }
         }
 

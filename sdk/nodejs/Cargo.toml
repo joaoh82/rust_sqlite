@@ -1,0 +1,41 @@
+[package]
+name = "sqlrite-nodejs"
+version = "0.1.0"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "Node.js bindings for the SQLRite embedded database engine. Ships the `sqlrite` npm package with prebuilt `.node` binaries."
+repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
+
+# Like the Python binding, this is a cdylib loaded at runtime by Node
+# via N-API — not a standalone binary. The `.node` artifact is just a
+# cdylib renamed with a `.node` extension.
+#
+# Named `sqlrite_nodejs` so the rlib doesn't collide with the root
+# `sqlrite` crate or with the FFI crate's `sqlrite_c`. The user-
+# facing import is `const { Database } = require('sqlrite')` — that
+# naming lives in package.json, not Cargo.
+[lib]
+name = "sqlrite_nodejs"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+sqlrite = { path = "../.." }
+
+# napi-rs 2.x — mature + widely deployed (used by prisma, swc,
+# lightningcss, etc.). Version 2.16 adds `serde-json` features we
+# don't need here. Feature `napi9` targets N-API v9 (Node 18+).
+napi = { version = "2.16", default-features = false, features = ["napi9"] }
+napi-derive = "2.16"
+
+[build-dependencies]
+# Generates the glue code napi-rs needs at build time (platform
+# detection, symbol versioning for Node's loader, etc.).
+napi-build = "2.2"
+
+# The release profile that ships the .node binary to npm (LTO,
+# strip-symbols, ~30% smaller) lives at the workspace root's
+# Cargo.toml, not here — workspace-level profile tables win, and
+# Cargo warns if a member tries to override them.

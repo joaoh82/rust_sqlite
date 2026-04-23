@@ -1,0 +1,306 @@
+# The "publish" half of the two-workflow release flow. Fires
+# automatically when a Release PR (from `release-pr.yml`) merges —
+# detects it via the `release: v<semver>` commit message on the
+# merge commit. A `workflow_dispatch` fallback lets a human re-run
+# the publish side manually when the auto-trigger needs a kick.
+#
+# Phase 6d scope: tag-all + publish-crate + publish-ffi + finalize.
+# Phase 6e–6i add publish-desktop / publish-python / publish-nodejs /
+# publish-wasm / publish-go as separate jobs to this same file.
+#
+# Design doc: docs/release-plan.md.
+# One-time registry / branch-protection setup: docs/release-secrets.md.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to (re-)publish. Use only when the auto-trigger needs a manual kick.'
+        required: true
+        type: string
+
+# `contents: write` — tag creation + GitHub Release uploads.
+permissions:
+  contents: write
+
+# Only one release at a time across the whole workflow. Back-to-back
+# merges of two Release PRs (which should never happen, but still)
+# run serially rather than racing on tag creation.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Step 1: figure out whether this push commit is actually a release
+  # (and extract the version from the commit message), or just a
+  # regular push we should ignore. Runs on every push to main.
+  detect:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      should_release: ${{ steps.parse.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: parse
+        # On workflow_dispatch, trust the input verbatim (validated
+        # by the dispatcher).
+        # On push, parse the top line of the HEAD commit message.
+        # If it matches `release: vX.Y.Z`, extract and proceed.
+        # Anything else is a regular commit — exit silently.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Manually dispatched release for v$VERSION"
+            exit 0
+          fi
+
+          MSG=$(git log -1 --pretty=%s)
+          if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release commit detected: v$VERSION"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not a release commit — skipping"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Step 2: push per-product tags against the current commit. Runs
+  # BEFORE any publish step so a bad version number (e.g., tag
+  # already exists for some reason) aborts the whole release cleanly.
+  #
+  # Phase 6d only tags products whose publish jobs exist:
+  #   - sqlrite-v<V>       (Rust engine)
+  #   - sqlrite-ffi-v<V>   (C FFI prebuilt binaries)
+  #   - v<V>               (umbrella)
+  #
+  # Later phases add sqlrite-py-v<V>, sqlrite-node-v<V>,
+  # sqlrite-wasm-v<V>, sdk/go/v<V>, sqlrite-desktop-v<V> as their
+  # publish jobs come online.
+  #
+  # Idempotent on re-run: if a tag already exists (partial-failure
+  # scenario where publish-crate succeeded but publish-ffi failed,
+  # say), we skip instead of failing. Lets "Re-run failed jobs" in
+  # the GitHub UI actually work.
+  tag-all:
+    name: Tag all products
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need tag history to check existing tags.
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create + push tags
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          TAGS=(
+            "sqlrite-v$V"
+            "sqlrite-ffi-v$V"
+            "v$V"
+          )
+          for tag in "${TAGS[@]}"; do
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "::notice::Tag $tag already exists — skipping (re-run scenario)"
+            else
+              git tag "$tag"
+              echo "Created tag $tag"
+            fi
+          done
+          git push --tags
+
+  # ---------------------------------------------------------------------------
+  # Step 3a: publish the Rust engine crate to crates.io + create
+  # its per-product GitHub Release. Gated by the `release`
+  # environment's required-reviewer rule (a maintainer has to
+  # click Approve before this job actually runs).
+  publish-crate:
+    name: Publish sqlrite crate to crates.io
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-crate
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          # `--no-verify` skips the rebuild+test that publish does
+          # by default — CI already ran on the same commit on the
+          # Release PR, so re-running here is duplicate work. Also
+          # `-p sqlrite` is explicit about which workspace member
+          # we're publishing (could be omitted since sqlrite is the
+          # root package, but being explicit protects against
+          # future layout changes).
+          cargo publish -p sqlrite --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-v${{ needs.detect.outputs.version }}
+          name: Rust engine v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite/${{ needs.detect.outputs.version }}
+
+            ```toml
+            [dependencies]
+            sqlrite = "${{ needs.detect.outputs.version }}"
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3b: build `libsqlrite_c` for each supported platform and
+  # upload the tarballs to the `sqlrite-ffi-v<V>` GitHub Release.
+  #
+  # Matrix covers the platforms the Go / Python / Node SDKs' cgo /
+  # dlopen paths care about. Note: macos-latest is Apple Silicon
+  # (aarch64). A universal binary (x86_64 + aarch64 lipo'd
+  # together) is a follow-up — the MVP ships aarch64-only for
+  # macOS. Add `macos-13` to the matrix if x86_64 Mac support
+  # becomes a real ask.
+  publish-ffi:
+    name: Publish C FFI (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            shared_lib: libsqlrite_c.so
+            static_lib: libsqlrite_c.a
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            shared_lib: libsqlrite_c.so
+            static_lib: libsqlrite_c.a
+          - os: macos-latest
+            platform: macos-aarch64
+            shared_lib: libsqlrite_c.dylib
+            static_lib: libsqlrite_c.a
+          - os: windows-latest
+            platform: windows-x86_64
+            shared_lib: sqlrite_c.dll
+            static_lib: sqlrite_c.lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-ffi-${{ matrix.platform }}
+
+      - name: Build libsqlrite_c
+        run: cargo build --release -p sqlrite-ffi
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          STAGE="sqlrite-ffi-v$V-${{ matrix.platform }}"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          cp "target/release/${{ matrix.shared_lib }}" "$STAGE/lib/"
+          cp "target/release/${{ matrix.static_lib }}" "$STAGE/lib/" 2>/dev/null || \
+            echo "::warning::static lib ${{ matrix.static_lib }} not found on ${{ matrix.platform }} — shipping shared lib only"
+          cp "sqlrite-ffi/include/sqlrite.h" "$STAGE/include/"
+          # README pointer so end users know what they're looking at
+          # when they untar the download.
+          cat > "$STAGE/README" <<EOF
+          SQLRite C FFI v$V — ${{ matrix.platform }}
+
+          Contents:
+            lib/ ${{ matrix.shared_lib }}  — dynamic library to link against
+            lib/ ${{ matrix.static_lib }}  — static library (if present)
+            include/ sqlrite.h             — C header
+
+          Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/sqlrite-ffi/README.md
+          EOF
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          # Emit the path for the upload step below.
+          echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-ffi-v${{ needs.detect.outputs.version }}
+          name: C FFI v${{ needs.detect.outputs.version }}
+          body: |
+            Prebuilt `libsqlrite_c` for every supported platform, plus the `sqlrite.h` header.
+
+            Download the tarball for your platform, extract, and link:
+
+            ```
+            tar xzf sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>.tar.gz
+            # lib/   — dynamic + static libraries
+            # include/sqlrite.h — header to #include
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 4: create the umbrella GitHub Release. Runs after all
+  # publish-* jobs succeed. Uses GitHub's native auto-generated
+  # release notes so the changelog is "everything between the
+  # previous v* tag and this one" — curated via .github/release.yml
+  # config if we add one later.
+  finalize:
+    name: Finalize umbrella release
+    needs: [detect, publish-crate, publish-ffi]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Umbrella GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.detect.outputs.version }}
+          name: v${{ needs.detect.outputs.version }}
+          body: |
+            **SQLRite v${{ needs.detect.outputs.version }}**
+
+            Per-product releases in this wave:
+
+            - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite/${{ needs.detect.outputs.version }})
+            - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+
+            _Python / Node.js / WASM / Go / desktop SDKs land as their publish jobs come online (Phases 6e–6i)._
+
+            ---
+
+            Auto-generated changelog below ↓
+          generate_release_notes: true

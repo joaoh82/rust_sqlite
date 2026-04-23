@@ -3,3 +3,44 @@
 **/.swp
 *.swp
 history
+*.sqlrite
+
+# Desktop app — frontend build output + deps
+desktop/node_modules
+desktop/dist
+desktop/src-tauri/target
+desktop/src-tauri/gen
+desktop/.vite
+
+# Compiled C samples (the source stays; the binary is rebuilt per platform)
+examples/c/hello
+
+# Python SDK build artifacts + test caches
+__pycache__
+*.pyc
+.pytest_cache
+sdk/python/*.egg-info
+sdk/python/dist
+
+# Node.js SDK build artifacts + deps
+sdk/nodejs/node_modules
+sdk/nodejs/*.node
+# napi-rs auto-generates these per-build; source of truth is src/lib.rs.
+sdk/nodejs/index.js
+sdk/nodejs/index.d.ts
+
+# Go SDK — go.sum files are environment-specific during development
+# until a published tag lands (Phase 6e); until then we commit only
+# go.mod and let downstream users run `go mod tidy` themselves.
+sdk/go/go.sum
+examples/go/go.sum
+
+# WASM SDK build outputs (wasm-pack writes here; the source of
+# truth is src/lib.rs + Cargo.toml).
+sdk/wasm/pkg
+sdk/wasm/pkg-node
+sdk/wasm/target
+examples/wasm/pkg
+
+# macOS
+.DS_Store

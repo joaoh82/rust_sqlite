@@ -1,9 +1,12 @@
+pub mod db;
+pub mod executor;
+pub mod pager;
 pub mod parser;
 // pub mod tokenizer;
-pub mod db;
 
 use parser::create::CreateQuery;
 use parser::insert::InsertQuery;
+use parser::select::SelectQuery;
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
@@ -41,7 +44,7 @@ impl SQLCommand {
 pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     let dialect = SQLiteDialect {};
     let message: String;
-    let mut ast = Parser::parse_sql(&dialect, &query).map_err(SQLRiteError::from)?;
+    let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 
     if ast.len() > 1 {
         return Err(SQLRiteError::SqlError(ParserError::ParserError(format!(
@@ -50,15 +53,90 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         ))));
     }
 
-    let query = ast.pop().unwrap();
+    // Comment-only or whitespace-only input parses to an empty Vec<Statement>.
+    // Return a benign status rather than panicking on `pop().unwrap()`. Callers
+    // (REPL, Tauri app) treat this as a no-op with no disk write triggered.
+    let Some(query) = ast.pop() else {
+        return Ok("No statement to execute.".to_string());
+    };
+
+    // Transaction boundary statements are routed to Database-level
+    // handlers before we even inspect the rest of the AST. They don't
+    // mutate table data directly, so they short-circuit the
+    // is_write_statement / auto-save path.
+    match &query {
+        Statement::StartTransaction { .. } => {
+            db.begin_transaction()?;
+            return Ok(String::from("BEGIN"));
+        }
+        Statement::Commit { .. } => {
+            if !db.in_transaction() {
+                return Err(SQLRiteError::General(
+                    "cannot COMMIT: no transaction is open".to_string(),
+                ));
+            }
+            // Flush accumulated in-memory changes to disk. If the save
+            // fails we auto-rollback the in-memory state to the
+            // pre-BEGIN snapshot and surface a combined error. Leaving
+            // the transaction open after a failed COMMIT would be
+            // unsafe: auto-save on any subsequent non-transactional
+            // statement would silently publish partial mid-transaction
+            // work. Auto-rollback keeps the disk-plus-memory pair
+            // coherent — the user loses their in-flight work on a disk
+            // error, but that's the only safe outcome.
+            if let Some(path) = db.source_path.clone() {
+                if let Err(save_err) = pager::save_database(db, &path) {
+                    let _ = db.rollback_transaction();
+                    return Err(SQLRiteError::General(format!(
+                        "COMMIT failed — transaction rolled back: {save_err}"
+                    )));
+                }
+            }
+            db.commit_transaction()?;
+            return Ok(String::from("COMMIT"));
+        }
+        Statement::Rollback { .. } => {
+            db.rollback_transaction()?;
+            return Ok(String::from("ROLLBACK"));
+        }
+        _ => {}
+    }
+
+    // Statements that mutate state — trigger auto-save on success. Read-only
+    // SELECTs skip the save entirely to avoid pointless file writes.
+    let is_write_statement = matches!(
+        &query,
+        Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    );
+
+    // Early-reject mutations on a read-only database before they touch
+    // in-memory state. Phase 4e: without this, a user running INSERT
+    // on a `--readonly` REPL would see the row appear in the printed
+    // table, and then the auto-save would fail — leaving the in-memory
+    // Database visibly diverged from disk.
+    if is_write_statement && db.is_read_only() {
+        return Err(SQLRiteError::General(
+            "cannot execute: database is opened read-only".to_string(),
+        ));
+    }
 
     // Initialy only implementing some basic SQL Statements
     match query {
-        Statement::CreateTable { .. } => {
+        Statement::CreateTable(_) => {
             let create_query = CreateQuery::new(&query);
             match create_query {
                 Ok(payload) => {
                     let table_name = payload.table_name.clone();
+                    if table_name == pager::MASTER_TABLE_NAME {
+                        return Err(SQLRiteError::General(format!(
+                            "'{}' is a reserved name used by the internal schema catalog",
+                            pager::MASTER_TABLE_NAME
+                        )));
+                    }
                     // Checking if table already exists, after parsing CREATE TABLE query
                     match db.contains_table(table_name.to_string()) {
                         true => {
@@ -81,7 +159,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 Err(err) => return Err(err),
             }
         }
-        Statement::Insert { .. } => {
+        Statement::Insert(_) => {
             let insert_query = InsertQuery::new(&query);
             match insert_query {
                 Ok(payload) => {
@@ -109,18 +187,14 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                                 columns.len()
                                             )));
                                         }
-                                        match db_table.validate_unique_constraint(&columns, value) {
-                                            Ok(()) => {
-                                                // No unique constraint violation, moving forward with inserting row
-                                                db_table.insert_row(&columns, &value);
-                                            }
-                                            Err(err) => {
-                                                return Err(SQLRiteError::Internal(format!(
-                                                    "Unique key constaint violation: {}",
-                                                    err
-                                                )))
-                                            }
-                                        }
+                                        db_table
+                                            .validate_unique_constraint(&columns, value)
+                                            .map_err(|err| {
+                                                SQLRiteError::Internal(format!(
+                                                    "Unique key constraint violation: {err}"
+                                                ))
+                                            })?;
+                                        db_table.insert_row(&columns, value)?;
                                     }
                                 }
                                 false => {
@@ -133,7 +207,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                             db_table.print_table_data();
                         }
                         false => {
-                            return Err(SQLRiteError::Internal("Table doesn't exist".to_string()))
+                            return Err(SQLRiteError::Internal("Table doesn't exist".to_string()));
                         }
                     }
                 }
@@ -142,15 +216,55 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 
             message = String::from("INSERT Statement executed.")
         }
-        Statement::Query(_query) => message = String::from("SELECT Statement executed."),
-        // Statement::Insert { .. } => message = String::from("INSERT Statement executed."),
-        Statement::Delete { .. } => message = String::from("DELETE Statement executed."),
+        Statement::Query(_) => {
+            let select_query = SelectQuery::new(&query)?;
+            let (rendered, rows) = executor::execute_select(select_query, db)?;
+            // Print the result table above the status message so the REPL shows both.
+            print!("{rendered}");
+            message = format!(
+                "SELECT Statement executed. {rows} row{s} returned.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
+        Statement::Delete(_) => {
+            let rows = executor::execute_delete(&query, db)?;
+            message = format!(
+                "DELETE Statement executed. {rows} row{s} deleted.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
+        Statement::Update(_) => {
+            let rows = executor::execute_update(&query, db)?;
+            message = format!(
+                "UPDATE Statement executed. {rows} row{s} updated.",
+                s = if rows == 1 { "" } else { "s" }
+            );
+        }
+        Statement::CreateIndex(_) => {
+            let name = executor::execute_create_index(&query, db)?;
+            message = format!("CREATE INDEX '{name}' executed.");
+        }
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "SQL Statement not supported yet.".to_string(),
-            ))
+            ));
         }
     };
+
+    // Auto-save: if the database is backed by a file AND no explicit
+    // transaction is open AND the statement changed state, flush to
+    // disk before returning. Inside a `BEGIN … COMMIT` block the
+    // mutations accumulate in memory (protected by the ROLLBACK
+    // snapshot) and land on disk in one shot when COMMIT runs.
+    //
+    // A failed save surfaces as an error — the in-memory state already
+    // mutated, so the caller should know disk is out of sync. The
+    // Pager held on `db` diffs against its last-committed snapshot,
+    // so only pages whose bytes actually changed are written.
+    if is_write_statement && db.source_path.is_some() && !db.in_transaction() {
+        let path = db.source_path.clone().unwrap();
+        pager::save_database(db, &path)?;
+    }
 
     Ok(message)
 }
@@ -159,18 +273,73 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn process_command_select_test() {
-        let inputed_query = String::from("SELECT * from users;");
+    /// Builds a `users(id INTEGER PK, name TEXT, age INTEGER)` table populated
+    /// with three rows, for use in executor-level tests.
+    fn seed_users_table() -> Database {
         let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);",
+            &mut db,
+        )
+        .expect("create table");
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('alice', 30);",
+            &mut db,
+        )
+        .expect("insert alice");
+        process_command("INSERT INTO users (name, age) VALUES ('bob', 25);", &mut db)
+            .expect("insert bob");
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('carol', 40);",
+            &mut db,
+        )
+        .expect("insert carol");
+        db
+    }
 
-        let _ = match process_command(&inputed_query, &mut db) {
-            Ok(response) => assert_eq!(response, "SELECT Statement executed."),
-            Err(err) => {
-                eprintln!("Error: {}", err);
-                assert!(false)
-            }
-        };
+    #[test]
+    fn process_command_select_all_test() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT * FROM users;", &mut db).expect("select");
+        assert!(response.contains("3 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_where_test() {
+        let mut db = seed_users_table();
+        let response =
+            process_command("SELECT name FROM users WHERE age > 25;", &mut db).expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_eq_string_test() {
+        let mut db = seed_users_table();
+        let response =
+            process_command("SELECT name FROM users WHERE name = 'bob';", &mut db).expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn process_command_select_limit_test() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT * FROM users ORDER BY age ASC LIMIT 2;", &mut db)
+            .expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_select_unknown_table_test() {
+        let mut db = Database::new("tempdb".to_string());
+        let result = process_command("SELECT * FROM nope;", &mut db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_command_select_unknown_column_test() {
+        let mut db = seed_users_table();
+        let result = process_command("SELECT height FROM users;", &mut db);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -184,7 +353,7 @@ mod tests {
             name TEXT
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -199,7 +368,7 @@ mod tests {
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
-        let _ = match process_command(&insert_query, &mut db) {
+        match process_command(&insert_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
             Err(err) => {
                 eprintln!("Error: {}", err);
@@ -218,7 +387,7 @@ mod tests {
             name TEXT
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -233,7 +402,7 @@ mod tests {
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
-        let _ = match process_command(&insert_query, &mut db) {
+        match process_command(&insert_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
             Err(err) => {
                 eprintln!("Error: {}", err);
@@ -243,28 +412,703 @@ mod tests {
     }
 
     #[test]
-    fn process_command_delete_test() {
-        let inputed_query = String::from("DELETE FROM users WHERE id=1;");
-        let mut db = Database::new("tempdb".to_string());
+    fn process_command_delete_where_test() {
+        let mut db = seed_users_table();
+        let response =
+            process_command("DELETE FROM users WHERE name = 'bob';", &mut db).expect("delete");
+        assert!(response.contains("1 row deleted"));
 
-        let _ = match process_command(&inputed_query, &mut db) {
-            Ok(response) => assert_eq!(response, "DELETE Statement executed."),
-            Err(err) => {
-                eprintln!("Error: {}", err);
-                assert!(false)
-            }
-        };
+        let remaining = process_command("SELECT * FROM users;", &mut db).expect("select");
+        assert!(remaining.contains("2 rows returned"));
     }
 
     #[test]
-    fn process_command_not_implemented_test() {
-        let inputed_query = String::from("UPDATE users SET name='josh' where id=1;");
-        let mut db = Database::new("tempdb".to_string());
-        let expected = Err(SQLRiteError::NotImplemented(
-            "SQL Statement not supported yet.".to_string(),
-        ));
+    fn process_command_delete_all_test() {
+        let mut db = seed_users_table();
+        let response = process_command("DELETE FROM users;", &mut db).expect("delete");
+        assert!(response.contains("3 rows deleted"));
+    }
 
-        let result = process_command(&inputed_query, &mut db).map_err(|e| e);
-        assert_eq!(result, expected);
+    #[test]
+    fn process_command_update_where_test() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        let response = process_command("UPDATE users SET age = 99 WHERE name = 'bob';", &mut db)
+            .expect("update");
+        assert!(response.contains("1 row updated"));
+
+        // Confirm the cell was actually rewritten.
+        let users = db.get_table("users".to_string()).unwrap();
+        let bob_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("name", *r) == Some(Value::Text("bob".to_string())))
+            .expect("bob row must exist");
+        assert_eq!(users.get_value("age", bob_rowid), Some(Value::Integer(99)));
+    }
+
+    #[test]
+    fn process_command_update_unique_violation_test() {
+        let mut db = seed_users_table();
+        // `name` is not UNIQUE in the seed — reinforce with an explicit unique column.
+        process_command(
+            "CREATE TABLE tags (id INTEGER PRIMARY KEY, label TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO tags (label) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO tags (label) VALUES ('b');", &mut db).unwrap();
+
+        let result = process_command("UPDATE tags SET label = 'a' WHERE label = 'b';", &mut db);
+        assert!(result.is_err(), "expected UNIQUE violation, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_insert_type_mismatch_returns_error_test() {
+        // Previously this panicked in parse::<i32>().unwrap(); now it should return an error cleanly.
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let result = process_command("INSERT INTO items (qty) VALUES ('not a number');", &mut db);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_insert_missing_integer_returns_error_test() {
+        // Non-PK INTEGER without a value should error (not panic on "Null".parse()).
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let result = process_command("INSERT INTO items (id) VALUES (1);", &mut db);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn process_command_update_arith_test() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        process_command("UPDATE users SET age = age + 1;", &mut db).expect("update +1");
+
+        let users = db.get_table("users".to_string()).unwrap();
+        let mut ages: Vec<i64> = users
+            .rowids()
+            .into_iter()
+            .filter_map(|r| match users.get_value("age", r) {
+                Some(Value::Integer(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        ages.sort();
+        assert_eq!(ages, vec![26, 31, 41]); // 25+1, 30+1, 40+1
+    }
+
+    #[test]
+    fn process_command_select_arithmetic_where_test() {
+        let mut db = seed_users_table();
+        // age * 2 > 55  →  only ages > 27.5  →  alice(30) + carol(40)
+        let response =
+            process_command("SELECT name FROM users WHERE age * 2 > 55;", &mut db).expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    #[test]
+    fn process_command_divide_by_zero_test() {
+        let mut db = seed_users_table();
+        let result = process_command("SELECT age / 0 FROM users;", &mut db);
+        // Projection only supports bare columns, so this errors earlier; still shouldn't panic.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_command_unsupported_statement_test() {
+        let mut db = Database::new("tempdb".to_string());
+        // Nothing in Phase 1 handles DROP.
+        let result = process_command("DROP TABLE users;", &mut db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_input_is_a_noop_not_a_panic() {
+        // Regression for: desktop app pre-fills the textarea with a
+        // comment-only placeholder, and hitting Run used to panic because
+        // sqlparser produced zero statements and pop().unwrap() exploded.
+        let mut db = Database::new("t".to_string());
+        for input in ["", "   ", "-- just a comment", "-- comment\n-- another"] {
+            let result = process_command(input, &mut db);
+            assert!(result.is_ok(), "input {input:?} should not error");
+            let msg = result.unwrap();
+            assert!(msg.contains("No statement"), "got: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn create_index_adds_explicit_index() {
+        let mut db = seed_users_table();
+        let response = process_command("CREATE INDEX users_age_idx ON users (age);", &mut db)
+            .expect("create index");
+        assert!(response.contains("users_age_idx"));
+
+        // The index should now be attached to the users table.
+        let users = db.get_table("users".to_string()).unwrap();
+        let idx = users
+            .index_by_name("users_age_idx")
+            .expect("index should exist after CREATE INDEX");
+        assert_eq!(idx.column_name, "age");
+        assert!(!idx.is_unique);
+    }
+
+    #[test]
+    fn create_unique_index_rejects_duplicate_existing_values() {
+        let mut db = seed_users_table();
+        // `name` is already UNIQUE (auto-indexed); insert a duplicate-age row
+        // first so CREATE UNIQUE INDEX on age catches the conflict.
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 30);", &mut db).unwrap();
+        let result = process_command(
+            "CREATE UNIQUE INDEX users_age_unique ON users (age);",
+            &mut db,
+        );
+        assert!(
+            result.is_err(),
+            "expected unique-index failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn where_eq_on_indexed_column_uses_index_probe() {
+        // Build a table big enough that a full scan would be expensive,
+        // then rely on the index-probe fast path. This test verifies
+        // correctness (right rows returned); the perf win is implicit.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, tag TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE INDEX big_tag_idx ON big (tag);", &mut db).unwrap();
+        for i in 1..=100 {
+            let tag = if i % 3 == 0 { "hot" } else { "cold" };
+            process_command(&format!("INSERT INTO big (tag) VALUES ('{tag}');"), &mut db).unwrap();
+        }
+        let response =
+            process_command("SELECT id FROM big WHERE tag = 'hot';", &mut db).expect("select");
+        // 1..=100 has 33 multiples of 3.
+        assert!(
+            response.contains("33 rows returned"),
+            "response was {response:?}"
+        );
+    }
+
+    #[test]
+    fn where_eq_on_indexed_column_inside_parens_uses_index_probe() {
+        let mut db = seed_users_table();
+        let response = process_command("SELECT name FROM users WHERE (name = 'bob');", &mut db)
+            .expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn where_eq_literal_first_side_uses_index_probe() {
+        let mut db = seed_users_table();
+        // `'bob' = name` should hit the same path as `name = 'bob'`.
+        let response =
+            process_command("SELECT name FROM users WHERE 'bob' = name;", &mut db).expect("select");
+        assert!(response.contains("1 row returned"));
+    }
+
+    #[test]
+    fn non_equality_where_still_falls_back_to_full_scan() {
+        // Sanity: range predicates bypass the optimizer and the full-scan
+        // path still returns correct results.
+        let mut db = seed_users_table();
+        let response =
+            process_command("SELECT name FROM users WHERE age > 28;", &mut db).expect("select");
+        assert!(response.contains("2 rows returned"));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 4f — Transactions (BEGIN / COMMIT / ROLLBACK)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rollback_restores_pre_begin_in_memory_state() {
+        // In-memory DB (no pager): BEGIN, insert a row, ROLLBACK.
+        // The row must disappear from the live tables HashMap.
+        let mut db = seed_users_table();
+        let before = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(before, 3);
+
+        process_command("BEGIN;", &mut db).expect("BEGIN");
+        assert!(db.in_transaction());
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 50);", &mut db)
+            .expect("INSERT inside txn");
+        // Mid-transaction read sees the new row.
+        let mid = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(mid, 4);
+
+        process_command("ROLLBACK;", &mut db).expect("ROLLBACK");
+        assert!(!db.in_transaction());
+        let after = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(
+            after, 3,
+            "ROLLBACK should have restored the pre-BEGIN state"
+        );
+    }
+
+    #[test]
+    fn commit_keeps_mutations_and_clears_txn_flag() {
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).expect("BEGIN");
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 50);", &mut db)
+            .expect("INSERT inside txn");
+        process_command("COMMIT;", &mut db).expect("COMMIT");
+        assert!(!db.in_transaction());
+        let after = db.get_table("users".to_string()).unwrap().rowids().len();
+        assert_eq!(after, 4);
+    }
+
+    #[test]
+    fn rollback_undoes_update_and_delete_side_by_side() {
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("UPDATE users SET age = 999;", &mut db).unwrap();
+        process_command("DELETE FROM users WHERE name = 'bob';", &mut db).unwrap();
+        // Mid-txn: one row gone, others have age=999.
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 2);
+        for r in users.rowids() {
+            assert_eq!(users.get_value("age", r), Some(Value::Integer(999)));
+        }
+
+        process_command("ROLLBACK;", &mut db).unwrap();
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 3);
+        // Original ages {30, 25, 40} — none should be 999.
+        for r in users.rowids() {
+            assert_ne!(users.get_value("age", r), Some(Value::Integer(999)));
+        }
+    }
+
+    #[test]
+    fn nested_begin_is_rejected() {
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        let err = process_command("BEGIN;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").contains("already open"),
+            "nested BEGIN should error; got: {err}"
+        );
+        // Still in the original transaction; a ROLLBACK clears it.
+        assert!(db.in_transaction());
+        process_command("ROLLBACK;", &mut db).unwrap();
+    }
+
+    #[test]
+    fn orphan_commit_and_rollback_are_rejected() {
+        let mut db = seed_users_table();
+        let commit_err = process_command("COMMIT;", &mut db).unwrap_err();
+        assert!(format!("{commit_err}").contains("no transaction"));
+        let rollback_err = process_command("ROLLBACK;", &mut db).unwrap_err();
+        assert!(format!("{rollback_err}").contains("no transaction"));
+    }
+
+    #[test]
+    fn error_inside_transaction_keeps_txn_open() {
+        // A bad INSERT inside a txn doesn't commit or abort automatically —
+        // the user can still ROLLBACK. SQLite's implicit-rollback behavior
+        // isn't modeled here.
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        let err = process_command("INSERT INTO nope (x) VALUES (1);", &mut db);
+        assert!(err.is_err());
+        assert!(db.in_transaction(), "txn should stay open after error");
+        process_command("ROLLBACK;", &mut db).unwrap();
+    }
+
+    /// Builds a file-backed Database at a unique temp path, with the
+    /// schema seeded and `source_path` set so subsequent process_command
+    /// calls auto-save. Returns (path, db). Drop the db before deleting
+    /// the files.
+    fn seed_file_backed(name: &str, schema: &str) -> (std::path::PathBuf, Database) {
+        use crate::sql::pager::{open_database, save_database};
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("sqlrite-txn-{name}-{pid}-{nanos}.sqlrite"));
+
+        // Seed the file, then reopen to get a source_path-attached db
+        // (save_database alone doesn't attach a fresh pager to a db
+        // whose source_path was None before the call).
+        {
+            let mut seed = Database::new("t".to_string());
+            process_command(schema, &mut seed).unwrap();
+            save_database(&mut seed, &p).unwrap();
+        }
+        let db = open_database(&p, "t".to_string()).unwrap();
+        (p, db)
+    }
+
+    fn cleanup_file(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    #[test]
+    fn begin_commit_rollback_round_trip_through_disk() {
+        // File-backed DB: commit inside a transaction must actually
+        // persist. ROLLBACK inside a *later* transaction must not
+        // un-do the previously-committed changes.
+        use crate::sql::pager::open_database;
+
+        let (path, mut db) = seed_file_backed(
+            "roundtrip",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+        );
+
+        // Transaction 1: insert two rows, commit.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('b');", &mut db).unwrap();
+        process_command("COMMIT;", &mut db).unwrap();
+
+        // Transaction 2: insert another, roll back.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('c');", &mut db).unwrap();
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        drop(db); // release pager lock
+
+        let reopened = open_database(&path, "t".to_string()).unwrap();
+        let notes = reopened.get_table("notes".to_string()).unwrap();
+        assert_eq!(notes.rowids().len(), 2, "committed rows should survive");
+
+        drop(reopened);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn write_inside_transaction_does_not_autosave() {
+        // File-backed DB: writes inside BEGIN/…/COMMIT must NOT hit
+        // the WAL until COMMIT. We prove it by checking the WAL file
+        // size before vs during the transaction.
+        let (path, mut db) =
+            seed_file_backed("noas", "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);");
+
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_path);
+        let frames_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO t (x) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO t (x) VALUES ('b');", &mut db).unwrap();
+
+        // Mid-transaction: WAL must be unchanged — no auto-save fired.
+        let frames_mid = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(
+            frames_before, frames_mid,
+            "WAL should not grow during an open transaction"
+        );
+
+        process_command("COMMIT;", &mut db).unwrap();
+
+        drop(db); // release pager lock
+        let fresh = crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        assert_eq!(
+            fresh.get_table("t".to_string()).unwrap().rowids().len(),
+            2,
+            "COMMIT should have persisted both inserted rows"
+        );
+        drop(fresh);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn rollback_undoes_create_table() {
+        // Schema DDL inside a txn: ROLLBACK must make the new table
+        // disappear. The txn snapshot captures db.tables as of BEGIN,
+        // and ROLLBACK reassigns tables from that snapshot, so a table
+        // created mid-transaction has no entry in the snapshot.
+        let mut db = seed_users_table();
+        assert_eq!(db.tables.len(), 1);
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command(
+            "CREATE TABLE dropme (id INTEGER PRIMARY KEY, x TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO dropme (x) VALUES ('stuff');", &mut db).unwrap();
+        assert_eq!(db.tables.len(), 2);
+
+        process_command("ROLLBACK;", &mut db).unwrap();
+        assert_eq!(
+            db.tables.len(),
+            1,
+            "CREATE TABLE should have been rolled back"
+        );
+        assert!(db.get_table("dropme".to_string()).is_err());
+    }
+
+    #[test]
+    fn rollback_restores_secondary_index_state() {
+        // Phase 4f edge case: rolling back an INSERT on a UNIQUE-indexed
+        // column must also clean up the index, otherwise a re-insert of
+        // the same value would spuriously collide.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (email) VALUES ('a@x');", &mut db).unwrap();
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db).unwrap();
+        // Inside the txn: the index now contains both 'a@x' and 'b@x'.
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        // Re-inserting 'b@x' after rollback must succeed — if the index
+        // wasn't properly restored, it would think 'b@x' is still a
+        // collision and fail with a UNIQUE violation.
+        let reinsert = process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db);
+        assert!(
+            reinsert.is_ok(),
+            "re-insert after rollback should succeed, got {reinsert:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_last_rowid_counter() {
+        // Rowids allocated inside a rolled-back transaction should be
+        // reusable. The snapshot restores Table::last_rowid, so the
+        // next insert picks up where the pre-BEGIN state left off.
+        use crate::sql::db::table::Value;
+
+        let mut db = seed_users_table(); // 3 rows, last_rowid = 3
+        let pre = db.get_table("users".to_string()).unwrap().last_rowid;
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO users (name, age) VALUES ('d', 50);", &mut db).unwrap(); // would be rowid 4
+        process_command("INSERT INTO users (name, age) VALUES ('e', 60);", &mut db).unwrap(); // would be rowid 5
+        process_command("ROLLBACK;", &mut db).unwrap();
+
+        let post = db.get_table("users".to_string()).unwrap().last_rowid;
+        assert_eq!(pre, post, "last_rowid must roll back with the snapshot");
+
+        // Confirm: the next insert reuses rowid pre+1.
+        process_command("INSERT INTO users (name, age) VALUES ('d', 50);", &mut db).unwrap();
+        let users = db.get_table("users".to_string()).unwrap();
+        let d_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("name", *r) == Some(Value::Text("d".into())))
+            .expect("d row must exist");
+        assert_eq!(d_rowid, pre + 1);
+    }
+
+    #[test]
+    fn commit_on_in_memory_db_clears_txn_without_pager_call() {
+        // In-memory DB (no source_path): COMMIT must still work — just
+        // no disk flush. Covers the `if let Some(path) = …` branch
+        // where the guard falls through without calling save_database.
+        let mut db = seed_users_table(); // no source_path
+        assert!(db.source_path.is_none());
+
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO users (name, age) VALUES ('z', 99);", &mut db).unwrap();
+        process_command("COMMIT;", &mut db).unwrap();
+
+        assert!(!db.in_transaction());
+        assert_eq!(db.get_table("users".to_string()).unwrap().rowids().len(), 4);
+    }
+
+    #[test]
+    fn failed_commit_auto_rolls_back_in_memory_state() {
+        // Data-safety regression: on COMMIT save failure we must auto-
+        // rollback the in-memory state. Otherwise, any subsequent
+        // non-transactional statement would auto-save the partial
+        // mid-transaction work, silently publishing uncommitted
+        // changes to disk.
+        //
+        // We simulate a save failure by making the WAL sidecar path
+        // unavailable mid-transaction: after BEGIN, we take an
+        // exclusive OS lock on the WAL via a second File handle,
+        // forcing the next save to fail when it tries to append.
+        //
+        // Simpler repro: point source_path at a directory (not a file).
+        // `OpenOptions::open` will fail with EISDIR on save.
+        use crate::sql::pager::save_database;
+
+        // Seed a file-backed db.
+        let (path, mut db) = seed_file_backed(
+            "failcommit",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+        );
+
+        // Prime one committed row so we have a baseline.
+        process_command("INSERT INTO notes (body) VALUES ('before');", &mut db).unwrap();
+
+        // Open a new txn and add a row.
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('inflight');", &mut db).unwrap();
+        assert_eq!(
+            db.get_table("notes".to_string()).unwrap().rowids().len(),
+            2,
+            "inflight row visible mid-txn"
+        );
+
+        // Swap source_path to a path that will fail on open. A
+        // directory is a reliable failure mode — Pager::open on a
+        // directory errors with an I/O error.
+        let orig_source = db.source_path.clone();
+        let orig_pager = db.pager.take();
+        db.source_path = Some(std::env::temp_dir());
+
+        let commit_result = process_command("COMMIT;", &mut db);
+        assert!(commit_result.is_err(), "commit must fail");
+        let err_str = format!("{}", commit_result.unwrap_err());
+        assert!(
+            err_str.contains("COMMIT failed") && err_str.contains("rolled back"),
+            "error must surface auto-rollback; got: {err_str}"
+        );
+
+        // Auto-rollback fired: the inflight row is gone, the txn flag
+        // is cleared, and a follow-up non-txn statement won't leak
+        // stale state.
+        assert!(
+            !db.in_transaction(),
+            "txn must be cleared after auto-rollback"
+        );
+        assert_eq!(
+            db.get_table("notes".to_string()).unwrap().rowids().len(),
+            1,
+            "inflight row must be rolled back"
+        );
+
+        // Restore the real source_path + pager and verify a clean
+        // subsequent write goes through.
+        db.source_path = orig_source;
+        db.pager = orig_pager;
+        process_command("INSERT INTO notes (body) VALUES ('after');", &mut db).unwrap();
+        drop(db);
+
+        // Reopen and assert only 'before' + 'after' landed on disk.
+        let reopened = crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        let notes = reopened.get_table("notes".to_string()).unwrap();
+        assert_eq!(notes.rowids().len(), 2);
+        // Ensure no leaked save_database partial happened.
+        let _ = save_database; // silence unused-import lint if any
+        drop(reopened);
+        cleanup_file(&path);
+    }
+
+    #[test]
+    fn begin_on_read_only_is_rejected() {
+        use crate::sql::pager::{open_database_read_only, save_database};
+
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-txn-ro-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        {
+            let mut seed = Database::new("t".to_string());
+            process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut seed).unwrap();
+            save_database(&mut seed, &path).unwrap();
+        }
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        let err = process_command("BEGIN;", &mut ro).unwrap_err();
+        assert!(
+            format!("{err}").contains("read-only"),
+            "BEGIN on RO db should surface read-only; got: {err}"
+        );
+        assert!(!ro.in_transaction());
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    #[test]
+    fn read_only_database_rejects_mutations_before_touching_state() {
+        // Phase 4e end-to-end: a `--readonly` caller that runs INSERT
+        // must error *before* the row is added to the in-memory table.
+        // Otherwise the user sees a rendered result table with the
+        // phantom row, followed by the auto-save error — UX rot and a
+        // state-drift risk.
+        use crate::sql::pager::open_database_read_only;
+
+        let mut seed = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut seed,
+        )
+        .unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('alpha');", &mut seed).unwrap();
+
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-ro-reject-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        crate::sql::pager::save_database(&mut seed, &path).unwrap();
+        drop(seed);
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        let notes_before = ro.get_table("notes".to_string()).unwrap().rowids().len();
+
+        for stmt in [
+            "INSERT INTO notes (body) VALUES ('beta');",
+            "UPDATE notes SET body = 'x';",
+            "DELETE FROM notes;",
+            "CREATE TABLE more (id INTEGER PRIMARY KEY);",
+            "CREATE INDEX notes_body ON notes (body);",
+        ] {
+            let err = process_command(stmt, &mut ro).unwrap_err();
+            assert!(
+                format!("{err}").contains("read-only"),
+                "stmt {stmt:?} should surface a read-only error; got: {err}"
+            );
+        }
+
+        // Nothing mutated: same row count as before, and SELECTs still work.
+        let notes_after = ro.get_table("notes".to_string()).unwrap().rowids().len();
+        assert_eq!(notes_before, notes_after);
+        let sel = process_command("SELECT * FROM notes;", &mut ro).expect("select on RO must work");
+        assert!(sel.contains("1 row returned"));
+
+        // Cleanup.
+        drop(ro);
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
     }
 }

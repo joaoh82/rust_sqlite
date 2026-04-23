@@ -1,0 +1,40 @@
+{
+  "name": "sqlrite",
+  "version": "0.1.0",
+  "description": "Node.js bindings for SQLRite — a small, embeddable SQLite clone written in Rust.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joaoh82/rust_sqlite"
+  },
+  "homepage": "https://github.com/joaoh82/rust_sqlite",
+  "license": "MIT",
+  "keywords": [
+    "database",
+    "sql",
+    "sqlite",
+    "embedded",
+    "rust",
+    "napi-rs"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "napi": {
+    "name": "sqlrite"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "sqlrite.*.node"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test test/test.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}

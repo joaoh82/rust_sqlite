@@ -1,14 +1,25 @@
-use crate::error::{Result, SQLRiteError};
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use rustyline::Editor;
+use rustyline::history::DefaultHistory;
 
 use crate::repl::REPLHelper;
-use rustyline::Editor;
-use std::fmt;
+use sqlrite::error::{Result, SQLRiteError};
+use sqlrite::sql::db::database::Database;
+use sqlrite::sql::pager::{open_database, save_database};
 
 #[derive(Debug, PartialEq)]
 pub enum MetaCommand {
     Exit,
     Help,
-    Open(String),
+    /// `.open FILENAME` — create or load a persistent database.
+    Open(PathBuf),
+    /// `.save FILENAME` — write the current database to disk.
+    Save(PathBuf),
+    /// `.tables` — list the tables in the current database.
+    Tables,
+    /// Parsed line that didn't match any known meta-command.
     Unknown,
 }
 
@@ -19,6 +30,8 @@ impl fmt::Display for MetaCommand {
             MetaCommand::Exit => f.write_str(".exit"),
             MetaCommand::Help => f.write_str(".help"),
             MetaCommand::Open(_) => f.write_str(".open"),
+            MetaCommand::Save(_) => f.write_str(".save"),
+            MetaCommand::Tables => f.write_str(".tables"),
             MetaCommand::Unknown => f.write_str("Unknown command"),
         }
     }
@@ -27,109 +40,276 @@ impl fmt::Display for MetaCommand {
 impl MetaCommand {
     pub fn new(command: String) -> MetaCommand {
         let args: Vec<&str> = command.split_whitespace().collect();
-        let cmd = args[0].to_owned();
-        match cmd.as_ref() {
+        let Some(cmd) = args.first() else {
+            return MetaCommand::Unknown;
+        };
+        match *cmd {
             ".exit" => MetaCommand::Exit,
             ".help" => MetaCommand::Help,
-            ".open" => MetaCommand::Open(command),
+            ".open" => match args.get(1) {
+                Some(path) => MetaCommand::Open(PathBuf::from(path)),
+                None => MetaCommand::Unknown,
+            },
+            ".save" => match args.get(1) {
+                Some(path) => MetaCommand::Save(PathBuf::from(path)),
+                None => MetaCommand::Unknown,
+            },
+            ".tables" => MetaCommand::Tables,
             _ => MetaCommand::Unknown,
         }
     }
 }
 
-pub fn handle_meta_command(command: MetaCommand, repl: &mut Editor<REPLHelper>) -> Result<String> {
+/// Executes a parsed meta-command. May mutate `db` — `.open` replaces it
+/// with the loaded file's database; `.save` just reads it.
+pub fn handle_meta_command(
+    command: MetaCommand,
+    repl: &mut Editor<REPLHelper, DefaultHistory>,
+    db: &mut Database,
+) -> Result<String> {
     match command {
         MetaCommand::Exit => {
             repl.append_history("history").unwrap();
             std::process::exit(0)
         }
         MetaCommand::Help => Ok(format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             "Special commands:\n",
             ".help            - Display this message\n",
-            ".open <FILENAME> - Close existing database and reopen FILENAME\n",
-            ".save <FILENAME> - Write in-memory database into FILENAME\n",
-            ".read <FILENAME> - Read input from FILENAME\n",
-            ".tables          - List names of tables\n",
-            ".ast <QUERY>     - Show the abstract syntax tree for QUERY.\n",
-            ".exit            - Quits this application"
+            ".open <FILENAME> - Open a SQLRite database file (creates it if missing)\n",
+            ".save <FILENAME> - Write the current in-memory database to FILENAME\n",
+            ".tables          - List tables in the current database\n",
+            ".exit            - Quit this application\n",
+            "\nOther meta commands (.read, .ast) are not implemented yet."
         )),
-        MetaCommand::Open(args) => Ok(format!("To be implemented: {}", args)),
-        MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(format!(
-            "Unknown command or invalid arguments. Enter '.help'"
-        ))),
+        MetaCommand::Open(path) => handle_open(&path, db),
+        MetaCommand::Save(path) => handle_save(&path, db),
+        MetaCommand::Tables => handle_tables(db),
+        MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(
+            "Unknown command or invalid arguments. Enter '.help'".to_string(),
+        )),
     }
+}
+
+fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
+    let db_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("db")
+        .to_string();
+    if path.exists() {
+        let loaded = open_database(path, db_name)?;
+        let table_count = loaded.tables.len();
+        *db = loaded;
+        Ok(format!(
+            "Opened '{}' ({table_count} table{s} loaded). Auto-save enabled.",
+            path.display(),
+            s = if table_count == 1 { "" } else { "s" }
+        ))
+    } else {
+        // Same behavior as SQLite: `.open` on a missing file creates a fresh
+        // DB that will be materialized on the next committing statement.
+        let mut fresh = Database::new(db_name);
+        fresh.source_path = Some(path.to_path_buf());
+        // Touch the file with a valid empty DB so the path now exists and a
+        // subsequent `.open` finds it. This also catches permission errors early
+        // and attaches the long-lived pager to the fresh database.
+        save_database(&mut fresh, path)?;
+        *db = fresh;
+        Ok(format!(
+            "Opened '{}' (new database). Auto-save enabled.",
+            path.display()
+        ))
+    }
+}
+
+fn handle_save(path: &Path, db: &mut Database) -> Result<String> {
+    save_database(db, path)?;
+    if db.source_path.as_deref() == Some(path) {
+        Ok(format!(
+            "Flushed database to '{}' (auto-save is already on).",
+            path.display()
+        ))
+    } else {
+        Ok(format!("Saved database to '{}'.", path.display()))
+    }
+}
+
+fn handle_tables(db: &Database) -> Result<String> {
+    if db.tables.is_empty() {
+        return Ok("(no tables)".to_string());
+    }
+    // Sort for deterministic output — HashMap iteration order is arbitrary.
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repl::{get_config, REPLHelper};
+    use crate::repl::{REPLHelper, get_config};
+    use sqlrite::process_command;
 
-    #[test]
-    fn get_meta_command_exit_test() {
-        // Starting Rustyline with a default configuration
+    fn new_editor() -> Editor<REPLHelper, DefaultHistory> {
         let config = get_config();
-
-        // Getting a new Rustyline Helper
         let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
+        let mut repl: Editor<REPLHelper, DefaultHistory> =
+            Editor::with_config(config).expect("failed to build rustyline editor");
         repl.set_helper(Some(helper));
+        repl
+    }
 
-        let inputed_command = MetaCommand::Help;
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("sqlrite-meta-{pid}-{nanos}-{name}.sqlrite"));
+        p
+    }
 
-        let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_ok(), true);
+    /// Phase 4c: every .sqlrite has a `-wal` sidecar now. Delete both so
+    /// `/tmp` doesn't accumulate orphan WALs across test runs.
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(PathBuf::from(wal));
     }
 
     #[test]
-    fn get_meta_command_open_test() {
-        // Starting Rustyline with a default configuration
-        let config = get_config();
-
-        // Getting a new Rustyline Helper
-        let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
-        repl.set_helper(Some(helper));
-
-        let inputed_command = MetaCommand::Open(".open database.db".to_string());
-
-        let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_ok(), true);
+    fn help_works() {
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+        let result = handle_meta_command(MetaCommand::Help, &mut repl, &mut db);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn get_meta_command_unknown_command_test() {
-        // Starting Rustyline with a default configuration
-        let config = get_config();
-
-        // Getting a new Rustyline Helper
-        let helper = REPLHelper::default();
-
-        // Initiatlizing Rustyline Editor with set config and setting helper
-        let mut repl = Editor::with_config(config);
-        repl.set_helper(Some(helper));
-
-        let inputed_command = MetaCommand::Unknown;
-
-        let result = handle_meta_command(inputed_command, &mut repl);
-        assert_eq!(result.is_err(), true);
+    fn parse_open_requires_argument() {
+        assert_eq!(MetaCommand::new(".open".to_string()), MetaCommand::Unknown);
+        assert_eq!(
+            MetaCommand::new(".open my.sqlrite".to_string()),
+            MetaCommand::Open(PathBuf::from("my.sqlrite"))
+        );
     }
 
     #[test]
-    fn meta_command_display_trait_test() {
-        let exit = MetaCommand::Exit;
-        let help = MetaCommand::Help;
-        let open = MetaCommand::Open(".open database.db".to_string());
-        let unknown = MetaCommand::Unknown;
+    fn parse_save_requires_argument() {
+        assert_eq!(MetaCommand::new(".save".to_string()), MetaCommand::Unknown);
+        assert_eq!(
+            MetaCommand::new(".save my.sqlrite".to_string()),
+            MetaCommand::Save(PathBuf::from("my.sqlrite"))
+        );
+    }
 
-        assert_eq!(format!("{}", exit), ".exit");
-        assert_eq!(format!("{}", help), ".help");
-        assert_eq!(format!("{}", open), ".open");
-        assert_eq!(format!("{}", unknown), "Unknown command");
+    #[test]
+    fn tables_meta_command() {
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+        // Empty case.
+        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut db).unwrap();
+        assert_eq!(msg, "(no tables)");
+
+        // Populated case — two tables, output should be sorted.
+        process_command("CREATE TABLE zebras (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        process_command("CREATE TABLE apples (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut db).unwrap();
+        assert_eq!(msg, "apples\nzebras");
+    }
+
+    #[test]
+    fn save_then_open_round_trips_through_meta_commands() {
+        use sqlrite::sql::db::table::Value;
+
+        let path = tmp_path("meta_roundtrip");
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+
+        handle_meta_command(MetaCommand::Save(path.clone()), &mut repl, &mut db).expect("save");
+
+        // Replace db with a fresh one, then .open the file.
+        db = Database::new("fresh".to_string());
+        let msg =
+            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+        assert!(msg.contains("1 table loaded"));
+
+        let users = db.get_table("users".to_string()).unwrap();
+        let rowids = users.rowids();
+        assert_eq!(rowids.len(), 1);
+        assert_eq!(
+            users.get_value("name", rowids[0]),
+            Some(Value::Text("alice".to_string()))
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_missing_file_creates_fresh_db_and_materializes_file() {
+        let path = tmp_path("missing");
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+
+        let msg =
+            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+        assert!(msg.contains("new database"));
+        assert_eq!(db.tables.len(), 0);
+        // Auto-save expects a file to exist to auto-flush into, so open-of-missing
+        // touches the file with a valid empty DB.
+        assert!(path.exists());
+        assert_eq!(db.source_path.as_deref(), Some(path.as_path()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn auto_save_persists_writes_without_explicit_save() {
+        use sqlrite::sql::db::table::Value;
+
+        let path = tmp_path("autosave");
+        let mut repl = new_editor();
+        let mut db = Database::new("x".to_string());
+
+        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+
+        // The first write should auto-flush to disk.
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+
+        // Drop the first Database so its exclusive lock releases before we
+        // reopen the same file for verification.
+        drop(db);
+
+        // Reopen the file from scratch in a fresh Database — no manual .save was called.
+        let fresh = sqlrite::sql::pager::open_database(&path, "x".to_string())
+            .expect("open after auto-save");
+        let users = fresh.get_table("users".to_string()).expect("users table");
+        let rowids = users.rowids();
+        assert_eq!(rowids.len(), 1);
+        assert_eq!(
+            users.get_value("name", rowids[0]),
+            Some(Value::Text("alice".to_string()))
+        );
+
+        cleanup(&path);
     }
 }
