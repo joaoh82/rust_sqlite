@@ -71,11 +71,33 @@ jobs:
           # doesn't steal macOS's target dir and vice versa.
           shared-key: rust-build-and-test
 
-      - name: cargo build --workspace --exclude sqlrite-desktop
-        run: cargo build --workspace --exclude sqlrite-desktop --all-targets
+      # Exclusions explained:
+      #
+      # - `sqlrite-desktop` needs the Svelte frontend built first
+      #   (handled in the `desktop-build` job).
+      #
+      # - `sqlrite-python` + `sqlrite-nodejs` are PyO3/napi-rs
+      #   extension-module cdylibs. Their `extension-module` feature
+      #   tells the Rust toolchain not to link libpython / libnode at
+      #   compile time, so `--all-targets` fails on macOS when it
+      #   tries to build the auto-generated test binary for their
+      #   rlib targets (unresolved Python/Node symbols). The per-SDK
+      #   `python-sdk` + `nodejs-sdk` jobs below exercise these
+      #   crates through their native tooling (maturin / napi-rs).
+      - name: cargo build
+        run: |
+          cargo build --workspace \
+            --exclude sqlrite-desktop \
+            --exclude sqlrite-python \
+            --exclude sqlrite-nodejs \
+            --all-targets
 
-      - name: cargo test --workspace --exclude sqlrite-desktop
-        run: cargo test --workspace --exclude sqlrite-desktop
+      - name: cargo test
+        run: |
+          cargo test --workspace \
+            --exclude sqlrite-desktop \
+            --exclude sqlrite-python \
+            --exclude sqlrite-nodejs
 
   # ---------------------------------------------------------------------------
   # Rust: lint — fmt + clippy + doc. One cell (ubuntu) because these
@@ -103,12 +125,25 @@ jobs:
         # No `-D warnings` for now — see the top-level env comment.
         # Deny-by-default lints (the ones that surface real bugs,
         # e.g. `approx_constant`) still fail without the flag.
-        run: cargo clippy --workspace --exclude sqlrite-desktop --all-targets
+        # Exclude the extension-module SDK cdylibs for the same
+        # reason as `rust-build-and-test` — their test binaries
+        # can't link standalone.
+        run: |
+          cargo clippy --workspace \
+            --exclude sqlrite-desktop \
+            --exclude sqlrite-python \
+            --exclude sqlrite-nodejs \
+            --all-targets
 
       - name: cargo doc
         # `--no-deps` skips deps docs (they build on docs.rs, not here).
         # Not warnings-as-errors yet — same rationale as clippy above.
-        run: cargo doc --workspace --exclude sqlrite-desktop --no-deps
+        run: |
+          cargo doc --workspace \
+            --exclude sqlrite-desktop \
+            --exclude sqlrite-python \
+            --exclude sqlrite-nodejs \
+            --no-deps
 
   # ---------------------------------------------------------------------------
   # Python SDK: build the PyO3 extension, install into a venv, run pytest.
