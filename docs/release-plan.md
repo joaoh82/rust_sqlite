@@ -309,11 +309,13 @@ first-person so future-you isn't re-discovering it at 2am.
 We land these one at a time, each in its own commit on this branch,
 each verified on GitHub before moving on.
 
-1. **6a — `scripts/bump-version.sh`** + docs for it. Runnable
-   locally so you can rehearse the full bump without GitHub in
-   the loop. Verify by running `./scripts/bump-version.sh 0.1.1`,
-   `cargo build`, `git diff` — should show eleven version-string
-   changes + a refreshed Cargo.lock, and nothing else.
+1. **6a — `scripts/bump-version.sh`** + docs for it. **✅ Landed.**
+   Verified locally: `./scripts/bump-version.sh 0.1.1` produces a
+   clean 10-file diff (+1 more from `Cargo.lock` after `cargo
+   build`). `cargo test --lib` passes at the bumped version.
+   Edge-case checks confirmed: invalid semver rejected, empty
+   input rejected, prerelease versions accepted, idempotent on
+   repeat runs, clean back-out via `git checkout`.
 2. **6b — `ci.yml`** (CI on every PR). Lowest risk, highest
    signal. Open a PR with this plan doc + the bump script → CI
    fires → six green checks. Mergeable.

@@ -37,6 +37,11 @@ As of April 2026, SQLRite has:
 
 See the [Roadmap](roadmap.md) for the full phase plan.
 
+## Release engineering
+
+- [Release plan](release-plan.md) — Phase 6 design doc: lockstep versioning, PR-based release flow, OIDC trusted publishing, the ten-file version-bump surface
+- [`scripts/`](../scripts/) — runnable tooling used by release workflows + reproducible locally (start with `scripts/bump-version.sh`)
+
 ## Conventions
 
 - Code lives under [`src/`](../src/); docs live here under [`docs/`](./).

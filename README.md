@@ -206,7 +206,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 **Phase 6 — Release engineering + CI/CD**
 Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. Two-workflow design: `release-pr.yml` opens a Release PR with the version bumps (human reviews + merges), then `release.yml` fires on merge to tag + publish everything. Trusted-publishing via OIDC for PyPI + npm (no long-lived tokens). Full plan: [`docs/release-plan.md`](docs/release-plan.md).
 
-- [ ] **6a — Bump script**: `scripts/bump-version.sh` rewrites every version-string-carrying manifest (11 files) in a single pass. Runnable locally for rehearsing a release
+- [x] **6a — Bump script**: `scripts/bump-version.sh` rewrites the version string in ten manifests (7 TOML, 3 JSON) in a single pass; semver-validated, idempotent, cross-platform (BSD + GNU sed). Runnable locally for rehearsing a release: `./scripts/bump-version.sh 0.2.0 && cargo build && git diff`.
 - [ ] **6b — CI**: GitHub Actions matrix on Linux / macOS / Windows; `cargo build` / `test` / `clippy` / `fmt` on every PR + push, plus per-SDK test jobs for Python / Node / Go / WASM
 - [ ] **6c — Trusted publisher setup + branch protection**: one-time non-code config for PyPI + npm OIDC, crates.io token, GitHub `release` environment, `main` branch protection. Captured in `docs/release-secrets.md`
 - [ ] **6d — Release PR + partial publish**: `release-pr.yml` (dispatch → opens PR with bumps), `release.yml` wired for crates.io + C FFI tarballs + umbrella GitHub Release. First canary at `v0.1.1`

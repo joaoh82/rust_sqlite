@@ -326,9 +326,17 @@ Once Phase 5 landed artifacts in five distribution channels (crates.io, PyPI, np
 
 **Approach**: lockstep versioning (one bump, one PR, all products) with a two-workflow design that respects branch protection. Full plan + rationale in [release-plan.md](release-plan.md).
 
-### Phase 6a — `scripts/bump-version.sh` + local dry-run
+### ✅ Phase 6a — `scripts/bump-version.sh`
 
-One script that rewrites every product's version string in a single pass (eleven files across root Cargo.toml, sub-crate Cargo.tomls, pyproject.toml, package.json manifests, tauri.conf.json). Runnable locally for rehearsing a release without GitHub in the loop. Sourced by the release workflow for the actual commit on dispatch.
+One script that rewrites the version string across every product's manifest in a single pass — seven TOML files (root `Cargo.toml`, sub-crate `Cargo.toml`s, `sdk/python/pyproject.toml`) and three JSON files (two `package.json`s + `tauri.conf.json`) = ten manifests edited per release. `Cargo.lock` refreshes via `cargo build` after the script runs, making eleven files total in the release diff.
+
+Uses line-anchored `sed` (both BSD + GNU flavors) — no `jq` dependency, no Python, portable to every CI runner and dev machine. Validates the input against the semver regex (`X.Y.Z[-prerelease][+build]`); rejects `foo`, `0.2`, `0.2.0.5` cleanly. Idempotent: running twice with the same version is a no-op; running with a different version lands on the second. A verify pass at the end confirms every file actually updated, catching future refactors (e.g., someone reformats a JSON file to 4-space indent) that would otherwise silently no-op.
+
+Used by:
+- Humans, locally: `./scripts/bump-version.sh 0.2.0 && cargo build && git diff` rehearses the bump without GitHub.
+- The Phase 6d release workflow, on `workflow_dispatch` — the commit that the Release PR contains.
+
+After the Phase 6a commit lands, full test suite still passes at bumped version `0.1.1` with zero code changes beyond the manifests themselves (verified end-to-end before back-out).
 
 ### Phase 6b — `ci.yml`
 
