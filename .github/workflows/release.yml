@@ -63,7 +63,12 @@ jobs:
             exit 0
           fi
 
-          MSG=$(git log -1 --pretty=%s)
+          # GitHub's default squash-merge title is `<PR title> (#N)` —
+          # e.g. `release: v0.1.2 (#18)`. Strip the trailing ` (#N)` so
+          # the regex matches both the squash-merge form and the
+          # stripped-title form (we still recommend editing to the
+          # latter, but should-just-work beats should-remember).
+          MSG=$(git log -1 --pretty=%s | sed -E 's/ \(#[0-9]+\)$//')
           if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
