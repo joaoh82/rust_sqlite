@@ -7,7 +7,7 @@
 
 [package]
 name = "sqlrite-wasm"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
