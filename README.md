@@ -204,12 +204,21 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [ ] Code examples for every language under `examples/{rust,python,nodejs,go,wasm}/`
 
 **Phase 6 — Release engineering + CI/CD**
-- [ ] **6a — CI**: GitHub Actions matrix on Linux / macOS / Windows; `cargo build` / `test` / `clippy` / `fmt` on every PR + push
-- [ ] **6b — Desktop releases**: Tauri build matrix triggered on `v*` tag → signed `.AppImage` / `.deb` / `.dmg` / `.msi` uploaded to GitHub Release
-- [ ] **6c — Rust crate publish**: `cargo publish` to crates.io on tag push
-- [ ] **6d — C FFI prebuilt binaries**: `libsqlrite.{so,dylib,dll}` for Linux x86_64/aarch64 + macOS universal + Windows x86_64 as GitHub Release assets
-- [ ] **6e — Language SDK publishes**: wheels → PyPI, `.node` binaries → npm, Go `sdk/go/v*.*.*` git tag, `sqlrite-wasm` package → npm
-- [ ] **6f — Release orchestration**: `.github/workflows/release.yml` fans a single `v*` tag push out to every publish workflow and finalizes the GitHub Release
+Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. Two-workflow design: `release-pr.yml` opens a Release PR with the version bumps (human reviews + merges), then `release.yml` fires on merge to tag + publish everything. Trusted-publishing via OIDC for PyPI + npm (no long-lived tokens). Full plan: [`docs/release-plan.md`](docs/release-plan.md).
+
+- [ ] **6a — Bump script**: `scripts/bump-version.sh` rewrites every version-string-carrying manifest (11 files) in a single pass. Runnable locally for rehearsing a release
+- [ ] **6b — CI**: GitHub Actions matrix on Linux / macOS / Windows; `cargo build` / `test` / `clippy` / `fmt` on every PR + push, plus per-SDK test jobs for Python / Node / Go / WASM
+- [ ] **6c — Trusted publisher setup + branch protection**: one-time non-code config for PyPI + npm OIDC, crates.io token, GitHub `release` environment, `main` branch protection. Captured in `docs/release-secrets.md`
+- [ ] **6d — Release PR + partial publish**: `release-pr.yml` (dispatch → opens PR with bumps), `release.yml` wired for crates.io + C FFI tarballs + umbrella GitHub Release. First canary at `v0.1.1`
+- [ ] **6e — Desktop publish**: add `publish-desktop` to `release.yml` — Tauri build matrix → unsigned `.AppImage` / `.deb` / `.dmg` / `.msi` → GitHub Release
+- [ ] **6f — Python SDK publish**: `maturin-action` → abi3 wheels for manylinux x86_64/aarch64 + macOS universal + Windows x86_64 → PyPI via OIDC
+- [ ] **6g — Node.js SDK publish**: `@napi-rs/cli` → `.node` binaries per platform → npm via OIDC
+- [ ] **6h — WASM publish**: `wasm-pack publish` → `sqlrite-wasm` on npm
+- [ ] **6i — Go SDK publish**: `sdk/go/vX.Y.Z` git tag + attach FFI tarballs to the Go GitHub Release for `go get` users who want prebuilt `libsqlrite_c`
+
+**Phase 6.1 — Code signing** *(follow-up)*
+- [ ] macOS Apple Developer ID cert → `codesign` + `notarytool` in `tauri-action`
+- [ ] Windows code-signing cert → `signtool` in `tauri-action`
 
 **Phase 7 — AI-era extensions** *(research)*
 - [ ] Vector / embedding column type with an ANN index

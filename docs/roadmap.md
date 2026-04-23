@@ -322,34 +322,56 @@ Phase 6e will publish `sqlrite-wasm` to npm via `wasm-pack publish` on `v*` tag 
 
 ## Phase 6 — Release engineering + CI/CD
 
-Once Phase 5 has artifacts in five different distribution channels (crates.io, PyPI, npm, Go modules, GitHub Releases for WASM + desktop), we need proper release automation. GitHub Actions end-to-end.
+Once Phase 5 landed artifacts in five distribution channels (crates.io, PyPI, npm, Go modules, GitHub Releases for WASM + desktop), Phase 6 automates the release pipeline end-to-end via GitHub Actions.
 
-### Phase 6a — CI
+**Approach**: lockstep versioning (one bump, one PR, all products) with a two-workflow design that respects branch protection. Full plan + rationale in [release-plan.md](release-plan.md).
 
-`.github/workflows/ci.yml` — `cargo build`, `cargo test`, `cargo clippy --deny-warnings`, `cargo fmt --check`. Matrix on Linux / macOS / Windows. Runs on every PR + push to main.
+### Phase 6a — `scripts/bump-version.sh` + local dry-run
 
-### Phase 6b — Desktop app releases
+One script that rewrites every product's version string in a single pass (eleven files across root Cargo.toml, sub-crate Cargo.tomls, pyproject.toml, package.json manifests, tauri.conf.json). Runnable locally for rehearsing a release without GitHub in the loop. Sourced by the release workflow for the actual commit on dispatch.
 
-`.github/workflows/desktop-release.yml` — Tauri build matrix: Linux (`.AppImage`, `.deb`), macOS (`.dmg`, universal x86_64 + aarch64), Windows (`.msi`). Triggered on `v*` tag push. Uploads signed artifacts to the GitHub Release.
+### Phase 6b — `ci.yml`
 
-### Phase 6c — Rust crate publish
+Runs on every PR + push to main. Matrix: `{ubuntu-latest, macos-latest, windows-latest}` × (rust-ci, python-ci, nodejs-ci, go-ci [skip Windows], wasm-ci, fmt-docs-ci). Caches `target/` + `node_modules/` for fast PR turnaround. Blocks merge if any job fails.
 
-`.github/workflows/publish-crate.yml` — `cargo publish` to crates.io on tag push. Guarded by a `CRATES_IO_TOKEN` secret.
+### Phase 6c — Branch protection + trusted publishing setup
 
-### Phase 6d — C FFI prebuilt binaries
+One-time non-code setup. `main` requires `ci.yml` green + 1 review. PyPI trusted publisher pointed at this repo's `release.yml`. Same for npm (`sqlrite` and `sqlrite-wasm` packages). GitHub Environment named `release` with the maintainer as a required reviewer — acts as the human-in-the-loop gate before publish jobs actually write to a registry. Captured in `docs/release-secrets.md`.
 
-Matrix build of `libsqlrite.{so,dylib,dll}` for Linux x86_64/aarch64, macOS universal, Windows x86_64. Uploaded as GitHub Release assets so Go and anyone consuming the C header has a no-build-required path.
+### Phase 6d — `release-pr.yml` + partial `release.yml`
 
-### Phase 6e — Language SDK publishes
+**`release-pr.yml`** — `workflow_dispatch` with a `version` input. Bumps every manifest, opens a PR titled `Release vX.Y.Z`.
 
-- **Python**: `maturin-action` publishes wheels for manylinux x86_64/aarch64, macOS universal, Windows x86_64 to PyPI.
-- **Node.js**: `napi-rs` prebuild action ships `.node` binaries to npm per platform.
-- **Go**: tag the `sdk/go/` directory as `sdk/go/v*.*.*` so `go get` picks it up — Go modules pull straight from git, no central registry push needed.
-- **WASM**: `sqlrite-wasm` package on npm, built and published via `wasm-pack publish`.
+**`release.yml`** (partial) — triggered by the release PR's merge commit (matches `^release: v`). First iteration wires up the `tag-all`, `publish-crate`, `publish-ffi`, and `finalize` jobs only. After this step lands, `cargo publish` + GitHub Release tarballs work end-to-end at a canary `0.1.1` version.
 
-### Phase 6f — Release orchestration
+### Phase 6e — Desktop publish
 
-`.github/workflows/release.yml` — on `v*` tag push, fan out to every publish workflow, wait for completion, then finalize the GitHub Release with artifact links and release notes generated from the commit log since the previous tag. Single command (`git tag v0.2.0 && git push --tags`) turns into a full cross-platform, cross-language release.
+Adds `publish-desktop` job to `release.yml`. `tauri-action` builds for Linux (AppImage + deb), macOS (dmg universal), Windows (msi). Unsigned — signing is Phase 6.1.
+
+### Phase 6f — Python SDK publish
+
+Adds `publish-python` job. `maturin-action` builds abi3-py38 wheels; PyPI publish via OIDC trusted publisher.
+
+### Phase 6g — Node.js SDK publish
+
+Adds `publish-nodejs` job. `@napi-rs/cli` builds `.node` binaries per platform; npm publish via OIDC.
+
+### Phase 6h — WASM publish
+
+Adds `publish-wasm` job. `wasm-pack publish` to npm as `sqlrite-wasm`.
+
+### Phase 6i — Go SDK publish
+
+Adds `publish-go` job. No registry — tags `sdk/go/vX.Y.Z`; attaches the FFI tarballs (from `publish-ffi`) to the Go GitHub Release for users who want prebuilt `libsqlrite_c`.
+
+### Phase 6.1 — Code signing *(follow-up)*
+
+Desktop installers from Phase 6e ship unsigned. Phase 6.1 adds code signing:
+- macOS: Apple Developer ID cert → `codesign` + notarization via `xcrun notarytool` in `tauri-action`.
+- Windows: code-signing cert → `signtool` via `tauri-action`.
+- Involves procurement (Apple Developer $99/yr, Windows EV cert ~$300/yr) and secret management — both are separate ops tasks.
+
+Separate phase because the code changes are tiny (just tauri-action flags) but the procurement story is long-lived.
 
 ## Phase 7 — AI-era extensions *(research)*
 
