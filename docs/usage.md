@@ -168,4 +168,21 @@ The REPL persists an interaction history file named `history` in the working dir
 
 ## Programmatic use
 
-There's no library crate yet — everything is built as a binary. A `lib.rs` split and a public `Connection` / `Statement` API are part of Phase 5. For now, see the tests under `src/sql/mod.rs` and `src/sql/pager/mod.rs` for how to drive the engine in Rust code.
+The engine is both a binary (the REPL you've been using) and a library (the `sqlrite` crate). Phase 5a landed a stable public API:
+
+```rust
+use sqlrite::Connection;
+
+let mut conn = Connection::open("foo.sqlrite")?;
+conn.execute("INSERT INTO users (name) VALUES ('alice')")?;
+
+let mut stmt = conn.prepare("SELECT id, name FROM users")?;
+let mut rows = stmt.query()?;
+while let Some(row) = rows.next()? {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get_by_name("name")?;
+    println!("{id}: {name}");
+}
+```
+
+See [Embedding the SQLRite engine](embedding.md) for the full API reference, and [`examples/`](../examples/) for runnable samples (`cargo run --example quickstart` walks through the basics end-to-end). Language SDKs for Python, Node.js, Go, and WASM land in Phases 5b – 5g.

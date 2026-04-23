@@ -33,6 +33,15 @@ path = "src/lib.rs"
 name = "sqlrite"
 path = "src/main.rs"
 
+# Phase 5a quickstart — the canonical "how do I use this as a library?"
+# walkthrough. Run with `cargo run --example quickstart`. Lives under
+# `examples/rust/` so the top-level `examples/` directory can fan out
+# into sibling language-SDK directories (python/, nodejs/, go/, wasm/)
+# as each Phase 5 sub-phase lands.
+[[example]]
+name = "quickstart"
+path = "examples/rust/quickstart.rs"
+
 [dependencies]
 # CLI
 rustyline = "18.0"

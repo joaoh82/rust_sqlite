@@ -193,12 +193,25 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **4e — Multi-reader / single-writer**: new `AccessMode { ReadWrite, ReadOnly }` drives lock mode. `Pager::open_read_only` takes a shared lock (`flock(LOCK_SH)`) on both the main file and the WAL; `open` / `create` stay exclusive. Multiple RO openers coexist; any writer excludes all readers (POSIX flock semantics — "multiple readers OR one writer", not both). Read-only Pagers reject writes with a typed error. REPL gained a `--readonly` flag; library exposes `sqlrite::open_database_read_only`. Read marks aren't needed under flock — a writer can't coexist with readers, so the checkpointer never pulls frames out from under them.
 - [x] **4f — Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`)**: `BEGIN` snapshots the in-memory tables (`Table::deep_clone`) and suppresses auto-save; every subsequent mutation stays in memory. `COMMIT` flushes accumulated changes in one `save_database` call (one WAL commit frame for the whole transaction). `ROLLBACK` restores the pre-BEGIN snapshot. Nested begins, orphan commits/rollbacks, and BEGIN on read-only DBs all return typed errors. Errors mid-transaction keep the transaction open so the caller can explicitly recover.
 
-**Phase 5 — Library + embedding**
-- [ ] Split into `lib` + `bin` crates; public `Connection` / `Statement` / `Rows` API
-- [ ] C FFI shim so non-Rust callers can embed the engine
-- [ ] **WASM** build (`wasm-pack`) so the engine runs in a browser
+**Phase 5 — Embedding surface: public API + language SDKs**
+- [x] **5a — Public Rust API** *(partial)*: `Connection` / `Statement` / `Rows` / `Row` / `OwnedRow` / `FromValue` / `Value` at the crate root; structured row return from the executor; `examples/rust/quickstart.rs` runnable via `cargo run --example quickstart`. Parameter binding + cursor abstraction deferred to 5a.2.
+- [ ] **5b — C FFI shim**: `libsqlrite.{so,dylib,dll}` + generated `sqlrite.h` via `cbindgen`; opaque-pointer types, C error codes, UTF-8 strings
+- [ ] **5c — Python SDK** on PyPI: `sqlrite` module via PyO3 + maturin, DB-API 2.0-inspired surface (`sqlrite.connect(...)`, `cursor.execute(...)`)
+- [ ] **5d — Node.js SDK** on npm: prebuilt `.node` bindings via napi-rs; `better-sqlite3`-style sync API (`new Database(...)`, `stmt.prepare(...).run(...)`)
+- [ ] **5e — Go SDK** via cgo against the C FFI; implements `database/sql` driver so users get the standard-library experience (`sql.Open("sqlrite", path)`)
+- [ ] **5f — Rust crate polish**: crate metadata, docs.rs config, `Connection`-oriented quickstart, prep for `cargo publish`
+- [ ] **5g — WASM** build via `wasm-pack` (`web` + `bundler` targets); in-memory-only MVP (OPFS-backed persistence deferred). Browser demo under `examples/wasm/`
+- [ ] Code examples for every language under `examples/{rust,python,nodejs,go,wasm}/`
 
-**Phase 6 — AI-era extensions** *(research)*
+**Phase 6 — Release engineering + CI/CD**
+- [ ] **6a — CI**: GitHub Actions matrix on Linux / macOS / Windows; `cargo build` / `test` / `clippy` / `fmt` on every PR + push
+- [ ] **6b — Desktop releases**: Tauri build matrix triggered on `v*` tag → signed `.AppImage` / `.deb` / `.dmg` / `.msi` uploaded to GitHub Release
+- [ ] **6c — Rust crate publish**: `cargo publish` to crates.io on tag push
+- [ ] **6d — C FFI prebuilt binaries**: `libsqlrite.{so,dylib,dll}` for Linux x86_64/aarch64 + macOS universal + Windows x86_64 as GitHub Release assets
+- [ ] **6e — Language SDK publishes**: wheels → PyPI, `.node` binaries → npm, Go `sdk/go/v*.*.*` git tag, `sqlrite-wasm` package → npm
+- [ ] **6f — Release orchestration**: `.github/workflows/release.yml` fans a single `v*` tag push out to every publish workflow and finalizes the GitHub Release
+
+**Phase 7 — AI-era extensions** *(research)*
 - [ ] Vector / embedding column type with an ANN index
 - [ ] Natural-language → SQL front-end that emits queries against this engine
 - [ ] Other agent-era ideas as they emerge

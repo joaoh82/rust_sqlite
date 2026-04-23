@@ -152,15 +152,135 @@ Reader-side semantics fall out of this for free: we're still single-writer under
 
 Fourteen new tests under `src/sql/mod.rs` covering the happy paths, every rejection edge, and the trickier secondary-effects: rollback of `CREATE TABLE`, rollback of a secondary-index insert (followed by successful re-insert to prove the index was restored, not just the rows), `last_rowid` counter restoration, in-memory COMMIT without a pager, and the auto-rollback on a failed COMMIT save.
 
-## Phase 5 — Library, embedding, WASM
+## Phase 5 — Embedding surface: public API + language SDKs
 
-- Split into `lib` + `bin` crates
-- Public `Connection` / `Statement` / `Rows` API
-- **Cursor abstraction** (deferred from Phase 3d): stream rows through the B-Tree via the pager on demand instead of eagerly loading every row into the in-memory `Table`. Touches `Table::rowids`, `Table::get_value`, and the executor's row iteration. Naturally pairs with the public `Statement::query_iter` API
-- C FFI shim (`libsqlrite.so` / `libsqlrite.dylib`)
-- WASM build via `wasm-pack` so the engine runs in a browser
+The engine is already available as a Rust library (split in Phase 2.5.1). Phase 5 turns that library into a proper cross-language embedding surface: a public Rust API that external code can rely on, a C FFI shim for non-Rust consumers, and SDKs for the four languages people actually use to embed an SQLite-like engine (Python, Node.js, Go, plus polishing the Rust crate). Capped off by a WASM build so the engine runs in a browser. Each sub-phase is shippable on its own.
 
-## Phase 6 — AI-era extensions *(research)*
+### ✅ Phase 5a — Public `Connection` / `Statement` / `Rows` API *(partial)*
+
+Foundation every language binding builds on — shape after `rusqlite` / Python's `sqlite3`:
+
+```rust
+let mut conn = Connection::open("foo.sqlrite")?;
+conn.execute("INSERT INTO users (name) VALUES ('alice')")?;
+let mut stmt = conn.prepare("SELECT id, name FROM users")?;
+let mut rows = stmt.query()?;
+while let Some(row) = rows.next()? {
+    let (id, name): (i64, String) = (row.get(0)?, row.get_by_name("name")?);
+    println!("{id}: {name}");
+}
+```
+
+**Landed (5a.1):**
+- New `src/connection.rs` with `Connection`, `Statement`, `Rows`, `Row`, `OwnedRow`, and `FromValue`. All re-exported at the crate root (`sqlrite::Connection` etc.).
+- `executor::execute_select` split: `execute_select_rows` returns `SelectResult { columns, rows: Vec<Vec<Value>> }`; the existing string-rendering path is now a thin wrapper on top, so REPL/Tauri behaviour is unchanged.
+- `FromValue` impls for `i64`, `f64`, `String`, `bool`, `Option<T>`, `Value`. Trait is public so downstream crates can extend it.
+- `Connection::open` / `open_read_only` / `open_in_memory`; transactions flow through `execute("BEGIN")` / `execute("COMMIT")` / `execute("ROLLBACK")` with `Connection::in_transaction()` for introspection.
+- `examples/rust/quickstart.rs` — runnable end-to-end walkthrough via `cargo run --example quickstart`.
+- 9 new Connection tests: in-memory round-trip, file-backed persistence across connections, RO rejection, transactions, `get_by_name`, NULL → `Option<None>`, `prepare` multi-statement rejection, `query` on non-SELECT rejection, out-of-bounds index error.
+
+**Deferred to 5a.2 (separate slice):**
+- **Parameter binding** — `stmt.query(&[&30])` style. Requires touching the executor and the parser path; material enough to deserve its own commit.
+- **Cursor abstraction** (deferred from Phase 3d). Today `Rows` wraps an eagerly-materialized `Vec<Vec<Value>>`. Phase 5a.2 swaps this for a lazy B-Tree walker so long SELECTs stream in O(1) memory. Touches `Table::rowids`, `Table::get_value`, and the executor's row iteration; the `Rows::next() -> Result<Option<Row>>` signature was designed up-front to accept the streaming version without an API break.
+
+### Phase 5b — C FFI shim
+
+`libsqlrite.so` / `libsqlrite.dylib` / `libsqlrite.dll`. Opaque-pointer types (`SqlriteConnection*`, `SqlriteStatement*`), C error codes, UTF-8 string conventions. Generated `sqlrite.h` via `cbindgen`. This is the universal ABI every non-Rust language binds against.
+
+### Phase 5c — Python SDK
+
+`sqlrite` on PyPI. Built with `PyO3` + `maturin` so we ship prebuilt wheels per platform (no "install Rust first" tax on end users). Shape inspired by `sqlite3` / PEP 249 (DB-API 2.0):
+
+```python
+import sqlrite
+conn = sqlrite.connect("foo.sqlrite")
+cur = conn.cursor()
+cur.execute("INSERT INTO users (name) VALUES (?)", ("alice",))
+for row in cur.execute("SELECT * FROM users"):
+    print(row)
+conn.commit()
+```
+
+Examples in `examples/python/`.
+
+### Phase 5d — Node.js SDK
+
+`sqlrite` (or `@sqlrite/engine`) on npm. Built with `napi-rs` so Node.js users get a prebuilt `.node` binary (no `node-gyp` compile dance). Shape inspired by `better-sqlite3`'s sync API:
+
+```js
+import { Database } from 'sqlrite';
+const db = new Database('foo.sqlrite');
+db.prepare("INSERT INTO users (name) VALUES (?)").run('alice');
+const rows = db.prepare("SELECT * FROM users").all();
+```
+
+Examples in `examples/nodejs/`.
+
+### Phase 5e — Go SDK
+
+Git module via cgo against the C FFI. Implements `database/sql` driver so Go users get the idiomatic standard-library experience:
+
+```go
+import (
+    "database/sql"
+    _ "github.com/joaoh82/rust_sqlite/sdk/go"
+)
+db, _ := sql.Open("sqlrite", "foo.sqlrite")
+db.Exec("INSERT INTO users (name) VALUES (?)", "alice")
+```
+
+Examples in `examples/go/`.
+
+### Phase 5f — Rust crate polish
+
+The Rust library is already shippable — this sub-phase adds crate metadata, docs.rs config, a `Connection`-oriented quickstart, and prep for the `cargo publish` step that lands in Phase 6. Examples in `examples/rust/` (or promoted from 5a).
+
+### Phase 5g — WASM build
+
+`wasm-pack build` with both `web` and `bundler` targets. The engine runs entirely in-memory in the browser for the MVP (no file locks, no WAL sidecar — those don't translate to a tab's sandbox). A minimal HTML demo under `examples/wasm/` shows:
+
+```js
+import init, { Connection } from 'sqlrite-wasm';
+await init();
+const conn = Connection.open_in_memory();
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+const rows = conn.query("SELECT * FROM users");
+```
+
+OPFS-backed persistence is a later concern.
+
+## Phase 6 — Release engineering + CI/CD
+
+Once Phase 5 has artifacts in five different distribution channels (crates.io, PyPI, npm, Go modules, GitHub Releases for WASM + desktop), we need proper release automation. GitHub Actions end-to-end.
+
+### Phase 6a — CI
+
+`.github/workflows/ci.yml` — `cargo build`, `cargo test`, `cargo clippy --deny-warnings`, `cargo fmt --check`. Matrix on Linux / macOS / Windows. Runs on every PR + push to main.
+
+### Phase 6b — Desktop app releases
+
+`.github/workflows/desktop-release.yml` — Tauri build matrix: Linux (`.AppImage`, `.deb`), macOS (`.dmg`, universal x86_64 + aarch64), Windows (`.msi`). Triggered on `v*` tag push. Uploads signed artifacts to the GitHub Release.
+
+### Phase 6c — Rust crate publish
+
+`.github/workflows/publish-crate.yml` — `cargo publish` to crates.io on tag push. Guarded by a `CRATES_IO_TOKEN` secret.
+
+### Phase 6d — C FFI prebuilt binaries
+
+Matrix build of `libsqlrite.{so,dylib,dll}` for Linux x86_64/aarch64, macOS universal, Windows x86_64. Uploaded as GitHub Release assets so Go and anyone consuming the C header has a no-build-required path.
+
+### Phase 6e — Language SDK publishes
+
+- **Python**: `maturin-action` publishes wheels for manylinux x86_64/aarch64, macOS universal, Windows x86_64 to PyPI.
+- **Node.js**: `napi-rs` prebuild action ships `.node` binaries to npm per platform.
+- **Go**: tag the `sdk/go/` directory as `sdk/go/v*.*.*` so `go get` picks it up — Go modules pull straight from git, no central registry push needed.
+- **WASM**: `sqlrite-wasm` package on npm, built and published via `wasm-pack publish`.
+
+### Phase 6f — Release orchestration
+
+`.github/workflows/release.yml` — on `v*` tag push, fan out to every publish workflow, wait for completion, then finalize the GitHub Release with artifact links and release notes generated from the commit log since the previous tag. Single command (`git tag v0.2.0 && git push --tags`) turns into a full cross-platform, cross-language release.
+
+## Phase 7 — AI-era extensions *(research)*
 
 - Vector / embedding column type with an ANN index
 - Natural-language → SQL front-end (emit SQL against this engine)

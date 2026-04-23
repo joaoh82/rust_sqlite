@@ -22,7 +22,7 @@ pub struct OrderByClause {
 }
 
 /// A parsed, simplified SELECT query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectQuery {
     pub table_name: String,
     pub projection: Projection,

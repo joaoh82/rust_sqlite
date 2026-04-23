@@ -18,7 +18,20 @@ use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
 /// Executes a parsed `SelectQuery` against the database and returns a
 /// human-readable rendering of the result set (prettytable). Also returns
 /// the number of rows produced, for the top-level status message.
-pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usize)> {
+/// Structured result of a SELECT: column names in projection order,
+/// and each matching row as a `Vec<Value>` aligned with the columns.
+/// Phase 5a introduced this so the public `Connection` / `Statement`
+/// API has typed rows to yield; the existing `execute_select` that
+/// returns pre-rendered text is now a thin wrapper on top.
+pub struct SelectResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// Executes a SELECT and returns structured rows. The typed rows are
+/// what the new public API streams to callers; the REPL / Tauri app
+/// pre-render into a prettytable via `execute_select`.
+pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectResult> {
     let table = db
         .get_table(query.table_name.clone())
         .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
@@ -68,27 +81,49 @@ pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usiz
         matching.truncate(n);
     }
 
-    // Render the result.
+    // Build typed rows. Missing cells surface as `Value::Null` — that
+    // maps a column-not-present-for-this-rowid case onto the public
+    // `Row::get` → `Option<T>` surface cleanly.
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching.len());
+    for rowid in &matching {
+        let row: Vec<Value> = projected_cols
+            .iter()
+            .map(|col| table.get_value(col, *rowid).unwrap_or(Value::Null))
+            .collect();
+        rows.push(row);
+    }
+
+    Ok(SelectResult {
+        columns: projected_cols,
+        rows,
+    })
+}
+
+/// Executes a SELECT and returns `(rendered_table, row_count)`. The
+/// REPL and Tauri app use this to keep the table-printing behaviour
+/// the engine has always shipped. Structured callers use
+/// `execute_select_rows` instead.
+pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usize)> {
+    let result = execute_select_rows(query, db)?;
+    let row_count = result.rows.len();
+
     let mut print_table = PrintTable::new();
-    let header_cells: Vec<PrintCell> = projected_cols.iter().map(|c| PrintCell::new(c)).collect();
+    let header_cells: Vec<PrintCell> = result
+        .columns
+        .iter()
+        .map(|c| PrintCell::new(c))
+        .collect();
     print_table.add_row(PrintRow::new(header_cells));
 
-    for rowid in &matching {
-        let cells: Vec<PrintCell> = projected_cols
+    for row in &result.rows {
+        let cells: Vec<PrintCell> = row
             .iter()
-            .map(|col| {
-                let display = table
-                    .get_value(col, *rowid)
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_else(|| "".to_string());
-                PrintCell::new(&display)
-            })
+            .map(|v| PrintCell::new(&v.to_display_string()))
             .collect();
         print_table.add_row(PrintRow::new(cells));
     }
 
-    let rendered = print_table.to_string();
-    Ok((rendered, matching.len()))
+    Ok((print_table.to_string(), row_count))
 }
 
 /// Executes a DELETE statement. Returns the number of rows removed.
