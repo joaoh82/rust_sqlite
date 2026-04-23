@@ -44,10 +44,7 @@ pub fn read_u64(buf: &[u8], pos: usize) -> Result<(u64, usize)> {
     let mut shift: u32 = 0;
     for i in 0..MAX_VARINT_BYTES {
         let byte = *buf.get(pos + i).ok_or_else(|| {
-            SQLRiteError::Internal(format!(
-                "varint read past buffer end at offset {}",
-                pos + i
-            ))
+            SQLRiteError::Internal(format!("varint read past buffer end at offset {}", pos + i))
         })?;
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
@@ -128,10 +125,10 @@ mod tests {
         for v in [
             0u64,
             1,
-            127,              // last 1-byte value
-            128,              // first 2-byte value
-            16_383,           // last 2-byte value
-            16_384,           // first 3-byte value
+            127,    // last 1-byte value
+            128,    // first 2-byte value
+            16_383, // last 2-byte value
+            16_384, // first 3-byte value
             u32::MAX as u64,
             u64::MAX,
         ] {

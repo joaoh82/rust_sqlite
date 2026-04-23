@@ -407,10 +407,7 @@ impl Pager {
         let mut dirty: Vec<(u32, Box<[u8; PAGE_SIZE]>)> = staged
             .into_iter()
             .filter(|(n, bytes)| {
-                let existing = self
-                    .wal_cache
-                    .get(n)
-                    .or_else(|| self.on_disk.get(n));
+                let existing = self.wal_cache.get(n).or_else(|| self.on_disk.get(n));
                 match existing {
                     Some(e) => e.as_ref() != bytes.as_ref(),
                     None => true,
@@ -490,11 +487,7 @@ impl Pager {
         // `require_writable` already guaranteed we're ReadWrite; in
         // ReadWrite mode `wal` is always `Some` (it's only `None` for
         // ReadOnly opens of a DB that had no sidecar on disk).
-        let wal_frame_count = self
-            .wal
-            .as_ref()
-            .map(|w| w.frame_count())
-            .unwrap_or(0);
+        let wal_frame_count = self.wal.as_ref().map(|w| w.frame_count()).unwrap_or(0);
 
         // Nothing to flush? Skip the fsyncs and get out.
         if wal_frame_count == 0 && self.wal_cache.is_empty() {
@@ -825,8 +818,7 @@ mod tests {
         // *different* bytes — no commit frame follows. A later
         // `Pager::open` must ignore this orphan frame.
         {
-            let mut w =
-                crate::sql::pager::wal::Wal::open(&wal_path_for(&path)).unwrap();
+            let mut w = crate::sql::pager::wal::Wal::open(&wal_path_for(&path)).unwrap();
             let mut other = Box::new([0u8; PAGE_SIZE]);
             other[0] = 0x99;
             w.append_frame(2, &other, None).unwrap();
@@ -1164,10 +1156,7 @@ mod tests {
             // Drop the pager first so its exclusive lock releases.
         }
         {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
             f.write_all(&make_page(0xEE)).unwrap();
             f.sync_all().unwrap();

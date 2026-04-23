@@ -123,11 +123,9 @@ fn main() -> rustyline::Result<()> {
         None => "Connected to a transient in-memory database.\nUse '.open FILENAME' to reopen on a persistent database.".to_string(),
     };
     println!(
-        "{} - {}\n{}{}{}",
+        "{} - {}\nEnter .exit to quit.\nEnter .help for usage hints.\n{}",
         crate_name!(),
         crate_version!(),
-        "Enter .exit to quit.\n",
-        "Enter .help for usage hints.\n",
         connection_line,
     );
 

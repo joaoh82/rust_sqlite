@@ -44,7 +44,7 @@ impl SQLCommand {
 pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     let dialect = SQLiteDialect {};
     let message: String;
-    let mut ast = Parser::parse_sql(&dialect, &query).map_err(SQLRiteError::from)?;
+    let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 
     if ast.len() > 1 {
         return Err(SQLRiteError::SqlError(ParserError::ParserError(format!(
@@ -207,7 +207,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                             db_table.print_table_data();
                         }
                         false => {
-                            return Err(SQLRiteError::Internal("Table doesn't exist".to_string()))
+                            return Err(SQLRiteError::Internal("Table doesn't exist".to_string()));
                         }
                     }
                 }
@@ -282,12 +282,18 @@ mod tests {
             &mut db,
         )
         .expect("create table");
-        process_command("INSERT INTO users (name, age) VALUES ('alice', 30);", &mut db)
-            .expect("insert alice");
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('alice', 30);",
+            &mut db,
+        )
+        .expect("insert alice");
         process_command("INSERT INTO users (name, age) VALUES ('bob', 25);", &mut db)
             .expect("insert bob");
-        process_command("INSERT INTO users (name, age) VALUES ('carol', 40);", &mut db)
-            .expect("insert carol");
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('carol', 40);",
+            &mut db,
+        )
+        .expect("insert carol");
         db
     }
 
@@ -301,25 +307,24 @@ mod tests {
     #[test]
     fn process_command_select_where_test() {
         let mut db = seed_users_table();
-        let response = process_command("SELECT name FROM users WHERE age > 25;", &mut db)
-            .expect("select");
+        let response =
+            process_command("SELECT name FROM users WHERE age > 25;", &mut db).expect("select");
         assert!(response.contains("2 rows returned"));
     }
 
     #[test]
     fn process_command_select_eq_string_test() {
         let mut db = seed_users_table();
-        let response = process_command("SELECT name FROM users WHERE name = 'bob';", &mut db)
-            .expect("select");
+        let response =
+            process_command("SELECT name FROM users WHERE name = 'bob';", &mut db).expect("select");
         assert!(response.contains("1 row returned"));
     }
 
     #[test]
     fn process_command_select_limit_test() {
         let mut db = seed_users_table();
-        let response =
-            process_command("SELECT * FROM users ORDER BY age ASC LIMIT 2;", &mut db)
-                .expect("select");
+        let response = process_command("SELECT * FROM users ORDER BY age ASC LIMIT 2;", &mut db)
+            .expect("select");
         assert!(response.contains("2 rows returned"));
     }
 
@@ -348,7 +353,7 @@ mod tests {
             name TEXT
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -363,7 +368,7 @@ mod tests {
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
-        let _ = match process_command(&insert_query, &mut db) {
+        match process_command(&insert_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
             Err(err) => {
                 eprintln!("Error: {}", err);
@@ -382,7 +387,7 @@ mod tests {
             name TEXT
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -397,7 +402,7 @@ mod tests {
 
         // Inserting data into table
         let insert_query = String::from("INSERT INTO users (name) Values ('josh');");
-        let _ = match process_command(&insert_query, &mut db) {
+        match process_command(&insert_query, &mut db) {
             Ok(response) => assert_eq!(response, "INSERT Statement executed."),
             Err(err) => {
                 eprintln!("Error: {}", err);
@@ -409,8 +414,8 @@ mod tests {
     #[test]
     fn process_command_delete_where_test() {
         let mut db = seed_users_table();
-        let response = process_command("DELETE FROM users WHERE name = 'bob';", &mut db)
-            .expect("delete");
+        let response =
+            process_command("DELETE FROM users WHERE name = 'bob';", &mut db).expect("delete");
         assert!(response.contains("1 row deleted"));
 
         let remaining = process_command("SELECT * FROM users;", &mut db).expect("select");
@@ -510,8 +515,7 @@ mod tests {
         let mut db = seed_users_table();
         // age * 2 > 55  →  only ages > 27.5  →  alice(30) + carol(40)
         let response =
-            process_command("SELECT name FROM users WHERE age * 2 > 55;", &mut db)
-                .expect("select");
+            process_command("SELECT name FROM users WHERE age * 2 > 55;", &mut db).expect("select");
         assert!(response.contains("2 rows returned"));
     }
 
@@ -571,7 +575,10 @@ mod tests {
             "CREATE UNIQUE INDEX users_age_unique ON users (age);",
             &mut db,
         );
-        assert!(result.is_err(), "expected unique-index failure, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected unique-index failure, got {result:?}"
+        );
     }
 
     #[test]
@@ -588,11 +595,10 @@ mod tests {
         process_command("CREATE INDEX big_tag_idx ON big (tag);", &mut db).unwrap();
         for i in 1..=100 {
             let tag = if i % 3 == 0 { "hot" } else { "cold" };
-            process_command(&format!("INSERT INTO big (tag) VALUES ('{tag}');"), &mut db)
-                .unwrap();
+            process_command(&format!("INSERT INTO big (tag) VALUES ('{tag}');"), &mut db).unwrap();
         }
-        let response = process_command("SELECT id FROM big WHERE tag = 'hot';", &mut db)
-            .expect("select");
+        let response =
+            process_command("SELECT id FROM big WHERE tag = 'hot';", &mut db).expect("select");
         // 1..=100 has 33 multiples of 3.
         assert!(
             response.contains("33 rows returned"),
@@ -603,11 +609,8 @@ mod tests {
     #[test]
     fn where_eq_on_indexed_column_inside_parens_uses_index_probe() {
         let mut db = seed_users_table();
-        let response = process_command(
-            "SELECT name FROM users WHERE (name = 'bob');",
-            &mut db,
-        )
-        .expect("select");
+        let response = process_command("SELECT name FROM users WHERE (name = 'bob');", &mut db)
+            .expect("select");
         assert!(response.contains("1 row returned"));
     }
 
@@ -615,11 +618,8 @@ mod tests {
     fn where_eq_literal_first_side_uses_index_probe() {
         let mut db = seed_users_table();
         // `'bob' = name` should hit the same path as `name = 'bob'`.
-        let response = process_command(
-            "SELECT name FROM users WHERE 'bob' = name;",
-            &mut db,
-        )
-        .expect("select");
+        let response =
+            process_command("SELECT name FROM users WHERE 'bob' = name;", &mut db).expect("select");
         assert!(response.contains("1 row returned"));
     }
 
@@ -628,8 +628,8 @@ mod tests {
         // Sanity: range predicates bypass the optimizer and the full-scan
         // path still returns correct results.
         let mut db = seed_users_table();
-        let response = process_command("SELECT name FROM users WHERE age > 28;", &mut db)
-            .expect("select");
+        let response =
+            process_command("SELECT name FROM users WHERE age > 28;", &mut db).expect("select");
         assert!(response.contains("2 rows returned"));
     }
 
@@ -647,11 +647,8 @@ mod tests {
 
         process_command("BEGIN;", &mut db).expect("BEGIN");
         assert!(db.in_transaction());
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('dan', 50);",
-            &mut db,
-        )
-        .expect("INSERT inside txn");
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 50);", &mut db)
+            .expect("INSERT inside txn");
         // Mid-transaction read sees the new row.
         let mid = db.get_table("users".to_string()).unwrap().rowids().len();
         assert_eq!(mid, 4);
@@ -659,18 +656,18 @@ mod tests {
         process_command("ROLLBACK;", &mut db).expect("ROLLBACK");
         assert!(!db.in_transaction());
         let after = db.get_table("users".to_string()).unwrap().rowids().len();
-        assert_eq!(after, 3, "ROLLBACK should have restored the pre-BEGIN state");
+        assert_eq!(
+            after, 3,
+            "ROLLBACK should have restored the pre-BEGIN state"
+        );
     }
 
     #[test]
     fn commit_keeps_mutations_and_clears_txn_flag() {
         let mut db = seed_users_table();
         process_command("BEGIN;", &mut db).expect("BEGIN");
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('dan', 50);",
-            &mut db,
-        )
-        .expect("INSERT inside txn");
+        process_command("INSERT INTO users (name, age) VALUES ('dan', 50);", &mut db)
+            .expect("INSERT inside txn");
         process_command("COMMIT;", &mut db).expect("COMMIT");
         assert!(!db.in_transaction());
         let after = db.get_table("users".to_string()).unwrap().rowids().len();
@@ -808,10 +805,8 @@ mod tests {
         // File-backed DB: writes inside BEGIN/…/COMMIT must NOT hit
         // the WAL until COMMIT. We prove it by checking the WAL file
         // size before vs during the transaction.
-        let (path, mut db) = seed_file_backed(
-            "noas",
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);",
-        );
+        let (path, mut db) =
+            seed_file_backed("noas", "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);");
 
         let mut wal_path = path.as_os_str().to_owned();
         wal_path.push("-wal");
@@ -832,8 +827,7 @@ mod tests {
         process_command("COMMIT;", &mut db).unwrap();
 
         drop(db); // release pager lock
-        let fresh =
-            crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        let fresh = crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
         assert_eq!(
             fresh.get_table("t".to_string()).unwrap().rowids().len(),
             2,
@@ -862,7 +856,11 @@ mod tests {
         assert_eq!(db.tables.len(), 2);
 
         process_command("ROLLBACK;", &mut db).unwrap();
-        assert_eq!(db.tables.len(), 1, "CREATE TABLE should have been rolled back");
+        assert_eq!(
+            db.tables.len(),
+            1,
+            "CREATE TABLE should have been rolled back"
+        );
         assert!(db.get_table("dropme".to_string()).is_err());
     }
 
@@ -887,8 +885,7 @@ mod tests {
         // Re-inserting 'b@x' after rollback must succeed — if the index
         // wasn't properly restored, it would think 'b@x' is still a
         // collision and fail with a UNIQUE violation.
-        let reinsert =
-            process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db);
+        let reinsert = process_command("INSERT INTO users (email) VALUES ('b@x');", &mut db);
         assert!(
             reinsert.is_ok(),
             "re-insert after rollback should succeed, got {reinsert:?}"
@@ -906,27 +903,15 @@ mod tests {
         let pre = db.get_table("users".to_string()).unwrap().last_rowid;
 
         process_command("BEGIN;", &mut db).unwrap();
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('d', 50);",
-            &mut db,
-        )
-        .unwrap(); // would be rowid 4
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('e', 60);",
-            &mut db,
-        )
-        .unwrap(); // would be rowid 5
+        process_command("INSERT INTO users (name, age) VALUES ('d', 50);", &mut db).unwrap(); // would be rowid 4
+        process_command("INSERT INTO users (name, age) VALUES ('e', 60);", &mut db).unwrap(); // would be rowid 5
         process_command("ROLLBACK;", &mut db).unwrap();
 
         let post = db.get_table("users".to_string()).unwrap().last_rowid;
         assert_eq!(pre, post, "last_rowid must roll back with the snapshot");
 
         // Confirm: the next insert reuses rowid pre+1.
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('d', 50);",
-            &mut db,
-        )
-        .unwrap();
+        process_command("INSERT INTO users (name, age) VALUES ('d', 50);", &mut db).unwrap();
         let users = db.get_table("users".to_string()).unwrap();
         let d_rowid = users
             .rowids()
@@ -945,18 +930,11 @@ mod tests {
         assert!(db.source_path.is_none());
 
         process_command("BEGIN;", &mut db).unwrap();
-        process_command(
-            "INSERT INTO users (name, age) VALUES ('z', 99);",
-            &mut db,
-        )
-        .unwrap();
+        process_command("INSERT INTO users (name, age) VALUES ('z', 99);", &mut db).unwrap();
         process_command("COMMIT;", &mut db).unwrap();
 
         assert!(!db.in_transaction());
-        assert_eq!(
-            db.get_table("users".to_string()).unwrap().rowids().len(),
-            4
-        );
+        assert_eq!(db.get_table("users".to_string()).unwrap().rowids().len(), 4);
     }
 
     #[test]
@@ -983,13 +961,11 @@ mod tests {
         );
 
         // Prime one committed row so we have a baseline.
-        process_command("INSERT INTO notes (body) VALUES ('before');", &mut db)
-            .unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('before');", &mut db).unwrap();
 
         // Open a new txn and add a row.
         process_command("BEGIN;", &mut db).unwrap();
-        process_command("INSERT INTO notes (body) VALUES ('inflight');", &mut db)
-            .unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('inflight');", &mut db).unwrap();
         assert_eq!(
             db.get_table("notes".to_string()).unwrap().rowids().len(),
             2,
@@ -1014,7 +990,10 @@ mod tests {
         // Auto-rollback fired: the inflight row is gone, the txn flag
         // is cleared, and a follow-up non-txn statement won't leak
         // stale state.
-        assert!(!db.in_transaction(), "txn must be cleared after auto-rollback");
+        assert!(
+            !db.in_transaction(),
+            "txn must be cleared after auto-rollback"
+        );
         assert_eq!(
             db.get_table("notes".to_string()).unwrap().rowids().len(),
             1,
@@ -1025,13 +1004,11 @@ mod tests {
         // subsequent write goes through.
         db.source_path = orig_source;
         db.pager = orig_pager;
-        process_command("INSERT INTO notes (body) VALUES ('after');", &mut db)
-            .unwrap();
+        process_command("INSERT INTO notes (body) VALUES ('after');", &mut db).unwrap();
         drop(db);
 
         // Reopen and assert only 'before' + 'after' landed on disk.
-        let reopened =
-            crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
+        let reopened = crate::sql::pager::open_database(&path, "t".to_string()).unwrap();
         let notes = reopened.get_table("notes".to_string()).unwrap();
         assert_eq!(notes.rowids().len(), 2);
         // Ensure no leaked save_database partial happened.
@@ -1056,11 +1033,7 @@ mod tests {
         };
         {
             let mut seed = Database::new("t".to_string());
-            process_command(
-                "CREATE TABLE t (id INTEGER PRIMARY KEY);",
-                &mut seed,
-            )
-            .unwrap();
+            process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut seed).unwrap();
             save_database(&mut seed, &path).unwrap();
         }
 
@@ -1128,8 +1101,7 @@ mod tests {
         // Nothing mutated: same row count as before, and SELECTs still work.
         let notes_after = ro.get_table("notes".to_string()).unwrap().rowids().len();
         assert_eq!(notes_before, notes_after);
-        let sel =
-            process_command("SELECT * FROM notes;", &mut ro).expect("select on RO must work");
+        let sel = process_command("SELECT * FROM notes;", &mut ro).expect("select on RO must work");
         assert!(sel.contains("1 row returned"));
 
         // Cleanup.

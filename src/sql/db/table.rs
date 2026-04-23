@@ -30,7 +30,7 @@ impl DataType {
             "none" => DataType::None,
             _ => {
                 eprintln!("Invalid data type given {}", cmd);
-                return DataType::Invalid;
+                DataType::Invalid
             }
         }
     }
@@ -84,8 +84,7 @@ impl Table {
         let columns = create_query.columns;
 
         let mut table_cols: Vec<Column> = vec![];
-        let table_rows: Arc<Mutex<HashMap<String, Row>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let table_rows: Arc<Mutex<HashMap<String, Row>>> = Arc::new(Mutex::new(HashMap::new()));
         let mut secondary_indexes: Vec<SecondaryIndex> = Vec::new();
         for col in &columns {
             let col_name = &col.name;
@@ -199,10 +198,7 @@ impl Table {
 
     /// Returns the list of column names in declaration order.
     pub fn column_names(&self) -> Vec<String> {
-        self.columns
-            .iter()
-            .map(|c| c.column_name.clone())
-            .collect()
+        self.columns.iter().map(|c| c.column_name.clone()).collect()
     }
 
     /// Returns all rowids currently stored in the table, in ascending order.
@@ -286,11 +282,8 @@ impl Table {
             )));
         }
 
-        let column_names: Vec<String> = self
-            .columns
-            .iter()
-            .map(|c| c.column_name.clone())
-            .collect();
+        let column_names: Vec<String> =
+            self.columns.iter().map(|c| c.column_name.clone()).collect();
 
         for (i, value) in values.into_iter().enumerate() {
             let col_name = &column_names[i];
@@ -301,9 +294,7 @@ impl Table {
                 let rows_clone = Arc::clone(&self.rows);
                 let mut row_data = rows_clone.lock().expect("rows mutex poisoned");
                 let cell = row_data.get_mut(col_name).ok_or_else(|| {
-                    SQLRiteError::Internal(format!(
-                        "Row storage missing for column '{col_name}'"
-                    ))
+                    SQLRiteError::Internal(format!("Row storage missing for column '{col_name}'"))
                 })?;
 
                 match (cell, &value) {
@@ -793,7 +784,7 @@ impl Table {
         let header_row = PrintRow::new(
             column_names
                 .iter()
-                .map(|col| PrintCell::new(&col))
+                .map(|col| PrintCell::new(col))
                 .collect::<Vec<PrintCell>>(),
         );
 
@@ -879,10 +870,10 @@ pub enum Row {
 impl Row {
     fn get_serialized_col_data(&self) -> Vec<String> {
         match self {
-            Row::Integer(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
-            Row::Real(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
-            Row::Text(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
-            Row::Bool(cd) => cd.iter().map(|(_i, v)| v.to_string()).collect(),
+            Row::Integer(cd) => cd.values().map(|v| v.to_string()).collect(),
+            Row::Real(cd) => cd.values().map(|v| v.to_string()).collect(),
+            Row::Text(cd) => cd.values().map(|v| v.to_string()).collect(),
+            Row::Bool(cd) => cd.values().map(|v| v.to_string()).collect(),
             Row::None => panic!("Found None in columns"),
         }
     }
@@ -986,7 +977,7 @@ mod tests {
             score REAL
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -1007,7 +998,7 @@ mod tests {
             .collect::<Vec<&Column>>()
             .first()
         {
-            assert_eq!(column.is_pk, true);
+            assert!(column.is_pk);
             assert_eq!(column.datatype, DataType::Integer);
         } else {
             panic!("column not found");
@@ -1022,7 +1013,7 @@ mod tests {
             last_name TEXT NOT NULl
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }

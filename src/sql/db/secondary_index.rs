@@ -172,12 +172,8 @@ impl SecondaryIndex {
     /// Empty `Vec` if the value isn't present.
     pub fn lookup(&self, value: &Value) -> Vec<i64> {
         match (&self.entries, value) {
-            (IndexEntries::Integer(m), Value::Integer(v)) => {
-                m.get(v).cloned().unwrap_or_default()
-            }
-            (IndexEntries::Text(m), Value::Text(s)) => {
-                m.get(s).cloned().unwrap_or_default()
-            }
+            (IndexEntries::Integer(m), Value::Integer(v)) => m.get(v).cloned().unwrap_or_default(),
+            (IndexEntries::Text(m), Value::Text(s)) => m.get(s).cloned().unwrap_or_default(),
             _ => Vec::new(),
         }
     }

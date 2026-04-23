@@ -515,7 +515,10 @@ mod tests {
         assert_eq!(w2.last_commit_page_count(), Some(42));
         let read = w2.read_page(7).unwrap().expect("frame should be visible");
         assert_eq!(read.as_ref(), content.as_ref());
-        assert!(w2.read_page(99).unwrap().is_none(), "untouched page is None");
+        assert!(
+            w2.read_page(99).unwrap().is_none(),
+            "untouched page is None"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
@@ -549,7 +552,7 @@ mod tests {
         let p = tmp_wal("dirty_tail");
         let mut w = Wal::create(&p).unwrap();
         w.append_frame(5, &page(50), Some(10)).unwrap(); // committed V1
-        w.append_frame(5, &page(51), None).unwrap();     // orphan dirty V2
+        w.append_frame(5, &page(51), None).unwrap(); // orphan dirty V2
         drop(w);
 
         let mut w2 = Wal::open(&p).unwrap();
@@ -639,7 +642,10 @@ mod tests {
 
         let mut w2 = Wal::open(&p).unwrap();
         // First frame survived.
-        assert_eq!(w2.read_page(1).unwrap().unwrap().as_ref(), page(0x11).as_ref());
+        assert_eq!(
+            w2.read_page(1).unwrap().unwrap().as_ref(),
+            page(0x11).as_ref()
+        );
         // Second frame was truncated out — its content isn't readable.
         assert_eq!(w2.read_page(2).unwrap(), None);
         assert_eq!(w2.frame_count(), 1);
@@ -662,7 +668,10 @@ mod tests {
             f.write_all(&[0xaa; 2000]).unwrap();
         }
         let mut w2 = Wal::open(&p).unwrap();
-        assert_eq!(w2.read_page(42).unwrap().unwrap().as_ref(), page(42).as_ref());
+        assert_eq!(
+            w2.read_page(42).unwrap().unwrap().as_ref(),
+            page(42).as_ref()
+        );
         assert_eq!(w2.frame_count(), 1);
         let _ = std::fs::remove_file(&p);
     }

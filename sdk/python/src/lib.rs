@@ -99,8 +99,7 @@ fn connect(database: &str) -> PyResult<Connection> {
 #[pyfunction]
 #[pyo3(text_signature = "(database, /)")]
 fn connect_read_only(database: &str) -> PyResult<Connection> {
-    let rust_conn =
-        RustConnection::open_read_only(PathBuf::from(database)).map_err(map_err)?;
+    let rust_conn = RustConnection::open_read_only(PathBuf::from(database)).map_err(map_err)?;
     Ok(Connection {
         inner: Some(Mutex::new(rust_conn)),
     })
@@ -148,7 +147,12 @@ impl Connection {
     /// Convenience shorthand for `cursor().execute(sql)`. Returns
     /// the cursor so you can chain `.fetchall()` off it.
     #[pyo3(signature = (sql, params=None))]
-    fn execute(slf: Py<Self>, py: Python<'_>, sql: &str, params: Option<Py<PyAny>>) -> PyResult<Cursor> {
+    fn execute(
+        slf: Py<Self>,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<Py<PyAny>>,
+    ) -> PyResult<Cursor> {
         let mut cur = Self::cursor(slf);
         cur.execute(py, sql, params)?;
         Ok(cur)
@@ -431,15 +435,18 @@ impl Cursor {
         let mut out: Vec<Py<PyTuple>> = Vec::with_capacity(cols.len());
         for name in cols {
             out.push(
-                PyTuple::new(py, [
-                    name.into_pyobject(py)?.into_any().unbind(),
-                    py.None(),
-                    py.None(),
-                    py.None(),
-                    py.None(),
-                    py.None(),
-                    py.None(),
-                ])?
+                PyTuple::new(
+                    py,
+                    [
+                        name.into_pyobject(py)?.into_any().unbind(),
+                        py.None(),
+                        py.None(),
+                        py.None(),
+                        py.None(),
+                        py.None(),
+                        py.None(),
+                    ],
+                )?
                 .into(),
             );
         }

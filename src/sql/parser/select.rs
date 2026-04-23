@@ -148,8 +148,7 @@ fn parse_projection(items: &[SelectItem]) -> Result<Projection> {
             }
             SelectItem::ExprWithAlias { .. } | SelectItem::UnnamedExpr(_) => {
                 return Err(SQLRiteError::NotImplemented(
-                    "Only bare column references are supported in the projection list"
-                        .to_string(),
+                    "Only bare column references are supported in the projection list".to_string(),
                 ));
             }
         }
@@ -177,10 +176,9 @@ fn parse_order_by(order_by: Option<&sqlparser::ast::OrderBy>) -> Result<Option<O
     let obe = &exprs[0];
     let column = match &obe.expr {
         Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map(|i| i.value.clone())
-            .unwrap_or_default(),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|i| i.value.clone()).unwrap_or_default()
+        }
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "ORDER BY only supports a bare column name for now".to_string(),

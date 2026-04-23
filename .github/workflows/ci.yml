@@ -1,0 +1,323 @@
+# Continuous integration — runs on every pull request + every push to
+# main. Blocks PR merge when anything fails (once branch protection is
+# configured on the GitHub side — see docs/release-plan.md Phase 6c).
+#
+# Jobs:
+#   - rust-build-and-test   {ubuntu, macos, windows}   cargo build + test
+#   - rust-lint             ubuntu                     fmt + clippy + doc
+#   - python-sdk            {ubuntu, macos, windows}   maturin develop + pytest
+#   - nodejs-sdk            {ubuntu, macos, windows}   napi build + node --test
+#   - go-sdk                {ubuntu, macos}            cgo against libsqlrite_c + go test
+#   - wasm-build            ubuntu                     wasm-pack build + size report
+#   - desktop-build         ubuntu                     npm ci + cargo build -p sqlrite-desktop
+#
+# All jobs use caching so a warm PR run takes 2–3 minutes on ubuntu.
+# Go CI skips Windows for Phase 6b — Go's cgo on Windows needs a mingw
+# setup that we haven't wired into the Go sidecar; deferred follow-up.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel previous CI runs on the same branch when a new push arrives.
+# Saves compute + shortens PR feedback loops.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Suppress the "incremental compilation is not recommended for CI"
+  # advice line-noise across every Rust job. We don't want incremental
+  # on CI anyway (every run is from scratch).
+  CARGO_INCREMENTAL: '0'
+  # Colored cargo output survives into the GitHub Actions log view.
+  CARGO_TERM_COLOR: always
+  # Note: we intentionally do NOT set `RUSTFLAGS: '-D warnings'` at
+  # the workflow level. The codebase has ~24 pre-existing clippy
+  # warnings (mostly cosmetic — overindented docstrings, `Vec::new()
+  # + push` patterns, etc.) that will get cleaned up incrementally.
+  # Once the count is zero, we'll tighten by adding `-D warnings`
+  # here. Hard clippy errors (deny-by-default lints like
+  # `approx_constant`) still fail CI without this flag — that's the
+  # backstop for real correctness issues.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust: build + test the whole workspace (minus the desktop crate —
+  # it needs a frontend build, handled in its own job).
+  rust-build-and-test:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Bucket by OS + job — separate caches so a Linux miss
+          # doesn't steal macOS's target dir and vice versa.
+          shared-key: rust-build-and-test
+
+      - name: cargo build --workspace --exclude sqlrite-desktop
+        run: cargo build --workspace --exclude sqlrite-desktop --all-targets
+
+      - name: cargo test --workspace --exclude sqlrite-desktop
+        run: cargo test --workspace --exclude sqlrite-desktop
+
+  # ---------------------------------------------------------------------------
+  # Rust: lint — fmt + clippy + doc. One cell (ubuntu) because these
+  # are platform-independent checks. Runs in parallel with the matrix
+  # build/test job above.
+  rust-lint:
+    name: rust lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-lint
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # No `-D warnings` for now — see the top-level env comment.
+        # Deny-by-default lints (the ones that surface real bugs,
+        # e.g. `approx_constant`) still fail without the flag.
+        run: cargo clippy --workspace --exclude sqlrite-desktop --all-targets
+
+      - name: cargo doc
+        # `--no-deps` skips deps docs (they build on docs.rs, not here).
+        # Not warnings-as-errors yet — same rationale as clippy above.
+        run: cargo doc --workspace --exclude sqlrite-desktop --no-deps
+
+  # ---------------------------------------------------------------------------
+  # Python SDK: build the PyO3 extension, install into a venv, run pytest.
+  python-sdk:
+    name: python-sdk (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # Bash on every runner (Windows' git bash is available via
+        # `shell: bash`) so the same commands work everywhere — no
+        # PowerShell / cmd fork.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-sdk-${{ matrix.os }}
+
+      # maturin develop needs a virtualenv or conda env to install
+      # into. We create one per job + export VIRTUAL_ENV so every
+      # subsequent step sees it. Cross-platform: Windows venvs have
+      # `Scripts/` instead of `bin/`, so we pick the right path.
+      - name: Create venv
+        run: |
+          python -m venv .venv
+          if [ -d .venv/bin ]; then
+            echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+            echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          else
+            echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+            echo "$PWD/.venv/Scripts" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install maturin + pytest
+        run: pip install maturin pytest
+
+      - name: maturin develop
+        working-directory: sdk/python
+        run: maturin develop
+
+      - name: pytest
+        working-directory: sdk/python
+        run: python -m pytest tests/
+
+  # ---------------------------------------------------------------------------
+  # Node.js SDK: napi-rs build produces a .node binary. `npm test`
+  # exercises the node:test suite against it.
+  nodejs-sdk:
+    name: nodejs-sdk (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/nodejs/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nodejs-sdk-${{ matrix.os }}
+
+      - name: npm ci
+        working-directory: sdk/nodejs
+        run: npm ci
+
+      - name: npm run build
+        working-directory: sdk/nodejs
+        run: npm run build
+
+      - name: npm test
+        working-directory: sdk/nodejs
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Go SDK: cgo-linked against libsqlrite_c. We build the FFI crate in
+  # release mode first so the .so / .dylib is available for go test.
+  #
+  # Skips Windows for Phase 6b — Go's cgo on Windows needs a mingw
+  # toolchain that isn't preinstalled on `windows-latest` runners; a
+  # follow-up task in the roadmap adds it.
+  go-sdk:
+    name: go-sdk (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: sdk/go/go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: go-sdk-${{ matrix.os }}
+
+      - name: Build libsqlrite_c
+        # The Go driver's `#cgo LDFLAGS` references target/release.
+        run: cargo build --release -p sqlrite-ffi
+
+      - name: go test ./...
+        working-directory: sdk/go
+        run: go test -v ./...
+
+  # ---------------------------------------------------------------------------
+  # WASM: only the build + size check (no tests — the WASM module's
+  # behavior is covered by the other SDKs' test suites; WASM just
+  # re-targets the same engine). One cell because WASM is a
+  # cross-compilation target, not a host OS.
+  wasm-build:
+    name: wasm-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # sdk/wasm is its own workspace (see Cargo.toml comment);
+          # key it separately so it doesn't blow the main cache.
+          workspaces: sdk/wasm
+          shared-key: wasm-build
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: wasm-pack build --target web --release
+        working-directory: sdk/wasm
+        run: wasm-pack build --target web --release
+
+      - name: Report .wasm size
+        # Surfaces size regressions in PR logs. Not a hard limit yet;
+        # if/when we set a budget, convert to a failing check.
+        working-directory: sdk/wasm
+        run: |
+          size=$(stat -c '%s' pkg/sqlrite_wasm_bg.wasm 2>/dev/null || stat -f '%z' pkg/sqlrite_wasm_bg.wasm)
+          echo "::notice title=WASM bundle size::sqlrite_wasm_bg.wasm = $size bytes ($(( size / 1024 )) KiB)"
+
+  # ---------------------------------------------------------------------------
+  # Desktop: Tauri's Rust side + the Svelte frontend. Needs Node to
+  # build the frontend first because Tauri's build.rs looks for the
+  # compiled assets in `desktop/dist/`.
+  #
+  # One cell (ubuntu) for CI speed — release builds are tested in the
+  # Phase 6e desktop-release workflow's build matrix on all three OSes.
+  # Here we just need to prove the Rust side compiles.
+  desktop-build:
+    name: desktop-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Tauri needs Linux webkit + friends before cargo build runs.
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-build
+
+      - name: npm ci
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+
+      - name: Build Rust side
+        run: cargo build -p sqlrite-desktop

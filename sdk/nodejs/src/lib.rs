@@ -140,9 +140,9 @@ impl Database {
     #[napi]
     pub fn exec(&self, sql: String) -> Result<()> {
         let mut borrow = self.inner.borrow_mut();
-        let conn = borrow.as_mut().ok_or_else(|| {
-            napi::Error::from_reason("cannot exec: database is closed")
-        })?;
+        let conn = borrow
+            .as_mut()
+            .ok_or_else(|| napi::Error::from_reason("cannot exec: database is closed"))?;
         conn.execute(&sql).map_err(map_err)?;
         Ok(())
     }
@@ -155,9 +155,9 @@ impl Database {
         // We verify the SQL parses at prepare time so syntax errors
         // surface early, matching better-sqlite3's behavior.
         let mut borrow = self.inner.borrow_mut();
-        let conn = borrow.as_mut().ok_or_else(|| {
-            napi::Error::from_reason("cannot prepare: database is closed")
-        })?;
+        let conn = borrow
+            .as_mut()
+            .ok_or_else(|| napi::Error::from_reason("cannot prepare: database is closed"))?;
         let _ = conn.prepare(&sql).map_err(map_err)?;
         Ok(Statement {
             db_raw: self as *const Database,
@@ -234,9 +234,9 @@ impl Statement {
     fn run_query(&self, env: &Env) -> Result<(Vec<String>, Vec<OwnedRow>)> {
         self.with_db("query", |db| {
             let mut borrow = db.inner.borrow_mut();
-            let conn = borrow.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("cannot query: database is closed")
-            })?;
+            let conn = borrow
+                .as_mut()
+                .ok_or_else(|| napi::Error::from_reason("cannot query: database is closed"))?;
             let stmt = conn.prepare(&self.sql).map_err(map_err)?;
             let mut rows: Rows = stmt.query().map_err(map_err)?;
             let columns = rows.columns().to_vec();
@@ -260,9 +260,9 @@ impl Statement {
         reject_params_for_now(&params)?;
         self.with_db("run", |db| {
             let mut borrow = db.inner.borrow_mut();
-            let conn = borrow.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("cannot run: database is closed")
-            })?;
+            let conn = borrow
+                .as_mut()
+                .ok_or_else(|| napi::Error::from_reason("cannot run: database is closed"))?;
             conn.execute(&self.sql).map_err(map_err)?;
             Ok(RunResult {
                 // `changes` and `lastInsertRowid` aren't tracked by

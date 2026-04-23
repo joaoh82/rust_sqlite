@@ -93,10 +93,8 @@ impl Cell {
         varint::write_i64(&mut body, self.rowid);
         varint::write_u64(&mut body, self.values.len() as u64);
         encode_null_bitmap(&mut body, &self.values);
-        for v in &self.values {
-            if let Some(v) = v {
-                encode_value(&mut body, v)?;
-            }
+        for v in self.values.iter().flatten() {
+            encode_value(&mut body, v)?;
         }
 
         let mut out = Vec::with_capacity(body.len() + varint::MAX_VARINT_BYTES);
@@ -144,9 +142,9 @@ impl Cell {
     pub fn peek_kind(buf: &[u8], pos: usize) -> Result<u8> {
         let (_body_len, len_bytes) = varint::read_u64(buf, pos)?;
         let kind_pos = pos + len_bytes;
-        buf.get(kind_pos)
-            .copied()
-            .ok_or_else(|| SQLRiteError::Internal("paged cell truncated before kind tag".to_string()))
+        buf.get(kind_pos).copied().ok_or_else(|| {
+            SQLRiteError::Internal("paged cell truncated before kind tag".to_string())
+        })
     }
 
     /// Decodes a local cell starting at `buf[pos]`. Returns
@@ -266,9 +264,9 @@ pub(super) fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
 }
 
 pub(super) fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
-    let tag = *buf.get(pos).ok_or_else(|| {
-        SQLRiteError::Internal(format!("value block truncated at offset {pos}"))
-    })?;
+    let tag = *buf
+        .get(pos)
+        .ok_or_else(|| SQLRiteError::Internal(format!("value block truncated at offset {pos}")))?;
     let body_start = pos + 1;
     match tag {
         tag::INTEGER => {
@@ -290,9 +288,7 @@ pub(super) fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
             let text_start = body_start + n;
             let text_end = text_start + (len as usize);
             if text_end > buf.len() {
-                return Err(SQLRiteError::Internal(
-                    "Text value truncated".to_string(),
-                ));
+                return Err(SQLRiteError::Internal("Text value truncated".to_string()));
             }
             let s = std::str::from_utf8(&buf[text_start..text_end])
                 .map_err(|e| SQLRiteError::Internal(format!("Text value is not valid UTF-8: {e}")))?
@@ -300,9 +296,9 @@ pub(super) fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
             Ok((Value::Text(s), 1 + n + (len as usize)))
         }
         tag::BOOL => {
-            let byte = *buf.get(body_start).ok_or_else(|| {
-                SQLRiteError::Internal("Bool value truncated".to_string())
-            })?;
+            let byte = *buf
+                .get(body_start)
+                .ok_or_else(|| SQLRiteError::Internal("Bool value truncated".to_string()))?;
             Ok((Value::Bool(byte != 0), 1 + 1))
         }
         other => Err(SQLRiteError::Internal(format!(
@@ -342,7 +338,10 @@ mod tests {
             vec![
                 Some(Value::Integer(7)),
                 Some(Value::Text("hello".to_string())),
-                Some(Value::Real(3.14)),
+                // Any non-PI real number works for the round-trip
+                // assertion; clippy's `approx_constant` lint rejects
+                // 3.14 because it thinks we meant `f64::consts::PI`.
+                Some(Value::Real(2.5)),
                 Some(Value::Bool(true)),
             ],
         ));
@@ -365,7 +364,10 @@ mod tests {
 
     #[test]
     fn all_null_cell() {
-        round_trip(&Cell::new(9, vec![None, None, None, None, None, None, None, None, None]));
+        round_trip(&Cell::new(
+            9,
+            vec![None, None, None, None, None, None, None, None, None],
+        ));
     }
 
     #[test]
@@ -391,13 +393,24 @@ mod tests {
 
     #[test]
     fn bool_edges() {
-        round_trip(&Cell::new(1, vec![Some(Value::Bool(true)), Some(Value::Bool(false))]));
+        round_trip(&Cell::new(
+            1,
+            vec![Some(Value::Bool(true)), Some(Value::Bool(false))],
+        ));
     }
 
     #[test]
     fn real_edges() {
         // f64::NAN != NaN, so we can't round_trip() it; cover the typical edges.
-        for v in [0.0f64, 1.0, -1.0, f64::MIN, f64::MAX, f64::INFINITY, f64::NEG_INFINITY] {
+        for v in [
+            0.0f64,
+            1.0,
+            -1.0,
+            f64::MIN,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             round_trip(&Cell::new(1, vec![Some(Value::Real(v))]));
         }
     }
@@ -411,10 +424,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_buffer() {
-        let cell = Cell::new(
-            1,
-            vec![Some(Value::Text("some text here".to_string()))],
-        );
+        let cell = Cell::new(1, vec![Some(Value::Text("some text here".to_string()))]);
         let bytes = cell.encode().unwrap();
         let truncated = &bytes[..bytes.len() - 5];
         assert!(Cell::decode(truncated, 0).is_err());
@@ -431,12 +441,12 @@ mod tests {
         //   null bitmap            = 0 (column 0 is not null)
         //   value tag              = 0xFE (bogus)
         let mut buf = Vec::new();
-        buf.push(5);            // cell_length
-        buf.push(KIND_LOCAL);   // kind_tag
-        buf.push(0);            // rowid = 0
-        buf.push(1);            // col_count = 1
-        buf.push(0);            // null bitmap
-        buf.push(0xFE);         // bad value tag
+        buf.push(5); // cell_length
+        buf.push(KIND_LOCAL); // kind_tag
+        buf.push(0); // rowid = 0
+        buf.push(1); // col_count = 1
+        buf.push(0); // null bitmap
+        buf.push(0xFE); // bad value tag
         let err = Cell::decode(&buf, 0).unwrap_err();
         assert!(format!("{err}").contains("unknown value tag"));
     }
@@ -446,7 +456,7 @@ mod tests {
         // Length prefix followed by the overflow kind tag. Cell::decode must
         // refuse — this is what PagedEntry::decode is for.
         let mut buf = Vec::new();
-        buf.push(1);            // cell_length = just the kind byte
+        buf.push(1); // cell_length = just the kind byte
         buf.push(KIND_OVERFLOW);
         let err = Cell::decode(&buf, 0).unwrap_err();
         assert!(format!("{err}").contains("non-local"));
@@ -476,13 +486,25 @@ mod tests {
     fn null_bitmap_byte_boundary() {
         // Cell with exactly 8 columns: bitmap is exactly 1 byte.
         let values: Vec<Option<Value>> = (0..8)
-            .map(|i| if i % 2 == 0 { Some(Value::Integer(i)) } else { None })
+            .map(|i| {
+                if i % 2 == 0 {
+                    Some(Value::Integer(i))
+                } else {
+                    None
+                }
+            })
             .collect();
         round_trip(&Cell::new(1, values));
 
         // 9 columns: bitmap is 2 bytes.
         let values: Vec<Option<Value>> = (0..9)
-            .map(|i| if i % 3 == 0 { Some(Value::Integer(i)) } else { None })
+            .map(|i| {
+                if i % 3 == 0 {
+                    Some(Value::Integer(i))
+                } else {
+                    None
+                }
+            })
             .collect();
         round_trip(&Cell::new(1, values));
     }

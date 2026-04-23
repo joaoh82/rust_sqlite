@@ -43,8 +43,8 @@ use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::table::Value;
 use crate::sql::executor::execute_select_rows;
-use crate::sql::parser::select::SelectQuery;
 use crate::sql::pager::{AccessMode, open_database_with_mode, save_database};
+use crate::sql::parser::select::SelectQuery;
 use crate::sql::process_command;
 
 /// A handle to a SQLRite database. Opens a file or an in-memory DB;
@@ -216,23 +216,17 @@ impl<'c> Statement<'c> {
     fn new(conn: &'c mut Connection, sql: &str) -> Result<Self> {
         // Parse once at prepare time so syntax errors surface early.
         let dialect = SQLiteDialect {};
-        let mut ast =
-            Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
+        let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
         let Some(stmt) = ast.pop() else {
-            return Err(SQLRiteError::General(
-                "no statement to prepare".to_string(),
-            ));
+            return Err(SQLRiteError::General("no statement to prepare".to_string()));
         };
         if !ast.is_empty() {
             return Err(SQLRiteError::General(
-                "prepare() accepts a single statement; found more than one"
-                    .to_string(),
+                "prepare() accepts a single statement; found more than one".to_string(),
             ));
         }
         let kind = match &stmt {
-            sqlparser::ast::Statement::Query(_) => {
-                StatementKind::Select(SelectQuery::new(&stmt)?)
-            }
+            sqlparser::ast::Statement::Query(_) => StatementKind::Select(SelectQuery::new(&stmt)?),
             _ => StatementKind::Other,
         };
         Ok(Self {
@@ -262,8 +256,7 @@ impl<'c> Statement<'c> {
                 })
             }
             StatementKind::Other => Err(SQLRiteError::General(
-                "query() only works on SELECT statements; use run() for DDL/DML"
-                    .to_string(),
+                "query() only works on SELECT statements; use run() for DDL/DML".to_string(),
             )),
         }
     }
@@ -358,9 +351,11 @@ impl<'r> Row<'r> {
 
     /// Value at column named `name`. Case-sensitive.
     pub fn get_by_name<T: FromValue>(&self, name: &str) -> Result<T> {
-        let idx = self.columns.iter().position(|c| c == name).ok_or_else(|| {
-            SQLRiteError::General(format!("no column named '{name}' in row"))
-        })?;
+        let idx = self
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| SQLRiteError::General(format!("no column named '{name}' in row")))?;
         self.get(idx)
     }
 
@@ -399,9 +394,11 @@ impl OwnedRow {
     }
 
     pub fn get_by_name<T: FromValue>(&self, name: &str) -> Result<T> {
-        let idx = self.columns.iter().position(|c| c == name).ok_or_else(|| {
-            SQLRiteError::General(format!("no column named '{name}' in row"))
-        })?;
+        let idx = self
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| SQLRiteError::General(format!("no column named '{name}' in row")))?;
         self.get(idx)
     }
 }
@@ -433,9 +430,7 @@ impl FromValue for f64 {
         match v {
             Value::Real(f) => Ok(*f),
             Value::Integer(n) => Ok(*n as f64),
-            Value::Null => Err(SQLRiteError::General(
-                "expected Real, got NULL".to_string(),
-            )),
+            Value::Null => Err(SQLRiteError::General("expected Real, got NULL".to_string())),
             other => Err(SQLRiteError::General(format!(
                 "cannot convert {other:?} to f64"
             ))),
@@ -447,9 +442,7 @@ impl FromValue for String {
     fn from_value(v: &Value) -> Result<Self> {
         match v {
             Value::Text(s) => Ok(s.clone()),
-            Value::Null => Err(SQLRiteError::General(
-                "expected Text, got NULL".to_string(),
-            )),
+            Value::Null => Err(SQLRiteError::General("expected Text, got NULL".to_string())),
             other => Err(SQLRiteError::General(format!(
                 "cannot convert {other:?} to String"
             ))),
@@ -462,9 +455,7 @@ impl FromValue for bool {
         match v {
             Value::Bool(b) => Ok(*b),
             Value::Integer(n) => Ok(*n != 0),
-            Value::Null => Err(SQLRiteError::General(
-                "expected Bool, got NULL".to_string(),
-            )),
+            Value::Null => Err(SQLRiteError::General("expected Bool, got NULL".to_string())),
             other => Err(SQLRiteError::General(format!(
                 "cannot convert {other:?} to bool"
             ))),
@@ -516,16 +507,14 @@ mod tests {
     #[test]
     fn in_memory_roundtrip() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);",
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO users (name, age) VALUES ('alice', 30);")
             .unwrap();
         conn.execute("INSERT INTO users (name, age) VALUES ('bob', 25);")
             .unwrap();
 
-        let mut stmt = conn.prepare("SELECT id, name, age FROM users;").unwrap();
+        let stmt = conn.prepare("SELECT id, name, age FROM users;").unwrap();
         let mut rows = stmt.query().unwrap();
         assert_eq!(rows.columns(), &["id", "name", "age"]);
         let mut collected: Vec<(i64, String, i64)> = Vec::new();
@@ -546,15 +535,14 @@ mod tests {
         let path = tmp_path("persist");
         {
             let mut c1 = Connection::open(&path).unwrap();
-            c1.execute(
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);",
-            )
-            .unwrap();
-            c1.execute("INSERT INTO items (label) VALUES ('one');").unwrap();
+            c1.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);")
+                .unwrap();
+            c1.execute("INSERT INTO items (label) VALUES ('one');")
+                .unwrap();
         }
         {
             let mut c2 = Connection::open(&path).unwrap();
-            let mut stmt = c2.prepare("SELECT label FROM items;").unwrap();
+            let stmt = c2.prepare("SELECT label FROM items;").unwrap();
             let mut rows = stmt.query().unwrap();
             let first = rows.next().unwrap().expect("one row");
             assert_eq!(first.get::<String>(0).unwrap(), "one");
@@ -568,7 +556,8 @@ mod tests {
         let path = tmp_path("ro_reject");
         {
             let mut c = Connection::open(&path).unwrap();
-            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .unwrap();
             c.execute("INSERT INTO t (id) VALUES (1);").unwrap();
         } // writer drops → releases exclusive lock
 
@@ -592,7 +581,7 @@ mod tests {
         conn.execute("ROLLBACK;").unwrap();
         assert!(!conn.in_transaction());
 
-        let mut stmt = conn.prepare("SELECT x FROM t;").unwrap();
+        let stmt = conn.prepare("SELECT x FROM t;").unwrap();
         let rows = stmt.query().unwrap().collect_all().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
@@ -602,9 +591,10 @@ mod tests {
     fn get_by_name_works() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
-        conn.execute("INSERT INTO t (a, b) VALUES (42, 'hello');").unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (42, 'hello');")
+            .unwrap();
 
-        let mut stmt = conn.prepare("SELECT a, b FROM t;").unwrap();
+        let stmt = conn.prepare("SELECT a, b FROM t;").unwrap();
         let mut rows = stmt.query().unwrap();
         let row = rows.next().unwrap().unwrap();
         assert_eq!(row.get_by_name::<i64>("a").unwrap(), 42);
@@ -619,7 +609,7 @@ mod tests {
         // id INTEGER PRIMARY KEY autoincrements; `note` is left unspecified.
         conn.execute("INSERT INTO t (id) VALUES (1);").unwrap();
 
-        let mut stmt = conn.prepare("SELECT id, note FROM t;").unwrap();
+        let stmt = conn.prepare("SELECT id, note FROM t;").unwrap();
         let mut rows = stmt.query().unwrap();
         let row = rows.next().unwrap().unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -637,7 +627,8 @@ mod tests {
     #[test]
     fn query_on_non_select_errors() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
         let stmt = conn.prepare("INSERT INTO t VALUES (1);").unwrap();
         let err = stmt.query().unwrap_err();
         assert!(format!("{err}").contains("SELECT"));
@@ -649,7 +640,7 @@ mod tests {
         conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY);")
             .unwrap();
         conn.execute("INSERT INTO t (a) VALUES (1);").unwrap();
-        let mut stmt = conn.prepare("SELECT a FROM t;").unwrap();
+        let stmt = conn.prepare("SELECT a FROM t;").unwrap();
         let mut rows = stmt.query().unwrap();
         let row = rows.next().unwrap().unwrap();
         let err = row.get::<i64>(99).unwrap_err();

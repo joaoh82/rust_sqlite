@@ -127,10 +127,7 @@ fn list_tables(state: State<'_, AppState>) -> Result<Vec<TableInfo>, String> {
     let locked = state.db.lock().map_err(engine_err)?;
     let mut names: Vec<&String> = locked.tables.keys().collect();
     names.sort();
-    Ok(names
-        .into_iter()
-        .map(|n| table_info(&locked, n))
-        .collect())
+    Ok(names.into_iter().map(|n| table_info(&locked, n)).collect())
 }
 
 #[tauri::command]

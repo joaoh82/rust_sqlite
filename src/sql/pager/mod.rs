@@ -58,7 +58,6 @@ use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::db::table::{Column, DataType, Row, Table, Value};
-use crate::sql::parser::create::CreateQuery;
 use crate::sql::pager::cell::Cell;
 use crate::sql::pager::header::DbHeader;
 use crate::sql::pager::index_cell::IndexCell;
@@ -69,6 +68,7 @@ use crate::sql::pager::overflow::{
 use crate::sql::pager::page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAYLOAD_PER_PAGE, PageType};
 use crate::sql::pager::pager::Pager;
 use crate::sql::pager::table_page::TablePage;
+use crate::sql::parser::create::CreateQuery;
 
 // Re-export so callers can spell `sql::pager::AccessMode` without
 // reaching into the `pager::pager::pager` submodule path.
@@ -96,11 +96,7 @@ pub fn open_database_read_only(path: &Path, db_name: String) -> Result<Database>
 /// Opens a database file and reconstructs the in-memory `Database`,
 /// leaving the long-lived `Pager` attached for subsequent auto-save
 /// (read-write) or consistent-snapshot reads (read-only).
-pub fn open_database_with_mode(
-    path: &Path,
-    db_name: String,
-    mode: AccessMode,
-) -> Result<Database> {
+pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -> Result<Database> {
     let pager = Pager::open_with_mode(path, mode)?;
 
     // 1. Load sqlrite_master from the tree at header.schema_root_page.
@@ -226,9 +222,8 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
             index_entries.push((table, idx));
         }
     }
-    index_entries.sort_by(|(ta, ia), (tb, ib)| {
-        ta.tb_name.cmp(&tb.tb_name).then(ia.name.cmp(&ib.name))
-    });
+    index_entries
+        .sort_by(|(ta, ia), (tb, ib)| ta.tb_name.cmp(&tb.tb_name).then(ia.name.cmp(&ib.name)));
     for (_table, idx) in index_entries {
         let (rootpage, new_next) = stage_index_btree(&mut pager, idx, next_free_page)?;
         next_free_page = new_next;
@@ -505,9 +500,9 @@ fn load_index_rows(pager: &Pager, idx: &mut SecondaryIndex, root_page: u32) -> R
     let first_leaf = find_leftmost_leaf(pager, root_page)?;
     let mut current = first_leaf;
     while current != 0 {
-        let page_buf = pager.read_page(current).ok_or_else(|| {
-            SQLRiteError::Internal(format!("missing index leaf page {current}"))
-        })?;
+        let page_buf = pager
+            .read_page(current)
+            .ok_or_else(|| SQLRiteError::Internal(format!("missing index leaf page {current}")))?;
         if page_buf[0] != PageType::TableLeaf as u8 {
             return Err(SQLRiteError::Internal(format!(
                 "page {current} tagged {} but expected TableLeaf (index)",
@@ -559,10 +554,9 @@ fn parse_create_index_sql(sql: &str) -> Result<(String, String, bool)> {
     }
     let col = match &columns[0].column.expr {
         Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map(|p| p.value.clone())
-            .unwrap_or_default(),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| p.value.clone()).unwrap_or_default()
+        }
         other => {
             return Err(SQLRiteError::Internal(format!(
                 "unsupported indexed column expression: {other:?}"
@@ -641,10 +635,7 @@ fn stage_index_leaves(
         if !current_leaf.would_fit(entry_bytes.len()) {
             let next_leaf_page_num = next_free_page;
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
-            leaves.push((
-                current_leaf_page,
-                current_max_rowid.unwrap_or(i64::MIN),
-            ));
+            leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
             next_free_page += 1;
@@ -670,9 +661,9 @@ fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<(
     let first_leaf = find_leftmost_leaf(pager, root_page)?;
     let mut current = first_leaf;
     while current != 0 {
-        let page_buf = pager.read_page(current).ok_or_else(|| {
-            SQLRiteError::Internal(format!("missing leaf page {current}"))
-        })?;
+        let page_buf = pager
+            .read_page(current)
+            .ok_or_else(|| SQLRiteError::Internal(format!("missing leaf page {current}")))?;
         if page_buf[0] != PageType::TableLeaf as u8 {
             return Err(SQLRiteError::Internal(format!(
                 "page {current} tagged {} but expected TableLeaf",
@@ -690,11 +681,8 @@ fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<(
             let cell = match entry {
                 PagedEntry::Local(c) => c,
                 PagedEntry::Overflow(r) => {
-                    let body_bytes = read_overflow_chain(
-                        pager,
-                        r.first_overflow_page,
-                        r.total_body_len,
-                    )?;
+                    let body_bytes =
+                        read_overflow_chain(pager, r.first_overflow_page, r.total_body_len)?;
                     let (c, _) = Cell::decode(&body_bytes, 0)?;
                     c
                 }
@@ -745,11 +733,7 @@ fn find_leftmost_leaf(pager: &Pager, root_page: u32) -> Result<u32> {
 ///
 /// Deterministic: same in-memory rows → same pages at same offsets, so
 /// the Pager's diff commit still skips unchanged tables.
-fn stage_table_btree(
-    pager: &mut Pager,
-    table: &Table,
-    start_page: u32,
-) -> Result<(u32, u32)> {
+fn stage_table_btree(pager: &mut Pager, table: &Table, start_page: u32) -> Result<(u32, u32)> {
     let (leaves, mut next_free_page) = stage_leaves(pager, table, start_page)?;
     if leaves.len() == 1 {
         return Ok((leaves[0].0, next_free_page));
@@ -788,10 +772,7 @@ fn stage_leaves(
             // this decision and the new leaf's allocation below).
             let next_leaf_page_num = next_free_page;
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
-            leaves.push((
-                current_leaf_page,
-                current_max_rowid.unwrap_or(i64::MIN),
-            ));
+            leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
             next_free_page += 1;
@@ -929,7 +910,11 @@ mod tests {
             &mut db,
         )
         .unwrap();
-        process_command("INSERT INTO users (name, age) VALUES ('alice', 30);", &mut db).unwrap();
+        process_command(
+            "INSERT INTO users (name, age) VALUES ('alice', 30);",
+            &mut db,
+        )
+        .unwrap();
         process_command("INSERT INTO users (name, age) VALUES ('bob', 25);", &mut db).unwrap();
         process_command(
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
@@ -996,8 +981,11 @@ mod tests {
 
         {
             let mut db = open_database(&path, "test".to_string()).unwrap();
-            process_command("INSERT INTO users (name, age) VALUES ('carol', 40);", &mut db)
-                .unwrap();
+            process_command(
+                "INSERT INTO users (name, age) VALUES ('carol', 40);",
+                &mut db,
+            )
+            .unwrap();
             save_database(&mut db, &path).unwrap();
         } // db drops → its exclusive lock releases before we reopen below.
 
@@ -1048,8 +1036,11 @@ mod tests {
         )
         .unwrap();
         let body = "A".repeat(10_000);
-        process_command(&format!("INSERT INTO docs (body) VALUES ('{body}');"), &mut db)
-            .unwrap();
+        process_command(
+            &format!("INSERT INTO docs (body) VALUES ('{body}');"),
+            &mut db,
+        )
+        .unwrap();
         save_database(&mut db, &path).unwrap();
 
         let loaded = open_database(&path, "big".to_string()).unwrap();
@@ -1122,7 +1113,10 @@ mod tests {
 
         // Peek at `things`'s root page via the pager attached to the
         // loaded DB and check it's an InteriorNode, not a leaf.
-        let pager = loaded.pager.as_ref().expect("loaded DB should have a pager");
+        let pager = loaded
+            .pager
+            .as_ref()
+            .expect("loaded DB should have a pager");
         // sqlrite_master's row for `things` holds its root page. Easiest
         // way to find it: walk the leaf chain by using find_leftmost_leaf
         // and then hop one level up. Simpler: read the master, scan for
@@ -1162,8 +1156,11 @@ mod tests {
         .unwrap();
         for i in 1..=5 {
             let tag = if i % 2 == 0 { "odd" } else { "even" };
-            process_command(&format!("INSERT INTO users (tag) VALUES ('{tag}');"), &mut db)
-                .unwrap();
+            process_command(
+                &format!("INSERT INTO users (tag) VALUES ('{tag}');"),
+                &mut db,
+            )
+            .unwrap();
         }
         process_command("CREATE INDEX users_tag_idx ON users (tag);", &mut db).unwrap();
         save_database(&mut db, &path).unwrap();
@@ -1235,7 +1232,10 @@ mod tests {
             table
                 .restore_row(
                     i,
-                    vec![Some(Value::Integer(i)), Some(Value::Text(format!("r-{i}-{body}")))],
+                    vec![
+                        Some(Value::Integer(i)),
+                        Some(Value::Text(format!("r-{i}-{body}"))),
+                    ],
                 )
                 .unwrap();
         }

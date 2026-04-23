@@ -14,15 +14,13 @@ use sqlrite::{Connection, Result};
 fn main() -> Result<()> {
     let mut conn = Connection::open_in_memory()?;
 
-    conn.execute(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);",
-    )?;
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")?;
     conn.execute("INSERT INTO users (name, age) VALUES ('alice', 30);")?;
     conn.execute("INSERT INTO users (name, age) VALUES ('bob', 25);")?;
     conn.execute("INSERT INTO users (name, age) VALUES ('charlie', 40);")?;
 
     println!("All users:");
-    let mut stmt = conn.prepare("SELECT id, name, age FROM users;")?;
+    let stmt = conn.prepare("SELECT id, name, age FROM users;")?;
     let mut rows = stmt.query()?;
     while let Some(row) = rows.next()? {
         let id: i64 = row.get_by_name("id")?;
@@ -34,17 +32,15 @@ fn main() -> Result<()> {
             "  {} — {} ({})",
             id,
             name,
-            age.map(|a| a.to_string()).unwrap_or_else(|| "NULL".to_string())
+            age.map(|a| a.to_string())
+                .unwrap_or_else(|| "NULL".to_string())
         );
     }
 
     // Transactions: BEGIN + INSERT + ROLLBACK leaves the table untouched.
     conn.execute("BEGIN;")?;
     conn.execute("INSERT INTO users (name, age) VALUES ('will_vanish', 99);")?;
-    println!(
-        "\nMid-transaction row count: {}",
-        count_users(&mut conn)?
-    );
+    println!("\nMid-transaction row count: {}", count_users(&mut conn)?);
     conn.execute("ROLLBACK;")?;
     println!(
         "Post-rollback row count:   {} (unchanged)",
@@ -55,7 +51,7 @@ fn main() -> Result<()> {
 }
 
 fn count_users(conn: &mut Connection) -> Result<usize> {
-    let mut stmt = conn.prepare("SELECT id FROM users;")?;
+    let stmt = conn.prepare("SELECT id FROM users;")?;
     let rows = stmt.query()?.collect_all()?;
     Ok(rows.len())
 }

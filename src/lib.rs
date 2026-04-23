@@ -67,8 +67,8 @@ pub use sql::db::table::Value;
 pub use error::{Result, SQLRiteError};
 pub use sql::db::database::Database;
 pub use sql::pager::{
-    AccessMode, MASTER_TABLE_NAME, open_database, open_database_read_only,
-    open_database_with_mode, save_database,
+    AccessMode, MASTER_TABLE_NAME, open_database, open_database_read_only, open_database_with_mode,
+    save_database,
 };
 pub use sql::process_command;
 

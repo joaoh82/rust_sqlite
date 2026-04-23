@@ -338,9 +338,21 @@ Used by:
 
 After the Phase 6a commit lands, full test suite still passes at bumped version `0.1.1` with zero code changes beyond the manifests themselves (verified end-to-end before back-out).
 
-### Phase 6b — `ci.yml`
+### ✅ Phase 6b — `ci.yml`
 
-Runs on every PR + push to main. Matrix: `{ubuntu-latest, macos-latest, windows-latest}` × (rust-ci, python-ci, nodejs-ci, go-ci [skip Windows], wasm-ci, fmt-docs-ci). Caches `target/` + `node_modules/` for fast PR turnaround. Blocks merge if any job fails.
+Runs on every PR + push to main. Seven parallel jobs with caching via `Swatinem/rust-cache` + `actions/setup-*` built-in caches for fast PR turnaround:
+
+- **rust-build-and-test** — Linux / macOS / Windows matrix; `cargo build --workspace --exclude sqlrite-desktop --all-targets` + `cargo test`
+- **rust-lint** — ubuntu only; `cargo fmt --check`, `cargo clippy`, `cargo doc --no-deps`
+- **python-sdk** — Linux / macOS / Windows matrix; creates a venv + sets `VIRTUAL_ENV` so `maturin develop` works cross-platform, then `pytest`
+- **nodejs-sdk** — Linux / macOS / Windows matrix; `npm ci && npm run build && npm test`
+- **go-sdk** — Linux / macOS matrix (Windows skipped — Go cgo on Windows needs mingw, deferred); `cargo build --release -p sqlrite-ffi` + `go test -v ./...`
+- **wasm-build** — ubuntu only; `wasm-pack build --target web --release` + `.wasm` size reported as a GitHub notice
+- **desktop-build** — ubuntu only; installs Tauri Linux deps (webkit2gtk, appindicator, rsvg, patchelf), `npm ci && npm run build` for the frontend, then `cargo build -p sqlrite-desktop`. Other platforms covered in the Phase 6e desktop-release matrix.
+
+Pre-existing clippy warnings (~24, mostly cosmetic — overindented docstrings, `Vec::new() + push` patterns, `&Vec<T>` vs `&[T]`, `assert!(false)` in tests) stay as warnings rather than errors. Hard clippy errors (deny-by-default lints like `approx_constant`) still block. A follow-up task will clean up the warnings and then flip on `-D warnings` at the workflow level.
+
+One pre-existing warning fixed inline during Phase 6b: a `3.14` test constant in `src/sql/pager/cell.rs` that clippy's `approx_constant` lint (deny-by-default) flags as a PI lookalike. Swapped for `2.5`.
 
 ### Phase 6c — Branch protection + trusted publishing setup
 

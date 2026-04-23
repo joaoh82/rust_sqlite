@@ -5,8 +5,8 @@ use std::cmp::Ordering;
 
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Update,
+    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, Statement, TableFactor,
+    TableWithJoins, UnaryOperator, Update,
 };
 
 use crate::error::{Result, SQLRiteError};
@@ -108,11 +108,7 @@ pub fn execute_select(query: SelectQuery, db: &Database) -> Result<(String, usiz
     let row_count = result.rows.len();
 
     let mut print_table = PrintTable::new();
-    let header_cells: Vec<PrintCell> = result
-        .columns
-        .iter()
-        .map(|c| PrintCell::new(c))
-        .collect();
+    let header_cells: Vec<PrintCell> = result.columns.iter().map(|c| PrintCell::new(c)).collect();
     print_table.add_row(PrintRow::new(header_cells));
 
     for row in &result.rows {
@@ -144,9 +140,9 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
 
     // Compute matching rowids with an immutable borrow, then mutate.
     let matching: Vec<i64> = {
-        let table = db.get_table(table_name.clone()).map_err(|_| {
-            SQLRiteError::Internal(format!("Table '{table_name}' not found"))
-        })?;
+        let table = db
+            .get_table(table_name.clone())
+            .map_err(|_| SQLRiteError::Internal(format!("Table '{table_name}' not found")))?;
         match select_rowids(table, selection.as_ref())? {
             RowidSource::IndexProbe(rowids) => rowids,
             RowidSource::FullScan => {
@@ -197,9 +193,9 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     // Resolve assignment targets to plain column names and verify they exist.
     let mut parsed_assignments: Vec<(String, Expr)> = Vec::with_capacity(assignments.len());
     {
-        let tbl = db.get_table(table_name.clone()).map_err(|_| {
-            SQLRiteError::Internal(format!("Table '{table_name}' not found"))
-        })?;
+        let tbl = db
+            .get_table(table_name.clone())
+            .map_err(|_| SQLRiteError::Internal(format!("Table '{table_name}' not found")))?;
         for a in assignments {
             let col = match &a.target {
                 AssignmentTarget::ColumnName(name) => name
@@ -297,15 +293,11 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         )));
     }
 
-    let index_name = name
-        .as_ref()
-        .map(|n| n.to_string())
-        .ok_or_else(|| {
-            SQLRiteError::NotImplemented(
-                "anonymous CREATE INDEX (no name) is not supported — give it a name"
-                    .to_string(),
-            )
-        })?;
+    let index_name = name.as_ref().map(|n| n.to_string()).ok_or_else(|| {
+        SQLRiteError::NotImplemented(
+            "anonymous CREATE INDEX (no name) is not supported — give it a name".to_string(),
+        )
+    })?;
 
     let table_name_str = table_name.to_string();
     let column_name = match &columns[0].column.expr {
@@ -565,9 +557,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
     match expr {
         Expr::Nested(inner) => eval_expr(inner, table, rowid),
 
-        Expr::Identifier(ident) => Ok(table
-            .get_value(&ident.value, rowid)
-            .unwrap_or(Value::Null)),
+        Expr::Identifier(ident) => Ok(table.get_value(&ident.value, rowid).unwrap_or(Value::Null)),
 
         Expr::CompoundIdentifier(parts) => {
             // Accept `table.col` — we only have one table in scope, so ignore the qualifier.

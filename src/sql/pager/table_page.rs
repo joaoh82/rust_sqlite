@@ -184,10 +184,7 @@ impl TablePage {
     /// Iterates `(rowid, Cell)` pairs in ascending rowid order. This is
     /// O(N × cell-decode) — only use it when you actually need the bodies.
     pub fn iter(&self) -> TablePageIter<'_> {
-        TablePageIter {
-            page: self,
-            pos: 0,
-        }
+        TablePageIter { page: self, pos: 0 }
     }
 
     /// Inserts `cell` as a local entry in rowid order. See
@@ -227,8 +224,7 @@ impl TablePage {
 
                 // Write entry content at the new cells_top.
                 let new_cells_top = self.cells_top() - encoded.len();
-                self.buf[new_cells_top..new_cells_top + encoded.len()]
-                    .copy_from_slice(encoded);
+                self.buf[new_cells_top..new_cells_top + encoded.len()].copy_from_slice(encoded);
                 self.set_cells_top(new_cells_top);
 
                 // Shift slot entries [insert_at..n) up by one to make room,
@@ -236,7 +232,8 @@ impl TablePage {
                 let old_count = self.slot_count();
                 let shift_start = Self::slots_start() + insert_at * SLOT_SIZE;
                 let shift_end = Self::slots_start() + old_count * SLOT_SIZE;
-                self.buf.copy_within(shift_start..shift_end, shift_start + SLOT_SIZE);
+                self.buf
+                    .copy_within(shift_start..shift_end, shift_start + SLOT_SIZE);
                 self.set_slot_count(old_count + 1);
                 self.set_slot_offset(insert_at, new_cells_top);
                 Ok(())
@@ -355,7 +352,7 @@ mod tests {
         p.insert(&int_cell(2, 20)).unwrap();
         p.insert(&int_cell(3, 30)).unwrap();
 
-        assert_eq!(p.delete(2).unwrap(), true);
+        assert!(p.delete(2).unwrap());
         assert_eq!(p.slot_count(), 2);
         assert_eq!(p.lookup(2).unwrap(), None);
 
@@ -372,7 +369,7 @@ mod tests {
     fn delete_missing_rowid_reports_false() {
         let mut p = TablePage::empty();
         p.insert(&int_cell(1, 10)).unwrap();
-        assert_eq!(p.delete(999).unwrap(), false);
+        assert!(!p.delete(999).unwrap());
         assert_eq!(p.slot_count(), 1);
     }
 

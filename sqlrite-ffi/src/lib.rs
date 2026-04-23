@@ -259,9 +259,7 @@ pub unsafe extern "C" fn sqlrite_open_read_only(
 ///
 /// `out` must be a valid writable pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlrite_open_in_memory(
-    out: *mut *mut SqlriteConnection,
-) -> SqlriteStatus {
+pub unsafe extern "C" fn sqlrite_open_in_memory(out: *mut *mut SqlriteConnection) -> SqlriteStatus {
     if out.is_null() {
         set_last_error("output pointer is null");
         return SqlriteStatus::InvalidArgument;
@@ -492,20 +490,25 @@ pub unsafe extern "C" fn sqlrite_column_int64(
     idx: c_int,
     out: *mut i64,
 ) -> SqlriteStatus {
-    with_current_value(stmt, idx, |v, out_void| match v {
-        Value::Integer(n) => {
-            unsafe { *(out_void as *mut i64) = *n };
-            SqlriteStatus::Ok
-        }
-        Value::Null => {
-            set_last_error("column is NULL (use sqlrite_column_is_null to check first)");
-            SqlriteStatus::Error
-        }
-        other => {
-            set_last_error(format!("cannot convert {other:?} to int64"));
-            SqlriteStatus::Error
-        }
-    }, out as *mut c_void)
+    with_current_value(
+        stmt,
+        idx,
+        |v, out_void| match v {
+            Value::Integer(n) => {
+                unsafe { *(out_void as *mut i64) = *n };
+                SqlriteStatus::Ok
+            }
+            Value::Null => {
+                set_last_error("column is NULL (use sqlrite_column_is_null to check first)");
+                SqlriteStatus::Error
+            }
+            other => {
+                set_last_error(format!("cannot convert {other:?} to int64"));
+                SqlriteStatus::Error
+            }
+        },
+        out as *mut c_void,
+    )
 }
 
 /// Reads column `idx` as a double.
@@ -515,24 +518,29 @@ pub unsafe extern "C" fn sqlrite_column_double(
     idx: c_int,
     out: *mut c_double,
 ) -> SqlriteStatus {
-    with_current_value(stmt, idx, |v, out_void| match v {
-        Value::Real(f) => {
-            unsafe { *(out_void as *mut c_double) = *f };
-            SqlriteStatus::Ok
-        }
-        Value::Integer(n) => {
-            unsafe { *(out_void as *mut c_double) = *n as c_double };
-            SqlriteStatus::Ok
-        }
-        Value::Null => {
-            set_last_error("column is NULL");
-            SqlriteStatus::Error
-        }
-        other => {
-            set_last_error(format!("cannot convert {other:?} to double"));
-            SqlriteStatus::Error
-        }
-    }, out as *mut c_void)
+    with_current_value(
+        stmt,
+        idx,
+        |v, out_void| match v {
+            Value::Real(f) => {
+                unsafe { *(out_void as *mut c_double) = *f };
+                SqlriteStatus::Ok
+            }
+            Value::Integer(n) => {
+                unsafe { *(out_void as *mut c_double) = *n as c_double };
+                SqlriteStatus::Ok
+            }
+            Value::Null => {
+                set_last_error("column is NULL");
+                SqlriteStatus::Error
+            }
+            other => {
+                set_last_error(format!("cannot convert {other:?} to double"));
+                SqlriteStatus::Error
+            }
+        },
+        out as *mut c_void,
+    )
 }
 
 /// Reads column `idx` as a newly-allocated NUL-terminated UTF-8
@@ -543,23 +551,28 @@ pub unsafe extern "C" fn sqlrite_column_text(
     idx: c_int,
     out: *mut *mut c_char,
 ) -> SqlriteStatus {
-    with_current_value(stmt, idx, |v, out_void| match v {
-        Value::Text(s) => {
-            unsafe { *(out_void as *mut *mut c_char) = alloc_c_string(s) };
-            SqlriteStatus::Ok
-        }
-        Value::Null => {
-            set_last_error("column is NULL");
-            SqlriteStatus::Error
-        }
-        // For Int/Real/Bool we coerce to the display form — matches
-        // sqlite3_column_text's lenient behavior.
-        other => {
-            let rendered = other.to_display_string();
-            unsafe { *(out_void as *mut *mut c_char) = alloc_c_string(&rendered) };
-            SqlriteStatus::Ok
-        }
-    }, out as *mut c_void)
+    with_current_value(
+        stmt,
+        idx,
+        |v, out_void| match v {
+            Value::Text(s) => {
+                unsafe { *(out_void as *mut *mut c_char) = alloc_c_string(s) };
+                SqlriteStatus::Ok
+            }
+            Value::Null => {
+                set_last_error("column is NULL");
+                SqlriteStatus::Error
+            }
+            // For Int/Real/Bool we coerce to the display form — matches
+            // sqlite3_column_text's lenient behavior.
+            other => {
+                let rendered = other.to_display_string();
+                unsafe { *(out_void as *mut *mut c_char) = alloc_c_string(&rendered) };
+                SqlriteStatus::Ok
+            }
+        },
+        out as *mut c_void,
+    )
 }
 
 /// Writes `1` to `*out` if column `idx` is NULL, `0` otherwise.
@@ -569,10 +582,15 @@ pub unsafe extern "C" fn sqlrite_column_is_null(
     idx: c_int,
     out: *mut c_int,
 ) -> SqlriteStatus {
-    with_current_value(stmt, idx, |v, out_void| {
-        unsafe { *(out_void as *mut c_int) = matches!(v, Value::Null) as c_int };
-        SqlriteStatus::Ok
-    }, out as *mut c_void)
+    with_current_value(
+        stmt,
+        idx,
+        |v, out_void| {
+            unsafe { *(out_void as *mut c_int) = matches!(v, Value::Null) as c_int };
+            SqlriteStatus::Ok
+        },
+        out as *mut c_void,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -704,15 +722,10 @@ mod tests {
     fn open_in_memory_execute_and_close() {
         unsafe {
             let mut conn: *mut SqlriteConnection = ptr::null_mut();
-            assert_eq!(
-                sqlrite_open_in_memory(&mut conn),
-                SqlriteStatus::Ok
-            );
+            assert_eq!(sqlrite_open_in_memory(&mut conn), SqlriteStatus::Ok);
             assert!(!conn.is_null());
 
-            let (_c1, p1) = cstr(
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);",
-            );
+            let (_c1, p1) = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);");
             assert_eq!(sqlrite_execute(conn, p1), SqlriteStatus::Ok);
 
             let (_c2, p2) = cstr("INSERT INTO t (x) VALUES ('alpha');");
@@ -729,8 +742,7 @@ mod tests {
             let mut conn: *mut SqlriteConnection = ptr::null_mut();
             sqlrite_open_in_memory(&mut conn);
 
-            let (_c, p) =
-                cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);");
+            let (_c, p) = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);");
             sqlrite_execute(conn, p);
             let (_c, p) = cstr("INSERT INTO t (x) VALUES ('alpha');");
             sqlrite_execute(conn, p);
@@ -763,15 +775,9 @@ mod tests {
                 }
                 assert_eq!(status, SqlriteStatus::Row);
                 let mut id: i64 = 0;
-                assert_eq!(
-                    sqlrite_column_int64(stmt, 0, &mut id),
-                    SqlriteStatus::Ok
-                );
+                assert_eq!(sqlrite_column_int64(stmt, 0, &mut id), SqlriteStatus::Ok);
                 let mut text: *mut c_char = ptr::null_mut();
-                assert_eq!(
-                    sqlrite_column_text(stmt, 1, &mut text),
-                    SqlriteStatus::Ok
-                );
+                assert_eq!(sqlrite_column_text(stmt, 1, &mut text), SqlriteStatus::Ok);
                 let s = CStr::from_ptr(text).to_string_lossy().into_owned();
                 sqlrite_free_string(text);
                 collected.push((id, s));

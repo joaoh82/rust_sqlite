@@ -240,13 +240,12 @@ mod tests {
         .unwrap();
         process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
 
-        handle_meta_command(MetaCommand::Save(path.clone()), &mut repl, &mut db)
-            .expect("save");
+        handle_meta_command(MetaCommand::Save(path.clone()), &mut repl, &mut db).expect("save");
 
         // Replace db with a fresh one, then .open the file.
         db = Database::new("fresh".to_string());
-        let msg = handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db)
-            .expect("open");
+        let msg =
+            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
         assert!(msg.contains("1 table loaded"));
 
         let users = db.get_table("users".to_string()).unwrap();
@@ -266,8 +265,8 @@ mod tests {
         let mut repl = new_editor();
         let mut db = Database::new("x".to_string());
 
-        let msg = handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db)
-            .expect("open");
+        let msg =
+            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
         assert!(msg.contains("new database"));
         assert_eq!(db.tables.len(), 0);
         // Auto-save expects a file to exist to auto-flush into, so open-of-missing
@@ -286,8 +285,7 @@ mod tests {
         let mut repl = new_editor();
         let mut db = Database::new("x".to_string());
 
-        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db)
-            .expect("open");
+        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
 
         // The first write should auto-flush to disk.
         process_command(

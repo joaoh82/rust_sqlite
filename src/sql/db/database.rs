@@ -181,7 +181,7 @@ mod tests {
             email TEXT NOT NULL UNIQUE
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }
@@ -207,7 +207,7 @@ mod tests {
             email TEXT NOT NULL UNIQUE
         );";
         let dialect = SQLiteDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &query_statement).unwrap();
+        let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
         }

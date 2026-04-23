@@ -26,7 +26,7 @@
 //! this module just exposes [`OVERFLOW_THRESHOLD`] as a suggestion.
 
 use crate::error::{Result, SQLRiteError};
-use crate::sql::pager::cell::{KIND_LOCAL, KIND_OVERFLOW, Cell};
+use crate::sql::pager::cell::{Cell, KIND_LOCAL, KIND_OVERFLOW};
 use crate::sql::pager::page::{PAGE_HEADER_SIZE, PAGE_SIZE, PAYLOAD_PER_PAGE, PageType};
 use crate::sql::pager::pager::Pager;
 use crate::sql::pager::varint;
@@ -159,11 +159,7 @@ impl PagedEntry {
 /// Writes `bytes` into a chain of Overflow-typed pages starting at
 /// `start_page`, using consecutive page numbers. Returns the first page
 /// number *after* the chain (i.e., the next free page to hand out).
-pub fn write_overflow_chain(
-    pager: &mut Pager,
-    bytes: &[u8],
-    start_page: u32,
-) -> Result<u32> {
+pub fn write_overflow_chain(pager: &mut Pager, bytes: &[u8], start_page: u32) -> Result<u32> {
     if bytes.is_empty() {
         return Err(SQLRiteError::Internal(
             "refusing to write an empty overflow chain — caller should inline instead".to_string(),
@@ -186,18 +182,12 @@ pub fn write_overflow_chain(
 /// payload bytes. Reads exactly `total_body_len` bytes — a mismatch between
 /// what the chain carries and what the OverflowRef claims is a corruption
 /// error.
-pub fn read_overflow_chain(
-    pager: &Pager,
-    first_page: u32,
-    total_body_len: u64,
-) -> Result<Vec<u8>> {
+pub fn read_overflow_chain(pager: &Pager, first_page: u32, total_body_len: u64) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(total_body_len as usize);
     let mut current = first_page;
     while current != 0 {
         let raw = pager.read_page(current).ok_or_else(|| {
-            SQLRiteError::Internal(format!(
-                "overflow chain references missing page {current}"
-            ))
+            SQLRiteError::Internal(format!("overflow chain references missing page {current}"))
         })?;
         let ty_byte = raw[0];
         if ty_byte != PageType::Overflow as u8 {
