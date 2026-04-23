@@ -152,12 +152,13 @@ jobs:
         run: |
           # `--no-verify` skips the rebuild+test that publish does
           # by default — CI already ran on the same commit on the
-          # Release PR, so re-running here is duplicate work. Also
-          # `-p sqlrite` is explicit about which workspace member
-          # we're publishing (could be omitted since sqlrite is the
-          # root package, but being explicit protects against
-          # future layout changes).
-          cargo publish -p sqlrite --no-verify
+          # Release PR, so re-running here is duplicate work.
+          #
+          # Package name on crates.io is `sqlrite-engine`, not
+          # `sqlrite` — the latter was taken by an unrelated project
+          # (see root Cargo.toml for context). The [lib] name is
+          # still `sqlrite`, so downstream code writes `use sqlrite::…`.
+          cargo publish -p sqlrite-engine --no-verify
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
@@ -165,11 +166,17 @@ jobs:
           tag_name: sqlrite-v${{ needs.detect.outputs.version }}
           name: Rust engine v${{ needs.detect.outputs.version }}
           body: |
-            Published to crates.io: https://crates.io/crates/sqlrite/${{ needs.detect.outputs.version }}
+            Published to crates.io: https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }}
 
             ```toml
             [dependencies]
-            sqlrite = "${{ needs.detect.outputs.version }}"
+            sqlrite-engine = "${{ needs.detect.outputs.version }}"
+            ```
+
+            ```rust
+            // The [lib] name stays `sqlrite`, so the import alias is
+            // the short one even though the package name is longer.
+            use sqlrite::{Database, ExecutionResult};
             ```
 
             See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
@@ -295,7 +302,7 @@ jobs:
 
             Per-product releases in this wave:
 
-            - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite/${{ needs.detect.outputs.version }})
+            - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }})
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
 
             _Python / Node.js / WASM / Go / desktop SDKs land as their publish jobs come online (Phases 6e–6i)._

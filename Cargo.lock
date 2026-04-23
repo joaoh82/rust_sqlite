@@ -3735,7 +3735,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlrite"
+name = "sqlrite-desktop"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlrite-engine",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+]
+
+[[package]]
+name = "sqlrite-engine"
 version = "0.1.1"
 dependencies = [
  "clap",
@@ -3750,23 +3762,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlrite-desktop"
-version = "0.1.1"
-dependencies = [
- "serde",
- "serde_json",
- "sqlrite",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
-]
-
-[[package]]
 name = "sqlrite-ffi"
 version = "0.1.1"
 dependencies = [
  "cbindgen",
- "sqlrite",
+ "sqlrite-engine",
 ]
 
 [[package]]
@@ -3776,7 +3776,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "sqlrite",
+ "sqlrite-engine",
 ]
 
 [[package]]
@@ -3784,7 +3784,7 @@ name = "sqlrite-python"
 version = "0.1.1"
 dependencies = [
  "pyo3",
- "sqlrite",
+ "sqlrite-engine",
 ]
 
 [[package]]

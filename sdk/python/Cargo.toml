@@ -23,7 +23,11 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-sqlrite = { path = "../.." }
+# `package = "sqlrite-engine"` — crates.io name — with an import alias
+# of `sqlrite` so src/ code can keep saying `use sqlrite::…`. See root
+# Cargo.toml for the full story on why the package name differs from
+# the lib name.
+sqlrite = { package = "sqlrite-engine", path = "../.." }
 
 # PyO3 with the `abi3-py38` feature so one wheel works on every
 # CPython 3.8+ release — no per-Python-version rebuild.

@@ -27,7 +27,11 @@ path = "src/lib.rs"
 [dependencies]
 # The engine we're wrapping. Taken from the workspace root via a path dep so
 # the FFI layer always tracks HEAD — no version-lock drift between the two.
-sqlrite = { path = ".." }
+# `package = "sqlrite-engine"` because the crate is published under that
+# name on crates.io (the `sqlrite` name was taken by another project); the
+# `sqlrite = …` key keeps the import alias as `sqlrite` so `use sqlrite::…`
+# in src/ still resolves.
+sqlrite = { package = "sqlrite-engine", path = ".." }
 
 # Build-time C header generation. `cbindgen` walks this crate's extern "C"
 # declarations and emits `sqlrite.h`. We invoke it from build.rs so callers

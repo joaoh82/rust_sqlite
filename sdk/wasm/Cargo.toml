@@ -30,7 +30,9 @@ crate-type = ["cdylib", "rlib"]
 # Engine as a path dep. `default-features = false` disables both
 # `cli` (rustyline + clap + env_logger — not wasm-safe) and
 # `file-locks` (fs2 — doesn't exist on wasm32-unknown-unknown).
-sqlrite = { path = "../..", default-features = false }
+# `package = "sqlrite-engine"` — crates.io name — with an import alias
+# of `sqlrite` so src/ code can keep saying `use sqlrite::…`.
+sqlrite = { package = "sqlrite-engine", path = "../..", default-features = false }
 
 # wasm-bindgen + friends. `serde-serialize` on wasm-bindgen gives
 # us `serde_wasm_bindgen` interop for structured row objects.

@@ -208,8 +208,12 @@ The "publish" half. Auto-fires on the release commit.
     them. Runs *before* the publish jobs — if a tag already exists
     (accidental re-run, cosmic ray), the whole workflow aborts
     cleanly.
-  - **publish-crate** — `cargo publish` the root crate to crates.io.
-    Creates GitHub Release `sqlrite-vX.Y.Z`.
+  - **publish-crate** — `cargo publish -p sqlrite-engine` the root
+    crate to crates.io. (The crates.io name is `sqlrite-engine`, not
+    `sqlrite`, because the short name was already taken by an
+    unrelated project; the `[lib] name = "sqlrite"` keeps `use
+    sqlrite::…` valid at import sites.) Creates GitHub Release
+    `sqlrite-vX.Y.Z`.
   - **publish-ffi** — matrix build of `libsqlrite_c` for
     `{linux-x86_64, linux-aarch64, macos-universal, windows-x86_64}`.
     Packages each as a tarball containing the `.so`/`.dylib`/`.dll`,

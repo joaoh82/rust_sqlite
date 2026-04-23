@@ -22,7 +22,11 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-sqlrite = { path = "../.." }
+# `package = "sqlrite-engine"` — crates.io name — with an import alias
+# of `sqlrite` so src/ code can keep saying `use sqlrite::…`. See root
+# Cargo.toml for the full story on why the package name differs from
+# the lib name.
+sqlrite = { package = "sqlrite-engine", path = "../.." }
 
 # napi-rs 2.x — mature + widely deployed (used by prisma, swc,
 # lightningcss, etc.). Version 2.16 adds `serde-json` features we
