@@ -387,13 +387,15 @@ Jobs wired up in Phase 6d:
 
 1. **detect** — parse version from commit message or dispatch input. Outputs `version` + `should_release`.
 2. **tag-all** — idempotent: creates `sqlrite-vX.Y.Z`, `sqlrite-ffi-vX.Y.Z`, and umbrella `vX.Y.Z`; skips any tag that already exists so "Re-run failed jobs" works cleanly after a partial-failure scenario.
-3. **publish-crate** — `cargo publish -p sqlrite --no-verify` using `CRATES_IO_TOKEN` from the `release` environment (required-reviewer gate applies). Creates the per-product GitHub Release `sqlrite-vX.Y.Z`.
+3. **publish-crate** — `cargo publish -p sqlrite-engine --no-verify` using `CRATES_IO_TOKEN` from the `release` environment (required-reviewer gate applies). Creates the per-product GitHub Release `sqlrite-vX.Y.Z`. The crates.io name is `sqlrite-engine` because the short `sqlrite` name was taken by an unrelated project; the `[lib] name = "sqlrite"` preserves `use sqlrite::…` at the import site.
 4. **publish-ffi** — matrix build of `libsqlrite_c` on Linux x86_64 (`ubuntu-latest`), Linux aarch64 (`ubuntu-24.04-arm`), macOS aarch64 (`macos-latest`), Windows x86_64 (`windows-latest`). Packages the cdylib + staticlib + `sqlrite.h` + README stub into a tarball, uploads to the `sqlrite-ffi-vX.Y.Z` GitHub Release. macOS universal (x86_64 + aarch64 lipo'd together) is a follow-up — MVP ships aarch64-only for Mac; add `macos-13` to the matrix if x86 demand materializes.
 5. **finalize** — creates the umbrella `vX.Y.Z` GitHub Release with GitHub's native auto-generated notes (`generate_release_notes: true`). Body links to every per-product release from this wave.
 
 Products whose publish jobs land in later phases (desktop, Python, Node.js, WASM, Go) aren't tagged yet — `tag-all` only creates tags for products that have an active publish job. Cleaner than creating empty releases for products we can't actually ship.
 
-**Verification path**: push this branch → merge → dispatch `release-pr.yml` with version `0.1.1` → review the auto-opened PR → merge → approve the `release` environment prompt → watch crates.io show `sqlrite 0.1.1` + Release page show two per-product releases + umbrella release. Once that works end-to-end, 6e lands the desktop publish, and we bump to `v0.1.2` for the next canary.
+**Verification path**: push this branch → merge → dispatch `release-pr.yml` with version `0.1.1` → review the auto-opened PR → merge → approve the `release` environment prompt → watch crates.io show `sqlrite-engine 0.1.1` + Release page show two per-product releases + umbrella release. Once that works end-to-end, 6e lands the desktop publish, and we bump to `v0.1.2` for the next canary.
+
+> **v0.1.1 canary retrospective** *(2026-04-22)* — first publish attempt failed on `cargo publish` with a 403 because the `sqlrite` crate name on crates.io is owned by an unrelated RAG-SQLite project. Renamed the package to `sqlrite-engine` (lib / bin names unchanged, so `use sqlrite::…` still works for consumers). Tags `sqlrite-v0.1.1` / `sqlrite-ffi-v0.1.1` / `v0.1.1` stay on main per the never-reuse-a-tag policy; the next canary cuts `v0.1.2` under the new crate name.
 
 ### Phase 6e — Desktop publish
 

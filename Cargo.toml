@@ -13,12 +13,25 @@ members = [".", "desktop/src-tauri", "sqlrite-ffi", "sdk/python", "sdk/nodejs"]
 resolver = "3"
 
 [package]
-name = "sqlrite"
+# Published to crates.io as `sqlrite-engine` because `sqlrite` was
+# already taken (unrelated project — RAG-oriented SQLite wrapper). The
+# lib target below keeps `name = "sqlrite"`, so downstream Rust code
+# still writes `use sqlrite::…` — only the `cargo add` line and the
+# dependency declaration change:
+#
+#     [dependencies]
+#     sqlrite-engine = "0.1"
+#     # then in code: use sqlrite::{Database, …};
+#
+# Any workspace member here that depends on the engine uses the
+# `package =` key so the import name stays `sqlrite` internally:
+#     sqlrite = { package = "sqlrite-engine", path = "…" }
+name = "sqlrite-engine"
 version = "0.1.1"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
-description = "Light version of SQLite developed with Rust"
+description = "Light version of SQLite developed with Rust. Published as `sqlrite-engine` on crates.io; import as `use sqlrite::…`."
 repository = "https://github.com/joaoh82/rust_sqlite"
 license = "MIT"
 
