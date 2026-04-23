@@ -15,5 +15,12 @@ desktop/.vite
 # Compiled C samples (the source stays; the binary is rebuilt per platform)
 examples/c/hello
 
+# Python SDK build artifacts + test caches
+__pycache__
+*.pyc
+.pytest_cache
+sdk/python/*.egg-info
+sdk/python/dist
+
 # macOS
 .DS_Store
