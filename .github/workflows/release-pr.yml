@@ -1,0 +1,138 @@
+# The "prepare" half of the two-workflow release flow. Dispatched
+# manually with a target semver; runs `scripts/bump-version.sh`,
+# refreshes `Cargo.lock`, and opens a Release PR that a human
+# reviews + merges. Once that PR merges, `release.yml` auto-fires
+# to tag + publish everything.
+#
+# See docs/release-plan.md for the full design; docs/release-secrets.md
+# for the one-time registry setup this depends on.
+
+name: Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver to bump everything to (e.g., 0.2.0 or 1.0.0-rc.1)'
+        required: true
+        type: string
+
+# `contents: write` so the workflow can push the new branch;
+# `pull-requests: write` so it can open the PR. No other perms.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only one release PR at a time per version. If someone double-
+# dispatches at the same version, the second run errors out on
+# "branch already exists" rather than racing.
+concurrency:
+  group: release-pr-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  open-release-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history so `git log` / tag checks work — the
+          # version validation below needs to compare against the
+          # current version string in Cargo.toml, which is a
+          # single-commit lookup so we could live without depth 0,
+          # but it costs ~nothing on a repo this size.
+          fetch-depth: 0
+
+      - name: Validate version input
+        id: validate
+        run: |
+          VERSION="${{ inputs.version }}"
+          # Same semver regex as scripts/bump-version.sh — keep them
+          # in sync. Copy-pasted rather than shared to avoid adding
+          # a Python / awk dependency here.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a valid semver (X.Y.Z[-pre][+build])"
+            exit 1
+          fi
+
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "$VERSION" = "$CURRENT" ]; then
+            echo "::error::version is already $CURRENT — pick a new one"
+            exit 1
+          fi
+
+          # Reject re-using an existing tag. The policy is "never
+          # reuse, always bump past" — see release-plan.md.
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists — pick a higher version"
+            exit 1
+          fi
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        # Needed only so `cargo build` below can refresh Cargo.lock
+        # with the new workspace member versions.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-pr
+
+      - name: Run bump-version.sh
+        run: ./scripts/bump-version.sh "${{ inputs.version }}"
+
+      - name: Refresh Cargo.lock
+        # `cargo build` updates Cargo.lock with the new workspace
+        # member versions. `--exclude sqlrite-desktop` because the
+        # desktop crate needs the Svelte frontend compiled first
+        # (Tauri's build.rs looks for `desktop/dist/`) — we're not
+        # building a release artifact here, just refreshing the lock.
+        # `--quiet` keeps the log tidy; a real compile failure still
+        # surfaces.
+        run: cargo build --workspace --exclude sqlrite-desktop --quiet
+
+      - name: Configure git identity
+        # Use the github-actions[bot] identity so the commit shows
+        # up as from the bot, not as an impersonation. The email is
+        # the stable one GitHub uses for the bot account.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create branch + commit
+        # The commit message prefix `release: v` is load-bearing —
+        # `release.yml` matches on it to trigger the publish side
+        # after the PR merges. Keep it exact.
+        run: |
+          BRANCH="release/v${{ inputs.version }}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "release: v${{ inputs.version }}"
+          git push -u origin "$BRANCH"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Release v${{ inputs.version }}" \
+            --head "release/v${{ inputs.version }}" \
+            --base main \
+            --body "Bumps every product to \`v${{ inputs.version }}\` (previously \`${{ steps.validate.outputs.current }}\`).
+
+          The diff should be exactly:
+          - 10 manifests with a new \`version\` string (root Cargo.toml, sqlrite-ffi, sdk/python × 2, sdk/nodejs × 2, sdk/wasm, desktop × 3).
+          - \`Cargo.lock\` refreshed with the new workspace versions.
+
+          **Once this PR merges**, the \`release.yml\` workflow automatically:
+          1. Tags \`sqlrite-v${{ inputs.version }}\`, \`sqlrite-ffi-v${{ inputs.version }}\`, and umbrella \`v${{ inputs.version }}\` against the merge commit.
+          2. Publishes the Rust engine to crates.io (gated by maintainer approval in the \`release\` environment).
+          3. Builds \`libsqlrite_c\` for Linux x86_64/aarch64 + macOS aarch64 + Windows x86_64 and uploads them to the \`sqlrite-ffi\` GitHub Release.
+          4. Creates the umbrella \`v${{ inputs.version }}\` GitHub Release with auto-generated notes linking to the per-product ones.
+
+          Python / Node.js / WASM / Go / desktop SDKs land as their publish jobs come online (Phases 6e–6i).
+
+          See [docs/release-plan.md](../blob/main/docs/release-plan.md) for the full flow."

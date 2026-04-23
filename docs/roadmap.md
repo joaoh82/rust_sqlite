@@ -366,11 +366,34 @@ One-time non-code setup — the state lives in registry web UIs + GitHub setting
 
 The runbook is safe to execute right now — the PyPI + npm trusted-publisher entries reference `release.yml` (which lands in Phase 6d); they'll sit idle until that workflow exists.
 
-### Phase 6d — `release-pr.yml` + partial `release.yml`
+### ✅ Phase 6d — `release-pr.yml` + skeleton `release.yml`
 
-**`release-pr.yml`** — `workflow_dispatch` with a `version` input. Bumps every manifest, opens a PR titled `Release vX.Y.Z`.
+Two new workflows under `.github/workflows/`:
 
-**`release.yml`** (partial) — triggered by the release PR's merge commit (matches `^release: v`). First iteration wires up the `tag-all`, `publish-crate`, `publish-ffi`, and `finalize` jobs only. After this step lands, `cargo publish` + GitHub Release tarballs work end-to-end at a canary `0.1.1` version.
+**`release-pr.yml`** (dispatch → PR):
+- `workflow_dispatch` with a `version` input (required, semver-validated).
+- Validates: rejects downgrades, rejects reuse of an existing `v*` tag.
+- Creates branch `release/vX.Y.Z`, runs `scripts/bump-version.sh`, refreshes `Cargo.lock` via `cargo build --workspace --exclude sqlrite-desktop`.
+- Commits with the exact message `release: vX.Y.Z` (load-bearing — the publish workflow matches on it).
+- Pushes the branch, opens a PR titled `Release vX.Y.Z` with a body documenting what the merge will trigger.
+- Uses the `github-actions[bot]` identity for the commit; default `GITHUB_TOKEN` for push + PR-open (no extra secrets).
+
+**`release.yml`** (merge → tag + publish):
+- Triggers on `push: branches: [main]` with a first-step check of the HEAD commit message: if it matches `^release: v<semver>$`, proceed; else exit silently (so every non-release push to main no-ops cleanly).
+- Also reachable via `workflow_dispatch` for manual re-runs after partial failures (e.g., transient wheel-upload flake; re-dispatch at the same version).
+- Concurrency group `release` — one publish at a time, no parallel clobbering.
+
+Jobs wired up in Phase 6d:
+
+1. **detect** — parse version from commit message or dispatch input. Outputs `version` + `should_release`.
+2. **tag-all** — idempotent: creates `sqlrite-vX.Y.Z`, `sqlrite-ffi-vX.Y.Z`, and umbrella `vX.Y.Z`; skips any tag that already exists so "Re-run failed jobs" works cleanly after a partial-failure scenario.
+3. **publish-crate** — `cargo publish -p sqlrite --no-verify` using `CRATES_IO_TOKEN` from the `release` environment (required-reviewer gate applies). Creates the per-product GitHub Release `sqlrite-vX.Y.Z`.
+4. **publish-ffi** — matrix build of `libsqlrite_c` on Linux x86_64 (`ubuntu-latest`), Linux aarch64 (`ubuntu-24.04-arm`), macOS aarch64 (`macos-latest`), Windows x86_64 (`windows-latest`). Packages the cdylib + staticlib + `sqlrite.h` + README stub into a tarball, uploads to the `sqlrite-ffi-vX.Y.Z` GitHub Release. macOS universal (x86_64 + aarch64 lipo'd together) is a follow-up — MVP ships aarch64-only for Mac; add `macos-13` to the matrix if x86 demand materializes.
+5. **finalize** — creates the umbrella `vX.Y.Z` GitHub Release with GitHub's native auto-generated notes (`generate_release_notes: true`). Body links to every per-product release from this wave.
+
+Products whose publish jobs land in later phases (desktop, Python, Node.js, WASM, Go) aren't tagged yet — `tag-all` only creates tags for products that have an active publish job. Cleaner than creating empty releases for products we can't actually ship.
+
+**Verification path**: push this branch → merge → dispatch `release-pr.yml` with version `0.1.1` → review the auto-opened PR → merge → approve the `release` environment prompt → watch crates.io show `sqlrite 0.1.1` + Release page show two per-product releases + umbrella release. Once that works end-to-end, 6e lands the desktop publish, and we bump to `v0.1.2` for the next canary.
 
 ### Phase 6e — Desktop publish
 
