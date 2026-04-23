@@ -252,20 +252,38 @@ Landed:
 
 Phase 6e will publish prebuilt binaries to npm via the napi-rs GitHub Action (Linux x86_64/aarch64, macOS universal, Windows x86_64).
 
-### Phase 5e — Go SDK
+### ✅ Phase 5e — Go SDK
 
-Git module via cgo against the C FFI. Implements `database/sql` driver so Go users get the idiomatic standard-library experience:
+New `sdk/go/` directory ships a Go module at `github.com/joaoh82/rust_sqlite/sdk/go`. Unlike Python and Node (which bind Rust directly), Go goes through the C ABI from Phase 5b via cgo — Go's FFI story is cgo-shaped, so leveraging the existing `libsqlrite_c.{so,dylib,dll}` is both natural and free.
 
 ```go
 import (
     "database/sql"
     _ "github.com/joaoh82/rust_sqlite/sdk/go"
 )
+
 db, _ := sql.Open("sqlrite", "foo.sqlrite")
-db.Exec("INSERT INTO users (name) VALUES (?)", "alice")
+db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+rows, _ := db.Query("SELECT id, name FROM users")
+for rows.Next() {
+    var id int64; var name string
+    rows.Scan(&id, &name)
+}
 ```
 
-Examples in `examples/go/`.
+Landed:
+
+- Implements the full `database/sql/driver` surface: `Driver`, `Conn`, `Stmt`, `Rows`, `Tx`, plus context-aware variants (`ConnBeginTx`, `ExecerContext`, `QueryerContext`, `StmtExecContext`, `StmtQueryContext`, `Pinger`).
+- `sqlrite.DriverName = "sqlrite"` registered at package init; `_ "github.com/joaoh82/rust_sqlite/sdk/go"` is all users need.
+- `sqlrite.OpenReadOnly(path)` side door since `database/sql.Open` doesn't carry a read-only flag. Returns a regular `*sql.DB` backed by a custom `driver.Connector`.
+- cgo wiring: `#cgo CFLAGS: -I${SRCDIR}/../../sqlrite-ffi/include` + `LDFLAGS: -L…/target/release -lsqlrite_c` with an embedded rpath so `go run` / `go test` work without `DYLD_LIBRARY_PATH` dance.
+- Column type detection in `Rows.Next` tries `int64 → double → text` accessors in order, picking the first non-erroring one. Engine returns Bool/Int/Real via their Display through `sqlrite_column_text` as a catch-all.
+- 9 `go test` integration tests covering CRUD + `QueryRow` + `Columns()` + transactions commit/rollback + file-backed persistence across reopens + `OpenReadOnly` + bad-SQL + parameter-binding rejection.
+- Runnable `examples/go/hello.go` with its own `go.mod` + `replace` directive at `examples/go/`.
+
+Prerequisites for building from source: `cargo build --release -p sqlrite-ffi` to materialize `libsqlrite_c`. Phase 6e will publish prebuilt binaries as GitHub Release assets so end users don't need the Rust toolchain.
+
+Phase 6e also tags `sdk/go/v*.*.*` so `go get github.com/joaoh82/rust_sqlite/sdk/go@v0.1.0` resolves via Go's module proxy — no central registry push needed for Go.
 
 ### Phase 5f — Rust crate polish
 

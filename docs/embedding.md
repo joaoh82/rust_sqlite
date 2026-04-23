@@ -161,11 +161,32 @@ Unlike the C SDK, the Node.js binding wraps the Rust `Connection` directly (via 
 
 Full API tour: [`sdk/nodejs/README.md`](../sdk/nodejs/README.md); runnable walkthrough: [`examples/nodejs/hello.mjs`](../examples/nodejs/hello.mjs).
 
-### Go / WASM (Phases 5e – 5g)
+### Go (Phase 5e) ✅
 
-Still to come. Each SDK's README will show the language-idiomatic API; see [`examples/{go,wasm}/`](../examples/) as those land.
+`sdk/go/` — cgo-linked against `libsqlrite_c` from Phase 5b, implementing `database/sql/driver`:
 
-**Go** binds against the C ABI documented above via cgo + the `database/sql` driver contract. **WASM** uses `wasm-pack` to compile the Rust engine to the browser directly; the shipped package is `sqlrite-wasm` on npm.
+```go
+import (
+    "database/sql"
+    _ "github.com/joaoh82/rust_sqlite/sdk/go"
+)
+
+db, _ := sql.Open("sqlrite", "foo.sqlrite")
+_, _ = db.Exec("INSERT INTO users (name) VALUES ('alice')")
+rows, _ := db.Query("SELECT id, name FROM users")
+for rows.Next() {
+    var id int64; var name string
+    rows.Scan(&id, &name)
+}
+```
+
+Unlike the Python and Node.js bindings, Go goes through the C ABI — cgo is Go's FFI shape, so leveraging the existing `sqlrite-ffi` shim is natural and free. The driver implements every major `database/sql/driver` interface (`Driver`, `Conn`, `Stmt`, `Rows`, `Tx`, plus the context-aware variants), so every standard library construct works: `QueryRow`, `Prepare`, transactions via `db.Begin()`, `*sql.Stmt.ExecContext`, etc.
+
+Full API tour: [`sdk/go/README.md`](../sdk/go/README.md); runnable walkthrough: [`examples/go/hello.go`](../examples/go/hello.go).
+
+### WASM (Phase 5g)
+
+Still to come. `wasm-pack` compiles the Rust engine straight to the browser (no FFI hop — WebAssembly is the target directly). The shipped package is `sqlrite-wasm` on npm; `examples/wasm/` lands alongside it.
 
 A fix in the Rust engine propagates through one wrapper update per language rather than four separate binding rewrites.
 

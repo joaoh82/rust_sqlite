@@ -29,5 +29,11 @@ sdk/nodejs/*.node
 sdk/nodejs/index.js
 sdk/nodejs/index.d.ts
 
+# Go SDK — go.sum files are environment-specific during development
+# until a published tag lands (Phase 6e); until then we commit only
+# go.mod and let downstream users run `go mod tidy` themselves.
+sdk/go/go.sum
+examples/go/go.sum
+
 # macOS
 .DS_Store
