@@ -183,9 +183,18 @@ while let Some(row) = rows.next()? {
 - **Parameter binding** — `stmt.query(&[&30])` style. Requires touching the executor and the parser path; material enough to deserve its own commit.
 - **Cursor abstraction** (deferred from Phase 3d). Today `Rows` wraps an eagerly-materialized `Vec<Vec<Value>>`. Phase 5a.2 swaps this for a lazy B-Tree walker so long SELECTs stream in O(1) memory. Touches `Table::rowids`, `Table::get_value`, and the executor's row iteration; the `Rows::next() -> Result<Option<Row>>` signature was designed up-front to accept the streaming version without an API break.
 
-### Phase 5b — C FFI shim
+### ✅ Phase 5b — C FFI shim
 
-`libsqlrite.so` / `libsqlrite.dylib` / `libsqlrite.dll`. Opaque-pointer types (`SqlriteConnection*`, `SqlriteStatement*`), C error codes, UTF-8 string conventions. Generated `sqlrite.h` via `cbindgen`. This is the universal ABI every non-Rust language binds against.
+New `sqlrite-ffi/` workspace crate ships `libsqlrite_c.{so,dylib,dll}` + `libsqlrite_c.a` alongside a cbindgen-generated `sqlrite-ffi/include/sqlrite.h`. Opaque-pointer types (`SqlriteConnection*`, `SqlriteStatement*`), C-style status codes (`Ok` / `Error` / `InvalidArgument` / `Done` / `Row`), thread-local last-error via `sqlrite_last_error()`. UTF-8 strings in both directions; heap-allocated C strings returned by `sqlrite_column_text` / `sqlrite_column_name` must be freed via `sqlrite_free_string`.
+
+Split API rather than SQLite's prepare/step-for-everything: `sqlrite_execute` is fire-and-forget for DDL/DML/transactions, `sqlrite_query` returns a statement handle that yields rows via `sqlrite_step` + `sqlrite_column_int64` / `_double` / `_text` / `_is_null`. `sqlrite_in_transaction` / `sqlrite_is_read_only` expose the flags.
+
+Crate named `sqlrite_c` (so the rlib doesn't collide with the root `sqlrite` crate; the shipped artifact is `libsqlrite_c.{so,dylib,dll}` — SDKs link against `-lsqlrite_c`). `build.rs` regenerates the header from the `extern "C"` surface on each `cargo build`.
+
+Deliverables:
+- 8 FFI-level tests covering every code path (open/execute/query/step/column_*/transactions/NULL/null-pointer/close-null-noop).
+- `examples/c/hello.c` + `Makefile` — runnable end-to-end sample that opens an in-memory DB, runs CREATE/INSERT/SELECT, iterates rows, runs a BEGIN/ROLLBACK block. `make run` does the whole build-and-execute.
+- `sqlrite-ffi/include/sqlrite.h` committed to the repo so downstream C consumers can grab the header without running cargo.
 
 ### Phase 5c — Python SDK
 

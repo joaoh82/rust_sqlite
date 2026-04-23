@@ -195,7 +195,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 
 **Phase 5 — Embedding surface: public API + language SDKs**
 - [x] **5a — Public Rust API** *(partial)*: `Connection` / `Statement` / `Rows` / `Row` / `OwnedRow` / `FromValue` / `Value` at the crate root; structured row return from the executor; `examples/rust/quickstart.rs` runnable via `cargo run --example quickstart`. Parameter binding + cursor abstraction deferred to 5a.2.
-- [ ] **5b — C FFI shim**: `libsqlrite.{so,dylib,dll}` + generated `sqlrite.h` via `cbindgen`; opaque-pointer types, C error codes, UTF-8 strings
+- [x] **5b — C FFI shim**: new `sqlrite-ffi/` workspace crate ships `libsqlrite_c.{so,dylib,dll}` + a cbindgen-generated `sqlrite.h`. Opaque-pointer types, thread-local last-error, split `sqlrite_execute` (DDL/DML/transactions) vs `sqlrite_query`/`sqlrite_step` (SELECT iteration). Runnable `examples/c/hello.c` + `Makefile` (`cd examples/c && make run`).
 - [ ] **5c — Python SDK** on PyPI: `sqlrite` module via PyO3 + maturin, DB-API 2.0-inspired surface (`sqlrite.connect(...)`, `cursor.execute(...)`)
 - [ ] **5d — Node.js SDK** on npm: prebuilt `.node` bindings via napi-rs; `better-sqlite3`-style sync API (`new Database(...)`, `stmt.prepare(...).run(...)`)
 - [ ] **5e — Go SDK** via cgo against the C FFI; implements `database/sql` driver so users get the standard-library experience (`sql.Open("sqlrite", path)`)

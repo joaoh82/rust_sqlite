@@ -1,9 +1,9 @@
 [workspace]
-# Root Cargo package (the engine crate) + the Tauri desktop app.
-# The engine is also the workspace root's own package for historical
-# compatibility with scripts that assume `cargo build` at the repo root
-# produces the REPL binary.
-members = [".", "desktop/src-tauri"]
+# Root Cargo package (the engine crate) + the Tauri desktop app + the
+# C FFI shim. The engine is also the workspace root's own package for
+# historical compatibility with scripts that assume `cargo build` at
+# the repo root produces the REPL binary.
+members = [".", "desktop/src-tauri", "sqlrite-ffi"]
 resolver = "3"
 
 [package]

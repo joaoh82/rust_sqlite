@@ -12,5 +12,8 @@ desktop/src-tauri/target
 desktop/src-tauri/gen
 desktop/.vite
 
+# Compiled C samples (the source stays; the binary is rebuilt per platform)
+examples/c/hello
+
 # macOS
 .DS_Store
