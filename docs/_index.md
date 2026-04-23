@@ -40,6 +40,7 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 ## Release engineering
 
 - [Release plan](release-plan.md) — Phase 6 design doc: lockstep versioning, PR-based release flow, OIDC trusted publishing, the ten-file version-bump surface
+- [Release secrets runbook](release-secrets.md) — one-time web-UI setup for crates.io, PyPI, npm, GitHub `release` environment, and `main` branch protection
 - [`scripts/`](../scripts/) — runnable tooling used by release workflows + reproducible locally (start with `scripts/bump-version.sh`)
 
 ## Conventions

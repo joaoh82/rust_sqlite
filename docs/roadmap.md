@@ -354,9 +354,17 @@ Pre-existing clippy warnings (~24, mostly cosmetic — overindented docstrings, 
 
 One pre-existing warning fixed inline during Phase 6b: a `3.14` test constant in `src/sql/pager/cell.rs` that clippy's `approx_constant` lint (deny-by-default) flags as a PI lookalike. Swapped for `2.5`.
 
-### Phase 6c — Branch protection + trusted publishing setup
+### ✅ Phase 6c — Trusted-publisher + branch-protection runbook
 
-One-time non-code setup. `main` requires `ci.yml` green + 1 review. PyPI trusted publisher pointed at this repo's `release.yml`. Same for npm (`sqlrite` and `sqlrite-wasm` packages). GitHub Environment named `release` with the maintainer as a required reviewer — acts as the human-in-the-loop gate before publish jobs actually write to a registry. Captured in `docs/release-secrets.md`.
+One-time non-code setup — the state lives in registry web UIs + GitHub settings, not in this repo. Documented top-to-bottom in [`docs/release-secrets.md`](release-secrets.md) so future-you isn't re-discovering it at 2am:
+
+1. **crates.io API token** → `CRATES_IO_TOKEN` in the `release` environment's secrets (crates.io doesn't support OIDC yet, so this is the only long-lived token in the pipeline).
+2. **PyPI trusted publisher** pointed at `release.yml` / environment `release` — short-lived OIDC tokens, no secret to leak.
+3. **npm trusted publishers** for both `sqlrite` (the Node binding) and `sqlrite-wasm` (the browser binding). npm doesn't have a pending-publisher mode like PyPI, so the runbook captures the first-release bootstrap: temporary `NPM_TOKEN`, then swap to OIDC.
+4. **GitHub `release` environment** — required reviewer (maintainer), `main`-only deployments, scoped secrets. Acts as a second human-in-the-loop gate after the Release PR merge but before any registry write.
+5. **Branch protection on `main`** — require 14 CI status checks green + 1 review + conversation resolution. Admin bypass left available for emergencies.
+
+The runbook is safe to execute right now — the PyPI + npm trusted-publisher entries reference `release.yml` (which lands in Phase 6d); they'll sit idle until that workflow exists.
 
 ### Phase 6d — `release-pr.yml` + partial `release.yml`
 
