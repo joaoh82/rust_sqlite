@@ -58,6 +58,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # Bash on every OS — Windows uses Git Bash (preinstalled on
+        # `windows-latest`). Without this, Windows defaults to pwsh,
+        # which doesn't understand bash's backslash line-continuation
+        # in multi-line `run:` blocks.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
