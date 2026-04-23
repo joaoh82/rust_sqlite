@@ -8,7 +8,7 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 |----------|--------|---------------|-----------|
 | Rust     | ✅ Phase 5a       | crates.io (Phase 6c) | [`rust/`](rust/)     |
 | C (FFI)  | ✅ Phase 5b       | GitHub Releases (Phase 6d) | [`c/`](c/)           |
-| Python   | 🚧 Phase 5c       | PyPI (Phase 6e)      | _coming soon_ |
+| Python   | ✅ Phase 5c       | PyPI (Phase 6e)      | [`python/`](python/) |
 | Node.js  | 🚧 Phase 5d       | npm (Phase 6e)       | _coming soon_ |
 | Go       | 🚧 Phase 5e       | Go modules (Phase 6e)| _coming soon_ |
 | WASM     | 🚧 Phase 5g       | npm as `sqlrite-wasm` (Phase 6e) | _coming soon_ |
@@ -32,6 +32,19 @@ cd examples/c && make run
 Builds the Rust cdylib (`libsqlrite_c.{so,dylib,dll}`) and compiles [`c/hello.c`](c/hello.c) against its generated header. The binary embeds an rpath pointing at the cargo target dir so `./hello` runs without any `LD_LIBRARY_PATH` / `DYLD_*` dance. Covers open → execute → query → step → column accessors + an explicit transaction block.
 
 See the top of [`c/hello.c`](c/hello.c) for the ownership rules that apply to every non-Rust binding (opaque handles, `sqlrite_free_string` for text columns, thread-local `sqlrite_last_error`).
+
+## Running the Python sample
+
+```bash
+# One-time: install maturin and build the wheel into your Python env.
+pip install maturin
+cd sdk/python && maturin develop
+
+# Then from the repo root:
+python examples/python/hello.py
+```
+
+Mirrors the Rust quickstart shape via the DB-API: `sqlrite.connect(":memory:")` → `cursor.execute` → iterate tuples, plus a BEGIN/ROLLBACK block. See [`python/hello.py`](python/hello.py) and [`sdk/python/README.md`](../sdk/python/README.md) for the full API tour.
 
 ## Design notes
 

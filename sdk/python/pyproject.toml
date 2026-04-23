@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sqlrite"
+version = "0.1.0"
+description = "Python bindings for SQLRite — a small, embeddable SQLite clone written in Rust."
+authors = [{ name = "Joao Henrique Machado Silva", email = "joaoh82@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["database", "sql", "sqlite", "embedded", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/joaoh82/rust_sqlite"
+Repository = "https://github.com/joaoh82/rust_sqlite"
+Documentation = "https://github.com/joaoh82/rust_sqlite/blob/main/docs/embedding.md"
+
+[tool.maturin]
+# Tell maturin the Python import name. Our Rust lib is `sqlrite_pymod`
+# (to avoid a crate-name collision with the root `sqlrite` crate), but
+# users `import sqlrite`.
+module-name = "sqlrite"
+# Let maturin produce abi3 wheels from the abi3-py38 feature declared
+# in Cargo.toml — one wheel per platform, not per Python version.
+features = ["pyo3/extension-module"]

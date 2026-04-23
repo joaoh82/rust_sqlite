@@ -196,21 +196,32 @@ Deliverables:
 - `examples/c/hello.c` + `Makefile` — runnable end-to-end sample that opens an in-memory DB, runs CREATE/INSERT/SELECT, iterates rows, runs a BEGIN/ROLLBACK block. `make run` does the whole build-and-execute.
 - `sqlrite-ffi/include/sqlrite.h` committed to the repo so downstream C consumers can grab the header without running cargo.
 
-### Phase 5c — Python SDK
+### ✅ Phase 5c — Python SDK
 
-`sqlrite` on PyPI. Built with `PyO3` + `maturin` so we ship prebuilt wheels per platform (no "install Rust first" tax on end users). Shape inspired by `sqlite3` / PEP 249 (DB-API 2.0):
+`sqlrite` module shipped via new `sdk/python/` workspace crate (PyO3 `abi3-py38` + maturin). One wheel works on every CPython 3.8+ release — no per-version rebuild. Shape follows PEP 249 / the stdlib `sqlite3` module:
 
 ```python
 import sqlrite
-conn = sqlrite.connect("foo.sqlrite")
-cur = conn.cursor()
-cur.execute("INSERT INTO users (name) VALUES (?)", ("alice",))
-for row in cur.execute("SELECT * FROM users"):
-    print(row)
-conn.commit()
+
+with sqlrite.connect("foo.sqlrite") as conn:
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+    cur.execute("INSERT INTO users (name) VALUES ('alice')")
+    for row in cur.execute("SELECT id, name FROM users"):
+        print(row)  # tuples, not Row objects (DB-API style)
 ```
 
-Examples in `examples/python/`.
+Landed:
+
+- `Connection` (`connect(path)` / `connect_read_only(path)` / `":memory:"`), `Cursor` (`execute`, `executemany`, `executescript`, `fetchone`/`fetchmany`/`fetchall`, iteration, `description`, `rowcount`), context-manager support (commits on clean exit, rolls back on exception), `in_transaction` / `read_only` properties.
+- `sqlrite.SQLRiteError` exception — every Rust error surfaces as this.
+- Parameter binding accepts the DB-API signature but raises `TypeError` on non-empty params (deferred to Phase 5a.2, which adds real binding across the whole stack).
+- Wraps the Rust `Connection` directly rather than the C FFI — PyO3 marshals types without the extra C round-trip.
+- 16 pytest integration tests in `sdk/python/tests/` covering CRUD, transactions, context manager commit/rollback, file-backed persistence, read-only rejection, error paths, DB-API shortcuts, `executescript`.
+- `examples/python/hello.py` runnable walkthrough after `maturin develop`.
+- `sdk/python/README.md` — install, quickstart, API table, status.
+
+Phase 6e will publish wheels to PyPI via `maturin-action` (manylinux x86_64/aarch64, macOS universal, Windows x86_64).
 
 ### Phase 5d — Node.js SDK
 

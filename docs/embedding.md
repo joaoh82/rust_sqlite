@@ -122,9 +122,33 @@ Every mutating call returns a `SqlriteStatus` int. `Ok = 0`; nonzero means check
 
 ## Language SDKs (Phases 5c – 5g)
 
-Shape stays consistent across bindings — `connect(path)` → `prepare(sql)` → `execute()` / `query()` / iteration, plus explicit transaction statements. Each SDK's README will show the language-idiomatic API; see [`examples/{python,nodejs,go,wasm}/`](../examples/) as those land.
+Shape stays consistent across bindings — `connect(path)` → `cursor`/`prepare` → `execute` / `query` / iteration, plus explicit transaction statements.
 
-All non-Rust SDKs bind against the same C ABI documented above, so a fix in the Rust engine propagates through one wrapper update rather than four separate binding rewrites.
+### Python (Phase 5c) ✅
+
+`sdk/python/` — PyO3 (`abi3-py38`) + maturin, PEP 249 / stdlib-`sqlite3` shape:
+
+```python
+import sqlrite
+
+with sqlrite.connect("foo.sqlrite") as conn:
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (name) VALUES ('alice')")
+    for row in cur.execute("SELECT id, name FROM users"):
+        print(row)  # tuples
+```
+
+The Python binding wraps the Rust `Connection` directly (not via the C FFI) — PyO3 marshals types cheaper than a C round-trip. Build via `cd sdk/python && maturin develop`; tests via `python -m pytest sdk/python/tests/`. PyPI publish lands in Phase 6e.
+
+Full API tour: [`sdk/python/README.md`](../sdk/python/README.md); runnable walkthrough: [`examples/python/hello.py`](../examples/python/hello.py).
+
+### Node.js / Go / WASM (Phases 5d – 5g)
+
+Still to come. Each SDK's README will show the language-idiomatic API; see [`examples/{nodejs,go,wasm}/`](../examples/) as those land.
+
+**Node.js** and **Go** both bind against the C ABI documented above (napi-rs for Node's `.node` module; cgo for Go's `database/sql` driver). **WASM** uses `wasm-pack` to compile the Rust engine to the browser directly; the shipped package is `sqlrite-wasm` on npm.
+
+A fix in the Rust engine propagates through one wrapper update per language rather than four separate binding rewrites.
 
 ## Distribution (Phase 6)
 
