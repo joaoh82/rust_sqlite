@@ -1,12 +1,13 @@
-# sqlrite (Node.js)
+# @joaoh82/sqlrite (Node.js)
 
 Node.js bindings for [SQLRite](https://github.com/joaoh82/rust_sqlite) — a small, embeddable SQLite clone written in Rust. Shape follows [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3) (sync API, row-as-object), so Node developers who've used that library can pick this up without reading the docs.
+
+> **Why the scoped name?** npm's registry rejected the unscoped `sqlrite` name as too similar to the existing `sqlite` / `sqlite3` packages. Scoping under `@joaoh82` (my npm user scope) bypasses that check cleanly — same pattern as `@napi-rs/canvas`, `@swc/core`, `@aws-sdk/client-s3`.
 
 ## Install
 
 ```bash
-# From npm (once Phase 6e's CI/CD release pipeline is live):
-npm install sqlrite
+npm install @joaoh82/sqlrite
 
 # From source in a clone of the repo:
 cd sdk/nodejs
@@ -17,7 +18,7 @@ npm run build         # produces sqlrite.<platform>-<arch>.node
 ## Quick tour
 
 ```js
-import { Database } from 'sqlrite';
+import { Database } from '@joaoh82/sqlrite';
 
 // File-backed or in-memory (use `":memory:"` to match better-sqlite3).
 const db = new Database('foo.sqlrite');

@@ -811,9 +811,11 @@ jobs:
 
       # Single atomic publish. `--provenance` signs the package
       # with a sigstore-backed attestation linking it to this
-      # workflow run. `--access public` because scoped packages
-      # default to private — we're using an unscoped name, but
-      # the flag is harmless and future-proofs against a rename.
+      # workflow run. `--access public` is REQUIRED because
+      # `@joaoh82/sqlrite` is a scoped package and scoped
+      # packages default to private; without the flag, npm
+      # would reject the upload for a free-tier account that
+      # can't host private packages.
       - name: Publish to npm
         working-directory: sdk/nodejs
         run: npm publish --provenance --access public
@@ -827,14 +829,14 @@ jobs:
           tag_name: sqlrite-node-v${{ needs.detect.outputs.version }}
           name: Node.js v${{ needs.detect.outputs.version }}
           body: |
-            Published to npm: https://www.npmjs.com/package/sqlrite/v/${{ needs.detect.outputs.version }}
+            Published to npm: https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}
 
             ```bash
-            npm install sqlrite@${{ needs.detect.outputs.version }}
+            npm install @joaoh82/sqlrite@${{ needs.detect.outputs.version }}
             ```
 
             ```javascript
-            const { Database } = require('sqlrite');
+            const { Database } = require('@joaoh82/sqlrite');
 
             const db = new Database(':memory:');
             db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
@@ -892,7 +894,7 @@ jobs:
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
-            - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
 
             _WASM / Go SDKs land as their publish jobs come online (Phases 6h–6i)._
 

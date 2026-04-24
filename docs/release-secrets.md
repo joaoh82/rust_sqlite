@@ -105,27 +105,36 @@ release, status flips to "active".
 
 ## 3. npm trusted publishers (two packages)
 
-**Why two:** we publish `sqlrite` (Node.js bindings from
+**Why two:** we publish `@joaoh82/sqlrite` (Node.js bindings from
 `sdk/nodejs/`) and `sqlrite-wasm` (browser bindings from
 `sdk/wasm/`) as separate npm packages. Each needs its own
 trusted-publisher record.
 
-### 3a. Reserve `sqlrite` on npm
+**Why the scoped name on the Node.js package:** npm's registry
+rejects the unscoped `sqlrite` name because of a similarity check
+against the existing `sqlite` / `sqlite3` packages (levenshtein
+distance 1). Scoping under `@joaoh82` (the author's npm user
+scope) bypasses the check cleanly — same pattern as `@napi-rs/*`,
+`@swc/core`, etc. Discovered during the v0.1.5 canary attempt;
+rename PR landed before the retry. Applies to the Node.js
+package only; `sqlrite-wasm` may or may not hit the same check
+when 6h lands (if it does, rename to `@joaoh82/sqlrite-wasm`).
 
-1. Log in at <https://www.npmjs.com/>.
-2. Search for `sqlrite` — confirm it's not taken. (If it is,
-   we'll rename — update `sdk/nodejs/package.json`'s `name` +
-   `napi.name` to something like `@joaoh82/sqlrite` and file an
-   issue.)
+### 3a. Reserve `@joaoh82/sqlrite` on npm
 
-### 3b. Trusted publisher for `sqlrite`
+1. Log in at <https://www.npmjs.com/> as `joaoh82`.
+2. Scoped packages under your user scope are auto-owned — no
+   manual name reservation step required. First-time publish
+   against the trusted publisher will create the package.
+
+### 3b. Trusted publisher for `@joaoh82/sqlrite`
 
 npm's trusted publishing flow:
 
-1. From the package page (after first manual publish, or via
-   <https://www.npmjs.com/package/sqlrite> once pre-registered),
-   click **Settings** → **Trusted Publishers**.
+1. Go to <https://www.npmjs.com/settings/~/packages> (or your
+   profile → Packages) → **Trusted Publishers** tab.
 2. **Add a new publisher**:
+   - **Package name**: `@joaoh82/sqlrite`
    - **Publisher**: GitHub Actions
    - **Organization or user**: `joaoh82`
    - **Repository**: `rust_sqlite`
@@ -133,20 +142,14 @@ npm's trusted publishing flow:
    - **Environment**: `release`
 3. Save.
 
-**npm's chicken-and-egg:** npm doesn't offer a "pending
-publisher" mode like PyPI. A package must exist before you can
-add a trusted publisher for it. First-time publish workaround:
-
-- Use a classic npm access token (generate one scoped to publish
-  for `sqlrite` only) for the very first publish only.
-- Store it temporarily as `NPM_TOKEN` in the `release`
-  environment's secrets.
-- After the first publish succeeds, add the trusted publisher
-  via the UI, then delete `NPM_TOKEN` from the secrets.
-- On the next release, OIDC takes over automatically.
-
-Document the temporary token in a pinned issue so it gets
-rotated out once OIDC is live.
+**npm's chicken-and-egg, resolved for scoped packages:** For
+unscoped names (like the abandoned `sqlrite` attempt), npm
+requires the package to already exist before you can add a
+trusted publisher — first publish needs a temporary `NPM_TOKEN`.
+For scoped packages under your own user scope, npm auto-owns
+the scope, and the trusted-publisher registration works against
+the future package before it exists. First CI publish creates
+it cleanly with OIDC. **No temporary token needed.**
 
 ### 3c. Repeat for `sqlrite-wasm`
 
