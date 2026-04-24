@@ -124,24 +124,27 @@ sqlrite> DELETE FROM users WHERE age < 30;
 
 #### Supported SQL
 
+**See [docs/supported-sql.md](docs/supported-sql.md) for the full reference** — semantics, error behavior, NULL rules, type coercion, case-sensitivity, read-only mode, and the complete list of what's *not* supported yet. The table below is a quick-reference summary.
+
 | Statement | Features |
 |---|---|
-| `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN` |
-| `CREATE [UNIQUE] INDEX` | single-column, named indexes; `IF NOT EXISTS` supported; persists as a dedicated cell-based B-Tree |
-| `INSERT INTO` | auto-ROWID for INTEGER PRIMARY KEY; UNIQUE enforcement via indexes; clean type errors (no panics) |
-| `SELECT` | `*` or column list, `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`. `WHERE col = literal` probes an index when one exists |
-| `UPDATE` | multi-column `SET`, `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
+| `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN`. Auto-creates `sqlrite_autoindex_<table>_<col>` for every PK + UNIQUE column |
+| `CREATE [UNIQUE] INDEX` | Single-column, named indexes; `IF NOT EXISTS`; persists as a dedicated cell-based B-Tree. INTEGER + TEXT columns only |
+| `INSERT INTO` | Explicit column list required; auto-ROWID for `INTEGER PRIMARY KEY`; multi-row `VALUES (…), (…)`; UNIQUE enforcement; clean type errors (no panics); NULL padding for omitted columns |
+| `SELECT` | `*` or column list; `WHERE`; single-column `ORDER BY [ASC\|DESC]`; `LIMIT n`. `WHERE col = literal` probes an index when one exists |
+| `UPDATE` | Multi-column `SET`; `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | Real transactions, snapshot-based; WAL-backed commit; single-level (no savepoints); auto-rollback if `COMMIT`'s disk write fails |
 
-Expressions in `WHERE` and `SET`:
+Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 
 - Comparisons — `=`, `<>`, `<`, `<=`, `>`, `>=`
-- Logical — `AND`, `OR`, `NOT`
+- Logical — `AND`, `OR`, `NOT` (SQL three-valued logic; NULL-as-false in `WHERE`)
 - Arithmetic — `+`, `-`, `*`, `/`, `%` (integer ops stay integer; any `REAL` promotes to `f64`; divide/modulo by zero is a clean error)
 - String concat — `||`
-- Literals — numbers, single-quoted strings, booleans, `NULL`; parentheses
+- Literals — integer + real numbers, `'single-quoted strings'`, `TRUE` / `FALSE`, `NULL`; parentheses for grouping
 
-Not yet implemented: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, expressions in the projection list, `OFFSET`. See the [Roadmap](#roadmap).
+**Not yet supported** (common ones): joins, subqueries, CTEs, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, expressions in the projection list, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
 
 #### Meta commands
 
