@@ -6,8 +6,9 @@
 #
 # Phase 6d: tag-all + publish-crate + publish-ffi + finalize.
 # Phase 6e adds publish-desktop.
-# Phases 6f–6i add publish-python / publish-nodejs / publish-wasm /
-# publish-go as separate jobs to this same file.
+# Phase 6f adds build-python-wheels + publish-python.
+# Phases 6g–6i add publish-nodejs / publish-wasm / publish-go as
+# separate jobs to this same file.
 #
 # Design doc: docs/release-plan.md.
 # One-time registry / branch-protection setup: docs/release-secrets.md.
@@ -85,14 +86,15 @@ jobs:
   # BEFORE any publish step so a bad version number (e.g., tag
   # already exists for some reason) aborts the whole release cleanly.
   #
-  # As of Phase 6e, we tag:
+  # As of Phase 6f, we tag:
   #   - sqlrite-v<V>           (Rust engine)
   #   - sqlrite-ffi-v<V>       (C FFI prebuilt binaries)
   #   - sqlrite-desktop-v<V>   (Tauri desktop installers)
+  #   - sqlrite-py-v<V>        (Python wheels on PyPI)
   #   - v<V>                   (umbrella)
   #
-  # Later phases add sqlrite-py-v<V>, sqlrite-node-v<V>,
-  # sqlrite-wasm-v<V>, sdk/go/v<V> as their publish jobs come online.
+  # Later phases add sqlrite-node-v<V>, sqlrite-wasm-v<V>,
+  # sdk/go/v<V> as their publish jobs come online.
   #
   # Idempotent on re-run: if a tag already exists (partial-failure
   # scenario where publish-crate succeeded but publish-ffi failed,
@@ -121,6 +123,7 @@ jobs:
             "sqlrite-v$V"
             "sqlrite-ffi-v$V"
             "sqlrite-desktop-v$V"
+            "sqlrite-py-v$V"
             "v$V"
           )
           for tag in "${TAGS[@]}"; do
@@ -426,6 +429,211 @@ jobs:
           # this — it uses `tagName` as the identity key.)
 
   # ---------------------------------------------------------------------------
+  # Step 3d: build Python wheels for every supported platform.
+  # (Phase 6f — build half; publish half lives in the next job.)
+  #
+  # Why the split: PyPI expects wheels to be uploaded as one
+  # batch — if publish-python-wheels had publish logic inline,
+  # each matrix cell would race to upload its wheel independently,
+  # and a failure mid-matrix would leave PyPI with a partial wave.
+  # The two-job shape lets us aggregate every wheel (+ sdist) into
+  # one `dist/` directory and do the upload as a single atomic
+  # step in the `publish-python` job below.
+  #
+  # Matrix mirrors publish-ffi / publish-desktop — same four
+  # OS / arch combinations. abi3-py38 means each platform gets
+  # ONE wheel that works on every CPython ≥ 3.8, so we don't
+  # need a per-Python-version matrix axis.
+  build-python-wheels:
+    name: Build Python wheel (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            platform: linux-x86_64
+            manylinux: auto
+          - os: ubuntu-24.04-arm
+            target: aarch64
+            platform: linux-aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: aarch64
+            platform: macos-aarch64
+            manylinux: ""
+          - os: windows-latest
+            target: x64
+            platform: windows-x86_64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.10 is the build interpreter; abi3 means the wheel
+          # itself runs on every CPython ≥ 3.8. Any recent
+          # Python on the runner would work — 3.10 is just
+          # well-supported + cached on all runner images.
+          python-version: '3.10'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-python-wheels-${{ matrix.platform }}
+
+      # `maturin-action` builds + packages the wheel. For Linux
+      # `manylinux: auto` means it runs inside a manylinux2014
+      # container so glibc gets baked at an old-enough version
+      # that the wheel runs on any distro shipped since ~2014.
+      # macOS / Windows don't use manylinux — the wheel tags
+      # reflect the specific OS version it was built on.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.platform }}
+          path: sdk/python/dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3e: build the Python source distribution.
+  #
+  # Uploaded alongside the wheels so users on odd platforms not
+  # covered by our wheel matrix (FreeBSD, alpine aarch64, etc.)
+  # can still `pip install sqlrite` and get a source build
+  # (requires their local Rust toolchain, which is the standard
+  # fallback path for any PyO3 crate).
+  build-python-sdist:
+    name: Build Python sdist
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: sdk/python/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3f: aggregate every wheel + the sdist, upload to PyPI
+  # via OIDC trusted publishing, and cut the per-product
+  # `sqlrite-py-v<V>` GitHub Release.
+  #
+  # OIDC trusted publishing: no long-lived PyPI API token exists
+  # anywhere. The `permissions: id-token: write` block below
+  # lets `pypa/gh-action-pypi-publish` mint a short-lived OIDC
+  # token, exchange it at PyPI for a one-time upload token, and
+  # push every wheel. PyPI-side config lives on the `sqlrite`
+  # project's settings page — see docs/release-secrets.md for
+  # the one-time trusted-publisher registration.
+  publish-python:
+    name: Publish Python wheels to PyPI
+    needs: [detect, tag-all, build-python-wheels, build-python-sdist]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC: required for PyPI trusted-publisher token exchange.
+      id-token: write
+      # For the softprops/action-gh-release step at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull every wheel artifact (one per matrix platform) +
+      # the sdist into a single `dist/` directory.
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: dist
+
+      - name: List files about to be uploaded
+        run: ls -la dist/
+
+      # Single atomic upload of all wheels + sdist. If any file
+      # fails to upload, none are published — no partial wave
+      # on PyPI.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Keep `skip-existing: false` so a re-run of this job
+          # (after a partial-failure scenario) fails loudly rather
+          # than silently ignoring already-uploaded files.
+          skip-existing: false
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-py-v${{ needs.detect.outputs.version }}
+          name: Python v${{ needs.detect.outputs.version }}
+          body: |
+            Published to PyPI: https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/
+
+            ```bash
+            pip install sqlrite==${{ needs.detect.outputs.version }}
+            ```
+
+            ```python
+            import sqlrite
+            conn = sqlrite.connect(":memory:")
+            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            conn.execute("INSERT INTO users (name) VALUES (?)", ("alice",))
+            for row in conn.execute("SELECT * FROM users"):
+                print(row)
+            ```
+
+            **Wheels in this release:**
+            - Linux x86_64 (manylinux2014 or newer)
+            - Linux aarch64 (manylinux2014 or newer)
+            - macOS aarch64 (Apple Silicon)
+            - Windows x86_64
+            - Source distribution (`.tar.gz`) — builds from source on other platforms via a local Rust toolchain
+
+            All wheels are `abi3-py38`, so one wheel per platform works on every CPython ≥ 3.8.
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: dist/*
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
   # Step 4: create the umbrella GitHub Release. Runs after all
   # publish-* jobs succeed. Uses GitHub's native auto-generated
   # release notes so the changelog is "everything between the
@@ -433,7 +641,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi, publish-desktop]
+    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -454,8 +662,9 @@ jobs:
             - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }})
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
+            - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
 
-            _Python / Node.js / WASM / Go SDKs land as their publish jobs come online (Phases 6f–6i)._
+            _Node.js / WASM / Go SDKs land as their publish jobs come online (Phases 6g–6i)._
 
             ---
 

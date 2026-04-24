@@ -409,9 +409,15 @@ Release assets land on the `sqlrite-desktop-vX.Y.Z` GitHub Release with a body t
 
 Follow-ups: macOS universal (x86_64 + aarch64 lipo'd — adds one Rust target build + `lipo` step), Linux aarch64 AppImage (adds one matrix cell on `ubuntu-24.04-arm`).
 
-### Phase 6f — Python SDK publish
+### ✅ Phase 6f — Python SDK publish
 
-Adds `publish-python` job. `maturin-action` builds abi3-py38 wheels; PyPI publish via OIDC trusted publisher.
+Adds three jobs to `release.yml` — `build-python-wheels` (matrix), `build-python-sdist` (single), `publish-python` (aggregator + PyPI upload + GitHub Release).
+
+**Two-job shape (build then publish), not one matrix job with inline upload**, because PyPI expects wheels as a single batch — racing uploads from per-platform matrix cells would leave PyPI with a partial wave if any one cell failed. Artifacts from every matrix cell land in a single aggregated `dist/` directory, which is then atomically uploaded by `pypa/gh-action-pypi-publish`.
+
+Wheel matrix mirrors publish-ffi + publish-desktop: Linux x86_64 (manylinux2014 via the `auto` preset), Linux aarch64 (same preset on `ubuntu-24.04-arm`), macOS aarch64, Windows x86_64. abi3-py38 means one wheel per platform works on every CPython ≥ 3.8 — no per-Python-version axis. An sdist is built alongside for platforms not covered by the wheel matrix.
+
+Authentication via PyPI trusted publishing (OIDC) — zero long-lived tokens. `permissions: id-token: write` on the publish job plus the `release` GitHub environment (one-time trusted-publisher config on PyPI's web UI, documented in `docs/release-secrets.md`).
 
 ### Phase 6g — Node.js SDK publish
 
