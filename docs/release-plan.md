@@ -73,7 +73,7 @@ GitHub Releases by product ("show me every Python release").
 | Rust engine     | `sqlrite-vX.Y.Z`       | crates.io + GitHub Release                       |
 | C FFI shim      | `sqlrite-ffi-vX.Y.Z`   | GitHub Release (per-platform tarballs)           |
 | Python SDK      | `sqlrite-py-vX.Y.Z`    | PyPI + GitHub Release                            |
-| Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm + GitHub Release                             |
+| Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm (`@joaoh82/sqlrite`) + GitHub Release        |
 | Go SDK          | `sdk/go/vX.Y.Z`        | Git tag (no registry) + GitHub Release assets    |
 | WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`sqlrite-wasm`) + GitHub Release            |
 | Desktop app     | `sqlrite-desktop-vX.Y.Z` | GitHub Release (unsigned installers)           |

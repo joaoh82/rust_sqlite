@@ -6,12 +6,12 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 
 | Language | Status | SDK published | Directory |
 |----------|--------|---------------|-----------|
-| Rust     | ✅ Phase 5a       | crates.io (Phase 6c) | [`rust/`](rust/)     |
+| Rust     | ✅ Phase 5a       | crates.io as `sqlrite-engine` (Phase 6d) | [`rust/`](rust/)     |
 | C (FFI)  | ✅ Phase 5b       | GitHub Releases (Phase 6d) | [`c/`](c/)           |
-| Python   | ✅ Phase 5c       | PyPI (Phase 6e)      | [`python/`](python/) |
-| Node.js  | ✅ Phase 5d       | npm (Phase 6e)       | [`nodejs/`](nodejs/) |
-| Go       | ✅ Phase 5e       | Go modules (Phase 6e)| [`go/`](go/)         |
-| WASM     | ✅ Phase 5g       | npm as `sqlrite-wasm` (Phase 6e) | [`wasm/`](wasm/)     |
+| Python   | ✅ Phase 5c       | PyPI as `sqlrite` (Phase 6f) | [`python/`](python/) |
+| Node.js  | ✅ Phase 5d       | npm as `@joaoh82/sqlrite` (Phase 6g) | [`nodejs/`](nodejs/) |
+| Go       | ✅ Phase 5e       | Go modules (Phase 6i) | [`go/`](go/)         |
+| WASM     | ✅ Phase 5g       | npm as `sqlrite-wasm` (Phase 6h) | [`wasm/`](wasm/)     |
 
 See [docs/roadmap.md](../docs/roadmap.md) for what each sub-phase delivers.
 

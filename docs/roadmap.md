@@ -360,7 +360,7 @@ One-time non-code setup — the state lives in registry web UIs + GitHub setting
 
 1. **crates.io API token** → `CRATES_IO_TOKEN` in the `release` environment's secrets (crates.io doesn't support OIDC yet, so this is the only long-lived token in the pipeline).
 2. **PyPI trusted publisher** pointed at `release.yml` / environment `release` — short-lived OIDC tokens, no secret to leak.
-3. **npm trusted publishers** for both `sqlrite` (the Node binding) and `sqlrite-wasm` (the browser binding). npm doesn't have a pending-publisher mode like PyPI, so the runbook captures the first-release bootstrap: temporary `NPM_TOKEN`, then swap to OIDC.
+3. **npm trusted publishers** for both `@joaoh82/sqlrite` (the Node binding — scoped because npm rejected the unscoped `sqlrite` name as too similar to `sqlite`/`sqlite3`) and `sqlrite-wasm` (the browser binding). Scoped packages under your own user scope auto-own the name, so the trusted-publisher flow works without a bootstrap `NPM_TOKEN`. See `docs/release-secrets.md` §3 for the full flow.
 4. **GitHub `release` environment** — required reviewer (maintainer), `main`-only deployments, scoped secrets. Acts as a second human-in-the-loop gate after the Release PR merge but before any registry write.
 5. **Branch protection on `main`** — require 14 CI status checks green + 1 review + conversation resolution. Admin bypass left available for emergencies.
 

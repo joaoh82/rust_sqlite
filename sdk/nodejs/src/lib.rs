@@ -1,12 +1,14 @@
 //! Node.js bindings for SQLRite (Phase 5d).
 //!
-//! Shipped as the `sqlrite` npm package. Shape inspired by
+//! Shipped as the `@joaoh82/sqlrite` npm package — scoped because
+//! the unscoped `sqlrite` name was rejected by npm's similarity
+//! check against `sqlite` / `sqlite3`. Shape inspired by
 //! [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3)
 //! (sync API, row-as-object), so JavaScript callers familiar with
 //! that library can pick this up immediately:
 //!
 //! ```js
-//! import { Database } from 'sqlrite';
+//! import { Database } from '@joaoh82/sqlrite';
 //!
 //! const db = new Database('foo.sqlrite');
 //! db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');

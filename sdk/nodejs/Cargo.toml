@@ -4,7 +4,7 @@ version = "0.1.4"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
-description = "Node.js bindings for the SQLRite embedded database engine. Ships the `sqlrite` npm package with prebuilt `.node` binaries."
+description = "Node.js bindings for the SQLRite embedded database engine. Ships the `@joaoh82/sqlrite` npm package with prebuilt `.node` binaries."
 repository = "https://github.com/joaoh82/rust_sqlite"
 license = "MIT"
 
@@ -14,8 +14,10 @@ license = "MIT"
 #
 # Named `sqlrite_nodejs` so the rlib doesn't collide with the root
 # `sqlrite` crate or with the FFI crate's `sqlrite_c`. The user-
-# facing import is `const { Database } = require('sqlrite')` — that
-# naming lives in package.json, not Cargo.
+# facing import is `const { Database } = require('@joaoh82/sqlrite')`
+# — scoped because the unscoped `sqlrite` name was rejected by npm
+# as too similar to `sqlite`/`sqlite3`. That naming lives in
+# package.json, not Cargo.
 [lib]
 name = "sqlrite_nodejs"
 crate-type = ["cdylib", "rlib"]

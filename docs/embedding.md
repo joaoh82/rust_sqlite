@@ -217,7 +217,7 @@ Phase 6 lands GitHub Actions CI + release automation:
 
 - **crates.io** — `sqlrite-engine` crate (published under a different name from the `sqlrite` lib target because the short name was already taken; users `cargo add sqlrite-engine` but still write `use sqlrite::…`)
 - **PyPI** — `sqlrite` wheels (manylinux x86_64/aarch64, macOS universal, Windows x86_64)
-- **npm** — `sqlrite` (Node) + `sqlrite-wasm` (browser) packages
+- **npm** — `@joaoh82/sqlrite` (Node) + `sqlrite-wasm` (browser) packages
 - **Go modules** — `sdk/go/v*` git tags
 - **GitHub Releases** — Tauri desktop builds + C FFI prebuilt libraries
 
