@@ -110,7 +110,11 @@ rust_sqlite/
 
 ## Running the desktop app
 
-A Tauri 2.0 desktop GUI lives under [`desktop/`](../desktop/). It needs Node.js in addition to the Rust toolchain:
+A Tauri 2.0 desktop GUI lives under [`desktop/`](../desktop/).
+
+**Don't want to build from source?** Prebuilt installers (`.dmg`, `.msi`, `.AppImage`, `.deb`, `.rpm`) land on every release at [the latest desktop release page](https://github.com/joaoh82/rust_sqlite/releases/latest). They're unsigned — see [the desktop docs](desktop.md#unsigned-installer-warnings) for the one-line Gatekeeper / SmartScreen bypasses.
+
+**From source** — needs Node.js in addition to the Rust toolchain:
 
 ```bash
 cd desktop

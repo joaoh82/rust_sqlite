@@ -385,9 +385,34 @@ jobs:
           tagName: sqlrite-desktop-v${{ needs.detect.outputs.version }}
           releaseName: Desktop v${{ needs.detect.outputs.version }}
           releaseBody: |
-            SQLRite desktop app — unsigned installers for Linux (AppImage + deb), macOS (dmg, aarch64), Windows (msi).
+            SQLRite desktop app — unsigned installers. This release wave ships:
 
-            **⚠️ Unsigned installers**: macOS shows "SQLRite can't be opened because it is from an unidentified developer" — right-click → Open → Open to bypass. Windows SmartScreen blocks on first run — click "More info" → "Run anyway". Code signing lands in Phase 6.1.
+            - **Linux**: `.AppImage` + `.deb` (Debian/Ubuntu) + `.rpm` (Fedora/RHEL), x86_64
+            - **macOS**: `.dmg` + raw `.app.tar.gz`, Apple Silicon (aarch64). Intel Macs not supported yet — tracked as a Phase 6e follow-up (universal dmg).
+            - **Windows**: `.msi` + `.exe` (NSIS installer), x86_64
+
+            ### ⚠️ Unsigned installer warnings
+
+            Installers aren't code-signed yet (Phase 6.1 wires up Apple Developer ID + Windows code-signing). First-launch warnings to expect:
+
+            **macOS — "SQLRite is damaged and can't be opened" or "unidentified developer":**
+
+            ```bash
+            xattr -cr /Applications/SQLRite.app
+            ```
+
+            This strips the `com.apple.quarantine` attribute your browser attached on download. macOS Gatekeeper shows "damaged" (not the gentler "unidentified developer") because Tauri ad-hoc signs the binary — Apple Silicon *requires* a signature, even an ad-hoc one, but quarantined ad-hoc signatures trip a stricter Gatekeeper path. The app is fine; the signature just isn't from a registered Apple Developer ID.
+
+            **Windows — SmartScreen "Windows protected your PC":**
+
+            Click "More info" → "Run anyway".
+
+            **Linux — AppImage:**
+
+            ```bash
+            chmod +x SQLRite_*_amd64.AppImage
+            ./SQLRite_*_amd64.AppImage
+            ```
 
             See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
           releaseDraft: false

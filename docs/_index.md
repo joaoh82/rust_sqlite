@@ -6,6 +6,7 @@ A small, hand-written guide to the SQLRite codebase — how it's structured, how
 
 - [Getting started](getting-started.md) — install toolchain, build, run the REPL, your first `CREATE TABLE`
 - [Using SQLRite](usage.md) — complete REPL / SQL / meta-command reference
+- [Desktop app](desktop.md) — downloads, unsigned-installer bypass steps, and the Tauri architecture
 - [Smoke test](smoke-test.md) — step-by-step walkthrough to sanity-check REPL + desktop app after any non-trivial change
 - [Architecture](architecture.md) — high-level layer diagram and module map
 - [Design decisions](design-decisions.md) — the "why" behind the major choices

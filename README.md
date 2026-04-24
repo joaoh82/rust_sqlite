@@ -65,7 +65,20 @@ A cross-platform Tauri 2.0 + Svelte 5 desktop GUI ships alongside the REPL (see 
 
 ![SQLRite Desktop](<images/SQLRite - Desktop.png> "The SQLRite desktop app")
 
-Launch it with `cd desktop && npm install && npm run tauri dev`. The header's New… / Open… / Save As… buttons cover the file lifecycle; the query editor has a live line-number gutter, `⌘/` (Ctrl+/) SQL comment toggle, and selection-aware Run (highlight a statement to run just that one).
+**Prebuilt installers** — download from the [latest desktop release](https://github.com/joaoh82/rust_sqlite/releases/latest):
+
+| Platform | Files |
+|---|---|
+| Linux x86_64 | `.AppImage`, `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL) |
+| macOS Apple Silicon | `.dmg`, raw `.app.tar.gz` *(Intel Macs not supported yet — universal dmg is a follow-up)* |
+| Windows x86_64 | `.msi`, `.exe` (NSIS) |
+
+> ⚠️ **Installers are unsigned** until Phase 6.1 wires up Apple Developer ID + Windows code-signing certs. First-launch friction to expect:
+> - **macOS**: "SQLRite is damaged" or "unidentified developer" → run `xattr -cr /Applications/SQLRite.app` once to strip the quarantine attribute, then it opens normally. The app is fine; Tauri ad-hoc signs every macOS binary (Apple Silicon requires a signature), but quarantined ad-hoc signatures trip a stricter Gatekeeper path with the scary "damaged" wording.
+> - **Windows**: SmartScreen → click "More info" → "Run anyway".
+> - **Linux AppImage**: `chmod +x SQLRite_*.AppImage` before launching.
+
+**From source** — `cd desktop && npm install && npm run tauri dev`. The header's New… / Open… / Save As… buttons cover the file lifecycle; the query editor has a live line-number gutter, `⌘/` (Ctrl+/) SQL comment toggle, and selection-aware Run (highlight a statement to run just that one).
 
 ### Developer guide
 
