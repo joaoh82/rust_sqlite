@@ -35,132 +35,16 @@ Only one database is active at a time. A subsequent `.open` replaces the in-memo
 
 ## Supported SQL
 
-Parsing is done by [`sqlparser`](https://crates.io/crates/sqlparser) using the SQLite dialect. Execution only implements the statements below; anything else is rejected with a `NotImplemented` error.
+The full SQL surface — every statement, every operator, every edge case, every "not yet" — lives in the canonical reference: **[Supported SQL](supported-sql.md)**.
 
-### `CREATE TABLE`
+Quick hits worth knowing when you're working at the REPL:
 
-```sql
-CREATE TABLE <name> (<col> <type> [constraint]*, ...);
-```
-
-- Supported types: `INTEGER` / `INT` / `BIGINT` / `SMALLINT`, `TEXT` / `VARCHAR`, `REAL` / `FLOAT` / `DOUBLE` / `DECIMAL`, `BOOLEAN`
-- Supported column constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`
-- Only one `PRIMARY KEY` per table; a duplicate column name is an error
-- Table-level constraints are parsed but not enforced yet
-
-### `INSERT INTO`
-
-```sql
-INSERT INTO <name> (col1, col2, ...) VALUES (v1, v2, ...);
-```
-
-- `INTEGER PRIMARY KEY` columns can be omitted — a ROWID is auto-assigned
-- Omitted non-PK columns are stored as NULL (with type restrictions — see [Storage model](storage-model.md))
-- Type-mismatched values return a typed error rather than panic
-- `UNIQUE` / `PRIMARY KEY` violations are rejected
-
-### `CREATE INDEX`
-
-```sql
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> (<column>);
-```
-
-- Single-column only — multi-column / composite indexes are future work
-- Integer and Text columns only (Real / Bool indexes aren't supported yet)
-- Anonymous indexes (no name) are rejected — give every index a name
-- `CREATE UNIQUE INDEX` fails if existing rows already carry duplicate values
-- Auto-created indexes: every `UNIQUE` and `PRIMARY KEY` column gets one at `CREATE TABLE` time, named `sqlrite_autoindex_<table>_<col>`
-
-### `SELECT`
-
-```sql
-SELECT {*|col1, col2, ...} FROM <name>
-  [WHERE <expr>]
-  [ORDER BY <col> [ASC|DESC]]
-  [LIMIT <n>];
-```
-
-- Single-table only — no joins, subqueries, or CTEs yet
-- Projection is `*` or a bare column list; expressions in the projection list aren't supported
-- `ORDER BY` takes exactly one column
-- `LIMIT` takes a non-negative integer literal; no `OFFSET` yet
-- **Optimizer**: `WHERE col = literal` (or `literal = col`) on an indexed column probes the index instead of scanning the whole table. AND / OR / range predicates still fall back to full scan.
-
-### `UPDATE`
-
-```sql
-UPDATE <name> SET col1 = <expr> [, col2 = <expr>] [WHERE <expr>];
-```
-
-- Assignments can reference other columns of the same row (`SET age = age + 1`)
-- The declared column type is enforced at write time; mismatched types error cleanly
-- UNIQUE constraints are re-checked against every other row's value
-
-### `DELETE`
-
-```sql
-DELETE FROM <name> [WHERE <expr>];
-```
-
-- No `WHERE` deletes every row in the table
-
-## Expressions
-
-Expressions work in `WHERE` predicates and `UPDATE`'s `SET` right-hand side.
-
-| Category | Operators |
-|---|---|
-| Comparison | `=`, `<>`, `<`, `<=`, `>`, `>=` |
-| Logical | `AND`, `OR`, `NOT` |
-| Arithmetic | `+`, `-`, `*`, `/`, `%` (integer ops stay integer; any `REAL` promotes to `f64`) |
-| String | `\|\|` (concat) |
-| Unary | `+`, `-` |
-| Grouping | Parentheses |
-
-Literals: integer numbers, real numbers, `'single-quoted strings'`, booleans (`TRUE`/`FALSE`), `NULL`.
-
-NULL handling follows SQL convention: any comparison or arithmetic involving NULL is unknown, which is treated as `false` in a `WHERE` clause. `NOT NULL` stays NULL. Division or modulo by zero returns a clean runtime error rather than a panic.
-
-## Transactions
-
-`BEGIN` / `COMMIT` / `ROLLBACK` work as expected:
-
-```sql
-BEGIN;
-INSERT INTO users (name) VALUES ('alice');
-INSERT INTO users (name) VALUES ('bob');
--- both visible within this session, not yet on disk
-ROLLBACK;  -- discards both inserts
-```
-
-```sql
-BEGIN;
-UPDATE users SET age = age + 1;
-COMMIT;  -- flushes every accumulated change as a single WAL commit frame
-```
-
-Semantics worth knowing:
-
-- **Auto-save is suppressed** inside a transaction. Mutations stay in memory until `COMMIT`, which writes them to the WAL in one atomic batch (single commit frame sealing every page that changed).
-- **Rollback is snapshot-based.** `BEGIN` deep-clones the in-memory table state; `ROLLBACK` restores it. This is O(N) in data size at BEGIN time; worth knowing if you start a transaction on a huge DB and then roll back.
-- **Nested `BEGIN` is rejected** — no savepoints yet.
-- **`BEGIN` on a read-only database** (`sqlrite --readonly`) is rejected.
-- **Runtime errors mid-transaction do not auto-rollback.** If an `INSERT` fails inside a transaction (bad syntax, UNIQUE violation, etc.), you're still in the transaction; the caller decides whether to `ROLLBACK` or `COMMIT` whatever succeeded.
-- **COMMIT save failure auto-rolls-back.** If the disk write at COMMIT time fails (disk full, permission denied, etc.), SQLRite restores the pre-BEGIN snapshot and surfaces an error like `COMMIT failed — transaction rolled back: …`. Leaving the in-flight mutations in memory after a failed COMMIT would be unsafe — any subsequent non-transactional statement would auto-save them, silently publishing partial work to disk.
-
-## Not yet supported
-
-- Joins (`INNER` / `LEFT OUTER` / `CROSS`)
-- Subqueries, CTEs, views
-- `GROUP BY`, aggregate functions (`COUNT`, `SUM`, `AVG`, ...)
-- `DISTINCT`, `HAVING`
-- `LIKE`, `IN`, `IS NULL`
-- Expressions in the projection list
-- `OFFSET`, multi-column `ORDER BY`
-- Savepoints (nested transactions)
-- Multiple databases in one process, attach/detach
-
-See [Roadmap](roadmap.md) for when these land.
+- **One statement per call.** The REPL / `Connection::execute` expects a single statement; multi-statement strings return `Expected a single query statement, but there are N`. For batch execution use the SDKs' `executescript` / `execute_batch`.
+- **Transactions are real.** `BEGIN` / `COMMIT` / `ROLLBACK` land as expected; auto-save is suppressed inside a transaction and everything flushes in one WAL commit frame on `COMMIT`. No nested transactions yet.
+- **Arithmetic stays honest.** Integer-only operations stay integer; any `REAL` operand promotes to `f64`; divide-by-zero is a typed runtime error, never a panic.
+- **NULL follows three-valued logic.** `NULL = NULL` is unknown (not true) — treated as false in `WHERE`. Use `IS NULL` / `IS NOT NULL` — oh wait, [those aren't supported yet](supported-sql.md#not-yet-supported). Track via Roadmap.
+- **Identifiers are case-sensitive** (table / column names; no normalization), but keywords aren't. String literals preserve case.
+- **Not yet supported**: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, projection expressions, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. See the [full list in the reference](supported-sql.md#not-yet-supported).
 
 ## History
 
