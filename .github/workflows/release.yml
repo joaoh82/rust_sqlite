@@ -7,8 +7,9 @@
 # Phase 6d: tag-all + publish-crate + publish-ffi + finalize.
 # Phase 6e adds publish-desktop.
 # Phase 6f adds build-python-wheels + publish-python.
-# Phases 6g–6i add publish-nodejs / publish-wasm / publish-go as
-# separate jobs to this same file.
+# Phase 6g adds build-nodejs-binaries + publish-nodejs.
+# Phases 6h–6i add publish-wasm / publish-go as separate jobs
+# to this same file.
 #
 # Design doc: docs/release-plan.md.
 # One-time registry / branch-protection setup: docs/release-secrets.md.
@@ -86,15 +87,16 @@ jobs:
   # BEFORE any publish step so a bad version number (e.g., tag
   # already exists for some reason) aborts the whole release cleanly.
   #
-  # As of Phase 6f, we tag:
+  # As of Phase 6g, we tag:
   #   - sqlrite-v<V>           (Rust engine)
   #   - sqlrite-ffi-v<V>       (C FFI prebuilt binaries)
   #   - sqlrite-desktop-v<V>   (Tauri desktop installers)
   #   - sqlrite-py-v<V>        (Python wheels on PyPI)
+  #   - sqlrite-node-v<V>      (Node.js N-API bindings on npm)
   #   - v<V>                   (umbrella)
   #
-  # Later phases add sqlrite-node-v<V>, sqlrite-wasm-v<V>,
-  # sdk/go/v<V> as their publish jobs come online.
+  # Later phases add sqlrite-wasm-v<V>, sdk/go/v<V> as their
+  # publish jobs come online.
   #
   # Idempotent on re-run: if a tag already exists (partial-failure
   # scenario where publish-crate succeeded but publish-ffi failed,
@@ -124,6 +126,7 @@ jobs:
             "sqlrite-ffi-v$V"
             "sqlrite-desktop-v$V"
             "sqlrite-py-v$V"
+            "sqlrite-node-v$V"
             "v$V"
           )
           for tag in "${TAGS[@]}"; do
@@ -634,6 +637,232 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Step 3g: build Node.js N-API binaries for every supported
+  # platform. (Phase 6g — build half; publish half lives in the
+  # next job.)
+  #
+  # Architecture: the "bundled binaries" approach, not napi-rs's
+  # newer optional-deps-per-platform pattern. The main `sqlrite`
+  # npm package ships every platform's `.node` binary inside one
+  # tarball; napi-rs's generated `index.js` dispatcher picks the
+  # right one at require time based on process.platform / arch.
+  # Simpler for MVP than maintaining N+1 npm packages; the cost
+  # is a ~15 MiB tarball instead of a ~4 MiB per-platform download,
+  # which is fine for a database driver people install once.
+  #
+  # Same build/publish split as publish-python for the same
+  # reason: npm expects one `npm publish` invocation per package
+  # version. If every matrix cell published independently, a
+  # partial-failure would put some-but-not-all binaries on npm
+  # with no clean rollback.
+  #
+  # Matrix mirrors publish-ffi / publish-desktop / publish-python.
+  # Naming convention for the `.node` file is napi-rs's own: the
+  # platform triple is baked into the filename, e.g.,
+  # `sqlrite.linux-x64-gnu.node` vs `sqlrite.darwin-arm64.node`.
+  # The `files` glob in sdk/nodejs/package.json matches on
+  # `sqlrite.*.node`, so whichever binaries land in the directory
+  # at publish time get included in the tarball.
+  build-nodejs-binaries:
+    name: Build Node.js binary (${{ matrix.platform }})
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            napi_triple: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            napi_triple: linux-arm64-gnu
+          - os: macos-latest
+            platform: macos-aarch64
+            napi_triple: darwin-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+            napi_triple: win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/nodejs/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-nodejs-${{ matrix.platform }}
+
+      - name: Install npm deps
+        working-directory: sdk/nodejs
+        run: npm ci
+
+      # `napi build --platform --release` produces:
+      #   - sqlrite.<napi_triple>.node  (the actual binary)
+      #   - index.js                    (platform-dispatch loader)
+      #   - index.d.ts                  (TypeScript types)
+      # We upload all three but only index.js/d.ts from the
+      # Linux x86_64 cell (they're identical across platforms
+      # since napi generates platform-agnostic dispatch code).
+      - name: Build native binary
+        working-directory: sdk/nodejs
+        run: npm run build
+
+      - name: Verify binary exists
+        working-directory: sdk/nodejs
+        shell: bash
+        run: |
+          ls -la sqlrite.*.node
+          # Fail early if napi produced an unexpected filename —
+          # otherwise the publish step would silently ship an
+          # incomplete tarball.
+          test -f "sqlrite.${{ matrix.napi_triple }}.node"
+
+      - name: Upload .node binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-binary-${{ matrix.platform }}
+          path: sdk/nodejs/sqlrite.${{ matrix.napi_triple }}.node
+          if-no-files-found: error
+          retention-days: 1
+
+      # Only Linux x86_64 uploads the shared dispatcher files.
+      # These are identical regardless of build platform (they're
+      # just require-the-right-.node glue), so we only need one
+      # copy in the final npm tarball.
+      - name: Upload JS dispatcher (linux-x86_64 only)
+        if: matrix.platform == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-dispatcher
+          path: |
+            sdk/nodejs/index.js
+            sdk/nodejs/index.d.ts
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Step 3h: aggregate every platform's `.node` binary + the JS
+  # dispatcher into sdk/nodejs/, publish to npm via OIDC trusted
+  # publishing, and cut the per-product `sqlrite-node-v<V>`
+  # GitHub Release.
+  #
+  # OIDC trusted publishing: similar to the PyPI setup in
+  # publish-python. `permissions: id-token: write` lets npm mint
+  # a short-lived OIDC token, which `npm publish --provenance`
+  # exchanges for a one-time upload token. No NPM_TOKEN secret.
+  # One-time trusted-publisher config on npmjs.com — see
+  # docs/release-secrets.md.
+  #
+  # `--provenance` also attaches a signed attestation linking
+  # the package to this exact GitHub Actions workflow run (via
+  # sigstore, same mechanism as PyPI's PEP 740). Users who care
+  # about supply-chain can verify it with `npm audit signatures`.
+  publish-nodejs:
+    name: Publish Node.js package to npm
+    needs: [detect, tag-all, build-nodejs-binaries]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC for npm trusted publisher + provenance signing.
+      id-token: write
+      # For softprops/action-gh-release step at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Pull every platform's `.node` binary plus the JS
+      # dispatcher into sdk/nodejs/, overlaying them on top of
+      # the checked-out package.json / package-lock.json / etc.
+      - name: Download .node binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nodejs-binary-*
+          path: sdk/nodejs
+          merge-multiple: true
+
+      - name: Download JS dispatcher
+        uses: actions/download-artifact@v4
+        with:
+          name: nodejs-dispatcher
+          path: sdk/nodejs
+
+      - name: List publish payload
+        working-directory: sdk/nodejs
+        run: |
+          ls -la
+          echo "---"
+          # Dry-run the pack to see exactly what ends up in the
+          # published tarball. A missing .node file or a stray
+          # devDep pulled in by accident would be visible here.
+          npm pack --dry-run
+
+      # Single atomic publish. `--provenance` signs the package
+      # with a sigstore-backed attestation linking it to this
+      # workflow run. `--access public` because scoped packages
+      # default to private — we're using an unscoped name, but
+      # the flag is harmless and future-proofs against a rename.
+      - name: Publish to npm
+        working-directory: sdk/nodejs
+        run: npm publish --provenance --access public
+        env:
+          # OIDC trusted publisher — no static token.
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-node-v${{ needs.detect.outputs.version }}
+          name: Node.js v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/sqlrite/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            npm install sqlrite@${{ needs.detect.outputs.version }}
+            ```
+
+            ```javascript
+            const { Database } = require('sqlrite');
+
+            const db = new Database(':memory:');
+            db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+            const stmt = db.prepare('INSERT INTO users (name) VALUES (?)');
+            stmt.run('alice');
+
+            for (const row of db.prepare('SELECT * FROM users').iterate()) {
+              console.log(row);
+            }
+            ```
+
+            **Binaries bundled in this release:**
+            - Linux x86_64 (`sqlrite.linux-x64-gnu.node`)
+            - Linux aarch64 (`sqlrite.linux-arm64-gnu.node`)
+            - macOS aarch64 (`sqlrite.darwin-arm64.node`)
+            - Windows x86_64 (`sqlrite.win32-x64-msvc.node`)
+
+            The package's `index.js` dispatcher auto-selects the right binary at require time — no platform-specific install step.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
   # Step 4: create the umbrella GitHub Release. Runs after all
   # publish-* jobs succeed. Uses GitHub's native auto-generated
   # release notes so the changelog is "everything between the
@@ -641,7 +870,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python]
+    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -663,8 +892,9 @@ jobs:
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
+            - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
 
-            _Node.js / WASM / Go SDKs land as their publish jobs come online (Phases 6g–6i)._
+            _WASM / Go SDKs land as their publish jobs come online (Phases 6h–6i)._
 
             ---
 

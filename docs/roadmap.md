@@ -419,9 +419,15 @@ Wheel matrix mirrors publish-ffi + publish-desktop: Linux x86_64 (manylinux2014 
 
 Authentication via PyPI trusted publishing (OIDC) — zero long-lived tokens. `permissions: id-token: write` on the publish job plus the `release` GitHub environment (one-time trusted-publisher config on PyPI's web UI, documented in `docs/release-secrets.md`).
 
-### Phase 6g — Node.js SDK publish
+### ✅ Phase 6g — Node.js SDK publish
 
-Adds `publish-nodejs` job. `@napi-rs/cli` builds `.node` binaries per platform; npm publish via OIDC.
+Adds two jobs to `release.yml` — `build-nodejs-binaries` (matrix of 4 platforms) + `publish-nodejs` (aggregator + npm upload + GitHub Release).
+
+**Bundled-binaries architecture**: the main `sqlrite` npm package ships every platform's `.node` binary inside one tarball (~15 MiB), not the per-platform optional-dep packages `@napi-rs/*` projects use. Simpler for an MVP (one npm publish, one package to manage); the tradeoff is a bigger install, acceptable for a database driver people install once. The `index.js` dispatcher napi generates picks the right binary at require time via `process.platform` + `process.arch`.
+
+Same build/publish split as publish-python — matrix cells upload `.node` artifacts, a single aggregator job downloads everything into `sdk/nodejs/`, runs `npm publish --provenance` once. `--provenance` attaches a sigstore-signed attestation linking the published package to this exact workflow run (npm's equivalent of PyPI's PEP 740).
+
+Authentication via npm OIDC trusted publishing — zero long-lived `NPM_TOKEN`. One-time trusted-publisher registration on npmjs.com, documented in `docs/release-secrets.md`.
 
 ### Phase 6h — WASM publish
 
