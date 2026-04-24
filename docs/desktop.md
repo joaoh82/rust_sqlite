@@ -8,7 +8,54 @@ Lives under [`desktop/`](../desktop/).
 
 *Screenshot: the default three-pane layout — sidebar with tables and schema on the left, query editor with line numbers up top, result grid below. Header carries New… / Open… / Save As… and shows the active database path.*
 
-## Running it
+## Installing a prebuilt binary
+
+Since Phase 6e, every release pushes installers to a per-version GitHub Release. Grab the right artifact for your platform from the [latest desktop release](https://github.com/joaoh82/rust_sqlite/releases/latest):
+
+| Platform | Artifact | Notes |
+|---|---|---|
+| Linux x86_64 | `SQLRite_<ver>_amd64.AppImage` | `chmod +x` then run directly; bundles its own libs |
+| Linux x86_64 | `SQLRite_<ver>_amd64.deb` | Debian / Ubuntu — `sudo dpkg -i` |
+| Linux x86_64 | `SQLRite-<ver>-1.x86_64.rpm` | Fedora / RHEL / openSUSE — `sudo rpm -i` |
+| macOS aarch64 | `SQLRite_<ver>_aarch64.dmg` | Apple Silicon only (M1/M2/M3/M4) |
+| macOS aarch64 | `SQLRite_aarch64.app.tar.gz` | Raw `.app` bundle — for users who don't want the dmg |
+| Windows x86_64 | `SQLRite_<ver>_x64_en-US.msi` | Windows Installer package |
+| Windows x86_64 | `SQLRite_<ver>_x64-setup.exe` | NSIS installer, smaller footprint |
+
+Intel Macs and Linux aarch64 are [tracked as follow-ups](roadmap.md#phase-6e-desktop-publish) — for now those platforms build from source.
+
+### Unsigned-installer warnings
+
+Installers ship **unsigned** until Phase 6.1 wires up Apple Developer ID + Windows code-signing certs. Expect one of these on first launch:
+
+#### macOS — "SQLRite is damaged and can't be opened"
+
+Or the gentler "unidentified developer" dialog on older macOS versions. One-time fix:
+
+```bash
+xattr -cr /Applications/SQLRite.app
+```
+
+Then double-click normally. Point `xattr` at wherever the `.app` lives if you haven't moved it to `/Applications` yet.
+
+**Why "damaged" instead of "unidentified developer"?** Apple Silicon *requires* every Mach-O binary to carry a signature — even an ad-hoc one (`codesign --sign -`), which is what Tauri applies by default. When you download the dmg, your browser attaches `com.apple.quarantine` as an extended attribute. On recent macOS, the combination of (quarantined) + (ad-hoc signed) trips a stricter Gatekeeper code path that reports "damaged" instead of the milder unsigned-app flow. Stripping the quarantine attribute with `xattr -cr` takes Gatekeeper out of the loop. The app isn't actually corrupt — the error message just isn't honest about what it's complaining about.
+
+Once Phase 6.1 lands notarization, this bypass won't be needed; macOS will trust the binary on first launch.
+
+#### Windows — SmartScreen "Windows protected your PC"
+
+Click **More info** → **Run anyway**. SmartScreen remembers your choice, so subsequent launches are clean.
+
+#### Linux — AppImage won't run
+
+```bash
+chmod +x SQLRite_<ver>_amd64.AppImage
+./SQLRite_<ver>_amd64.AppImage
+```
+
+`.deb` and `.rpm` packages don't have this step — they install through the system package manager and get the executable bit from the package metadata.
+
+## Running from source
 
 Two prerequisites beyond the engine's toolchain:
 
@@ -25,13 +72,15 @@ npm run tauri dev
 
 That builds the Rust side (incremental after the first time), boots the Vite dev server on port 1420, and opens a native window pointing at it. Hot reload works for the Svelte side; Rust changes trigger a rebuild.
 
-For a one-off release build:
+For a one-off release build that produces installers for your local platform:
 
 ```bash
 npm run tauri build
 ```
 
-Bundling is disabled in [`tauri.conf.json`](../desktop/src-tauri/tauri.conf.json) by default — flip `bundle.active` to `true` and plug in real app icons when you want to produce an installer.
+[`tauri.conf.json`](../desktop/src-tauri/tauri.conf.json) ships with `bundle.active: true` since Phase 6e, so this builds a full set of platform-native installers (`.dmg` on macOS, `.AppImage` / `.deb` / `.rpm` on Linux, `.msi` / `.exe` on Windows) under `desktop/src-tauri/target/release/bundle/`.
+
+Icons are pre-generated and committed at `desktop/src-tauri/icons/`. If you swap the source `icon.png`, re-run `npx tauri icon src-tauri/icons/icon.png` from `desktop/` and commit the regenerated `.icns` / `.ico` / size-specific PNGs. CI doesn't re-run this — the commit is the source of truth.
 
 ## Architecture
 
