@@ -9,7 +9,9 @@
 # Phase 6f adds build-python-wheels + publish-python.
 # Phase 6g adds build-nodejs-binaries + publish-nodejs.
 # Phase 6h adds publish-wasm.
-# Phase 6i adds publish-go.
+# Phase 6i adds publish-go (no registry — git tag + GitHub Release
+# with the FFI tarballs attached for users who want prebuilt
+# libsqlrite_c alongside `go get`).
 #
 # Design doc: docs/release-plan.md.
 # One-time registry / branch-protection setup: docs/release-secrets.md.
@@ -128,6 +130,7 @@ jobs:
             "sqlrite-py-v$V"
             "sqlrite-node-v$V"
             "sqlrite-wasm-v$V"
+            "sdk/go/v$V"
             "v$V"
           )
           for tag in "${TAGS[@]}"; do
@@ -1075,6 +1078,144 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Step 3i: publish the Go SDK. (Phase 6i.)
+  #
+  # Go's distribution model is unique among our publish channels:
+  # there's NO central registry. Go modules pull straight from VCS
+  # via tag, and `go get github.com/joaoh82/rust_sqlite/sdk/go@v0.X.Y`
+  # works the moment a `sdk/go/v0.X.Y` tag is on the remote (modulo
+  # ~minutes of cache lag at proxy.golang.org). The tag is created
+  # by `tag-all` upstream of this job — there's nothing to upload.
+  #
+  # **What this job DOES do:** the binding uses cgo against
+  # `libsqlrite_c` (the C FFI from sqlrite-ffi), so end users
+  # need that shared library on their system to run anything.
+  # We pull the per-platform tarballs that publish-ffi already
+  # uploaded to its release and re-attach them to the Go release
+  # page so Go users have a one-stop-shop:
+  #
+  #   `go get github.com/joaoh82/rust_sqlite/sdk/go@vX.Y.Z`
+  #   download `libsqlrite_c-<platform>.tar.gz` from the same
+  #   release page → set CGO_LDFLAGS / CGO_CFLAGS → `go build`.
+  #
+  # **Tag with slashes:** Go's submodule tag convention is
+  # `<subpath>/vX.Y.Z` — for our module path
+  # `github.com/joaoh82/rust_sqlite/sdk/go`, the canonical tag is
+  # `sdk/go/vX.Y.Z` (slashes intact). GitHub Releases handle
+  # slash-bearing tags fine; the URL just URL-encodes them.
+  publish-go:
+    name: Publish Go SDK GitHub Release
+    needs: [detect, tag-all, publish-ffi]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # For softprops/action-gh-release + gh CLI release-download.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full tag history to verify tag-all's `sdk/go/v$V`
+          # is on the remote.
+          fetch-depth: 0
+
+      # Cheap consistency check that tag-all did its job. If this
+      # fires, something's wrong upstream and the human should
+      # know before we cut a confusingly-named GitHub Release.
+      - name: Verify Go module tag exists
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          TAG="sdk/go/v$V"
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG not found — tag-all should have created + pushed it"
+            exit 1
+          fi
+          echo "Tag $TAG exists at $(git rev-parse --short $TAG)"
+
+      # Pull the tarballs publish-ffi already attached to the
+      # sqlrite-ffi-v<V> release. The `gh release download` flow
+      # avoids re-running the whole publish-ffi build matrix just
+      # to get the artifacts here — it's a single API call with
+      # the workflow's auto-injected GITHUB_TOKEN.
+      - name: Download FFI tarballs from this release wave
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          mkdir -p ffi-tarballs
+          gh release download "sqlrite-ffi-v$V" \
+            --repo joaoh82/rust_sqlite \
+            --dir ffi-tarballs \
+            --pattern '*.tar.gz'
+          echo "--- FFI tarballs downloaded ---"
+          ls -la ffi-tarballs/
+
+      # Cut the Go release page. Tag has slashes — softprops handles
+      # that correctly (URL-encodes the slashes in the resulting
+      # release URL).
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sdk/go/v${{ needs.detect.outputs.version }}
+          name: Go SDK v${{ needs.detect.outputs.version }}
+          body: |
+            ```bash
+            go get github.com/joaoh82/rust_sqlite/sdk/go@v${{ needs.detect.outputs.version }}
+            ```
+
+            ```go
+            package main
+
+            import (
+                "database/sql"
+                "fmt"
+
+                _ "github.com/joaoh82/rust_sqlite/sdk/go"  // registers "sqlrite" driver
+            )
+
+            func main() {
+                db, _ := sql.Open("sqlrite", ":memory:")
+                defer db.Close()
+
+                _, _ = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+                _, _ = db.Exec("INSERT INTO users (name) VALUES ('alice')")
+
+                rows, _ := db.Query("SELECT id, name FROM users")
+                defer rows.Close()
+                for rows.Next() {
+                    var id int64
+                    var name string
+                    rows.Scan(&id, &name)
+                    fmt.Printf("%d: %s\n", id, name)
+                }
+            }
+            ```
+
+            ## Prebuilt `libsqlrite_c` (cgo dependency)
+
+            The Go binding uses cgo against the `libsqlrite_c` shared library shipped by [`sqlrite-ffi`](https://github.com/joaoh82/rust_sqlite/tree/main/sqlrite-ffi). The tarballs attached below are the same ones from this release wave's [C FFI release](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — provided here so Go users have a one-stop-shop:
+
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-linux-x86_64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-linux-aarch64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-macos-aarch64.tar.gz`
+            - `sqlrite-ffi-v${{ needs.detect.outputs.version }}-windows-x86_64.tar.gz`
+
+            Extract for your platform, then point cgo at it:
+
+            ```bash
+            tar xzf sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>.tar.gz
+            export CGO_CFLAGS="-I$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/include"
+            export CGO_LDFLAGS="-L$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/lib -lsqlrite_c"
+            export LD_LIBRARY_PATH="$(pwd)/sqlrite-ffi-v${{ needs.detect.outputs.version }}-<platform>/lib"
+            go build ./...
+            ```
+
+            (On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`. On Windows, place the `.dll` next to your binary or on `%PATH%`.)
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: ffi-tarballs/*.tar.gz
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
   # Step 4: create the umbrella GitHub Release. Runs after all
   # publish-* jobs succeed. Uses GitHub's native auto-generated
   # release notes so the changelog is "everything between the
@@ -1082,7 +1223,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm]
+    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -1106,8 +1247,7 @@ jobs:
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
             - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
             - 🌐 [WASM](../../releases/tag/sqlrite-wasm-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}) — browser/bundler-target WebAssembly build via wasm-pack
-
-            _Go SDK lands as its publish job comes online (Phase 6i)._
+            - 🐹 [Go SDK](../../releases/tag/sdk%2Fgo%2Fv${{ needs.detect.outputs.version }}) → `go get github.com/joaoh82/rust_sqlite/sdk/go@v${{ needs.detect.outputs.version }}` — `database/sql` driver via cgo against `libsqlrite_c`
 
             ---
 

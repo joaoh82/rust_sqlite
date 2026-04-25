@@ -441,9 +441,19 @@ The `.wasm` binary is also attached to the `sqlrite-wasm-vX.Y.Z` GitHub Release 
 
 `docs/release-secrets.md` §3 now covers both scoped npm packages with the bootstrap-then-add-trusted-publisher flow we settled on after the v0.1.5–v0.1.7 publish-nodejs debugging cycle.
 
-### Phase 6i — Go SDK publish
+### ✅ Phase 6i — Go SDK publish
 
-Adds `publish-go` job. No registry — tags `sdk/go/vX.Y.Z`; attaches the FFI tarballs (from `publish-ffi`) to the Go GitHub Release for users who want prebuilt `libsqlrite_c`.
+Adds `publish-go` job. **No registry to publish to** — Go modules pull straight from VCS via tag (`go get …@vX.Y.Z` resolves the moment the tag is on GitHub, modulo proxy.golang.org cache lag). The job's actual work:
+
+1. Verifies `tag-all` pushed `sdk/go/v<V>` (the slash-bearing submodule tag Go modules require for the path `github.com/joaoh82/rust_sqlite/sdk/go`).
+2. Downloads the per-platform `libsqlrite_c-*.tar.gz` tarballs that `publish-ffi` already uploaded to its release.
+3. Re-attaches them to a fresh Go GitHub Release at the `sdk/go/v<V>` tag, so Go users have one page with both the `go get` instructions AND the cgo dependency tarballs.
+
+The release body documents the cgo wiring (`CGO_CFLAGS` / `CGO_LDFLAGS` / `LD_LIBRARY_PATH` per platform).
+
+**Why this can't fail in interesting ways:** no registry auth, no OIDC, no cross-platform build matrix, no npm-similarity-check theater. Just a tag check + a file download + a release create. The big hidden cost was getting the *upstream* (publish-ffi) right months earlier; this job is mostly orchestration on top.
+
+With 6i done, **Phase 6 is complete** — every product distribution channel ships on every release with one human action (Release PR review + merge).
 
 ### Phase 6.1 — Code signing *(follow-up)*
 
