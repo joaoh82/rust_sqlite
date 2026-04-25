@@ -778,10 +778,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NOTE: deliberately NO `registry-url:` here. setting that
+      # makes setup-node generate an `.npmrc` with
+      # `_authToken=${NODE_AUTH_TOKEN}`, which forces npm into
+      # token-based auth and *bypasses* the trusted-publisher
+      # OIDC pathway entirely. The v0.1.5 canary blew up on this
+      # exact issue: `404 Not Found - PUT ... is not in this
+      # registry` because npm sent an empty/missing
+      # NODE_AUTH_TOKEN instead of minting an OIDC token.
+      #
+      # With registry-url omitted, no `.npmrc` is generated, and
+      # npm CLI ≥ 11.5 auto-detects the GitHub Actions OIDC
+      # environment (via ACTIONS_ID_TOKEN_REQUEST_URL +
+      # permissions: id-token: write below), mints an OIDC token,
+      # and exchanges it at npm for a one-time publish token. The
+      # public default registry is fine — that's where
+      # registry.npmjs.org lives anyway.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+
+      # Node 20 LTS ships with npm 10.x, but trusted publishing
+      # auto-detection landed in npm 11.5. Force-upgrade so we
+      # don't depend on the runner image happening to ship a
+      # recent-enough npm.
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
 
       # Pull every platform's `.node` binary plus the JS
       # dispatcher into sdk/nodejs/, overlaying them on top of
@@ -804,24 +826,27 @@ jobs:
         run: |
           ls -la
           echo "---"
+          npm --version
+          echo "---"
           # Dry-run the pack to see exactly what ends up in the
           # published tarball. A missing .node file or a stray
           # devDep pulled in by accident would be visible here.
           npm pack --dry-run
 
-      # Single atomic publish. `--provenance` signs the package
-      # with a sigstore-backed attestation linking it to this
-      # workflow run. `--access public` is REQUIRED because
-      # `@joaoh82/sqlrite` is a scoped package and scoped
-      # packages default to private; without the flag, npm
-      # would reject the upload for a free-tier account that
-      # can't host private packages.
+      # Single atomic publish via OIDC trusted publisher. No
+      # `--provenance` flag and no env block — npm 11.5+ adds
+      # provenance automatically when the publish runs over OIDC,
+      # and an explicit `--provenance` flag combined with no
+      # auth token would actually error out under the older
+      # token-auth pathway.
+      #
+      # `--access public` is REQUIRED because `@joaoh82/sqlrite`
+      # is a scoped package and scoped packages default to
+      # private; without the flag, npm rejects the upload for a
+      # free-tier account that can't host private packages.
       - name: Publish to npm
         working-directory: sdk/nodejs
-        run: npm publish --provenance --access public
-        env:
-          # OIDC trusted publisher — no static token.
-          NPM_CONFIG_PROVENANCE: "true"
+        run: npm publish --access public
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
