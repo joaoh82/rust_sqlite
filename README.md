@@ -230,7 +230,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [ ] **6f — Python SDK publish**: `maturin-action` → abi3 wheels for manylinux x86_64/aarch64 + macOS universal + Windows x86_64 → PyPI via OIDC
 - [ ] **6g — Node.js SDK publish**: `@napi-rs/cli` → `.node` binaries per platform → npm via OIDC
 - [x] **6h — WASM publish**: `wasm-pack build --target bundler --scope joaoh82` + `npm publish --provenance` (OIDC) → `@joaoh82/sqlrite-wasm` on npm. Single job, no matrix (WebAssembly is universal). `.wasm` also attached to the `sqlrite-wasm-v<V>` GitHub Release.
-- [ ] **6i — Go SDK publish**: `sdk/go/vX.Y.Z` git tag + attach FFI tarballs to the Go GitHub Release for `go get` users who want prebuilt `libsqlrite_c`
+- [x] **6i — Go SDK publish**: `sdk/go/vX.Y.Z` git tag (Go modules pull straight from VCS, no registry); GitHub Release at that tag with the FFI tarballs from `publish-ffi` re-attached so Go users have a one-stop-shop. `go get github.com/joaoh82/rust_sqlite/sdk/go@vX.Y.Z` works as soon as the tag is pushed.
 
 **Phase 6.1 — Code signing** *(follow-up)*
 - [ ] macOS Apple Developer ID cert → `codesign` + `notarytool` in `tauri-action`

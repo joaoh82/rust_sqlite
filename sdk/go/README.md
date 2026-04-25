@@ -24,7 +24,7 @@ cargo build --release -p sqlrite-ffi   # produces target/release/libsqlrite_c.{s
 go get github.com/joaoh82/rust_sqlite/sdk/go
 ```
 
-Phase 6e will publish prebuilt `libsqlrite_c` binaries as GitHub Release assets so end users consuming the Go module don't need the Rust toolchain.
+Phase 6i ships prebuilt `libsqlrite_c` tarballs as GitHub Release assets on every release, so end users consuming the Go module don't need the Rust toolchain. Each release at `sdk/go/v<V>` includes per-platform tarballs (Linux x86_64/aarch64, macOS aarch64, Windows x86_64) you can extract and point cgo at via `CGO_CFLAGS` / `CGO_LDFLAGS`.
 
 ## Quick tour
 
