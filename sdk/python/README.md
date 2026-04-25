@@ -5,7 +5,7 @@ Python bindings for [SQLRite](https://github.com/joaoh82/rust_sqlite) — a smal
 ## Install
 
 ```bash
-# From PyPI (once Phase 6e's CI/CD release pipeline is live):
+# From PyPI:
 pip install sqlrite
 
 # From source in a clone of the repo:
@@ -100,7 +100,7 @@ python -m pytest tests/
 
 - PyO3 (`abi3-py38`) for the Rust-Python boundary — one wheel works on every CPython 3.8+ release, no per-version rebuild.
 - maturin as the build backend, emitting standard `.whl` files that pip can install directly.
-- Phase 6e lands GitHub Actions that publish wheels to PyPI for manylinux x86_64/aarch64, macOS universal, and Windows x86_64 on every `v*` tag push.
+- Phase 6f's CI publishes abi3-py38 wheels to PyPI for manylinux x86_64/aarch64, macOS aarch64, and Windows x86_64 (plus an sdist) on every release. OIDC trusted publishing — no long-lived PyPI token in the repo.
 
 ## Status
 

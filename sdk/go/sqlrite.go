@@ -20,10 +20,11 @@
 // This package is a thin cgo shim over the C FFI crate (sqlrite-ffi)
 // at ../../sqlrite-ffi. At build time cgo compiles sqlrite.h (the
 // cbindgen-generated header) and links the `libsqlrite_c` dynamic
-// library. Phase 6e will ship prebuilt binaries alongside the Go
-// module for every supported platform; for now, developers building
-// from a repo clone need `cargo build --release -p sqlrite-ffi`
-// first so the shared library exists.
+// library. Phase 6i ships prebuilt `libsqlrite_c` tarballs (Linux
+// x86_64/aarch64, macOS aarch64, Windows x86_64) on every release —
+// see the GitHub Release at sdk/go/v<V>. Developers building from
+// a repo clone need `cargo build --release -p sqlrite-ffi` first
+// so the shared library exists locally.
 //
 // # Parameter binding
 //
@@ -37,8 +38,10 @@ package sqlrite
 // Point cgo at the FFI crate's header + the cargo target dir. Paths
 // are relative to this Go file (${SRCDIR}). Developers checking out
 // the repo need to `cargo build --release -p sqlrite-ffi` once
-// before `go test`; Phase 6e packages prebuilt libraries into the
-// published Go module so end users don't need the Rust toolchain.
+// before `go test`. End users don't need the Rust toolchain — Phase
+// 6i attaches per-platform `libsqlrite_c` tarballs to every Go
+// release at `sdk/go/v<V>`; extract one and point `CGO_CFLAGS` /
+// `CGO_LDFLAGS` at the unpacked include/ + lib/ dirs.
 #cgo CFLAGS: -I${SRCDIR}/../../sqlrite-ffi/include
 #cgo LDFLAGS: -L${SRCDIR}/../../target/release -lsqlrite_c
 

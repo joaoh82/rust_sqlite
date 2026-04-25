@@ -221,7 +221,7 @@ Landed:
 - `examples/python/hello.py` runnable walkthrough after `maturin develop`.
 - `sdk/python/README.md` — install, quickstart, API table, status.
 
-Phase 6e will publish wheels to PyPI via `maturin-action` (manylinux x86_64/aarch64, macOS universal, Windows x86_64).
+Phase 6f publishes abi3-py38 wheels to PyPI via `maturin-action` (manylinux x86_64/aarch64, macOS aarch64, Windows x86_64) plus an sdist, on every release. OIDC trusted publishing — no long-lived PyPI token.
 
 ### ✅ Phase 5d — Node.js SDK
 
@@ -250,7 +250,7 @@ Landed:
 - `examples/nodejs/hello.mjs` runnable walkthrough.
 - `sdk/nodejs/README.md` — install, quickstart, API table, status.
 
-Phase 6e will publish prebuilt binaries to npm via the napi-rs GitHub Action (Linux x86_64/aarch64, macOS universal, Windows x86_64).
+Phase 6g publishes prebuilt `.node` binaries to npm under the `@joaoh82/sqlrite` scope via the napi-rs GitHub Action (Linux x86_64/aarch64, macOS aarch64, Windows x86_64). OIDC trusted publishing with sigstore provenance attestations — no `NPM_TOKEN` in the repo.
 
 ### ✅ Phase 5e — Go SDK
 
@@ -281,9 +281,9 @@ Landed:
 - 9 `go test` integration tests covering CRUD + `QueryRow` + `Columns()` + transactions commit/rollback + file-backed persistence across reopens + `OpenReadOnly` + bad-SQL + parameter-binding rejection.
 - Runnable `examples/go/hello.go` with its own `go.mod` + `replace` directive at `examples/go/`.
 
-Prerequisites for building from source: `cargo build --release -p sqlrite-ffi` to materialize `libsqlrite_c`. Phase 6e will publish prebuilt binaries as GitHub Release assets so end users don't need the Rust toolchain.
+Prerequisites for building from source: `cargo build --release -p sqlrite-ffi` to materialize `libsqlrite_c`. Phase 6i ships prebuilt `libsqlrite_c` tarballs as GitHub Release assets on every release at `sdk/go/v<V>`, so end users consuming the Go module don't need the Rust toolchain.
 
-Phase 6e also tags `sdk/go/v*.*.*` so `go get github.com/joaoh82/rust_sqlite/sdk/go@v0.1.0` resolves via Go's module proxy — no central registry push needed for Go.
+Phase 6i tags `sdk/go/v<V>` (slash-bearing submodule tag — Go's convention for module paths with subpaths) on every release, so `go get github.com/joaoh82/rust_sqlite/sdk/go@vX.Y.Z` resolves via proxy.golang.org as soon as the tag is pushed — no central registry push needed for Go.
 
 ### Phase 5f — Rust crate polish *(deferred — Phase 6c companion)*
 
@@ -364,7 +364,7 @@ One-time non-code setup — the state lives in registry web UIs + GitHub setting
 4. **GitHub `release` environment** — required reviewer (maintainer), `main`-only deployments, scoped secrets. Acts as a second human-in-the-loop gate after the Release PR merge but before any registry write.
 5. **Branch protection on `main`** — require 14 CI status checks green + 1 review + conversation resolution. Admin bypass left available for emergencies.
 
-The runbook is safe to execute right now — the PyPI + npm trusted-publisher entries reference `release.yml` (which lands in Phase 6d); they'll sit idle until that workflow exists.
+The runbook (now historical — Phase 6d–6i all landed) was safe to execute as soon as Phase 6c shipped; the PyPI + npm trusted-publisher entries point at `release.yml` and sat idle until Phase 6d wired up the first workflow run.
 
 ### ✅ Phase 6d — `release-pr.yml` + skeleton `release.yml`
 
