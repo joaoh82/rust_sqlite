@@ -821,32 +821,61 @@ jobs:
           name: nodejs-dispatcher
           path: sdk/nodejs
 
-      - name: List publish payload
+      - name: List publish payload + OIDC env diagnostics
         working-directory: sdk/nodejs
         run: |
           ls -la
           echo "---"
           npm --version
           echo "---"
+          # Confirm the OIDC env vars GitHub Actions auto-sets when
+          # `permissions: id-token: write` is granted. If either of
+          # these is empty, OIDC token exchange CAN'T happen and
+          # npm publish will fall back to "no auth available".
+          # Just print whether they're set, not their values
+          # (the URL has a trailing token-issuance path; treat as
+          # sensitive).
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "---"
           # Dry-run the pack to see exactly what ends up in the
           # published tarball. A missing .node file or a stray
           # devDep pulled in by accident would be visible here.
           npm pack --dry-run
 
-      # Single atomic publish via OIDC trusted publisher. No
-      # `--provenance` flag and no env block — npm 11.5+ adds
-      # provenance automatically when the publish runs over OIDC,
-      # and an explicit `--provenance` flag combined with no
-      # auth token would actually error out under the older
-      # token-auth pathway.
+      # Single atomic publish via OIDC trusted publisher.
+      #
+      # The `--provenance` flag is what tells npm CLI to use the
+      # OIDC code path. Without it, npm only checks for `_authToken`
+      # config and gives up with ENEEDAUTH (this happened on the
+      # v0.1.6 canary attempt that ran without the flag — npm
+      # never even tried OIDC). With it, npm:
+      #   1. Reads ACTIONS_ID_TOKEN_REQUEST_URL +
+      #      ACTIONS_ID_TOKEN_REQUEST_TOKEN from the GHA env
+      #   2. Mints an OIDC token bearing the workflow's identity
+      #      claims (repo, environment, workflow filename, etc.)
+      #   3. Exchanges it at npm for a one-time publish token
+      #   4. Publishes the package + attaches a sigstore-signed
+      #      provenance attestation linking the artifact to this
+      #      exact workflow run
+      #
+      # The previous v0.1.5 failure with `--provenance` set was a
+      # different bug — `registry-url` on setup-node was generating
+      # an `.npmrc` that forced token-auth and bypassed OIDC. With
+      # registry-url removed (this file's previous fix) and
+      # `--provenance` restored, both bugs are addressed.
       #
       # `--access public` is REQUIRED because `@joaoh82/sqlrite`
-      # is a scoped package and scoped packages default to
-      # private; without the flag, npm rejects the upload for a
-      # free-tier account that can't host private packages.
+      # is a scoped package and scoped packages default to private;
+      # without the flag, npm rejects the upload for a free-tier
+      # account that can't host private packages.
+      #
+      # `--loglevel verbose` makes auth/transport errors
+      # diagnosable from the run log without re-running with
+      # debug-on. Cheap insurance against another silent failure.
       - name: Publish to npm
         working-directory: sdk/nodejs
-        run: npm publish --access public
+        run: npm publish --access public --provenance --loglevel verbose
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
