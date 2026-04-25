@@ -12,10 +12,9 @@ Each step has a "verify" line you can run to confirm it took.
 
 - Sections 1 + 4 + 5 can be done right now (they don't reference
   workflow files).
-- Sections 2 + 3 (trusted publishers) are safe to do now too —
-  they'll point at `release.yml` which lands in Phase 6d, and
-  the publisher will sit idle until the first workflow run that
-  matches.
+- Sections 2 + 3 (trusted publishers) point at `release.yml`,
+  which has been live since Phase 6d. Each publisher activates
+  on the first workflow run that matches its subject claim.
 
 ---
 

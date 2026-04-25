@@ -138,7 +138,7 @@ with sqlrite.connect("foo.sqlrite") as conn:
         print(row)  # tuples
 ```
 
-The Python binding wraps the Rust `Connection` directly (not via the C FFI) — PyO3 marshals types cheaper than a C round-trip. Build via `cd sdk/python && maturin develop`; tests via `python -m pytest sdk/python/tests/`. PyPI publish lands in Phase 6e.
+The Python binding wraps the Rust `Connection` directly (not via the C FFI) — PyO3 marshals types cheaper than a C round-trip. Build via `cd sdk/python && maturin develop`; tests via `python -m pytest sdk/python/tests/`. Phase 6f publishes abi3-py38 wheels to PyPI on every release via OIDC trusted publishing.
 
 Full API tour: [`sdk/python/README.md`](../sdk/python/README.md); runnable walkthrough: [`examples/python/hello.py`](../examples/python/hello.py).
 
@@ -157,7 +157,7 @@ for (const row of db.prepare('SELECT id, name FROM users').all()) {
 db.close();
 ```
 
-Unlike the C SDK, the Node.js binding wraps the Rust `Connection` directly (via napi-rs, no C FFI hop). Prebuilt `.node` binaries shipped per platform in Phase 6e — no `node-gyp` install step. TypeScript definitions (`index.d.ts`) auto-generated from the Rust source.
+Unlike the C SDK, the Node.js binding wraps the Rust `Connection` directly (via napi-rs, no C FFI hop). Phase 6g publishes prebuilt `.node` binaries per platform under the `@joaoh82/sqlrite` scope on npm, with sigstore-signed provenance attestations via OIDC trusted publishing — no `node-gyp` install step on the user side. TypeScript definitions (`index.d.ts`) auto-generated from the Rust source.
 
 Full API tour: [`sdk/nodejs/README.md`](../sdk/nodejs/README.md); runnable walkthrough: [`examples/nodejs/hello.mjs`](../examples/nodejs/hello.mjs).
 

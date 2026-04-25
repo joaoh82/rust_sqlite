@@ -95,7 +95,7 @@ Every error surfaces as a JS `Error` with the Rust engine's message in `.message
 ## How this ships
 
 - [napi-rs](https://napi.rs/) (N-API v9 → Node 18+) for the Rust↔JS boundary.
-- Prebuilt `.node` binaries per platform — no `node-gyp` dance on install. Phase 6e's release pipeline publishes them to npm for Linux x86_64/aarch64, macOS universal, Windows x86_64.
+- Prebuilt `.node` binaries per platform — no `node-gyp` dance on install. Phase 6g's CI publishes them to npm under the `@joaoh82/sqlrite` scope for Linux x86_64/aarch64, macOS aarch64, Windows x86_64. OIDC trusted publishing — no long-lived `NPM_TOKEN` in the repo. Sigstore-signed provenance attestations attached to every release (verify with `npm audit signatures`).
 - Sync API, not async — the engine is in-process and most operations finish in microseconds; Promises would add overhead without a payoff.
 - Rows decoded directly in Rust (via napi-rs typed wrappers) rather than via a C-FFI detour — same philosophy as the Python SDK.
 

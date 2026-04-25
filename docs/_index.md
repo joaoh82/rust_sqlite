@@ -34,8 +34,11 @@ As of April 2026, SQLRite has:
 
 - A working SQL engine (in-memory + on-disk with a real B-Tree per table + secondary indexes, Phases 0 – 3 complete)
 - WAL-backed persistence with crash-safe checkpointing, shared/exclusive lock modes, and real `BEGIN` / `COMMIT` / `ROLLBACK` transactions (Phase 4 complete)
-- A stable public Rust embedding API (Phase 5a complete — the current frontier is Phase 5b, the C FFI shim, and the language SDKs that build on it)
+- A stable public Rust embedding API plus C FFI shim and SDKs for Python, Node.js, Go, and WASM (Phase 5 complete except the optional 5f crate-polish task)
 - A Tauri 2.0 + Svelte desktop app (Phase 2.5 complete)
+- A fully-automated release pipeline that ships every product to its registry on every release with one human action — Rust crate to crates.io (`sqlrite-engine`), Python wheels to PyPI (`sqlrite`), Node.js + WASM to npm (`@joaoh82/sqlrite` + `@joaoh82/sqlrite-wasm`), Go module via `sdk/go/v*` git tag, plus C FFI tarballs and unsigned desktop installers as GitHub Release assets (Phase 6 complete)
+
+The active frontier is **Phase 7 — AI-era extensions**.
 
 See the [Roadmap](roadmap.md) for the full phase plan.
 
