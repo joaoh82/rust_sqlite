@@ -8,8 +8,8 @@
 # Phase 6e adds publish-desktop.
 # Phase 6f adds build-python-wheels + publish-python.
 # Phase 6g adds build-nodejs-binaries + publish-nodejs.
-# Phases 6h–6i add publish-wasm / publish-go as separate jobs
-# to this same file.
+# Phase 6h adds publish-wasm.
+# Phase 6i adds publish-go.
 #
 # Design doc: docs/release-plan.md.
 # One-time registry / branch-protection setup: docs/release-secrets.md.
@@ -127,6 +127,7 @@ jobs:
             "sqlrite-desktop-v$V"
             "sqlrite-py-v$V"
             "sqlrite-node-v$V"
+            "sqlrite-wasm-v$V"
             "v$V"
           )
           for tag in "${TAGS[@]}"; do
@@ -919,6 +920,161 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Step 3h: build the WASM package via wasm-pack and publish to
+  # npm as @joaoh82/sqlrite-wasm. (Phase 6h.)
+  #
+  # Single job — unlike the Python / Node SDKs there's no per-OS
+  # binary matrix, because WebAssembly is one universal artifact
+  # that runs on any wasm32-capable host (browsers, Deno, modern
+  # bundlers). One build, one upload.
+  #
+  # **Why scoped (`@joaoh82/sqlrite-wasm`) preemptively:** the
+  # unscoped `sqlrite-wasm` is currently free on npm but the
+  # similarity check that rejected `sqlrite` (vs `sqlite`) might
+  # also reject `sqlrite-wasm` (vs `sqlite-wasm` — distance 1).
+  # Going scoped from day one matches the Node SDK's
+  # `@joaoh82/sqlrite` decision and avoids the rename dance we
+  # did in PR #30. Free to revisit if the ecosystem demands an
+  # unscoped name.
+  #
+  # **Build target = `bundler`:** webpack/vite/rollup users get
+  # JS modules + .wasm without needing additional config. `web`
+  # / `nodejs` / `deno` targets can be added as siblings later
+  # if there's demand; one target per package is the simpler
+  # MVP shape.
+  #
+  # `--scope joaoh82` on `wasm-pack build` makes wasm-pack emit
+  # an auto-generated package.json with `name: "@joaoh82/sqlrite-wasm"`
+  # in the `pkg/` output directory — saves us from managing two
+  # package.json files (the auto-generated one and a hand-written
+  # override).
+  publish-wasm:
+    name: Publish WASM package to npm
+    needs: [detect, tag-all]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC: required for npm trusted-publisher token exchange.
+      # Same flow proven in publish-nodejs after the v0.1.5–0.1.7
+      # debugging adventure.
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-wasm
+          workspaces: 'sdk/wasm -> target'
+
+      # Install wasm-pack — the canonical tool for building +
+      # packaging Rust crates as npm-publishable WASM modules.
+      # `cargo binstall` would be faster than `cargo install`
+      # (downloads a prebuilt binary) but binstall isn't
+      # preinstalled on `ubuntu-latest`; the curl|sh installer
+      # does the same thing in one step without bootstrapping
+      # binstall first.
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # See publish-nodejs for the long-form rationale of this
+      # whole setup-node + npm-upgrade dance. Short version:
+      # NO `registry-url:` (would force token-auth via .npmrc),
+      # then explicitly upgrade npm to 11.5+ so trusted
+      # publishing is supported.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
+
+      # Build the WASM package. `--target bundler` produces
+      # ES modules + .wasm that webpack/vite/rollup can consume
+      # directly. `--scope joaoh82` makes the auto-generated
+      # package.json's name `@joaoh82/sqlrite-wasm`. `--release`
+      # picks up the size-optimized profile from sdk/wasm/
+      # Cargo.toml ([profile.release] opt-level = "z" + LTO).
+      - name: Build WASM package
+        working-directory: sdk/wasm
+        run: |
+          wasm-pack build --release --target bundler --scope joaoh82
+          echo "--- generated pkg/ contents ---"
+          ls -la pkg/
+          echo "--- generated package.json ---"
+          cat pkg/package.json
+          echo "--- WASM binary size ---"
+          ls -la pkg/*.wasm
+
+      # OIDC env diagnostics — same defensive logging that paid
+      # off when publish-nodejs hit the trusted-publisher subject
+      # mismatch in v0.1.7.
+      - name: OIDC env diagnostics
+        working-directory: sdk/wasm/pkg
+        run: |
+          npm --version
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          npm pack --dry-run
+
+      # Atomic OIDC publish. Same flag combo proven in
+      # publish-nodejs: `--provenance` to trigger OIDC code path,
+      # `--access public` because scoped packages default to
+      # private, `--loglevel verbose` to keep error logs
+      # diagnosable.
+      - name: Publish to npm
+        working-directory: sdk/wasm/pkg
+        run: npm publish --access public --provenance --loglevel verbose
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-wasm-v${{ needs.detect.outputs.version }}
+          name: WASM v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            npm install @joaoh82/sqlrite-wasm@${{ needs.detect.outputs.version }}
+            ```
+
+            ```javascript
+            // Bundler target — works with webpack, vite, rollup, parcel
+            import init, { Database } from '@joaoh82/sqlrite-wasm';
+
+            await init();
+            const db = new Database();
+            db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+            db.exec("INSERT INTO users (name) VALUES ('alice')");
+            const rows = db.query("SELECT id, name FROM users");
+            // → [{ id: 1, name: 'alice' }]
+            ```
+
+            **What's in the package:**
+            - `sqlrite_wasm_bg.wasm` — the WebAssembly engine binary
+            - `sqlrite_wasm.js` — auto-generated JS glue (wasm-bindgen)
+            - `sqlrite_wasm.d.ts` — TypeScript types
+            - `package.json` — bundler-target metadata
+
+            **Build target:** `bundler` (webpack/vite/rollup-friendly).
+            For `web` / `nodejs` / `deno` targets, build from source via `wasm-pack build sdk/wasm --target <target>`.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          files: sdk/wasm/pkg/*.wasm
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
   # Step 4: create the umbrella GitHub Release. Runs after all
   # publish-* jobs succeed. Uses GitHub's native auto-generated
   # release notes so the changelog is "everything between the
@@ -926,7 +1082,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs]
+    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -949,8 +1105,9 @@ jobs:
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
             - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 🌐 [WASM](../../releases/tag/sqlrite-wasm-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}) — browser/bundler-target WebAssembly build via wasm-pack
 
-            _WASM / Go SDKs land as their publish jobs come online (Phases 6h–6i)._
+            _Go SDK lands as its publish job comes online (Phase 6i)._
 
             ---
 

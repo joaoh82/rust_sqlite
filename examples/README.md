@@ -11,7 +11,7 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 | Python   | ✅ Phase 5c       | PyPI as `sqlrite` (Phase 6f) | [`python/`](python/) |
 | Node.js  | ✅ Phase 5d       | npm as `@joaoh82/sqlrite` (Phase 6g) | [`nodejs/`](nodejs/) |
 | Go       | ✅ Phase 5e       | Go modules (Phase 6i) | [`go/`](go/)         |
-| WASM     | ✅ Phase 5g       | npm as `sqlrite-wasm` (Phase 6h) | [`wasm/`](wasm/)     |
+| WASM     | ✅ Phase 5g       | npm as `@joaoh82/sqlrite-wasm` (Phase 6h) | [`wasm/`](wasm/)     |
 
 See [docs/roadmap.md](../docs/roadmap.md) for what each sub-phase delivers.
 
@@ -89,5 +89,5 @@ See [`wasm/index.html`](wasm/index.html) and [`sdk/wasm/README.md`](../sdk/wasm/
 ## Design notes
 
 - **One shape across languages.** Every SDK exposes `Connection`, `prepare`, `execute`, and typed `Row` access. The language-specific file in each subdir shows the same CRUD + transaction walkthrough, so users picking up a new binding recognize the surface immediately.
-- **No build step required for end users.** Phase 6 ships prebuilt wheels (Python), `.node` binaries (Node.js), `libsqlrite.{so,dylib,dll}` (for Go / C), and `sqlrite-wasm` (browser) — no "install Rust first" tax.
+- **No build step required for end users.** Phase 6 ships prebuilt wheels (Python), `.node` binaries (Node.js), `libsqlrite.{so,dylib,dll}` (for Go / C), and `@joaoh82/sqlrite-wasm` (browser) — no "install Rust first" tax.
 - **Examples track the engine.** Each sub-phase's commit lands the example alongside the binding itself, so the sample always works against the current library shape.

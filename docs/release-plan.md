@@ -75,7 +75,7 @@ GitHub Releases by product ("show me every Python release").
 | Python SDK      | `sqlrite-py-vX.Y.Z`    | PyPI + GitHub Release                            |
 | Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm (`@joaoh82/sqlrite`) + GitHub Release        |
 | Go SDK          | `sdk/go/vX.Y.Z`        | Git tag (no registry) + GitHub Release assets    |
-| WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`sqlrite-wasm`) + GitHub Release            |
+| WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`@joaoh82/sqlrite-wasm`) + GitHub Release   |
 | Desktop app     | `sqlrite-desktop-vX.Y.Z` | GitHub Release (unsigned installers)           |
 | **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other seven; acts as the "this was release 0.2.0" anchor) |
 
@@ -290,8 +290,9 @@ from now.
    TestPyPI (for dry-runs) if we decide we want that later.
 3. **npm trusted publishing** — available via npm's newer "OIDC
    trusted publishing" system. One-time config on npm's web UI
-   for the `sqlrite` and `sqlrite-wasm` packages. No `NPM_TOKEN`
-   needed.
+   for the `@joaoh82/sqlrite` and `@joaoh82/sqlrite-wasm`
+   packages. No `NPM_TOKEN` needed (after a one-time placeholder
+   publish per `docs/release-secrets.md` §3a).
 4. **GitHub Environments** — create one called `release` in repo
    settings → Environments. Add `joaoh82` as a required reviewer
    on the `release` environment. The publish jobs reference

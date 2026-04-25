@@ -6,7 +6,7 @@
 //! I/O.
 //!
 //! ```js
-//! import init, { Database } from 'sqlrite-wasm';
+//! import init, { Database } from '@joaoh82/sqlrite-wasm';
 //! await init();
 //!
 //! const db = new Database();

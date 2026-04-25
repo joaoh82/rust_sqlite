@@ -1,19 +1,21 @@
-# sqlrite-wasm
+# @joaoh82/sqlrite-wasm
 
 WebAssembly build of the [SQLRite](https://github.com/joaoh82/rust_sqlite) embedded database engine. Runs entirely in a browser tab — no server, no backend — via `wasm-pack` / `wasm-bindgen`.
+
+> **Why the scoped name?** Same reason as `@joaoh82/sqlrite` (the Node SDK): the unscoped form risks tripping npm's similarity check against `sqlite-wasm` / `sqlite`. Scoping under `@joaoh82` is the standard Node ecosystem pattern (`@napi-rs/*`, `@swc/*`, etc.).
 
 ## Install
 
 ```bash
-npm install sqlrite-wasm   # once Phase 6e's CI/CD release lands
+npm install @joaoh82/sqlrite-wasm
 ```
 
-Or build locally from a repo clone:
+The npm package ships the `bundler` target (webpack / vite / rollup / parcel-friendly). For other build targets, build locally from a repo clone:
 
 ```bash
 # From a repo checkout:
 cd sdk/wasm
-wasm-pack build --target web --release      # → pkg/
+wasm-pack build --target web --release      # → pkg/, ES modules for direct browser use
 # …or for a bundler (Webpack / Vite):
 wasm-pack build --target bundler --release
 # …or for Node.js:
@@ -23,7 +25,7 @@ wasm-pack build --target nodejs --release
 ## Quick tour
 
 ```js
-import init, { Database } from 'sqlrite-wasm';
+import init, { Database } from '@joaoh82/sqlrite-wasm';
 
 // Async init — fetches the .wasm file and wires up memory.
 // Nothing else in the module works until this resolves.
