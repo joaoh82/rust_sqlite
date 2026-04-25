@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sqlrite"
-version = "0.1.5"
+version = "0.1.6"
 description = "Python bindings for SQLRite — a small, embeddable SQLite clone written in Rust."
 authors = [{ name = "Joao Henrique Machado Silva", email = "joaoh82@gmail.com" }]
 license = { text = "MIT" }
