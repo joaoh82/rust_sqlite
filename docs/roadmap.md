@@ -294,7 +294,7 @@ The Rust library is already shippable — this sub-phase adds crate metadata, do
 New `sdk/wasm/` crate (standalone, not in the Cargo workspace — wasm-only crates trip `cargo build --workspace` on native hosts). Compiles the Rust engine straight to `wasm32-unknown-unknown` via `wasm-bindgen`. Engine runs entirely in the browser tab.
 
 ```js
-import init, { Database } from 'sqlrite-wasm';
+import init, { Database } from '@joaoh82/sqlrite-wasm';
 await init();
 
 const db = new Database();
@@ -318,7 +318,7 @@ Landed:
 - No prepared-statement object at the JS boundary; `db.query(sql)` is one-shot. The engine still does prepare/execute internally.
 - Parameter binding deferred to 5a.2 (same as every other SDK).
 
-Phase 6e will publish `sqlrite-wasm` to npm via `wasm-pack publish` on `v*` tag push.
+Phase 6h publishes `@joaoh82/sqlrite-wasm` to npm via `wasm-pack build` + `npm publish` (OIDC trusted publisher) on every release.
 
 ## Phase 6 — Release engineering + CI/CD
 
@@ -360,7 +360,7 @@ One-time non-code setup — the state lives in registry web UIs + GitHub setting
 
 1. **crates.io API token** → `CRATES_IO_TOKEN` in the `release` environment's secrets (crates.io doesn't support OIDC yet, so this is the only long-lived token in the pipeline).
 2. **PyPI trusted publisher** pointed at `release.yml` / environment `release` — short-lived OIDC tokens, no secret to leak.
-3. **npm trusted publishers** for both `@joaoh82/sqlrite` (the Node binding — scoped because npm rejected the unscoped `sqlrite` name as too similar to `sqlite`/`sqlite3`) and `sqlrite-wasm` (the browser binding). Scoped packages under your own user scope auto-own the name, so the trusted-publisher flow works without a bootstrap `NPM_TOKEN`. See `docs/release-secrets.md` §3 for the full flow.
+3. **npm trusted publishers** for both `@joaoh82/sqlrite` (the Node binding) and `@joaoh82/sqlrite-wasm` (the browser binding). Both scoped because npm rejected the unscoped `sqlrite` and the WASM stem also risks the same similarity check against `sqlite-wasm`. Scoped packages under your own user scope auto-own the name; npm-side trusted-publisher config still requires the package to exist first (publish a `0.0.0` placeholder via `npm login` + `npm publish --access public` in a temp dir, then add the trusted publisher on the package's settings page). See `docs/release-secrets.md` §3 for the full flow + the gotchas we hit.
 4. **GitHub `release` environment** — required reviewer (maintainer), `main`-only deployments, scoped secrets. Acts as a second human-in-the-loop gate after the Release PR merge but before any registry write.
 5. **Branch protection on `main`** — require 14 CI status checks green + 1 review + conversation resolution. Admin bypass left available for emergencies.
 
@@ -429,9 +429,17 @@ Same build/publish split as publish-python — matrix cells upload `.node` artif
 
 Authentication via npm OIDC trusted publishing — zero long-lived `NPM_TOKEN`. One-time trusted-publisher registration on npmjs.com, documented in `docs/release-secrets.md`.
 
-### Phase 6h — WASM publish
+### ✅ Phase 6h — WASM publish
 
-Adds `publish-wasm` job. `wasm-pack publish` to npm as `sqlrite-wasm`.
+Adds a single `publish-wasm` job to `release.yml` (no per-platform matrix — WebAssembly is one universal artifact). `wasm-pack build --target bundler --scope joaoh82 --release` produces `sdk/wasm/pkg/` containing the `.wasm` binary, JS glue, TypeScript types, and an auto-generated `package.json` with `name: "@joaoh82/sqlrite-wasm"`. `npm publish --access public --provenance` then uploads via the same OIDC trusted-publisher flow as `publish-nodejs`.
+
+**Scoped (`@joaoh82/sqlrite-wasm`) preemptively** — the unscoped `sqlrite-wasm` is currently free on npm but the similarity check that rejected `sqlrite` (vs `sqlite`) might also reject `sqlrite-wasm` (vs `sqlite-wasm`, distance 1). Going scoped from day one matches the Node SDK and avoids the rename dance we did for it in PR #30.
+
+**Build target = `bundler`** ships JS modules + `.wasm` that webpack/vite/rollup/parcel users can consume directly. `web` / `nodejs` / `deno` targets can be added as siblings later if there's demand; one target per package is the simpler MVP shape.
+
+The `.wasm` binary is also attached to the `sqlrite-wasm-vX.Y.Z` GitHub Release for users who want a download link rather than going through npm.
+
+`docs/release-secrets.md` §3 now covers both scoped npm packages with the bootstrap-then-add-trusted-publisher flow we settled on after the v0.1.5–v0.1.7 publish-nodejs debugging cycle.
 
 ### Phase 6i — Go SDK publish
 

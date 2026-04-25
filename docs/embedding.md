@@ -189,7 +189,7 @@ Full API tour: [`sdk/go/README.md`](../sdk/go/README.md); runnable walkthrough: 
 `sdk/wasm/` — `wasm-bindgen` compiles the Rust engine directly to `wasm32-unknown-unknown`. The whole database runs in a browser tab:
 
 ```js
-import init, { Database } from 'sqlrite-wasm';
+import init, { Database } from '@joaoh82/sqlrite-wasm';
 await init();
 
 const db = new Database();
@@ -201,7 +201,7 @@ const rows = db.query("SELECT id, name FROM users");
 
 **In-memory only** in the MVP — file-backed mode needs OS file locks and a `-wal` sidecar that don't exist in a tab's sandbox. OPFS-backed persistence is a natural follow-up.
 
-Build locally via `wasm-pack build --target web --release` (or `bundler` / `nodejs`). Phase 6e publishes `sqlrite-wasm` to npm via `wasm-pack publish` on `v*` tag push.
+Build locally via `wasm-pack build --target web --release` (or `bundler` / `nodejs`). Phase 6h publishes `@joaoh82/sqlrite-wasm` (bundler target) to npm via `wasm-pack build` + `npm publish` (OIDC trusted publisher) on every release.
 
 The root engine crate is feature-gated (`cli` for rustyline/clap/env_logger; `file-locks` for fs2) so `default-features = false` strips out everything that wouldn't compile on `wasm32-unknown-unknown`.
 
@@ -217,7 +217,7 @@ Phase 6 lands GitHub Actions CI + release automation:
 
 - **crates.io** — `sqlrite-engine` crate (published under a different name from the `sqlrite` lib target because the short name was already taken; users `cargo add sqlrite-engine` but still write `use sqlrite::…`)
 - **PyPI** — `sqlrite` wheels (manylinux x86_64/aarch64, macOS universal, Windows x86_64)
-- **npm** — `@joaoh82/sqlrite` (Node) + `sqlrite-wasm` (browser) packages
+- **npm** — `@joaoh82/sqlrite` (Node) + `@joaoh82/sqlrite-wasm` (browser) packages
 - **Go modules** — `sdk/go/v*` git tags
 - **GitHub Releases** — Tauri desktop builds + C FFI prebuilt libraries
 
