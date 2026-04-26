@@ -464,22 +464,26 @@ Desktop installers from Phase 6e ship unsigned. Phase 6.1 adds code signing:
 
 Separate phase because the code changes are tiny (just tauri-action flags) but the procurement story is long-lived.
 
-## Phase 7 — AI-era extensions *(proposal — see [phase-7-plan.md](phase-7-plan.md))*
+## Phase 7 — AI-era extensions *(approved 2026-04-26 — see [phase-7-plan.md](phase-7-plan.md))*
 
-The full plan + open design questions live in [`docs/phase-7-plan.md`](phase-7-plan.md). Short version: turn SQLRite from "small SQLite clone" into "small SQLite clone that's pleasant to use from an LLM agent" by adding the storage + query primitives that modern AI workloads need (vectors, JSON), the surface that LLMs naturally drive (an MCP server), and a small natural-language convenience for humans (`.ask` REPL command).
+The full plan + recorded design decisions live in [`docs/phase-7-plan.md`](phase-7-plan.md). Short version: turn SQLRite from "small SQLite clone" into "small SQLite clone that's pleasant to use from an LLM agent" by adding the storage + query primitives that modern AI workloads need (vectors, JSON), the surface that LLMs naturally drive (an MCP server), and `ask()` as a first-class natural-language → SQL API across every product (REPL, library, SDKs, desktop, MCP).
 
-Proposed sub-phases (subject to decisions on the plan doc's Q1–Q10 before any code lands):
+Approved sub-phases (Q1–Q10 resolved):
 
-- **7a — `VECTOR(N)` column type** — dense fixed-dimension f32 storage via the existing cell encoding; bump file format to v4
-- **7b — Distance functions + KNN operators** — `vec_distance_l2/cosine/dot` plus pgvector-style `<->` `<=>` `<#>`
-- **7c — Brute-force KNN executor optimization** — recognize `ORDER BY <distance> LIMIT k`, use bounded min-heap
-- **7d — HNSW ANN index** — `CREATE INDEX … USING hnsw (col)`; persisted as cell-encoded graph
-- **7e — JSON column type + path queries** — `JSON` data type, `json_extract` / `json_array_length` / `json_object_keys` / `json_type`
-- **7f — Full-text search with BM25** — possibly deferred to Phase 8 per Q1; orthogonal to the LLM theme
-- **7g — `ask()` API across the product surface** — natural-language → SQL via configured LLM API (Anthropic-first), exposed in the REPL (as `.ask`), the Rust library (as `Connection::ask`), every SDK (Python / Node.js / Go / WASM), the desktop app (UI button next to "Run"), and the MCP server (as a tool). Foundational sub-sub-phase 7g.1 introduces a new `sqlrite-ask` crate; thin per-product adapters land in 7g.2-7g.8.
-- **7h — MCP server adapter** — new `sqlrite-mcp` binary so LLM agents drive the engine over MCP without language-specific glue
+- **7a — `VECTOR(N)` column type** — dense fixed-dimension f32 storage via the existing cell encoding; bump file format to v4. Bracket-array literal syntax `[0.1, 0.2, …]` (Q7).
+- **7b — Distance functions + KNN operators** — `vec_distance_l2/cosine/dot` plus pgvector-style `<->` `<=>` `<#>` operators (Q6).
+- **7c — Brute-force KNN executor optimization** — recognize `ORDER BY <distance> LIMIT k`, use bounded min-heap.
+- **7d — HNSW ANN index** — `CREATE INDEX … USING hnsw (col)`; persisted as cell-encoded graph. Fixed defaults `M=16, ef_construction=200, ef_search=50` (Q2).
+- **7e — JSON column type + path queries** — `JSON` data type stored as bincoded `serde_json::Value` (Q3); `json_extract` / `json_array_length` / `json_object_keys` / `json_type`.
+- **7f — ~~Full-text search with BM25~~** — **deferred to Phase 8** (Q1).
+- **7g — `ask()` API across the product surface** — natural-language → SQL via Anthropic API (Q4), Anthropic-first then OpenAI + Ollama follow-ups. Foundational 7g.1 introduces a new `sqlrite-ask` crate (Q10 — separate crate, not a feature flag). Thin per-product adapters in 7g.2-7g.8 cover REPL, desktop, Python, Node.js, Go, WASM (JS-callback shape per Q9), and the MCP `ask` tool.
+- **7h — MCP server adapter** — new `sqlrite-mcp` binary, hand-rolled JSON-RPC + tool framework (Q5).
 
-Total scope budget: ~2-3 kLOC of new Rust across the wave. Each sub-phase ships as its own PR + release wave through the Phase 6 pipeline. The Phase 7 wave will likely close out v0.2.0 (first minor bump after the 0.1.x Phase 6 cycle).
+Total scope budget: ~3-4 kLOC of new Rust across the wave. Each sub-phase ships as its own PR + release wave through the Phase 6 pipeline. The Phase 7 wave will likely close out **v0.2.0** (first minor bump after the 0.1.x Phase 6 cycle). Two new product lines added to lockstep versioning: `sqlrite-ask` and `sqlrite-mcp`.
+
+## Phase 8 — Full-text search + hybrid retrieval *(deferred from Phase 7 per Q1)*
+
+Adds the FTS5-style inverted-index machinery that Phase 7 deliberately skipped, plus a small hybrid-ranking convenience function (`bm25_score(...)` × `vec_distance_cosine(...)`) so RAG callers can do BM25 + vector search in a single query. Why deferred: ~600-800 LOC of its own, orthogonal to the AI-era theme, and Phase 7 was already large. Why we'll come back to it: hybrid search (lexical + semantic) is the modern standard for RAG retrieval — vector-only retrieval misses keyword-grounded queries. Will likely close out v0.3.0.
 
 ## "Possible extras" not pinned to a phase
 

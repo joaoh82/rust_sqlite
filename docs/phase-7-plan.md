@@ -1,6 +1,6 @@
 # Phase 7 — AI-era extensions: proposal + plan
 
-**Status:** *proposal, not yet implemented.* This document is the design + scoping pass before any code lands. The roadmap entry for Phase 7 in `roadmap.md` is intentionally a one-line stub until this doc resolves into shipped sub-phases.
+**Status:** *approved 2026-04-26 — implementation pending.* The 10 design questions (Q1–Q10) have been resolved by the project owner; see the **Decisions** section below for the canonical answers. Each per-sub-phase section reflects the chosen design. Implementation has not yet started — sub-phase 7a is the next branch to cut.
 
 **Audience:** primarily the project owner deciding what Phase 7 should be; secondarily future-self / contributors trying to understand the rationale once the decisions are made and code lands.
 
@@ -335,11 +335,13 @@ Recommend Order A. The first three sub-phases (7a + 7b + 7c) are tractable and e
 
 ---
 
-## Open questions — decide before starting
+## Decisions (was: open questions)
 
-These need a call from the project owner before implementation kicks off. Listed in rough order of "biggest impact on scope":
+Q1–Q10 were resolved by the project owner on 2026-04-26. Each question keeps its original options + recommendation as a record of the rationale; the **Decided:** line at the top is the canonical answer the implementation should follow.
 
 ### Q1. Is FTS (7f) in or out of Phase 7?
+
+> **Decided: OUT — defer to Phase 8.** Add FTS to the roadmap as its own next-phase work; this plan now covers seven sub-phases (7a–7e + 7g + 7h). **Follow-up note: come back to FTS in Phase 8** — the hybrid-search story (BM25 + vector combined) is genuinely useful for RAG, just not in this wave.
 
 - **In:** Phase 7 totals ~3 kLOC. Hybrid search story is complete. ~9 sub-phases.
 - **Out:** Phase 7 totals ~2 kLOC. Hybrid search becomes Phase 8. Faster to ship.
@@ -348,6 +350,8 @@ These need a call from the project owner before implementation kicks off. Listed
 
 ### Q2. HNSW parameters: fixed defaults or per-index configurable?
 
+> **Decided: fixed defaults** (`M=16, ef_construction=200, ef_search=50`).
+
 - **Fixed:** `M=16, ef_construction=200, ef_search=50`. Simpler API, less to test. Matches sqlite-vec's defaults.
 - **Configurable:** `CREATE INDEX … USING hnsw (col) WITH (m=32, ef_construction=400)`. Power-user knobs, more code, more test matrix.
 
@@ -355,12 +359,16 @@ These need a call from the project owner before implementation kicks off. Listed
 
 ### Q3. JSON storage format
 
+> **Decided: bincoded `serde_json::Value`** for the MVP. JSON indexing remains a future phase.
+
 - **bincoded `serde_json::Value`:** one-line implementation, fast read/write, opaque on disk.
 - **Parsed AST as cell-encoded structure:** more code, but lets us index into JSON without a full deserialize.
 
 **Recommendation:** bincoded `Value` for MVP. JSON indexing is a future phase; until then, opaque-on-disk is fine.
 
 ### Q4. `.ask` LLM provider — ship one or several?
+
+> **Decided: Anthropic-first.** OpenAI + Ollama as small follow-ups within Phase 7's run.
 
 - **Anthropic-only first:** ~150 LOC of provider adapter, ships fast. OpenAI + Ollama follow.
 - **All three at once (Anthropic + OpenAI + Ollama):** ~400 LOC of provider adapters, ships once, more upfront test surface, but each is mostly identical structure.
@@ -371,12 +379,16 @@ These need a call from the project owner before implementation kicks off. Listed
 
 ### Q5. MCP — roll our own or use a crate?
 
+> **Decided: roll our own.**
+
 - **Roll our own:** ~500 LOC, fits the project's "build it yourself to understand it" theme, no external dep churn.
 - **Use a crate:** smaller LOC count, depends on the crate's protocol-completeness + maintenance.
 
 **Recommendation:** roll our own. The MCP wire format is small enough that owning it is fine, and the educational value is real.
 
 ### Q6. Operator syntax `<->` `<=>` `<#>` — do we want pgvector-style or stick to function calls?
+
+> **Decided: operators.**
 
 - **Operators:** prettier queries, matches PostgreSQL+pgvector convention, tiny parser change.
 - **Functions only:** keeps the SQL surface smaller, less divergence from sqlparser's SQLite dialect.
@@ -385,12 +397,18 @@ These need a call from the project owner before implementation kicks off. Listed
 
 ### Q7. INSERT vector literal syntax — bracket-array or function call?
 
+> **Decided: bracket-array** (`[0.1, 0.2, 0.3]`).
+
 - **`[0.1, 0.2, 0.3]`:** matches Python / JSON / pgvector input format. Requires a small parser hook to recognize bracket arrays as a new expression type.
 - **`vector(0.1, 0.2, 0.3)`:** zero parser changes — it's just a function call. Verbose for high-dimensional vectors.
 
 **Recommendation:** bracket-array. The verbosity tax of `vector(0.1, 0.2, ..., 0.384)` for a 384-dim embedding is real, and bracket arrays are the standard literal form across the ecosystem.
 
 ### Q9. WASM `.ask` — ship it, defer it, or hand off to JS?
+
+> **Decided: Option B — JS-callback hook.** The WASM module does the schema-aware prompt construction; the caller passes a JS function that does the actual HTTP request. The WASM binary never sees the API key.
+>
+> **Documentation requirement:** when 7g.7 ships, `sdk/wasm/README.md` MUST get a prominent section explaining the callback pattern with a complete worked example (browser fetch → backend proxy → LLM provider → response back to WASM). The reason this approach exists (CORS + key-in-browser security) needs to be in the README too — otherwise the first user who tries to wire up a direct fetch from the browser will be confused why it doesn't work.
 
 The WASM SDK has a uniquely awkward situation for `.ask`:
 
@@ -408,6 +426,8 @@ Three options for WASM specifically:
 
 ### Q10. `sqlrite-ask` crate vs feature flag on `sqlrite-engine`?
 
+> **Decided: separate crate** (`sqlrite-ask`). Adds one product line to the lockstep release wave.
+
 - **Separate crate (`sqlrite-ask`):** zero dep weight on engine consumers who don't want LLM calls; cleaner separation; needs adding to lockstep version-bump + release pipeline.
 - **Feature flag (`sqlrite-engine` + feature `ask`):** simpler dep graph; but `cargo metadata` always shows the deps even when the feature is off; transitive TLS deps from `reqwest` etc.
 
@@ -415,9 +435,20 @@ Three options for WASM specifically:
 
 ### Q8. File format version bump
 
+> **Decided: bump to v4 at the start of 7a.** Document in `docs/file-format.md` as part of 7a. All Phase 7 storage additions (VECTOR cells, JSON cells, HNSW index nodes) live inside the v4 bump — no v5 mid-Phase-7.
+
 Adding `VECTOR`, `JSON`, and HNSW indexes all change what cells can hold. We should bump the file format version once (probably to v4) at the start of 7a and accept all three additions inside that bump. Old (pre-Phase-7) files stay readable; format-v4 files don't open in pre-Phase-7 SQLRite. Standard pattern.
 
 **Recommendation:** bump to v4 in 7a. Document in `docs/file-format.md`.
+
+---
+
+## Follow-ups parked outside Phase 7
+
+Two items the decision pass deliberately pushed out of scope but should not be forgotten:
+
+- **FTS (BM25) → Phase 8** *(per Q1).* The hybrid-search story (BM25 + vector combined) is genuinely useful for RAG; we deferred only because Phase 7 is already big. Phase 8 should pick this up, plus a small `bm25_score(...)` × `vec_distance_cosine(...)` hybrid-ranking convenience function.
+- **WASM `.ask` documentation** *(per Q9).* Sub-phase 7g.7 must land with `sdk/wasm/README.md` explaining the JS-callback pattern + a worked browser → backend → LLM-provider example. Add a checklist item to the 7g.7 PR description so reviewers catch it if missed.
 
 ---
 
@@ -457,28 +488,11 @@ For clarity:
 
 ---
 
-## What lands in roadmap.md when this proposal is approved
-
-Once the open questions are answered, the Phase 7 stub in `roadmap.md` gets replaced with:
-
-```
-## Phase 7 — AI-era extensions
-
-Sub-phases 7a–7g (FTS deferred to Phase 8 per Q1). See
-docs/phase-7-plan.md for the full design rationale. Each
-sub-phase ships as its own PR + release wave through the
-Phase 6 pipeline.
-```
-
-Plus per-sub-phase entries that get filled in as they ship — the same shape as Phase 6's sub-phase status list.
-
----
-
 ## Next steps
 
-1. Project owner answers Q1–Q10.
-2. Update this document with the chosen answers (so it becomes a record of decisions, not just a proposal).
-3. Cut a branch for sub-phase 7a (`feat/vector-column-type`).
+1. ~~Project owner answers Q1–Q10.~~ ✅ done 2026-04-26.
+2. ~~Update this document with the chosen answers.~~ ✅ done in the same commit that records this status.
+3. Cut a branch for sub-phase **7a** (`feat/vector-column-type`).
 4. Implementation begins.
 
 If any of the sub-phases turn out scope-misjudged in the doing — too small, too large, missing a hidden complication — re-scope in this document and link a "scope correction" note. The plan is allowed to evolve; that's why it's written down.
