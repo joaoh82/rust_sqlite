@@ -48,6 +48,10 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 - [Release secrets runbook](release-secrets.md) — one-time web-UI setup for crates.io, PyPI, npm, GitHub `release` environment, and `main` branch protection
 - [`scripts/`](../scripts/) — runnable tooling used by release workflows + reproducible locally (start with `scripts/bump-version.sh`)
 
+## Future work
+
+- [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `.ask` REPL command, MCP server). Currently a *proposal* — open questions Q1–Q8 need decisions before implementation starts.
+
 ## Conventions
 
 - Code lives under [`src/`](../src/); docs live here under [`docs/`](./).
