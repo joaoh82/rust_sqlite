@@ -468,7 +468,7 @@ Separate phase because the code changes are tiny (just tauri-action flags) but t
 
 The full plan + open design questions live in [`docs/phase-7-plan.md`](phase-7-plan.md). Short version: turn SQLRite from "small SQLite clone" into "small SQLite clone that's pleasant to use from an LLM agent" by adding the storage + query primitives that modern AI workloads need (vectors, JSON), the surface that LLMs naturally drive (an MCP server), and a small natural-language convenience for humans (`.ask` REPL command).
 
-Proposed sub-phases (subject to decisions on the plan doc's Q1–Q8 before any code lands):
+Proposed sub-phases (subject to decisions on the plan doc's Q1–Q10 before any code lands):
 
 - **7a — `VECTOR(N)` column type** — dense fixed-dimension f32 storage via the existing cell encoding; bump file format to v4
 - **7b — Distance functions + KNN operators** — `vec_distance_l2/cosine/dot` plus pgvector-style `<->` `<=>` `<#>`
@@ -476,7 +476,7 @@ Proposed sub-phases (subject to decisions on the plan doc's Q1–Q8 before any c
 - **7d — HNSW ANN index** — `CREATE INDEX … USING hnsw (col)`; persisted as cell-encoded graph
 - **7e — JSON column type + path queries** — `JSON` data type, `json_extract` / `json_array_length` / `json_object_keys` / `json_type`
 - **7f — Full-text search with BM25** — possibly deferred to Phase 8 per Q1; orthogonal to the LLM theme
-- **7g — `.ask` REPL command** — natural-language → SQL via configured LLM API (Anthropic-first); shows generated SQL before running
+- **7g — `ask()` API across the product surface** — natural-language → SQL via configured LLM API (Anthropic-first), exposed in the REPL (as `.ask`), the Rust library (as `Connection::ask`), every SDK (Python / Node.js / Go / WASM), the desktop app (UI button next to "Run"), and the MCP server (as a tool). Foundational sub-sub-phase 7g.1 introduces a new `sqlrite-ask` crate; thin per-product adapters land in 7g.2-7g.8.
 - **7h — MCP server adapter** — new `sqlrite-mcp` binary so LLM agents drive the engine over MCP without language-specific glue
 
 Total scope budget: ~2-3 kLOC of new Rust across the wave. Each sub-phase ships as its own PR + release wave through the Phase 6 pipeline. The Phase 7 wave will likely close out v0.2.0 (first minor bump after the 0.1.x Phase 6 cycle).

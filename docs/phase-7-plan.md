@@ -4,7 +4,7 @@
 
 **Audience:** primarily the project owner deciding what Phase 7 should be; secondarily future-self / contributors trying to understand the rationale once the decisions are made and code lands.
 
-**TL;DR:** turn SQLRite from "small SQLite clone" into "small SQLite clone that's pleasant to use from an LLM agent", by adding the storage + query primitives that modern AI workloads need (vectors, JSON, full-text), the surface that LLMs naturally drive (an MCP server), and a small natural-language convenience for humans (`.ask` REPL command). Stay proportional — the entire engine is ~5 kLOC today; Phase 7 should add ~2-3 kLOC, not 20 kLOC.
+**TL;DR:** turn SQLRite from "small SQLite clone" into "small SQLite clone that's pleasant to use from an LLM agent", by adding the storage + query primitives that modern AI workloads need (vectors, JSON, full-text), the surface that LLMs naturally drive (an MCP server), and a natural-language `ask()` API exposed across every product (REPL meta-command, library method, every SDK, desktop UI, MCP tool). Stay proportional — the entire engine is ~5 kLOC today; Phase 7 should add ~3-4 kLOC, not 20 kLOC.
 
 ---
 
@@ -42,7 +42,7 @@ Numbers to sanity-check scope:
 
 - Engine today: ~5 kLOC of Rust, plus 7 SDKs.
 - sqlite-vec (the closest comp): ~1500 LOC of C for vector + brute-force + IVF. We'll be larger because we have HNSW (more code than IVF) but smaller in places because we don't have to pretend to be a virtual table.
-- Phase 7 budget: **~2-3 kLOC of new Rust** across all sub-phases, not counting tests and docs. If a sub-phase blows up, we re-scope.
+- Phase 7 budget: **~3-4 kLOC of new Rust** across all sub-phases, not counting tests and docs. The bump from 2-3 to 3-4 kLOC vs. the original draft accounts for `.ask` being exposed across every product (one library crate `sqlrite-ask` + adapters for REPL / desktop / 4 SDKs / MCP), not just the REPL. If a sub-phase blows up beyond budget, we re-scope.
 
 ---
 
@@ -189,11 +189,22 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 
 ---
 
-### 7g — `.ask` REPL command (NL → SQL)
+### 7g — `ask()` API across the product surface (NL → SQL)
 
-**What.** A new meta-command: `.ask How many users signed up last week?` reads the current schema, builds a prompt, calls a configured LLM API, parses the response, shows the generated SQL, asks for `Y/n` confirmation, executes.
+**What.** Natural-language → SQL is a first-class feature available everywhere SQLRite is — not just the REPL. The user types (or the agent passes) a question; we read the schema, build a prompt, call a configured LLM API, parse the response, return the generated SQL (and optionally execute it).
 
-**Sketch:**
+**Surface:**
+
+- **REPL** — `.ask How many users are over 30?` → confirm-and-run UX
+- **Rust library** — `Connection::ask("question") -> AskResponse { sql, explanation }`
+- **Python SDK** — `conn.ask("question")` → returns `AskResponse(sql, explanation)`; `conn.ask_run("question")` for one-shot generate-and-execute
+- **Node.js SDK** — `db.ask("question")` / `db.askRun("question")`
+- **Go SDK** — `sqlrite.Ask(db, "question") (AskResponse, error)` and `AskRun(...)`
+- **WASM SDK** — `db.ask("question")` (with caveats — see Q9 below)
+- **Desktop app** — "Ask" button next to "Run" in the query editor; opens a prompt input, shows the generated SQL inline in the editor for review-and-run
+- **MCP server** — additional `ask` tool (the MCP gets the natural-language → SQL flow as a tool, on top of the raw `query`/`execute` tools from 7h)
+
+**Sketch — REPL:**
 
 ```
 sqlrite> .ask How many users are over 30?
@@ -207,22 +218,57 @@ Run? [Y/n] y
 +-------+
 ```
 
-**Configuration:**
+**Sketch — library:**
+
+```rust
+let resp = conn.ask("How many users are over 30?")?;
+println!("LLM produced: {}", resp.sql);
+// Caller decides whether to execute. The library deliberately does
+// NOT auto-execute — the SDK consumer is a developer, not an
+// interactive human, and silent execution of LLM-generated SQL is
+// dangerous.
+let rows = conn.execute(&resp.sql)?;
+```
+
+**Layered design.** The work splits into one library layer + several thin adapters:
+
+- **7g.1 — `sqlrite-ask` crate (foundational, ~400 LOC).** New separate crate (not feature-gated on the engine) so the engine stays pure-SQL with no HTTP / async deps. Owns: provider adapters (Anthropic / OpenAI / Ollama), prompt construction, schema introspection helper that walks `sqlrite_master`, the `AskResponse` type, configuration loading from env or a passed config struct. Depends on `sqlrite-engine` for the schema introspection.
+- **7g.2 — REPL `.ask` (~80 LOC).** Thin. Calls `sqlrite-ask`, prints the generated SQL, prompts `Y/n`, runs if confirmed. Most of the file is the rustyline integration.
+- **7g.3 — Desktop UI (~150 LOC).** New "Ask" button + prompt input + inline SQL preview in the editor. Calls into `sqlrite-ask` from a Tauri command; the command lives in `desktop/src-tauri/`. Schema introspection runs server-side; HTTP call also server-side (so the API key stays in the app process, not the webview).
+- **7g.4 — Python SDK (~80 LOC).** PyO3 wrapper around `sqlrite-ask`. `Connection.ask(question)` returns a Python object with `.sql` and `.explanation`. `Connection.ask_run(question)` is the convenience that calls `execute` after.
+- **7g.5 — Node.js SDK (~80 LOC).** Same shape via napi-rs. `db.ask(question)` / `db.askRun(question)`.
+- **7g.6 — Go SDK (~80 LOC).** cgo wrapper. `sqlrite.Ask(db, question)` returns `(AskResponse, error)`.
+- **7g.7 — WASM SDK (~150 LOC, see Q9).** Either skipped, or implemented with a JS-side fetch hook (the WASM binary calls back into JS to make the HTTP request, since `reqwest`'s wasm32 story is messy and CORS/keys are a separate problem).
+- **7g.8 — MCP server `ask` tool (~50 LOC).** Wires the existing tool framework from 7h to a single new tool that calls into `sqlrite-ask`.
+
+**Configuration:** the same config struct is accepted everywhere, with sensible env-var defaults:
 
 - `SQLRITE_LLM_PROVIDER` env var: `anthropic` (default) | `openai` | `ollama`
 - `SQLRITE_LLM_API_KEY` env var (for cloud providers)
 - `SQLRITE_LLM_MODEL` env var (default per provider)
+- Library APIs accept an explicit `AskConfig` parameter that, if provided, overrides env vars. Lets SDK consumers pass keys per-connection without env shenanigans.
 
 **Decisions:**
 
-- **Bring-your-own-API-key.** No bundled keys, no proxied service. Users configure once.
-- **Prompt construction.** Schema-aware — dump `sqlrite_master` + sample row counts for each table; include the user's question; demand SQL-only output. ~30-line prompt template.
-- **No streaming.** Wait for the full SQL response, then display. Streaming would complicate the confirm-before-run flow.
-- **No multi-turn.** Stateless — every `.ask` is a fresh prompt. Conversational refinement is a separate UX problem.
+- **Bring-your-own-API-key.** No bundled keys, no proxied service. Users configure once via env or pass a config object.
+- **Schema-aware prompt construction.** Dump `sqlrite_master` + column types + sample row counts for each table; include the user's question; demand SQL-only output. ~30-line prompt template, lives in `sqlrite-ask`. Once vector / JSON columns land (7a, 7e), the prompt teaches the LLM about them too — extends naturally.
+- **Library returns SQL, doesn't auto-execute.** The caller decides. SDK convenience wrappers (`ask_run` / `askRun` / `AskRun`) exist for the obvious one-shot pattern, but the default API is "generate, return, let me decide."
+- **REPL + Desktop ARE auto-execute-with-confirm.** They're interactive — confirming is the natural UX. `ask_run`-equivalent from the CLI/desktop perspective.
+- **No streaming.** Wait for the full SQL response, then display. Streaming would complicate the confirm-before-run flow and the SDK return-type story.
+- **No multi-turn.** Stateless — every `ask` is a fresh prompt. Conversational refinement is a separate UX problem (could be Phase 7's follow-up).
 
-**LOC estimate:** ~300-400 lines (HTTP client + provider adapters + prompt construction + REPL integration).
+**Why a separate crate (`sqlrite-ask`) instead of a feature flag on `sqlrite-engine`:**
 
-**Open question:** which provider's HTTP shape to ship first? Anthropic is what the project's owner uses (per the global notes about Claude API skill); OpenAI has wider compatibility in the ecosystem. I'd lean Anthropic-first with OpenAI-compatible as a follow-up — the project owner's daily-driver path matters more than catering to every reader.
+- The engine is currently pure-SQL with no HTTP / async deps. Adding `reqwest` + `tokio` (or `ureq` + sync) is a real weight bump even behind a feature flag — `cargo metadata` shows them, transitive deps pull in TLS, etc.
+- A separate crate lets WASM callers skip it entirely (they have their own fetch story) without playing feature-flag whack-a-mole.
+- Easier to evolve independently — provider adapters change much faster than the SQL engine.
+- Still gets one publish channel through the existing Phase 6 lockstep — `sqlrite-ask-v<V>` joins the product wave.
+
+**LOC estimate:** ~800-1200 lines total across all layers. The bulk (~400) is in `sqlrite-ask`; the per-product adapters are 50-150 lines each because they're thin wrappers.
+
+**Order within 7g.** 7g.1 ships first (everything else depends on it). 7g.2 (REPL) is the natural second since it's the smallest validation. 7g.3 (Desktop) and 7g.4-6 (SDKs) parallelize after 7g.1. 7g.7 (WASM) and 7g.8 (MCP) come last.
+
+**Open questions handled in Q4 + Q9 + Q10 below.**
 
 ---
 
@@ -259,9 +305,12 @@ Run? [Y/n] y
 
 7f (FTS5)                  — independent, but big — defer if scope tight
 
-7g (.ask)                  — independent, useful early for "show off" purposes
+7g (ask across products)   — 7g.1 (sqlrite-ask crate) is foundational
+                             7g.2 REPL / 7g.3 desktop / 7g.4-6 SDKs / 7g.7 WASM / 7g.8 MCP-tool
+                             all parallelize after 7g.1 lands
 
-7h (MCP)                   — useful AFTER 7d + 7f because it can expose them as tools
+7h (MCP server)            — useful AFTER 7d + 7f because it can expose them as tools
+                             7g.8 (ask-as-MCP-tool) lands inside 7h
 ```
 
 Two reasonable shipping orders:
@@ -269,20 +318,20 @@ Two reasonable shipping orders:
 **Order A — vector-first (recommended):**
 
 ```
-7a → 7b → 7c → 7d → 7e → 7g → 7h → 7f
+7a → 7b → 7c → 7d → 7e → 7g.1 → (7g.2 + 7g.3 + 7g.4 + 7g.5 + 7g.6 + 7g.7) → 7h (incl 7g.8) → 7f
 ```
 
-Reasoning: vectors are the marquee Phase 7 feature. Get them all the way to "production-quality with HNSW" before sprawling. JSON is a small bolt-on. `.ask` and MCP are the "show off" demos. FTS goes last because it's optional-scope.
+Reasoning: vectors are the marquee Phase 7 feature. Get them all the way to "production-quality with HNSW" before sprawling. JSON is a small bolt-on. `.ask`'s prompt construction (7g.1) is more interesting once it can teach the LLM about vector + JSON columns, so 7g lands after 7a/7e. The per-product `.ask` adapters (7g.2–7g.7) parallelize. MCP closes out the wave with `.ask` as one of its tools. FTS goes last because it's optional-scope.
 
 **Order B — agent-surface-first:**
 
 ```
-7g → 7h → 7e → 7a → 7b → 7c → 7d → 7f
+7g.1 → 7g.2 → 7h → 7g.3 → 7e → 7a → 7b → 7c → 7d → 7g.4-7 → 7f
 ```
 
-Reasoning: maximize "agent-shaped" surface area early so the project becomes useful in agent stacks before vectors land. Risk: `.ask` and MCP without vector search are less impressive demos.
+Reasoning: maximize "agent-shaped" surface area early so the project becomes useful in agent stacks before vectors land. Risk: `.ask`'s prompt has nothing fancy to teach the LLM about until 7a/7e land — schema-aware NL→SQL with no vector or JSON support is just "regular NL→SQL", which already exists in 50 other tools.
 
-Recommend Order A. The first three sub-phases (7a + 7b + 7c) are tractable in a small amount of work and end at "you can do KNN search in SQLRite". That's a coherent shippable.
+Recommend Order A. The first three sub-phases (7a + 7b + 7c) are tractable and end at "you can do KNN search in SQLRite" — a coherent shippable. By the time 7g.1 lands, the prompt has rich types to teach the LLM about, which is what makes a SQLRite-specific NL→SQL more compelling than a generic one.
 
 ---
 
@@ -313,10 +362,12 @@ These need a call from the project owner before implementation kicks off. Listed
 
 ### Q4. `.ask` LLM provider — ship one or several?
 
-- **Anthropic-only first:** ~300 LOC, ships fast. OpenAI-compatible follows.
-- **All three at once (Anthropic + OpenAI + Ollama):** ~500 LOC, ships once, more upfront test surface.
+- **Anthropic-only first:** ~150 LOC of provider adapter, ships fast. OpenAI + Ollama follow.
+- **All three at once (Anthropic + OpenAI + Ollama):** ~400 LOC of provider adapters, ships once, more upfront test surface, but each is mostly identical structure.
 
 **Recommendation:** Anthropic-first. The project owner's daily driver matters more than ecosystem-breadth on day one. OpenAI follows in a small follow-up.
+
+(Note: Q4 only governs which provider adapters ship in `sqlrite-ask` itself. The per-SDK and desktop/REPL surfaces — sub-phases 7g.2 through 7g.8 — work the same regardless of how many providers exist underneath.)
 
 ### Q5. MCP — roll our own or use a crate?
 
@@ -339,6 +390,29 @@ These need a call from the project owner before implementation kicks off. Listed
 
 **Recommendation:** bracket-array. The verbosity tax of `vector(0.1, 0.2, ..., 0.384)` for a 384-dim embedding is real, and bracket arrays are the standard literal form across the ecosystem.
 
+### Q9. WASM `.ask` — ship it, defer it, or hand off to JS?
+
+The WASM SDK has a uniquely awkward situation for `.ask`:
+
+- **CORS:** browsers block direct cross-origin POSTs from a WASM module to `api.anthropic.com` / `api.openai.com` unless the LLM provider serves CORS headers (they don't, deliberately — they don't want users embedding raw API keys in client-side JS).
+- **API key exposure:** even if CORS were OK, putting the API key into a WASM-loaded page exposes it to anyone with devtools.
+- **Both problems disappear server-side.** Node.js, Python, Go, desktop (Tauri runs the call in the Rust backend, not the webview) all do the HTTP from a trusted process.
+
+Three options for WASM specifically:
+
+- **A. Skip:** WASM SDK does not expose `ask()` for now. Users who need it deploy a Node-based proxy or use the cloud-hosted versions of the engine.
+- **B. JS-callback hook:** the WASM `db.ask(question)` returns the *generated prompt* and a list of fields, but doesn't make the HTTP call itself. The caller passes a JS function that does the call (typically routed through their own backend). The WASM side only does the schema introspection + prompt construction, never sees the API key.
+- **C. Direct HTTP via JS bindings:** the WASM module imports JS `fetch` and the user supplies the API key + provider URL. Insecure for production (key in the browser) but useful for local-only / Electron-style use.
+
+**Recommendation:** B. The "WASM does the schema-aware prompt; the caller does the HTTP" split is the cleanest security story and mirrors how every production browser-side LLM integration is built (call goes through your own backend). A few extra lines of glue for the user, but not a footgun.
+
+### Q10. `sqlrite-ask` crate vs feature flag on `sqlrite-engine`?
+
+- **Separate crate (`sqlrite-ask`):** zero dep weight on engine consumers who don't want LLM calls; cleaner separation; needs adding to lockstep version-bump + release pipeline.
+- **Feature flag (`sqlrite-engine` + feature `ask`):** simpler dep graph; but `cargo metadata` always shows the deps even when the feature is off; transitive TLS deps from `reqwest` etc.
+
+**Recommendation:** separate crate. Engine stays pure-SQL; LLM-stack churn (provider deprecations, API changes) doesn't ripple through engine consumers. Adds one product line to the lockstep release wave (`sqlrite-ask-v<V>`) — same shape as the other publish jobs.
+
 ### Q8. File format version bump
 
 Adding `VECTOR`, `JSON`, and HNSW indexes all change what cells can hold. We should bump the file format version once (probably to v4) at the start of 7a and accept all three additions inside that bump. Old (pre-Phase-7) files stay readable; format-v4 files don't open in pre-Phase-7 SQLRite. Standard pattern.
@@ -353,18 +427,22 @@ The Phase 6 lockstep release pipeline ships every product on every release. Phas
 
 | Product | What 7 adds for it |
 |---|---|
-| Rust engine | Everything — engine-level features |
-| C FFI | Vector type + KNN search exposed as new C functions; JSON likewise |
-| Python | Vector + JSON exposed as Python-native types (numpy interop?); `.ask` not exposed (REPL-specific) |
-| Node.js | Same as Python — vector + JSON; `.ask` not exposed |
-| WASM | Vector + JSON work; HNSW works (CPU only — no SIMD on wasm32 yet); `.ask` not exposed |
-| Go | Vector + JSON via cgo; `.ask` not exposed |
-| Desktop | UI for vector queries? (out of scope for Phase 7, future polish) |
-| MCP server | New product — its own crate, its own release tag `sqlrite-mcp-v<V>` |
+| Rust engine (`sqlrite-engine`) | Vector + JSON + HNSW + (optional) FTS at the SQL surface; new `Connection::ask()` re-exported from `sqlrite-ask` |
+| C FFI (`sqlrite-ffi`) | Vector + JSON exposed as new C functions; `.ask` exposed via a new `sqlrite_ask()` C function (links `sqlrite-ask`) |
+| Python SDK | Vector + JSON exposed as Python-native types (numpy interop where natural); `Connection.ask()` / `ask_run()` |
+| Node.js SDK | Same shape — vector + JSON + `db.ask()` / `db.askRun()` |
+| WASM SDK | Vector + JSON work; HNSW works (CPU only — no SIMD on wasm32 yet); `db.ask()` ships per Q9 (JS-callback shape — WASM does prompt construction, JS does the HTTP) |
+| Go SDK | Vector + JSON via cgo; `sqlrite.Ask(db, ...)` / `AskRun(...)` |
+| Desktop | "Ask" button in the query editor — natural-language → SQL preview → confirm-and-run. HTTP call runs in the Tauri Rust backend so the API key stays out of the webview. |
+| **`sqlrite-ask` (NEW product)** | New crate. Provider adapters (Anthropic / OpenAI / Ollama), prompt construction, schema introspection helper, `AskConfig` type. Independent release tag `sqlrite-ask-v<V>`. |
+| **`sqlrite-mcp` (NEW product)** | New binary. MCP server adapter exposing engine tools. Independent release tag `sqlrite-mcp-v<V>`. The `ask` MCP tool wraps `sqlrite-ask`. |
 
-The MCP server addition means an extra `publish-mcp` job in `release.yml` (parallels publish-go's "tag + GitHub Release" pattern, no registry upload).
+The two new products mean two extra publish jobs in `release.yml`:
 
-**Recommendation:** treat MCP as an 8th product line in the lockstep version bump. Add it to `scripts/bump-version.sh`'s manifest list, add a tag + release job to `release.yml`. Same lockstep version as everything else.
+- **`publish-ask`** — `cargo publish -p sqlrite-ask` to crates.io + GitHub Release `sqlrite-ask-v<V>`. Same shape as `publish-crate` for the engine.
+- **`publish-mcp`** — `cargo publish -p sqlrite-mcp` to crates.io + GitHub Release `sqlrite-mcp-v<V>` with the prebuilt binary tarballs attached for the same matrix as `publish-ffi` (Linux x86_64/aarch64, macOS aarch64, Windows x86_64). MCP servers are typically run as `npx` / `uvx` / direct binaries; users want a downloadable executable, not "build from source".
+
+**Recommendation:** treat both `sqlrite-ask` and `sqlrite-mcp` as new product lines in the lockstep version bump. Add them to `scripts/bump-version.sh`'s manifest list (now 13 manifests), add the two new tag + publish jobs to `release.yml`. Same lockstep version as everything else. The bump-version script and the tag-all step in release.yml both grow by two entries — small mechanical change, follows the same pattern as adding any other product line.
 
 ---
 
@@ -398,7 +476,7 @@ Plus per-sub-phase entries that get filled in as they ship — the same shape as
 
 ## Next steps
 
-1. Project owner answers Q1–Q8.
+1. Project owner answers Q1–Q10.
 2. Update this document with the chosen answers (so it becomes a record of decisions, not just a proposal).
 3. Cut a branch for sub-phase 7a (`feat/vector-column-type`).
 4. Implementation begins.
