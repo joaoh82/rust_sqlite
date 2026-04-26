@@ -48,6 +48,11 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 - [Release secrets runbook](release-secrets.md) — one-time web-UI setup for crates.io, PyPI, npm, GitHub `release` environment, and `main` branch protection
 - [`scripts/`](../scripts/) — runnable tooling used by release workflows + reproducible locally (start with `scripts/bump-version.sh`)
 
+## Future work
+
+- [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `ask()` API across REPL/library/SDKs/desktop/MCP, MCP server). **Approved 2026-04-26**, implementation starts at sub-phase 7a.
+- Phase 8 — Full-text search (FTS5-style BM25) + hybrid retrieval, deferred from Phase 7 per the plan-doc's Q1.
+
 ## Conventions
 
 - Code lives under [`src/`](../src/); docs live here under [`docs/`](./).
