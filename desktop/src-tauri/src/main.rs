@@ -234,11 +234,17 @@ fn extract_last_select(sql: &str, db: &Database) -> Option<CommandResult> {
 }
 
 fn display_value(v: &Value) -> String {
+    // Phase 7a: Vector values aren't auto-handled by this match — defer
+    // to Value::to_display_string for the canonical bracket-array format,
+    // which keeps the Vector arm in one place (table.rs's
+    // `format_vector_for_display`). All other variants stay inline so the
+    // hot path of integer/text/real/bool display avoids one indirection.
     match v {
         Value::Integer(n) => n.to_string(),
         Value::Text(s) => s.clone(),
         Value::Real(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Vector(_) => v.to_display_string(),
         Value::Null => "NULL".to_string(),
     }
 }

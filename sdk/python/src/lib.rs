@@ -491,6 +491,14 @@ fn value_to_pyobject(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
             // Bound before erasing the type.
             Ok(b.into_pyobject(py)?.to_owned().into_any().unbind())
         }
+        // Phase 7a — `VECTOR(N)` columns surface to Python as a `list[float]`.
+        // Widening f32→f64 here so Python's float (which is f64-backed)
+        // doesn't lose information; numpy interop / array module are
+        // future polish.
+        Value::Vector(elements) => {
+            let widened: Vec<f64> = elements.iter().map(|x| *x as f64).collect();
+            Ok(widened.into_pyobject(py)?.into_any().unbind())
+        }
         Value::Null => Ok(py.None()),
     }
 }

@@ -175,6 +175,20 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => serde_json::Value::String(s.clone()),
+        // Phase 7a — `VECTOR(N)` columns surface to JS as `Array<number>`.
+        // Widening f32→f64 (JS Number is f64-backed; serde_json::Number
+        // requires finite f64). NaN / Inf elements collapse to null
+        // entries — same fallback the Real arm already uses.
+        Value::Vector(elements) => serde_json::Value::Array(
+            elements
+                .iter()
+                .map(|x| {
+                    serde_json::Number::from_f64(*x as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
     }
 }
 

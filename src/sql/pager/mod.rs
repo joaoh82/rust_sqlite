@@ -319,12 +319,16 @@ fn take_integer(table: &Table, col: &str, rowid: i64) -> Result<i64> {
 fn table_to_create_sql(table: &Table) -> String {
     let mut parts = Vec::with_capacity(table.columns.len());
     for c in &table.columns {
-        let ty = match c.datatype {
-            DataType::Integer => "INTEGER",
-            DataType::Text => "TEXT",
-            DataType::Real => "REAL",
-            DataType::Bool => "BOOLEAN",
-            DataType::None | DataType::Invalid => "TEXT",
+        // Render the SQL type literally so the round-trip through
+        // CREATE TABLE re-parsing recreates the same schema. Vector
+        // carries its dimension inline.
+        let ty: String = match &c.datatype {
+            DataType::Integer => "INTEGER".to_string(),
+            DataType::Text => "TEXT".to_string(),
+            DataType::Real => "REAL".to_string(),
+            DataType::Bool => "BOOLEAN".to_string(),
+            DataType::Vector(dim) => format!("VECTOR({dim})"),
+            DataType::None | DataType::Invalid => "TEXT".to_string(),
         };
         let mut piece = format!("{} {}", c.column_name, ty);
         if c.is_pk {
@@ -369,12 +373,19 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
     {
         let mut map = rows.lock().expect("rows mutex poisoned");
         for col in &columns {
-            let row = match col.datatype {
+            // Mirror the dispatch in `Table::new` so the reconstructed
+            // table has the same shape it'd have if it were built fresh
+            // from SQL. Phase 7a adds the Vector arm — without it,
+            // VECTOR columns silently restore as Row::None and every
+            // restore_row hits a "storage None vs value Some(Vector(...))"
+            // type mismatch.
+            let row = match &col.datatype {
                 DataType::Integer => Row::Integer(BTreeMap::new()),
                 DataType::Text => Row::Text(BTreeMap::new()),
                 DataType::Real => Row::Real(BTreeMap::new()),
                 DataType::Bool => Row::Bool(BTreeMap::new()),
-                _ => Row::None,
+                DataType::Vector(_dim) => Row::Vector(BTreeMap::new()),
+                DataType::None | DataType::Invalid => Row::None,
             };
             map.insert(col.column_name.clone(), row);
 
@@ -573,6 +584,7 @@ fn clone_datatype(dt: &DataType) -> DataType {
         DataType::Text => DataType::Text,
         DataType::Real => DataType::Real,
         DataType::Bool => DataType::Bool,
+        DataType::Vector(dim) => DataType::Vector(*dim),
         DataType::None => DataType::None,
         DataType::Invalid => DataType::Invalid,
     }
@@ -970,6 +982,68 @@ mod tests {
 
         let notes = loaded.get_table("notes".to_string()).expect("notes table");
         assert_eq!(notes.rowids().len(), 1);
+
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7a — VECTOR(N) save / reopen round-trip
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_preserves_vector_column() {
+        let path = tmp_path("vec_roundtrip");
+
+        // Build, populate, save.
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(3));",
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                "INSERT INTO docs (embedding) VALUES ([0.1, 0.2, 0.3]);",
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                "INSERT INTO docs (embedding) VALUES ([1.5, -2.0, 3.5]);",
+                &mut db,
+            )
+            .unwrap();
+            save_database(&mut db, &path).expect("save");
+        } // db drops → its exclusive lock releases before reopen.
+
+        // Reopen and verify schema + data both round-tripped.
+        let loaded = open_database(&path, "test".to_string()).expect("open");
+        let docs = loaded.get_table("docs".to_string()).expect("docs table");
+
+        // Schema preserved: column is still VECTOR(3).
+        let embedding_col = docs
+            .columns
+            .iter()
+            .find(|c| c.column_name == "embedding")
+            .expect("embedding column");
+        assert!(
+            matches!(embedding_col.datatype, DataType::Vector(3)),
+            "expected DataType::Vector(3) after round-trip, got {:?}",
+            embedding_col.datatype
+        );
+
+        // Data preserved: both vectors still readable bit-for-bit.
+        let mut rows: Vec<Vec<f32>> = docs
+            .rowids()
+            .iter()
+            .filter_map(|r| match docs.get_value("embedding", *r) {
+                Some(Value::Vector(v)) => Some(v),
+                _ => None,
+            })
+            .collect();
+        rows.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![0.1f32, 0.2, 0.3]);
+        assert_eq!(rows[1], vec![1.5f32, -2.0, 3.5]);
 
         cleanup(&path);
     }

@@ -10,39 +10,86 @@ use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 /// SQLRite data types
 /// Mapped after SQLite Data Type Storage Classes and SQLite Affinity Type
 /// (Datatypes In SQLite Version 3)[https://www.sqlite.org/datatype3.html]
+///
+/// `Vector(dim)` is the Phase 7a addition — a fixed-dimension dense f32
+/// array. The dimension is part of the type so a `VECTOR(384)` column
+/// rejects `[0.1, 0.2, 0.3]` at INSERT time as a clean type error
+/// rather than silently storing the wrong shape.
 #[derive(PartialEq, Debug, Clone)]
 pub enum DataType {
     Integer,
     Text,
     Real,
     Bool,
+    /// Dense f32 vector of fixed dimension. The `usize` is the column's
+    /// declared dimension; every value stored in the column must have
+    /// exactly that many elements.
+    Vector(usize),
     None,
     Invalid,
 }
 
 impl DataType {
+    /// Constructs a `DataType` from the wire string the parser produces.
+    /// Pre-Phase-7 the strings were one-of `"integer" | "text" | "real" |
+    /// "bool" | "none"`. Phase 7a adds `"vector(N)"` (case-insensitive,
+    /// N a positive integer) for the new vector column type — encoded
+    /// in-band so we don't have to plumb a richer type through the
+    /// existing string-based ParsedColumn pipeline.
     pub fn new(cmd: String) -> DataType {
-        match cmd.to_lowercase().as_ref() {
+        let lower = cmd.to_lowercase();
+        match lower.as_str() {
             "integer" => DataType::Integer,
             "text" => DataType::Text,
             "real" => DataType::Real,
             "bool" => DataType::Bool,
             "none" => DataType::None,
+            other if other.starts_with("vector(") && other.ends_with(')') => {
+                // Strip the `vector(` prefix and trailing `)`, parse what's
+                // left as a positive integer dimension. Anything else is
+                // Invalid — surfaces a clean error at CREATE TABLE time.
+                let inside = &other["vector(".len()..other.len() - 1];
+                match inside.trim().parse::<usize>() {
+                    Ok(dim) if dim > 0 => DataType::Vector(dim),
+                    _ => {
+                        eprintln!("Invalid VECTOR dimension in {cmd}");
+                        DataType::Invalid
+                    }
+                }
+            }
             _ => {
                 eprintln!("Invalid data type given {}", cmd);
                 DataType::Invalid
             }
         }
     }
+
+    /// Inverse of `new` — returns the canonical lowercased wire string
+    /// for this DataType. Used by the parser to round-trip
+    /// `VECTOR(N)` → `DataType::Vector(N)` → `"vector(N)"` into
+    /// `ParsedColumn::datatype` so the rest of the pipeline keeps
+    /// working with strings.
+    pub fn to_wire_string(&self) -> String {
+        match self {
+            DataType::Integer => "Integer".to_string(),
+            DataType::Text => "Text".to_string(),
+            DataType::Real => "Real".to_string(),
+            DataType::Bool => "Bool".to_string(),
+            DataType::Vector(dim) => format!("vector({dim})"),
+            DataType::None => "None".to_string(),
+            DataType::Invalid => "Invalid".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             DataType::Integer => f.write_str("Integer"),
             DataType::Text => f.write_str("Text"),
             DataType::Real => f.write_str("Real"),
             DataType::Bool => f.write_str("Boolean"),
+            DataType::Vector(dim) => write!(f, "Vector({dim})"),
             DataType::None => f.write_str("None"),
             DataType::Invalid => f.write_str("Invalid"),
         }
@@ -100,11 +147,16 @@ impl Table {
             ));
 
             let dt = DataType::new(col.datatype.to_string());
-            let row_storage = match dt {
+            let row_storage = match &dt {
                 DataType::Integer => Row::Integer(BTreeMap::new()),
                 DataType::Real => Row::Real(BTreeMap::new()),
                 DataType::Text => Row::Text(BTreeMap::new()),
                 DataType::Bool => Row::Bool(BTreeMap::new()),
+                // The dimension is enforced at INSERT time against the
+                // column's declared DataType::Vector(dim). The Row variant
+                // itself doesn't carry the dim — every stored Vec<f32>
+                // already has it via .len().
+                DataType::Vector(_dim) => Row::Vector(BTreeMap::new()),
                 DataType::Invalid | DataType::None => Row::None,
             };
             table_rows
@@ -113,9 +165,11 @@ impl Table {
                 .insert(col.name.to_string(), row_storage);
 
             // Auto-create an index for every UNIQUE / PRIMARY KEY column,
-            // but only for types we know how to index. Real / Bool UNIQUE
-            // columns fall back to the linear scan path in
+            // but only for types we know how to index. Real / Bool / Vector
+            // UNIQUE columns fall back to the linear scan path in
             // validate_unique_constraint — same behavior as before 3e.
+            // (Vector UNIQUE is unusual; the linear-scan path will work
+            // via Value::Vector PartialEq, just at O(N) cost.)
             if (col.is_pk || col.is_unique) && matches!(dt, DataType::Integer | DataType::Text) {
                 let name = SecondaryIndex::auto_name(&table_name, &col.name);
                 match SecondaryIndex::new(
@@ -250,6 +304,9 @@ impl Table {
                         Row::Bool(m) => {
                             m.remove(&rowid);
                         }
+                        Row::Vector(m) => {
+                            m.remove(&rowid);
+                        }
                         Row::None => {}
                     }
                 }
@@ -329,6 +386,14 @@ impl Table {
                     (Row::Bool(_), None) => {
                         return Err(SQLRiteError::Internal(format!(
                             "Bool column '{col_name}' cannot store NULL — corrupt cell?"
+                        )));
+                    }
+                    (Row::Vector(map), Some(Value::Vector(v))) => {
+                        map.insert(rowid, v.clone());
+                    }
+                    (Row::Vector(_), None) => {
+                        return Err(SQLRiteError::Internal(format!(
+                            "Vector column '{col_name}' cannot store NULL — corrupt cell?"
                         )));
                     }
                     (row, v) => {
@@ -446,6 +511,15 @@ impl Table {
                 (Row::Bool(m), Value::Bool(v), _) => {
                     m.insert(rowid, *v);
                 }
+                (Row::Vector(m), Value::Vector(v), DataType::Vector(declared_dim)) => {
+                    if v.len() != *declared_dim {
+                        return Err(SQLRiteError::General(format!(
+                            "Vector dimension mismatch for column '{column}': declared {declared_dim}, got {}",
+                            v.len()
+                        )));
+                    }
+                    m.insert(rowid, v.clone());
+                }
                 // NULL writes: store the sentinel "Null" string for Text; for other
                 // types we leave storage as-is since those BTreeMaps can't hold NULL today.
                 (Row::Text(m), Value::Null, _) => {
@@ -532,6 +606,20 @@ impl Table {
                         "Type mismatch: expected BOOL for column '{name}', got '{val}'"
                     ))
                 })?,
+                DataType::Vector(declared_dim) => {
+                    let parsed_vec = parse_vector_literal(val).map_err(|e| {
+                        SQLRiteError::General(format!(
+                            "Type mismatch: expected VECTOR({declared_dim}) for column '{name}', {e}"
+                        ))
+                    })?;
+                    if parsed_vec.len() != *declared_dim {
+                        return Err(SQLRiteError::General(format!(
+                            "Vector dimension mismatch for column '{name}': declared {declared_dim}, got {}",
+                            parsed_vec.len()
+                        )));
+                    }
+                    Value::Vector(parsed_vec)
+                }
                 DataType::None | DataType::Invalid => {
                     return Err(SQLRiteError::Internal(format!(
                         "column '{name}' has an unsupported datatype"
@@ -687,6 +775,33 @@ impl Table {
                         })?;
                         tree.insert(next_rowid, parsed);
                         Some(Value::Bool(parsed))
+                    }
+                    Row::Vector(tree) => {
+                        // The parser put a bracket-array literal into `val`
+                        // (e.g. "[0.1,0.2,0.3]"). Parse it back here and
+                        // dim-check against the column's declared
+                        // DataType::Vector(N).
+                        let parsed = parse_vector_literal(&val).map_err(|e| {
+                            SQLRiteError::General(format!(
+                                "Type mismatch: expected VECTOR for column '{key}', {e}"
+                            ))
+                        })?;
+                        let declared_dim = match &self.columns[i].datatype {
+                            DataType::Vector(d) => *d,
+                            other => {
+                                return Err(SQLRiteError::Internal(format!(
+                                    "Row::Vector storage on non-Vector column '{key}' (declared as {other})"
+                                )));
+                            }
+                        };
+                        if parsed.len() != declared_dim {
+                            return Err(SQLRiteError::General(format!(
+                                "Vector dimension mismatch for column '{key}': declared {declared_dim}, got {}",
+                                parsed.len()
+                            )));
+                        }
+                        tree.insert(next_rowid, parsed.clone());
+                        Some(Value::Vector(parsed))
                     }
                     Row::None => {
                         return Err(SQLRiteError::Internal(format!(
@@ -864,6 +979,11 @@ pub enum Row {
     Text(BTreeMap<i64, String>),
     Real(BTreeMap<i64, f32>),
     Bool(BTreeMap<i64, bool>),
+    /// Phase 7a: dense f32 vector storage. Each `Vec<f32>` should have
+    /// length matching the column's declared `DataType::Vector(dim)`,
+    /// enforced at INSERT time. The Row variant doesn't carry the dim —
+    /// it lives in the column metadata.
+    Vector(BTreeMap<i64, Vec<f32>>),
     None,
 }
 
@@ -874,6 +994,7 @@ impl Row {
             Row::Real(cd) => cd.values().map(|v| v.to_string()).collect(),
             Row::Text(cd) => cd.values().map(|v| v.to_string()).collect(),
             Row::Bool(cd) => cd.values().map(|v| v.to_string()).collect(),
+            Row::Vector(cd) => cd.values().map(format_vector_for_display).collect(),
             Row::None => panic!("Found None in columns"),
         }
     }
@@ -884,6 +1005,7 @@ impl Row {
             Row::Real(cd) => cd.len(),
             Row::Text(cd) => cd.len(),
             Row::Bool(cd) => cd.len(),
+            Row::Vector(cd) => cd.len(),
             Row::None => panic!("Found None in columns"),
         }
     }
@@ -897,6 +1019,7 @@ impl Row {
             Row::Text(m) => m.keys().copied().collect(),
             Row::Real(m) => m.keys().copied().collect(),
             Row::Bool(m) => m.keys().copied().collect(),
+            Row::Vector(m) => m.keys().copied().collect(),
             Row::None => vec![],
         }
     }
@@ -915,9 +1038,32 @@ impl Row {
             }),
             Row::Real(m) => m.get(&rowid).map(|v| Value::Real(f64::from(*v))),
             Row::Bool(m) => m.get(&rowid).map(|v| Value::Bool(*v)),
+            Row::Vector(m) => m.get(&rowid).map(|v| Value::Vector(v.clone())),
             Row::None => None,
         }
     }
+}
+
+/// Render a vector for human display. Used by both `Row::get_serialized_col_data`
+/// (for the REPL's print-table path) and `Value::to_display_string`.
+///
+/// Format: `[0.1, 0.2, 0.3]` — JSON-like, decimal-minimal via `{}` Display.
+/// For high-dimensional vectors (e.g. 384 elements) this produces a long
+/// line; truncation ellipsis is a future polish (see Phase 7 plan, "What
+/// this proposal does NOT commit to").
+fn format_vector_for_display(v: &Vec<f32>) -> String {
+    let mut s = String::with_capacity(v.len() * 6 + 2);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        // Default f32 Display picks the minimal-roundtrip representation,
+        // so 0.1f32 prints as "0.1" not "0.10000000149011612". Good enough.
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
 }
 
 /// Runtime value produced by query execution. Separate from the on-disk `Row` enum
@@ -928,6 +1074,11 @@ pub enum Value {
     Text(String),
     Real(f64),
     Bool(bool),
+    /// Phase 7a: dense f32 vector as a runtime value. Carries its own
+    /// dimension implicitly via `Vec::len`; the column it's being
+    /// assigned to has a declared `DataType::Vector(N)` that's checked
+    /// at INSERT/UPDATE time.
+    Vector(Vec<f32>),
     Null,
 }
 
@@ -938,9 +1089,53 @@ impl Value {
             Value::Text(s) => s.clone(),
             Value::Real(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
+            Value::Vector(v) => format_vector_for_display(v),
             Value::Null => String::from("NULL"),
         }
     }
+}
+
+/// Parse a bracket-array literal like `"[0.1, 0.2, 0.3]"` (or `"[1, 2, 3]"`)
+/// into a `Vec<f32>`. The parser/insert pipeline stores vector literals as
+/// strings in `InsertQuery::rows` (a `Vec<Vec<String>>`); this helper is
+/// the inverse — turn the string back into a typed vector at the boundary
+/// where we actually need element-typed data.
+///
+/// Accepts:
+/// - `[]` → empty vector (caller's dimension check rejects it for VECTOR(N≥1))
+/// - `[0.1, 0.2, 0.3]` → standard float syntax
+/// - `[1, 2, 3]` → integers, coerced to f32 (matches `VALUES (1, 2)` for
+///   `REAL` columns; we widen ints to floats automatically)
+/// - whitespace tolerated everywhere (Python/JSON/pgvector convention)
+///
+/// Rejects with a descriptive message:
+/// - missing `[` / `]`
+/// - non-numeric elements (`['foo', 0.1]`)
+/// - NaN / Inf literals (we accept them via `f32::from_str` but caller can
+///   reject if undesired — for now we let them through; HNSW etc. will
+///   reject NaN at index time)
+pub fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return Err(SQLRiteError::General(format!(
+            "expected bracket-array literal `[...]`, got `{s}`"
+        )));
+    }
+    let inner = &trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (i, part) in inner.split(',').enumerate() {
+        let element = part.trim();
+        let parsed: f32 = element.parse().map_err(|_| {
+            SQLRiteError::General(format!(
+                "vector element {i} (`{element}`) is not a number"
+            ))
+        })?;
+        out.push(parsed);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -955,6 +1150,7 @@ mod tests {
         let text = DataType::Text;
         let real = DataType::Real;
         let boolean = DataType::Bool;
+        let vector = DataType::Vector(384);
         let none = DataType::None;
         let invalid = DataType::Invalid;
 
@@ -962,8 +1158,115 @@ mod tests {
         assert_eq!(format!("{}", text), "Text");
         assert_eq!(format!("{}", real), "Real");
         assert_eq!(format!("{}", boolean), "Boolean");
+        assert_eq!(format!("{}", vector), "Vector(384)");
         assert_eq!(format!("{}", none), "None");
         assert_eq!(format!("{}", invalid), "Invalid");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7a — VECTOR(N) column type
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn datatype_new_parses_vector_dim() {
+        // Standard cases.
+        assert_eq!(DataType::new("vector(1)".to_string()), DataType::Vector(1));
+        assert_eq!(
+            DataType::new("vector(384)".to_string()),
+            DataType::Vector(384)
+        );
+        assert_eq!(
+            DataType::new("vector(1536)".to_string()),
+            DataType::Vector(1536)
+        );
+
+        // Case-insensitive on the keyword.
+        assert_eq!(
+            DataType::new("VECTOR(384)".to_string()),
+            DataType::Vector(384)
+        );
+
+        // Whitespace inside parens tolerated (the create-parser strips it
+        // but the string-based round-trip in DataType::new is the one place
+        // we don't fully control input formatting).
+        assert_eq!(
+            DataType::new("vector( 64 )".to_string()),
+            DataType::Vector(64)
+        );
+    }
+
+    #[test]
+    fn datatype_new_rejects_bad_vector_strings() {
+        // dim = 0 is rejected (Q2: VECTOR(N≥1)).
+        assert_eq!(DataType::new("vector(0)".to_string()), DataType::Invalid);
+        // Non-numeric dim.
+        assert_eq!(DataType::new("vector(abc)".to_string()), DataType::Invalid);
+        // Empty parens.
+        assert_eq!(DataType::new("vector()".to_string()), DataType::Invalid);
+        // Negative dim wouldn't even parse as usize, so falls into Invalid.
+        assert_eq!(DataType::new("vector(-3)".to_string()), DataType::Invalid);
+    }
+
+    #[test]
+    fn datatype_to_wire_string_round_trips_vector() {
+        let dt = DataType::Vector(384);
+        let wire = dt.to_wire_string();
+        assert_eq!(wire, "vector(384)");
+        // And feeds back through DataType::new losslessly — this is the
+        // round-trip the ParsedColumn pipeline relies on.
+        assert_eq!(DataType::new(wire), DataType::Vector(384));
+    }
+
+    #[test]
+    fn parse_vector_literal_accepts_floats() {
+        let v = parse_vector_literal("[0.1, 0.2, 0.3]").expect("parse");
+        assert_eq!(v, vec![0.1f32, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn parse_vector_literal_accepts_ints_widening_to_f32() {
+        let v = parse_vector_literal("[1, 2, 3]").expect("parse");
+        assert_eq!(v, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn parse_vector_literal_handles_negatives_and_whitespace() {
+        let v = parse_vector_literal("[ -1.5 ,  2.0,  -3.5 ]").expect("parse");
+        assert_eq!(v, vec![-1.5f32, 2.0, -3.5]);
+    }
+
+    #[test]
+    fn parse_vector_literal_empty_brackets_is_empty_vec() {
+        let v = parse_vector_literal("[]").expect("parse");
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_vector_literal_rejects_non_bracketed() {
+        assert!(parse_vector_literal("0.1, 0.2").is_err());
+        assert!(parse_vector_literal("(0.1, 0.2)").is_err());
+        assert!(parse_vector_literal("[0.1, 0.2").is_err()); // missing ]
+        assert!(parse_vector_literal("0.1, 0.2]").is_err()); // missing [
+    }
+
+    #[test]
+    fn parse_vector_literal_rejects_non_numeric_elements() {
+        let err = parse_vector_literal("[1.0, 'foo', 3.0]").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("vector element 1") && msg.contains("'foo'"),
+            "error message should pinpoint the bad element: got `{msg}`"
+        );
+    }
+
+    #[test]
+    fn value_vector_display_format() {
+        let v = Value::Vector(vec![0.1, 0.2, 0.3]);
+        assert_eq!(v.to_display_string(), "[0.1, 0.2, 0.3]");
+
+        // Empty vector displays as `[]`.
+        let empty = Value::Vector(vec![]);
+        assert_eq!(empty.to_display_string(), "[]");
     }
 
     #[test]
