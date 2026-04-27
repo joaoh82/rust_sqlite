@@ -1156,11 +1156,8 @@ mod tests {
         .expect("create table");
 
         // Too few elements.
-        let err = process_command(
-            "INSERT INTO docs (embedding) VALUES ([0.1, 0.2]);",
-            &mut db,
-        )
-        .unwrap_err();
+        let err = process_command("INSERT INTO docs (embedding) VALUES ([0.1, 0.2]);", &mut db)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.to_lowercase().contains("dimension")

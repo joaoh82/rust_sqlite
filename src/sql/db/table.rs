@@ -1129,9 +1129,7 @@ pub fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
     for (i, part) in inner.split(',').enumerate() {
         let element = part.trim();
         let parsed: f32 = element.parse().map_err(|_| {
-            SQLRiteError::General(format!(
-                "vector element {i} (`{element}`) is not a number"
-            ))
+            SQLRiteError::General(format!("vector element {i} (`{element}`) is not a number"))
         })?;
         out.push(parsed);
     }
