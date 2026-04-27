@@ -6,14 +6,15 @@ use std::cmp::Ordering;
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement, TableFactor, TableWithJoins,
-    UnaryOperator, Update,
+    FunctionArgExpr, FunctionArguments, IndexType, ObjectNamePart, Statement, TableFactor,
+    TableWithJoins, UnaryOperator, Update,
 };
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
-use crate::sql::db::table::{DataType, Table, Value, parse_vector_literal};
+use crate::sql::db::table::{DataType, HnswIndexEntry, Table, Value, parse_vector_literal};
+use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
 
 /// Executes a parsed `SelectQuery` against the database and returns a
@@ -87,12 +88,24 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     // sort_by-per-row cost on the heap operations, but k is typically
     // 10-100 while N can be millions.
     //
-    // We branch in three cases:
-    //   1. ORDER BY + LIMIT k where k < |matching|  → bounded heap.
-    //   2. ORDER BY without LIMIT, or LIMIT >= |matching| → full sort
-    //      (heap saves nothing when we'd keep everyone anyway).
-    //   3. LIMIT without ORDER BY → just truncate (no sort needed).
+    // Phase 7d.2 — HNSW ANN probe.
+    //
+    // Even better than the bounded heap: if the ORDER BY expression is
+    // exactly `vec_distance_l2(<col>, <bracket-array literal>)` AND
+    // `<col>` has an HNSW index attached, skip the linear scan
+    // entirely and probe the graph in O(log N). Approximate but
+    // typically ≥ 0.95 recall (verified by the recall tests in
+    // src/sql/hnsw.rs).
+    //
+    // We branch in cases:
+    //   1. ORDER BY + LIMIT k matches the HNSW probe pattern  → graph probe.
+    //   2. ORDER BY + LIMIT k where k < |matching|            → bounded heap (7c).
+    //   3. ORDER BY without LIMIT, or LIMIT >= |matching|     → full sort.
+    //   4. LIMIT without ORDER BY                              → just truncate.
     match (&query.order_by, query.limit) {
+        (Some(order), Some(k)) if try_hnsw_probe(table, &order.expr, k).is_some() => {
+            matching = try_hnsw_probe(table, &order.expr, k).unwrap();
+        }
         (Some(order), Some(k)) if k < matching.len() => {
             matching = select_topk(&matching, table, order, k)?;
         }
@@ -165,6 +178,26 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
     };
     let table_name = extract_single_table_name(tables)?;
 
+    // Phase 7d.2 limitation: HNSW lacks an in-place delete-node operation.
+    // True deletion needs either soft-delete + tombstones or a graph rebuild
+    // — both nontrivial. Until 7d.3 lands persistence we don't have a
+    // natural rebuild trigger either. So: refuse DELETE on tables carrying
+    // any HNSW index, with a message that points at the workaround
+    // (DROP the index, DELETE, recreate).
+    {
+        let table = db.get_table(table_name.clone()).map_err(|_| {
+            SQLRiteError::General(format!("DELETE references unknown table '{table_name}'"))
+        })?;
+        if !table.hnsw_indexes.is_empty() {
+            let names: Vec<&str> = table.hnsw_indexes.iter().map(|e| e.name.as_str()).collect();
+            return Err(SQLRiteError::NotImplemented(format!(
+                "DELETE on tables with HNSW indexes is not supported yet \
+                 (Phase 7d.3 follow-up). DROP the index first, then DELETE, then re-CREATE. \
+                 Table '{table_name}' currently has: {names:?}"
+            )));
+        }
+    }
+
     // Compute matching rowids with an immutable borrow, then mutate.
     let matching: Vec<i64> = {
         let table = db
@@ -216,6 +249,25 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     }
 
     let table_name = extract_table_name(table)?;
+
+    // Phase 7d.2 limitation (same shape as DELETE above): we have no
+    // in-place UPDATE-an-HNSW-node primitive. UPDATE on a column NOT
+    // covered by HNSW is fine in principle, but the simplest MVP is
+    // refuse-everything-when-HNSW-is-present. Re-evaluate in 7d.3 once
+    // persistence + rebuild is in.
+    {
+        let tbl = db.get_table(table_name.clone()).map_err(|_| {
+            SQLRiteError::General(format!("UPDATE references unknown table '{table_name}'"))
+        })?;
+        if !tbl.hnsw_indexes.is_empty() {
+            let names: Vec<&str> = tbl.hnsw_indexes.iter().map(|e| e.name.as_str()).collect();
+            return Err(SQLRiteError::NotImplemented(format!(
+                "UPDATE on tables with HNSW indexes is not supported yet \
+                 (Phase 7d.3 follow-up). DROP the index first if you need to mutate. \
+                 Table '{table_name}' currently has: {names:?}"
+            )));
+        }
+    }
 
     // Resolve assignment targets to plain column names and verify they exist.
     let mut parsed_assignments: Vec<(String, Expr)> = Vec::with_capacity(assignments.len());
@@ -288,14 +340,23 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     Ok(work.len())
 }
 
-/// Handles `CREATE INDEX [UNIQUE] <name> ON <table> (<column>)`. Single-
-/// column indexes only; multi-column / composite indexes are future work.
+/// Handles `CREATE INDEX [UNIQUE] <name> ON <table> [USING <method>] (<column>)`.
+/// Single-column indexes only.
+///
+/// Two flavours, branching on the optional `USING <method>` clause:
+///   - **No USING, or `USING btree`**: regular B-Tree secondary index
+///     (Phase 3e). Indexable types: Integer, Text.
+///   - **`USING hnsw`**: HNSW ANN index (Phase 7d.2). Indexable types:
+///     Vector(N) only. Distance metric is L2 by default; cosine and
+///     dot variants are deferred to Phase 7d.x.
+///
 /// Returns the (possibly synthesized) index name for the status message.
 pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<String> {
     let Statement::CreateIndex(CreateIndex {
         name,
         table_name,
         columns,
+        using,
         unique,
         if_not_exists,
         predicate,
@@ -326,6 +387,26 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         )
     })?;
 
+    // Detect USING <method>. The `using` field on CreateIndex covers the
+    // pre-column form `CREATE INDEX … USING hnsw (col)`. (sqlparser also
+    // accepts a post-column form `… (col) USING hnsw` and parks that in
+    // `index_options`; we don't bother with it — the canonical form is
+    // pre-column and matches PG/pgvector convention.)
+    let method = match using {
+        Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw") => {
+            IndexMethod::Hnsw
+        }
+        Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("btree") => {
+            IndexMethod::Btree
+        }
+        Some(other) => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "CREATE INDEX … USING {other:?} is not supported (try `hnsw` or no USING clause)"
+            )));
+        }
+        None => IndexMethod::Btree,
+    };
+
     let table_name_str = table_name.to_string();
     let column_name = match &columns[0].column.expr {
         Expr::Identifier(ident) => ident.value.clone(),
@@ -340,7 +421,10 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         }
     };
 
-    // Validate: table exists, column exists, type is indexable, name is unique.
+    // Validate: table exists, column exists, type matches the index method,
+    // name is unique across both index kinds. Snapshot (rowid, value) pairs
+    // up front under the immutable borrow so the mutable attach later
+    // doesn't fight over `self`.
     let (datatype, existing_rowids_and_values): (DataType, Vec<(i64, Value)>) = {
         let table = db.get_table(table_name_str.clone()).map_err(|_| {
             SQLRiteError::General(format!(
@@ -357,7 +441,12 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
             .iter()
             .find(|c| c.column_name == column_name)
             .expect("we just verified the column exists");
-        if table.index_by_name(&index_name).is_some() {
+
+        // Name uniqueness check spans BOTH index kinds — a btree and an
+        // hnsw can't share a name.
+        if table.index_by_name(&index_name).is_some()
+            || table.hnsw_indexes.iter().any(|i| i.name == index_name)
+        {
             if *if_not_exists {
                 return Ok(index_name);
             }
@@ -367,9 +456,6 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         }
         let datatype = clone_datatype(&col.datatype);
 
-        // Snapshot (rowid, value) pairs so we can populate the index after
-        // it's attached. Doing this under the immutable borrow of the table
-        // means the mutable attach below can proceed without aliasing.
         let mut pairs = Vec::new();
         for rowid in table.rowids() {
             if let Some(v) = table.get_value(&column_name, rowid) {
@@ -379,21 +465,61 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         (datatype, pairs)
     };
 
-    // Build the index.
+    match method {
+        IndexMethod::Btree => create_btree_index(
+            db,
+            &table_name_str,
+            &index_name,
+            &column_name,
+            &datatype,
+            *unique,
+            &existing_rowids_and_values,
+        ),
+        IndexMethod::Hnsw => create_hnsw_index(
+            db,
+            &table_name_str,
+            &index_name,
+            &column_name,
+            &datatype,
+            *unique,
+            &existing_rowids_and_values,
+        ),
+    }
+}
+
+/// `USING <method>` choices recognized by `execute_create_index`. A
+/// missing USING clause defaults to `Btree` so existing CREATE INDEX
+/// statements (Phase 3e) keep working unchanged.
+#[derive(Debug, Clone, Copy)]
+enum IndexMethod {
+    Btree,
+    Hnsw,
+}
+
+/// Builds a Phase 3e B-Tree secondary index and attaches it to the table.
+fn create_btree_index(
+    db: &mut Database,
+    table_name: &str,
+    index_name: &str,
+    column_name: &str,
+    datatype: &DataType,
+    unique: bool,
+    existing: &[(i64, Value)],
+) -> Result<String> {
     let mut idx = SecondaryIndex::new(
-        index_name.clone(),
-        table_name_str.clone(),
-        column_name.clone(),
-        &datatype,
-        *unique,
+        index_name.to_string(),
+        table_name.to_string(),
+        column_name.to_string(),
+        datatype,
+        unique,
         IndexOrigin::Explicit,
     )?;
 
-    // Populate from the existing rows. UNIQUE violations here mean the
-    // existing data already breaks the new index's constraint — a common
-    // source of user confusion, so be explicit.
-    for (rowid, v) in &existing_rowids_and_values {
-        if *unique && idx.would_violate_unique(v) {
+    // Populate from existing rows. UNIQUE violations here mean the
+    // existing data already breaks the new index's constraint — a
+    // common source of user confusion, so be explicit.
+    for (rowid, v) in existing {
+        if unique && idx.would_violate_unique(v) {
             return Err(SQLRiteError::General(format!(
                 "cannot create UNIQUE index '{index_name}': column '{column_name}' \
                  already contains the duplicate value {}",
@@ -403,10 +529,100 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         idx.insert(v, *rowid)?;
     }
 
-    // Attach to the table.
-    let table_mut = db.get_table_mut(table_name_str)?;
+    let table_mut = db.get_table_mut(table_name.to_string())?;
     table_mut.secondary_indexes.push(idx);
-    Ok(index_name)
+    Ok(index_name.to_string())
+}
+
+/// Builds a Phase 7d.2 HNSW index and attaches it to the table.
+fn create_hnsw_index(
+    db: &mut Database,
+    table_name: &str,
+    index_name: &str,
+    column_name: &str,
+    datatype: &DataType,
+    unique: bool,
+    existing: &[(i64, Value)],
+) -> Result<String> {
+    // HNSW only makes sense on VECTOR columns. Reject anything else
+    // with a clear message — this is the most likely user error.
+    let dim = match datatype {
+        DataType::Vector(d) => *d,
+        other => {
+            return Err(SQLRiteError::General(format!(
+                "USING hnsw requires a VECTOR column; '{column_name}' is {other}"
+            )));
+        }
+    };
+
+    if unique {
+        return Err(SQLRiteError::General(
+            "UNIQUE has no meaning for HNSW indexes".to_string(),
+        ));
+    }
+
+    // Build the in-memory graph. Distance metric is L2 by default
+    // (Phase 7d.2 doesn't yet expose a knob for picking cosine/dot —
+    // see `docs/phase-7-plan.md` for the deferral).
+    //
+    // Seed: hash the index name so different indexes get different
+    // graph topologies, but the same index always gets the same one
+    // — useful when debugging recall / index size.
+    let seed = hash_str_to_seed(index_name);
+    let mut idx = HnswIndex::new(DistanceMetric::L2, seed);
+
+    // Snapshot the (rowid, vector) pairs into a side map so the
+    // get_vec closure below can serve them by id without re-borrowing
+    // the table (we're already holding `existing` — flatten it).
+    let mut vec_map: std::collections::HashMap<i64, Vec<f32>> =
+        std::collections::HashMap::with_capacity(existing.len());
+    for (rowid, v) in existing {
+        match v {
+            Value::Vector(vec) => {
+                if vec.len() != dim {
+                    return Err(SQLRiteError::Internal(format!(
+                        "row {rowid} stores a {}-dim vector in column '{column_name}' \
+                         declared as VECTOR({dim}) — schema invariant violated",
+                        vec.len()
+                    )));
+                }
+                vec_map.insert(*rowid, vec.clone());
+            }
+            // Non-vector values (theoretical NULL, type coercion bug)
+            // get skipped — they wouldn't have a sensible graph
+            // position anyway.
+            _ => continue,
+        }
+    }
+
+    for (rowid, _) in existing {
+        if let Some(v) = vec_map.get(rowid) {
+            let v_clone = v.clone();
+            idx.insert(*rowid, &v_clone, |id| {
+                vec_map.get(&id).cloned().unwrap_or_default()
+            });
+        }
+    }
+
+    let table_mut = db.get_table_mut(table_name.to_string())?;
+    table_mut.hnsw_indexes.push(HnswIndexEntry {
+        name: index_name.to_string(),
+        column_name: column_name.to_string(),
+        index: idx,
+    });
+    Ok(index_name.to_string())
+}
+
+/// Stable, deterministic hash of a string into a u64 RNG seed. FNV-1a;
+/// avoids pulling in `std::hash::DefaultHasher` (which is randomized
+/// per process).
+fn hash_str_to_seed(s: &str) -> u64 {
+    let mut h: u64 = 0xCBF29CE484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001B3);
+    }
+    h
 }
 
 /// Cheap clone helper — `DataType` intentionally doesn't derive `Clone`
@@ -524,6 +740,131 @@ fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> 
         return Some((c, l));
     }
     None
+}
+
+/// Recognizes the HNSW-probable query pattern and probes the graph
+/// if a matching index exists.
+///
+/// Looks for ORDER BY `vec_distance_l2(<col>, <bracket-array literal>)`
+/// where the table has an HNSW index attached to `<col>`. On a match,
+/// returns the top-k rowids straight from the graph (O(log N)). On
+/// any miss — different function name, no matching index, query
+/// dimension wrong, etc. — returns `None` and the caller falls through
+/// to the bounded-heap brute-force path (7c) or the full sort (7b),
+/// preserving correct results regardless of whether the HNSW pathway
+/// kicked in.
+///
+/// Phase 7d.2 caveats:
+/// - Only `vec_distance_l2` is recognized. Cosine and dot fall through
+///   to brute-force because we don't yet expose a per-index distance
+///   knob (deferred to Phase 7d.x — see `docs/phase-7-plan.md`).
+/// - Only ASCENDING order makes sense for "k nearest" — DESC ORDER BY
+///   `vec_distance_l2(...) LIMIT k` would mean "k farthest", which
+///   isn't what the index is built for. We don't bother to detect
+///   `ascending == false` here; the optimizer just skips and the
+///   fallback path handles it correctly (slower).
+fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>> {
+    if k == 0 {
+        return None;
+    }
+
+    // Pattern-match: order expr must be a function call vec_distance_l2(a, b).
+    let func = match order_expr {
+        Expr::Function(f) => f,
+        _ => return None,
+    };
+    let fname = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.to_lowercase(),
+        _ => return None,
+    };
+    if fname != "vec_distance_l2" {
+        return None;
+    }
+
+    // Extract the two args as raw Exprs.
+    let arg_list = match &func.args {
+        FunctionArguments::List(l) => &l.args,
+        _ => return None,
+    };
+    if arg_list.len() != 2 {
+        return None;
+    }
+    let exprs: Vec<&Expr> = arg_list
+        .iter()
+        .filter_map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect();
+    if exprs.len() != 2 {
+        return None;
+    }
+
+    // One arg must be a column reference (the indexed col); the other
+    // must be a bracket-array literal (the query vector). Try both
+    // orderings — pgvector's idiom puts the column on the left, but
+    // SQL is commutative for distance.
+    let (col_name, query_vec) = match identify_indexed_arg_and_literal(exprs[0], exprs[1]) {
+        Some(v) => v,
+        None => match identify_indexed_arg_and_literal(exprs[1], exprs[0]) {
+            Some(v) => v,
+            None => return None,
+        },
+    };
+
+    // Find the HNSW index on this column.
+    let entry = table
+        .hnsw_indexes
+        .iter()
+        .find(|e| e.column_name == col_name)?;
+
+    // Dimension sanity check — the query vector must match the
+    // indexed column's declared dimension. If it doesn't, the brute-
+    // force fallback would also error at the vec_distance_l2 dim-check;
+    // returning None here lets that path produce the user-visible
+    // error message.
+    let declared_dim = match table.columns.iter().find(|c| c.column_name == col_name) {
+        Some(c) => match &c.datatype {
+            DataType::Vector(d) => *d,
+            _ => return None,
+        },
+        None => return None,
+    };
+    if query_vec.len() != declared_dim {
+        return None;
+    }
+
+    // Probe the graph. Vectors are looked up from the table's row
+    // storage — a closure rather than a `&Table` so the algorithm
+    // module stays decoupled from the SQL types.
+    let column_for_closure = col_name.clone();
+    let table_ref = table;
+    let result = entry.index.search(&query_vec, k, |id| {
+        match table_ref.get_value(&column_for_closure, id) {
+            Some(Value::Vector(v)) => v,
+            _ => Vec::new(),
+        }
+    });
+    Some(result)
+}
+
+/// Helper for `try_hnsw_probe`: given two function args, identify which
+/// one is a bare column identifier (the indexed column) and which is a
+/// bracket-array literal (the query vector). Returns
+/// `Some((column_name, query_vec))` on a match, `None` otherwise.
+fn identify_indexed_arg_and_literal(a: &Expr, b: &Expr) -> Option<(String, Vec<f32>)> {
+    let col_name = match a {
+        Expr::Identifier(ident) if ident.quote_style.is_none() => ident.value.clone(),
+        _ => return None,
+    };
+    let lit_str = match b {
+        Expr::Identifier(ident) if ident.quote_style == Some('[') => {
+            format!("[{}]", ident.value)
+        }
+        _ => return None,
+    };
+    let v = parse_vector_literal(&lit_str).ok()?;
+    Some((col_name, v))
 }
 
 /// One entry in the bounded-heap top-k path. Holds a pre-evaluated

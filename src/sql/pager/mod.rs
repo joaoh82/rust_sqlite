@@ -151,9 +151,17 @@ pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -
         }
     }
 
-    // Second pass: attach each index to its table.
+    // Second pass: attach each index to its table. HNSW indexes
+    // (Phase 7d.2) take a different code path because their persisted
+    // form is just the CREATE INDEX SQL — the graph itself isn't
+    // persisted yet (Phase 7d.3). Detect HNSW via the SQL's USING clause
+    // and route to a graph-rebuild instead of the B-Tree-cell load.
     for row in index_rows {
-        attach_index(&mut db, &pager, row)?;
+        if create_index_sql_uses_hnsw(&row.sql) {
+            rebuild_hnsw_index(&mut db, &row)?;
+        } else {
+            attach_index(&mut db, &pager, row)?;
+        }
     }
 
     db.source_path = Some(path.to_path_buf());
@@ -232,6 +240,33 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
             name: idx.name.clone(),
             sql: idx.synthesized_sql(),
             rootpage,
+            last_rowid: 0,
+        });
+    }
+
+    // 2b. Phase 7d.2: persist HNSW indexes' CREATE INDEX SQL into
+    //     sqlrite_master so reopen reconstructs them. The graph itself
+    //     isn't persisted yet — `rootpage = 0` and the rebuild path
+    //     re-runs the SQL against current rows. Phase 7d.3 will write
+    //     the graph as cell-encoded pages and replace this with a real
+    //     rootpage + load-from-disk path.
+    let mut hnsw_entries: Vec<(&Table, &crate::sql::db::table::HnswIndexEntry)> = Vec::new();
+    for table in db.tables.values() {
+        for entry in &table.hnsw_indexes {
+            hnsw_entries.push((table, entry));
+        }
+    }
+    hnsw_entries
+        .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
+    for (table, entry) in hnsw_entries {
+        master_rows.push(CatalogEntry {
+            kind: "index".into(),
+            name: entry.name.clone(),
+            sql: format!(
+                "CREATE INDEX {} ON {} USING hnsw ({})",
+                entry.name, table.tb_name, entry.column_name
+            ),
+            rootpage: 0, // no on-disk graph yet (Phase 7d.3)
             last_rowid: 0,
         });
     }
@@ -419,6 +454,14 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
         columns,
         rows,
         secondary_indexes,
+        // HNSW indexes (Phase 7d.2) are reconstructed on open by re-
+        // executing each `CREATE INDEX … USING hnsw` SQL stored in
+        // `sqlrite_master`. This builder produces the empty shell;
+        // `replay_create_index_for_hnsw` (in this same module) walks
+        // sqlrite_master after every table is loaded and rebuilds the
+        // graph from current row data. Persistence of the graph itself
+        // (avoiding the on-open rebuild cost) is Phase 7d.3.
+        hnsw_indexes: Vec::new(),
         last_rowid,
         primary_key,
     }
@@ -575,6 +618,50 @@ fn parse_create_index_sql(sql: &str) -> Result<(String, String, bool)> {
         }
     };
     Ok((table_name.to_string(), col, unique))
+}
+
+/// True iff a CREATE INDEX SQL string uses `USING hnsw` (case-insensitive).
+/// Used by the open path to route HNSW indexes to the graph-rebuild path
+/// instead of the standard B-Tree cell-load. Pre-Phase-7d.2 indexes
+/// don't have a USING clause, so they all return false and continue
+/// taking the existing path.
+fn create_index_sql_uses_hnsw(sql: &str) -> bool {
+    use sqlparser::ast::{CreateIndex, IndexType, Statement};
+
+    let dialect = SQLiteDialect {};
+    let Ok(mut ast) = Parser::parse_sql(&dialect, sql) else {
+        return false;
+    };
+    let Some(Statement::CreateIndex(CreateIndex { using, .. })) = ast.pop() else {
+        return false;
+    };
+    matches!(using, Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw"))
+}
+
+/// Replays a CREATE INDEX … USING hnsw statement on a freshly-loaded
+/// database, rebuilding the in-memory HNSW graph from the table's
+/// current rows. Phase 7d.2 only — Phase 7d.3 will replace this with
+/// a load-from-disk path that reads the persisted graph.
+fn rebuild_hnsw_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
+    use crate::sql::executor::execute_create_index;
+    use sqlparser::ast::Statement;
+
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, &row.sql).map_err(SQLRiteError::from)?;
+    let Some(stmt @ Statement::CreateIndex(_)) = ast.pop() else {
+        return Err(SQLRiteError::Internal(format!(
+            "sqlrite_master HNSW row's SQL isn't a CREATE INDEX: {}",
+            row.sql
+        )));
+    };
+    // execute_create_index walks the table's existing rows and
+    // populates the new HnswIndex via the same code path used at
+    // user-issued CREATE INDEX time. The graph is identical to what
+    // the user originally got at index-creation; only the random
+    // RNG path through the geometric layer-assignment differs (we
+    // seed from the index name, so it's actually deterministic).
+    execute_create_index(&stmt, db)?;
+    Ok(())
 }
 
 /// Cheap clone helper — `DataType` doesn't derive `Clone` elsewhere.
@@ -1044,6 +1131,60 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![0.1f32, 0.2, 0.3]);
         assert_eq!(rows[1], vec![1.5f32, -2.0, 3.5]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn round_trip_rebuilds_hnsw_index_from_create_sql() {
+        // Phase 7d.2: HNSW indexes don't yet persist their graph (that's
+        // 7d.3), but the CREATE INDEX SQL goes into sqlrite_master and the
+        // open path re-runs it to rebuild the graph from current rows.
+        // After a save+reopen, the index entry should be back, with the
+        // same column + the same population.
+        let path = tmp_path("hnsw_roundtrip");
+
+        // Build, populate, index, save.
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(2));",
+                &mut db,
+            )
+            .unwrap();
+            for v in &[
+                "[1.0, 0.0]",
+                "[2.0, 0.0]",
+                "[0.0, 3.0]",
+                "[1.0, 4.0]",
+                "[10.0, 10.0]",
+            ] {
+                process_command(&format!("INSERT INTO docs (e) VALUES ({v});"), &mut db).unwrap();
+            }
+            process_command("CREATE INDEX ix_e ON docs USING hnsw (e);", &mut db).unwrap();
+            save_database(&mut db, &path).expect("save");
+        } // db drops → exclusive lock releases.
+
+        // Reopen and verify the index reattached, with the same name +
+        // column + populated graph.
+        let mut loaded = open_database(&path, "test".to_string()).expect("open");
+        {
+            let table = loaded.get_table("docs".to_string()).expect("docs");
+            assert_eq!(table.hnsw_indexes.len(), 1, "HNSW index should reattach");
+            let entry = &table.hnsw_indexes[0];
+            assert_eq!(entry.name, "ix_e");
+            assert_eq!(entry.column_name, "e");
+            assert_eq!(entry.index.len(), 5, "rebuilt graph should hold all 5 rows");
+        }
+
+        // Quick functional check: KNN query through the rebuilt index
+        // returns results.
+        let resp = process_command(
+            "SELECT id FROM docs ORDER BY vec_distance_l2(e, [1.0, 0.0]) ASC LIMIT 3;",
+            &mut loaded,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
 
         cleanup(&path);
     }
