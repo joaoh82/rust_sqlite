@@ -158,6 +158,14 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 
 **LOC estimate:** ~700-900 lines. The big sub-phase.
 
+> **Scope correction (2026-04-27, post-7c):** Re-scoping during implementation showed 7d works out to ~1300 LOC across three logical chunks, more than the original ~700-900 estimate and too much for one reviewable PR. Splitting into three:
+>
+> - **7d.1 — Pure HNSW algorithm** *(~700 LOC).* `src/sql/hnsw.rs` standalone module: insert + search + layer assignment + beam search per layer + L2/cosine/dot distance dispatch. No SQL integration yet — vectors are passed in via a `get_vec` closure so the algorithm doesn't depend on table types. Tests verify recall@k ≥ 0.95 vs brute-force on randomly-generated vector sets; deterministic via a fixed RNG seed.
+> - **7d.2 — SQL integration** *(~400 LOC).* `CREATE INDEX … USING hnsw (col)` parser + engine, INSERT wiring (also calls `hnsw.insert()`), query optimizer hook (recognizes `ORDER BY vec_distance_*(col, literal) LIMIT k` and probes the HNSW instead of full-scanning). HNSW lives in memory only at this point — gets rebuilt on every database open.
+> - **7d.3 — Persistence** *(~300 LOC).* Wire HNSW into the cell format: new `KIND_HNSW` cell tag, page-tree storage parallel to secondary indexes, save/reopen round-trip.
+>
+> Each 7d.x ships as its own PR + release wave. The user-facing value lands at 7d.2; 7d.3 closes the persistence loop. 7d.1 is foundational but ships a tested algorithmic primitive on its own — useful as documentation of the engine's "from scratch" theme.
+
 **Tests:** recall@k vs brute-force baseline (should be ≥ 0.95 on standard benchmark vectors); insert performance; delete semantics; persistence roundtrip.
 
 ---
