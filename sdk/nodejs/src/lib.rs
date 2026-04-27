@@ -61,6 +61,17 @@ fn value_to_js(env: &Env, v: &Value) -> Result<JsUnknown> {
         Value::Real(f) => Ok(env.create_double(*f)?.into_unknown()),
         Value::Text(s) => Ok(env.create_string(s)?.into_unknown()),
         Value::Bool(b) => Ok(env.get_boolean(*b)?.into_unknown()),
+        // Phase 7a — `VECTOR(N)` columns surface to JS as `Array<number>`.
+        // Widening f32→f64 since JS Number is f64-backed; no precision lost.
+        // Future polish: optionally hand back a Float32Array (typed array)
+        // for memory-efficient transfer of high-dim vectors.
+        Value::Vector(elements) => {
+            let mut arr = env.create_array_with_length(elements.len())?;
+            for (i, x) in elements.iter().enumerate() {
+                arr.set_element(i as u32, env.create_double(*x as f64)?)?;
+            }
+            Ok(arr.into_unknown())
+        }
         Value::Null => Ok(env.get_null()?.into_unknown()),
     }
 }

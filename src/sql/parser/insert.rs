@@ -61,7 +61,23 @@ impl InsertQuery {
                                     _ => {}
                                 },
                                 Expr::Identifier(i) => {
-                                    value_set.push(i.to_string());
+                                    // Phase 7a — sqlparser parses bracket-array
+                                    // literals like `[0.1, 0.2, 0.3]` as
+                                    // bracket-quoted identifiers (it inherits
+                                    // MSSQL-style `[name]` quoting). Detect
+                                    // that by `quote_style == Some('[')` and
+                                    // re-wrap with brackets so the
+                                    // `parse_vector_literal` helper at
+                                    // insert_row time can recognize and parse
+                                    // it. Regular unquoted identifiers (column
+                                    // refs, which don't make sense in INSERT
+                                    // VALUES anyway) keep the existing
+                                    // pass-through-as-string behavior.
+                                    if i.quote_style == Some('[') {
+                                        value_set.push(format!("[{}]", i.value));
+                                    } else {
+                                        value_set.push(i.to_string());
+                                    }
                                 }
                                 _ => {}
                             }

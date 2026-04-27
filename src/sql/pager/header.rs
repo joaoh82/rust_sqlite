@@ -22,7 +22,12 @@ pub const MAGIC: &[u8; 16] = b"SQLRiteFormat\0\0\0";
 ///   (first), distinguishing `'table'` and `'index'` rows; secondary
 ///   indexes persist as their own cell-based B-Trees whose cells use
 ///   the new `KIND_INDEX` format.
-pub const FORMAT_VERSION: u16 = 3;
+/// - Version 4 (Phase 7): cell encoding gains the `KIND_VECTOR` value
+///   tag (length-prefixed dense f32 array) for the new `VECTOR(N)`
+///   column type. Per the Phase 7 plan (`docs/phase-7-plan.md` Q8),
+///   later Phase 7 sub-phases (JSON, HNSW indexes) will add their own
+///   value/cell tags inside this same v4 envelope — no v5 mid-Phase-7.
+pub const FORMAT_VERSION: u16 = 4;
 
 /// Parsed header. `page_count` includes page 0 itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

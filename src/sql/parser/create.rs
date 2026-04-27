@@ -1,6 +1,45 @@
-use sqlparser::ast::{ColumnOption, CreateTable, DataType, Statement};
+use sqlparser::ast::{ColumnOption, CreateTable, DataType, ObjectName, ObjectNamePart, Statement};
 
 use crate::error::{Result, SQLRiteError};
+
+/// True when an `ObjectName` resolves to a single identifier `VECTOR`
+/// (case-insensitive). Phase 7a adds the `VECTOR(N)` column type as a
+/// sqlparser `DataType::Custom` — the engine recognizes it via this
+/// helper so the regular DataType match arm above stays uncluttered.
+fn is_vector_type(name: &ObjectName) -> bool {
+    name.0.len() == 1
+        && match &name.0[0] {
+            ObjectNamePart::Identifier(ident) => ident.value.eq_ignore_ascii_case("VECTOR"),
+            // Function-form ObjectNamePart shouldn't appear in a CREATE TABLE
+            // column type position. If it ever does, treat it as not-a-vector
+            // and the outer match falls through to the "Invalid" arm.
+            _ => false,
+        }
+}
+
+/// Parses the dimension out of the `Custom` args for `VECTOR(N)`.
+/// `args` is the `Vec<String>` sqlparser hands back for parenthesized
+/// type arguments — for `VECTOR(384)` that's `["384"]`. Validates that
+/// exactly one positive-integer argument was supplied.
+fn parse_vector_dim(args: &[String]) -> std::result::Result<usize, String> {
+    match args {
+        [] => Err("VECTOR requires a dimension, e.g. `VECTOR(384)`".to_string()),
+        [single] => {
+            let trimmed = single.trim();
+            match trimmed.parse::<usize>() {
+                Ok(d) if d > 0 => Ok(d),
+                Ok(_) => Err(format!("VECTOR dimension must be ≥ 1 (got `{trimmed}`)")),
+                Err(_) => Err(format!(
+                    "VECTOR dimension must be a positive integer (got `{trimmed}`)"
+                )),
+            }
+        }
+        many => Err(format!(
+            "VECTOR takes exactly one dimension argument (got {})",
+            many.len()
+        )),
+    }
+}
 
 /// The schema for each SQL column in every table is represented by
 /// the following structure after parsed and tokenized
@@ -57,7 +96,7 @@ impl CreateQuery {
 
                     // Parsing each column for it data type
                     // For now only accepting basic data types
-                    let datatype = match &col.data_type {
+                    let datatype: String = match &col.data_type {
                         DataType::TinyInt(_)
                         | DataType::SmallInt(_)
                         | DataType::Int2(_)
@@ -65,17 +104,32 @@ impl CreateQuery {
                         | DataType::Int4(_)
                         | DataType::Int8(_)
                         | DataType::Integer(_)
-                        | DataType::BigInt(_) => "Integer",
-                        DataType::Boolean => "Bool",
-                        DataType::Text => "Text",
-                        DataType::Varchar(_bytes) => "Text",
-                        DataType::Real => "Real",
-                        DataType::Float(_precision) => "Real",
-                        DataType::Double(_) => "Real",
-                        DataType::Decimal(_) => "Real",
+                        | DataType::BigInt(_) => "Integer".to_string(),
+                        DataType::Boolean => "Bool".to_string(),
+                        DataType::Text => "Text".to_string(),
+                        DataType::Varchar(_bytes) => "Text".to_string(),
+                        DataType::Real => "Real".to_string(),
+                        DataType::Float(_precision) => "Real".to_string(),
+                        DataType::Double(_) => "Real".to_string(),
+                        DataType::Decimal(_) => "Real".to_string(),
+                        // Phase 7a — `VECTOR(N)` parses as Custom("VECTOR", ["N"]).
+                        // sqlparser's SQLite dialect doesn't have a built-in
+                        // Vector variant; Custom is what unrecognized type
+                        // names + their parenthesized args fall through to.
+                        DataType::Custom(name, args) if is_vector_type(name) => {
+                            match parse_vector_dim(args) {
+                                Ok(dim) => format!("vector({dim})"),
+                                Err(e) => {
+                                    return Err(SQLRiteError::General(format!(
+                                        "Invalid VECTOR column '{}': {e}",
+                                        col.name
+                                    )));
+                                }
+                            }
+                        }
                         other => {
                             eprintln!("not matched on custom type: {other:?}");
-                            "Invalid"
+                            "Invalid".to_string()
                         }
                     };
 

@@ -390,6 +390,7 @@ fn clone_datatype(dt: &DataType) -> DataType {
         DataType::Text => DataType::Text,
         DataType::Real => DataType::Real,
         DataType::Bool => DataType::Bool,
+        DataType::Vector(dim) => DataType::Vector(*dim),
         DataType::None => DataType::None,
         DataType::Invalid => DataType::Invalid,
     }

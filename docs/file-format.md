@@ -152,8 +152,11 @@ tag       u8
   0x01 Real         f64 little-endian, 8 bytes
   0x02 Text         varint length, UTF-8 bytes
   0x03 Bool         u8 (0 or 1)
+  0x04 Vector       varint dim, then dim × 4 bytes f32 little-endian   (Phase 7a, format v4)
 body      variable (see tag)
 ```
+
+The Vector tag (Phase 7a) carries its own dimension as a leading varint so `decode_value` doesn't need schema context to read it. For the typical embedding sizes (384, 768, 1536) the dim varint is 2-3 bytes; the f32 array dominates payload size (4·dim bytes). Vectors that exceed the local-cell budget spill into the overflow chain via the same machinery as long Text values — no Vector-specific overflow path.
 
 ### Overflow cell body
 
@@ -280,7 +283,8 @@ These are not all enforced on open — we validate the header strictly and rely 
 
 - **v1** (Phases 2 / 3a / 3b) — schema catalog and table data were opaque `bincode` blobs chained across typed payload pages.
 - **v2** (Phases 3c / 3d) — cell-based storage and `sqlrite_master`. Phase 3d added interior pages without a version bump.
-- **v3** (Phase 3e, current) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
+- **v3** (Phase 3e) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
+- **v4** (Phase 7a, current) — value block dispatch gains the `0x04 Vector` tag for the new `VECTOR(N)` column type. Per the [Phase 7 plan's Q8](phase-7-plan.md#q8-file-format-version-bump), later Phase 7 sub-phases (JSON storage, HNSW indexes) will add their own value/cell tags inside this same v4 envelope — no v5 mid-Phase-7. The `CREATE TABLE` SQL stored in `sqlrite_master` carries vector columns as `VECTOR(N)` in the type position; on open, the engine re-parses that SQL and reconstructs `DataType::Vector(N)` from the `Custom` AST node sqlparser produces.
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL introduces a sibling file (`.sqlrite-wal`) rather than changing the main file format.
 

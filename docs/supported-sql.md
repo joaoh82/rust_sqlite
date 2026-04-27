@@ -34,6 +34,7 @@ CREATE TABLE <name> (<col> <type> [column_constraint]* [, ...]);
 | `TEXT`, `VARCHAR` | Text (String) | UTF-8; no length limit enforced (VARCHAR's `(n)` is parsed and ignored) |
 | `REAL`, `FLOAT`, `DOUBLE`, `DECIMAL` | Real (f64) | Double-precision; `DECIMAL(p,s)` precision/scale parsed and ignored |
 | `BOOLEAN` | Boolean | Stored compactly in the null bitmap's sibling bits; accepts `TRUE` / `FALSE` |
+| `VECTOR(N)` | Vector (Vec\<f32\>, fixed dim N) | **Phase 7a.** Dense f32 array of fixed dimension. `N` is required and must be ≥ 1. Inserted as bracket-array literals `[0.1, 0.2, ...]`. Dimension is enforced at INSERT/UPDATE; mismatched-length values are rejected. Distance functions and ANN indexing land in 7b–7d. |
 
 ### Column constraints
 
@@ -104,6 +105,7 @@ INSERT INTO <name> (col1, col2, ...) VALUES (v1, v2, ...)
 | Text | `'single-quoted'` — doubled single quotes escape: `'it''s'` |
 | Boolean | `TRUE`, `FALSE` (case-insensitive) |
 | NULL | `NULL` (case-insensitive) |
+| Vector | `[0.1, 0.2, 0.3]` — JSON-style bracket-array; integer elements widen to f32 (`[1, 2, 3]` is valid). For `VECTOR(N)` columns; dimension must match the declared `N`. *(Phase 7a)* |
 
 Hex literals, blob literals, and date/time functions are not supported.
 

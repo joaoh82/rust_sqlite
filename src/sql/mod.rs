@@ -272,6 +272,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::db::table::Value;
 
     /// Builds a `users(id INTEGER PK, name TEXT, age INTEGER)` table populated
     /// with three rows, for use in executor-level tests.
@@ -1110,5 +1111,162 @@ mod tests {
         let mut wal = path.as_os_str().to_owned();
         wal.push("-wal");
         let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7a — VECTOR(N) end-to-end through process_command
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn vector_create_table_and_insert_basic() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(3));",
+            &mut db,
+        )
+        .expect("create table with VECTOR(3)");
+        process_command(
+            "INSERT INTO docs (embedding) VALUES ([0.1, 0.2, 0.3]);",
+            &mut db,
+        )
+        .expect("insert vector");
+
+        // process_command returns a status string; the rendered table
+        // goes to stdout via print_table. Verify state by inspecting
+        // the database directly.
+        let sel = process_command("SELECT * FROM docs;", &mut db).expect("select");
+        assert!(sel.contains("1 row returned"));
+
+        let docs = db.get_table("docs".to_string()).expect("docs table");
+        let rowids = docs.rowids();
+        assert_eq!(rowids.len(), 1);
+        match docs.get_value("embedding", rowids[0]) {
+            Some(Value::Vector(v)) => assert_eq!(v, vec![0.1f32, 0.2, 0.3]),
+            other => panic!("expected Value::Vector(...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_dim_mismatch_at_insert_is_clean_error() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(3));",
+            &mut db,
+        )
+        .expect("create table");
+
+        // Too few elements.
+        let err = process_command("INSERT INTO docs (embedding) VALUES ([0.1, 0.2]);", &mut db)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("dimension")
+                && msg.contains("declared 3")
+                && msg.contains("got 2"),
+            "expected clear dim-mismatch error, got: {msg}"
+        );
+
+        // Too many elements.
+        let err = process_command(
+            "INSERT INTO docs (embedding) VALUES ([0.1, 0.2, 0.3, 0.4, 0.5]);",
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("got 5"),
+            "expected dim-mismatch error mentioning got 5, got: {err}"
+        );
+    }
+
+    #[test]
+    fn vector_create_table_rejects_missing_dim() {
+        let mut db = Database::new("tempdb".to_string());
+        // `VECTOR` (no parens) currently parses as `DataType::Custom` with
+        // empty args from sqlparser, OR may not parse as Custom at all
+        // depending on dialect. Either way, the column shouldn't end up
+        // as a usable Vector type. Accept any error here — the precise
+        // message is parser-version-dependent.
+        let result = process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR);",
+            &mut db,
+        );
+        assert!(
+            result.is_err(),
+            "expected CREATE TABLE with bare VECTOR to fail (no dim)"
+        );
+    }
+
+    #[test]
+    fn vector_create_table_rejects_zero_dim() {
+        let mut db = Database::new("tempdb".to_string());
+        let err = process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(0));",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("vector"),
+            "expected VECTOR-related error for VECTOR(0), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn vector_high_dim_works() {
+        // 384-dim vector (OpenAI text-embedding-3-small size). Mostly a
+        // smoke test — if cell encoding mishandles the size, this fails.
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE embeddings (id INTEGER PRIMARY KEY, e VECTOR(384));",
+            &mut db,
+        )
+        .expect("create table VECTOR(384)");
+
+        let lit = format!(
+            "[{}]",
+            (0..384)
+                .map(|i| format!("{}", i as f32 * 0.001))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let sql = format!("INSERT INTO embeddings (e) VALUES ({lit});");
+        process_command(&sql, &mut db).expect("insert 384-dim vector");
+
+        let sel = process_command("SELECT id FROM embeddings;", &mut db).expect("select id");
+        assert!(sel.contains("1 row returned"));
+    }
+
+    #[test]
+    fn vector_multiple_rows() {
+        // Three rows with different vectors — exercises the Row::Vector
+        // BTreeMap path (not just single-row insertion).
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(2));",
+            &mut db,
+        )
+        .expect("create");
+        for i in 0..3 {
+            let sql = format!("INSERT INTO docs (e) VALUES ([{i}.0, {}.0]);", i + 1);
+            process_command(&sql, &mut db).expect("insert");
+        }
+        let sel = process_command("SELECT * FROM docs;", &mut db).expect("select");
+        assert!(sel.contains("3 rows returned"));
+
+        // Verify each vector round-tripped correctly via direct DB inspection.
+        let docs = db.get_table("docs".to_string()).expect("docs table");
+        let rowids = docs.rowids();
+        assert_eq!(rowids.len(), 3);
+        let mut vectors: Vec<Vec<f32>> = rowids
+            .iter()
+            .filter_map(|r| match docs.get_value("e", *r) {
+                Some(Value::Vector(v)) => Some(v),
+                _ => None,
+            })
+            .collect();
+        vectors.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(vectors[0], vec![0.0f32, 1.0]);
+        assert_eq!(vectors[1], vec![1.0f32, 2.0]);
+        assert_eq!(vectors[2], vec![2.0f32, 3.0]);
     }
 }

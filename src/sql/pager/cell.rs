@@ -64,6 +64,11 @@ pub mod tag {
     pub const REAL: u8 = 1;
     pub const TEXT: u8 = 2;
     pub const BOOL: u8 = 3;
+    /// Phase 7a — dense f32 vector. Layout after the tag byte:
+    /// `dim (varint) | dim × 4 bytes f32 little-endian`.
+    /// dim is self-describing (varint) so `decode_value` can read the
+    /// payload without consulting schema metadata.
+    pub const VECTOR: u8 = 4;
 }
 
 /// A decoded cell: one row's worth of values plus its rowid.
@@ -254,6 +259,15 @@ pub(super) fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
             out.push(tag::BOOL);
             out.push(if *b { 1 } else { 0 });
         }
+        Value::Vector(v) => {
+            out.push(tag::VECTOR);
+            // dim as varint so the decoder doesn't need schema context.
+            varint::write_u64(out, v.len() as u64);
+            // Each f32 as 4 little-endian bytes; total payload = 4·dim.
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
         Value::Null => {
             return Err(SQLRiteError::Internal(
                 "Null values are encoded via the null bitmap, not a value block".to_string(),
@@ -300,6 +314,27 @@ pub(super) fn decode_value(buf: &[u8], pos: usize) -> Result<(Value, usize)> {
                 .get(body_start)
                 .ok_or_else(|| SQLRiteError::Internal("Bool value truncated".to_string()))?;
             Ok((Value::Bool(byte != 0), 1 + 1))
+        }
+        tag::VECTOR => {
+            // Layout: tag (1 byte, already consumed) | dim (varint)
+            //       | dim × 4 bytes f32 LE.
+            let (dim, n) = varint::read_u64(buf, body_start)?;
+            let dim = dim as usize;
+            let elements_start = body_start + n;
+            let elements_end = elements_start + dim * 4;
+            if elements_end > buf.len() {
+                return Err(SQLRiteError::Internal(format!(
+                    "Vector value truncated: needs {dim} × 4 = {} bytes",
+                    dim * 4
+                )));
+            }
+            let mut out = Vec::with_capacity(dim);
+            for i in 0..dim {
+                let off = elements_start + i * 4;
+                let arr: [u8; 4] = buf[off..off + 4].try_into().unwrap();
+                out.push(f32::from_le_bytes(arr));
+            }
+            Ok((Value::Vector(out), 1 + n + dim * 4))
         }
         other => Err(SQLRiteError::Internal(format!(
             "unknown value tag {other:#x} at offset {pos}"
@@ -412,6 +447,95 @@ mod tests {
             f64::NEG_INFINITY,
         ] {
             round_trip(&Cell::new(1, vec![Some(Value::Real(v))]));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7a — VECTOR(N) cell encoding round-trips
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn vector_round_trip_small() {
+        // 3-dim vector — the canonical "first test that exercises the
+        // wire format" shape. Covers the tag::VECTOR dispatch + varint
+        // dim + dim×4 little-endian f32 layout.
+        let v = vec![0.1f32, 0.2, 0.3];
+        round_trip(&Cell::new(1, vec![Some(Value::Vector(v))]));
+    }
+
+    #[test]
+    fn vector_round_trip_high_dim() {
+        // 384 elements — OpenAI's text-embedding-3-small dimension. Bigger
+        // than a single varint encoding step, exercises a realistic shape.
+        let v: Vec<f32> = (0..384).map(|i| i as f32 * 0.01).collect();
+        round_trip(&Cell::new(7, vec![Some(Value::Vector(v))]));
+    }
+
+    #[test]
+    fn vector_round_trip_edge_values() {
+        // Cover f32 edges — Inf/NaN are surprising values to find in
+        // user data but the encoder shouldn't choke.
+        let v = vec![
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        // NaN isn't equal to itself so we can't use round_trip(); inline
+        // the encode→decode and assert bit patterns instead.
+        let cell = Cell::new(2, vec![Some(Value::Vector(v.clone()))]);
+        let bytes = cell.encode().expect("encode");
+        let (decoded, _) = Cell::decode(&bytes, 0).expect("decode");
+        match &decoded.values[0] {
+            Some(Value::Vector(out)) => {
+                assert_eq!(out.len(), v.len());
+                for (i, (a, b)) in out.iter().zip(v.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "element {i} bits mismatch: out {a:?}, expected {b:?}"
+                    );
+                }
+            }
+            other => panic!("decoded into wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_round_trip_mixed_with_other_columns() {
+        // A row with INTEGER + TEXT + VECTOR columns — exercises the
+        // null-bitmap + sequential value-block decode path with a
+        // VECTOR cell in the middle.
+        let cell = Cell::new(
+            42,
+            vec![
+                Some(Value::Integer(7)),
+                Some(Value::Text("alpha".to_string())),
+                Some(Value::Vector(vec![1.0, 2.0, 3.0, 4.0])),
+                Some(Value::Bool(true)),
+            ],
+        );
+        round_trip(&cell);
+    }
+
+    #[test]
+    fn vector_decode_truncated_buffer_errors() {
+        // Build a real vector cell, then chop the last few bytes so the
+        // f32 array runs past the buffer end.
+        let cell = Cell::new(1, vec![Some(Value::Vector(vec![1.0, 2.0, 3.0]))]);
+        let bytes = cell.encode().expect("encode");
+        for chop in 1..=4 {
+            let truncated = &bytes[..bytes.len() - chop];
+            assert!(
+                Cell::decode(truncated, 0).is_err(),
+                "expected error decoding {} bytes short of full {}",
+                chop,
+                bytes.len()
+            );
         }
     }
 
