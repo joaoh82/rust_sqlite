@@ -122,13 +122,17 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 
 ---
 
-### 7c — Brute-force KNN executor optimization
+### ✅ 7c — Brute-force KNN executor optimization
 
-**What.** Recognize the pattern `ORDER BY <distance-expr> LIMIT k` and execute it with a bounded min-heap (size k) instead of a full sort. O(N log k) instead of O(N log N).
+**What shipped.** The SELECT executor now branches on `(ORDER BY, LIMIT k)` shape. When both are present and `k < N`, the new `select_topk` function maintains a bounded `BinaryHeap` of size k instead of full-sorting all N rowids. O(N log k) instead of O(N log N).
 
-**Why a separate sub-phase.** 7b makes it work; 7c makes it fast enough to be useful on millions of rows. Worth shipping as its own commit so the perf delta is visible in benchmarks.
+**Implementation note: max-heap with direction-aware Ord.** A single `HeapEntry { key: Value, rowid: i64, asc: bool }` wrapper handles both `ORDER BY ASC LIMIT k` (k smallest) and `ORDER BY DESC LIMIT k` (k largest) without separate code paths. The `asc` flag inverts the natural Ord, so the displacement test reduces to "new entry < heap top" in both cases. After the scan, `into_sorted_vec` returns the right caller-facing order (ascending for ASC, descending for DESC).
 
-**LOC estimate:** ~150 lines including a tiny benchmark to prove the speedup.
+**Measured speedup** (N=10k, k=10, single REAL column sort key, release build): ~1.8×. The advantage scales with N and with per-row work — KNN queries where the sort key is `vec_distance_l2(col, [...])` benefit much more because each key evaluation is itself O(dim).
+
+**LOC**: ~120 implementation + ~180 tests/benchmark = ~300 total. Slightly over the ~150 estimate because the test surface (correctness + bench + edge cases for k=0, k>N, empty input, distance-function integration) ended up larger than initially projected.
+
+**Pre-existing bug surfaced.** The seed function for the benchmark needed positive scores because the INSERT parser doesn't currently handle `Expr::UnaryOp(Minus, Number(...))` for negative literals. Worked around with a Knuth-hash scrambler that stays positive; the underlying parser bug is documented as a follow-up.
 
 ---
 

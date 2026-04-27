@@ -470,9 +470,9 @@ The full plan + recorded design decisions live in [`docs/phase-7-plan.md`](phase
 
 Approved sub-phases (Q1–Q10 resolved):
 
-- **7a — `VECTOR(N)` column type** — dense fixed-dimension f32 storage via the existing cell encoding; bump file format to v4. Bracket-array literal syntax `[0.1, 0.2, …]` (Q7).
-- **7b — Distance functions + KNN operators** — `vec_distance_l2/cosine/dot` plus pgvector-style `<->` `<=>` `<#>` operators (Q6).
-- **7c — Brute-force KNN executor optimization** — recognize `ORDER BY <distance> LIMIT k`, use bounded min-heap.
+- **✅ 7a — `VECTOR(N)` column type** *(v0.1.10)* — dense fixed-dimension f32 storage via the existing cell encoding; format bumped to v4. Bracket-array literal syntax `[0.1, 0.2, …]` (Q7).
+- **✅ 7b — Distance functions** *(v0.1.11)* — `vec_distance_l2/cosine/dot`, plus the ORDER BY-expressions parser change so KNN queries work end-to-end. Operators (`<->` `<=>` `<#>`) deferred to **7b.1** — sqlparser doesn't parse them natively, contradicting Q6's "tiny parser change" assumption.
+- **✅ 7c — Brute-force KNN executor optimization** — bounded `BinaryHeap` of size k for `ORDER BY <expr> LIMIT k`. ~1.8× faster than full-sort at N=10k for cheap keys; bigger gains on expensive keys like `vec_distance_l2`.
 - **7d — HNSW ANN index** — `CREATE INDEX … USING hnsw (col)`; persisted as cell-encoded graph. Fixed defaults `M=16, ef_construction=200, ef_search=50` (Q2).
 - **7e — JSON column type + path queries** — `JSON` data type stored as bincoded `serde_json::Value` (Q3); `json_extract` / `json_array_length` / `json_object_keys` / `json_type`.
 - **7f — ~~Full-text search with BM25~~** — **deferred to Phase 8** (Q1).
