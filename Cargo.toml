@@ -27,7 +27,7 @@ resolver = "3"
 # `package =` key so the import name stays `sqlrite` internally:
 #     sqlrite = { package = "sqlrite-engine", path = "…" }
 name = "sqlrite-engine"
-version = "0.1.11"
+version = "0.1.12"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
