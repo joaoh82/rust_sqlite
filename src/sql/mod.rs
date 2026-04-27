@@ -1269,4 +1269,134 @@ mod tests {
         assert_eq!(vectors[1], vec![1.0f32, 2.0]);
         assert_eq!(vectors[2], vec![2.0f32, 3.0]);
     }
+
+    // -----------------------------------------------------------------
+    // Phase 7b — vector distance functions through process_command
+    // -----------------------------------------------------------------
+
+    /// Builds a 3-row docs table with 2-dim vectors aligned along the
+    /// axes so the expected distances are easy to reason about:
+    ///   id=1: [1, 0]
+    ///   id=2: [0, 1]
+    ///   id=3: [1, 1]
+    fn seed_vector_docs() -> Database {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(2));",
+            &mut db,
+        )
+        .expect("create");
+        process_command("INSERT INTO docs (e) VALUES ([1.0, 0.0]);", &mut db).expect("insert 1");
+        process_command("INSERT INTO docs (e) VALUES ([0.0, 1.0]);", &mut db).expect("insert 2");
+        process_command("INSERT INTO docs (e) VALUES ([1.0, 1.0]);", &mut db).expect("insert 3");
+        db
+    }
+
+    #[test]
+    fn vec_distance_l2_in_where_filters_correctly() {
+        // Distance from [1,0]:
+        //   id=1 [1,0]: 0
+        //   id=2 [0,1]: √2 ≈ 1.414
+        //   id=3 [1,1]: 1
+        // WHERE distance < 1.1 should match id=1 and id=3 (2 rows).
+        let mut db = seed_vector_docs();
+        let resp = process_command(
+            "SELECT * FROM docs WHERE vec_distance_l2(e, [1.0, 0.0]) < 1.1;",
+            &mut db,
+        )
+        .expect("select");
+        assert!(
+            resp.contains("2 rows returned"),
+            "expected 2 rows, got: {resp}"
+        );
+    }
+
+    #[test]
+    fn vec_distance_cosine_in_where() {
+        // [1,0] vs [1,0]: cosine distance = 0
+        // [1,0] vs [0,1]: cosine distance = 1 (orthogonal)
+        // [1,0] vs [1,1]: cosine distance = 1 - 1/√2 ≈ 0.293
+        // WHERE distance < 0.5 → id=1 and id=3 (2 rows).
+        let mut db = seed_vector_docs();
+        let resp = process_command(
+            "SELECT * FROM docs WHERE vec_distance_cosine(e, [1.0, 0.0]) < 0.5;",
+            &mut db,
+        )
+        .expect("select");
+        assert!(
+            resp.contains("2 rows returned"),
+            "expected 2 rows, got: {resp}"
+        );
+    }
+
+    #[test]
+    fn vec_distance_dot_negated() {
+        // [1,0]·[1,0] = 1 → -1
+        // [1,0]·[0,1] = 0 → 0
+        // [1,0]·[1,1] = 1 → -1
+        // WHERE -dot < 0 (i.e. dot > 0) → id=1 and id=3 (2 rows).
+        let mut db = seed_vector_docs();
+        let resp = process_command(
+            "SELECT * FROM docs WHERE vec_distance_dot(e, [1.0, 0.0]) < 0.0;",
+            &mut db,
+        )
+        .expect("select");
+        assert!(
+            resp.contains("2 rows returned"),
+            "expected 2 rows, got: {resp}"
+        );
+    }
+
+    #[test]
+    fn knn_via_order_by_distance_limit() {
+        // Classic KNN shape: ORDER BY distance LIMIT k.
+        // Distances from [1,0]: id=1=0, id=3=1, id=2=√2.
+        // LIMIT 2 should return id=1 then id=3 in that order.
+        let mut db = seed_vector_docs();
+        let resp = process_command(
+            "SELECT id FROM docs ORDER BY vec_distance_l2(e, [1.0, 0.0]) ASC LIMIT 2;",
+            &mut db,
+        )
+        .expect("select");
+        assert!(
+            resp.contains("2 rows returned"),
+            "expected 2 rows, got: {resp}"
+        );
+    }
+
+    #[test]
+    fn distance_function_dim_mismatch_errors() {
+        // 2-dim column queried with a 3-dim probe → clean error.
+        let mut db = seed_vector_docs();
+        let err = process_command(
+            "SELECT * FROM docs WHERE vec_distance_l2(e, [1.0, 0.0, 0.0]) < 1.0;",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("dimension")
+                && msg.contains("lhs=2")
+                && msg.contains("rhs=3"),
+            "expected dim mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_function_errors_with_name() {
+        // Use the function in WHERE, not projection — the projection
+        // parser still requires bare column references; function calls
+        // there are a future enhancement (with `AS alias` support).
+        let mut db = seed_vector_docs();
+        let err = process_command(
+            "SELECT * FROM docs WHERE vec_does_not_exist(e, [1.0, 0.0]) < 1.0;",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("vec_does_not_exist"),
+            "expected error mentioning function name, got: {msg}"
+        );
+    }
 }

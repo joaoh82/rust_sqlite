@@ -14,10 +14,16 @@ pub enum Projection {
     Columns(Vec<String>),
 }
 
-/// An ORDER BY clause restricted to a single column, ascending by default.
+/// A parsed `ORDER BY` clause: a single sort key (expression), ascending
+/// by default. Phase 7b widened this from "bare column name" to
+/// "arbitrary expression" so KNN queries of the form
+/// `ORDER BY vec_distance_l2(col, [...]) LIMIT k` work end-to-end. The
+/// expression is evaluated per-row at execution time via `eval_expr`;
+/// the simple `ORDER BY col` form still works because that's just an
+/// `Expr::Identifier` taking the same path.
 #[derive(Debug, Clone)]
 pub struct OrderByClause {
-    pub column: String,
+    pub expr: Expr,
     pub ascending: bool,
 }
 
@@ -174,20 +180,15 @@ fn parse_order_by(order_by: Option<&sqlparser::ast::OrderBy>) -> Result<Option<O
         ));
     }
     let obe = &exprs[0];
-    let column = match &obe.expr {
-        Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => {
-            parts.last().map(|i| i.value.clone()).unwrap_or_default()
-        }
-        _ => {
-            return Err(SQLRiteError::NotImplemented(
-                "ORDER BY only supports a bare column name for now".to_string(),
-            ));
-        }
-    };
+    // Phase 7b: accept arbitrary expressions, not just bare column refs.
+    // The executor's `sort_rowids` evaluates this expression per row via
+    // `eval_expr`, which handles Identifier (column lookup), Function
+    // (vec_distance_*), arithmetic, etc. uniformly. The previous
+    // column-name-only restriction has been lifted.
+    let expr = obe.expr.clone();
     // `asc == None` is the dialect default (ASC).
     let ascending = obe.options.asc.unwrap_or(true);
-    Ok(Some(OrderByClause { column, ascending }))
+    Ok(Some(OrderByClause { expr, ascending }))
 }
 
 fn parse_limit(limit: Option<&LimitClause>) -> Result<Option<usize>> {

@@ -5,14 +5,15 @@ use std::cmp::Ordering;
 
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Update,
+    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement, TableFactor, TableWithJoins,
+    UnaryOperator, Update,
 };
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
-use crate::sql::db::table::{DataType, Table, Value};
+use crate::sql::db::table::{DataType, Table, Value, parse_vector_literal};
 use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
 
 /// Executes a parsed `SelectQuery` against the database and returns a
@@ -500,18 +501,42 @@ fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> 
 }
 
 fn sort_rowids(rowids: &mut [i64], table: &Table, order: &OrderByClause) -> Result<()> {
-    if !table.contains_column(order.column.clone()) {
-        return Err(SQLRiteError::Internal(format!(
-            "ORDER BY references unknown column '{}'",
-            order.column
-        )));
+    // Phase 7b: ORDER BY now accepts any expression (column ref,
+    // arithmetic, function call, …). Pre-compute the sort key for
+    // every rowid up front so the comparator is called O(N log N)
+    // times against pre-evaluated Values rather than re-evaluating
+    // the expression O(N log N) times. Not strictly necessary today,
+    // but vital once 7d's HNSW index lands and this same code path
+    // could be running tens of millions of distance computations.
+    let mut keys: Vec<(i64, Result<Value>)> = rowids
+        .iter()
+        .map(|r| (*r, eval_expr(&order.expr, table, *r)))
+        .collect();
+
+    // Surface the FIRST evaluation error if any. We could be lazy
+    // and let sort_by encounter it, but `Ord::cmp` can't return a
+    // Result and we'd have to swallow errors silently.
+    for (_, k) in &keys {
+        if let Err(e) = k {
+            return Err(SQLRiteError::General(format!(
+                "ORDER BY expression failed: {e}"
+            )));
+        }
     }
-    rowids.sort_by(|a, b| {
-        let va = table.get_value(&order.column, *a);
-        let vb = table.get_value(&order.column, *b);
-        let ord = compare_values(va.as_ref(), vb.as_ref());
+
+    keys.sort_by(|(_, ka), (_, kb)| {
+        // Both unwrap()s are safe — we just verified above that
+        // every key Result is Ok.
+        let va = ka.as_ref().unwrap();
+        let vb = kb.as_ref().unwrap();
+        let ord = compare_values(Some(va), Some(vb));
         if order.ascending { ord } else { ord.reverse() }
     });
+
+    // Write the sorted rowids back into the caller's slice.
+    for (i, (rowid, _)) in keys.into_iter().enumerate() {
+        rowids[i] = rowid;
+    }
     Ok(())
 }
 
@@ -558,7 +583,23 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
     match expr {
         Expr::Nested(inner) => eval_expr(inner, table, rowid),
 
-        Expr::Identifier(ident) => Ok(table.get_value(&ident.value, rowid).unwrap_or(Value::Null)),
+        Expr::Identifier(ident) => {
+            // Phase 7b — sqlparser parses bracket-array literals like
+            // `[0.1, 0.2, 0.3]` as bracket-quoted identifiers (it inherits
+            // MSSQL `[name]` syntax). When we see `quote_style == Some('[')`
+            // in expression-evaluation position (SELECT projection, WHERE,
+            // ORDER BY, function args), parse the bracketed content as a
+            // vector literal so the rest of the executor can compare /
+            // distance-compute against it. Same trick the INSERT parser
+            // uses; the executor needed its own copy because expression
+            // eval runs on a different code path.
+            if ident.quote_style == Some('[') {
+                let raw = format!("[{}]", ident.value);
+                let v = parse_vector_literal(&raw)?;
+                return Ok(Value::Vector(v));
+            }
+            Ok(table.get_value(&ident.value, rowid).unwrap_or(Value::Null))
+        }
 
         Expr::CompoundIdentifier(parts) => {
             // Accept `table.col` — we only have one table in scope, so ignore the qualifier.
@@ -659,10 +700,169 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             ))),
         },
 
+        // Phase 7b — function-call dispatch. Currently only the three
+        // vector-distance functions; this match arm becomes the single
+        // place to register more SQL functions later (e.g. abs(),
+        // length(), …) without re-touching the rest of the executor.
+        //
+        // Operator forms (`<->` `<=>` `<#>`) are NOT plumbed here: two
+        // of three don't parse natively in sqlparser (we'd need a
+        // string-preprocessing pass or a sqlparser fork). Deferred to
+        // a follow-up sub-phase; see docs/phase-7-plan.md's "Scope
+        // corrections" note.
+        Expr::Function(func) => eval_function(func, table, rowid),
+
         other => Err(SQLRiteError::NotImplemented(format!(
             "unsupported expression in WHERE/projection: {other:?}"
         ))),
     }
+}
+
+/// Dispatches an `Expr::Function` to its built-in implementation.
+/// Currently only the three vec_distance_* functions; other functions
+/// surface as `NotImplemented` errors with the function name in the
+/// message so users see what they tried.
+fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> Result<Value> {
+    // Function name lives in `name.0[0]` for unqualified calls. Anything
+    // qualified (e.g. `pkg.fn(...)`) falls through to NotImplemented.
+    let name = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.to_lowercase(),
+        _ => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "qualified function names not supported: {:?}",
+                func.name
+            )));
+        }
+    };
+
+    match name.as_str() {
+        "vec_distance_l2" | "vec_distance_cosine" | "vec_distance_dot" => {
+            let (a, b) = extract_two_vector_args(&name, &func.args, table, rowid)?;
+            let dist = match name.as_str() {
+                "vec_distance_l2" => vec_distance_l2(&a, &b),
+                "vec_distance_cosine" => vec_distance_cosine(&a, &b)?,
+                "vec_distance_dot" => vec_distance_dot(&a, &b),
+                _ => unreachable!(),
+            };
+            // Widen f32 → f64 for the runtime Value. Vectors are stored
+            // as f32 (consistent with industry convention for embeddings),
+            // but the executor's numeric type is f64 so distances slot
+            // into Value::Real cleanly and can be compared / ordered with
+            // other reals via the existing arithmetic + comparison paths.
+            Ok(Value::Real(dist as f64))
+        }
+        other => Err(SQLRiteError::NotImplemented(format!(
+            "unknown function: {other}(...)"
+        ))),
+    }
+}
+
+/// Extracts exactly two `Vec<f32>` arguments from a function call,
+/// validating arity and that both sides are Vector-typed with matching
+/// dimensions. Used by all three vec_distance_* functions.
+fn extract_two_vector_args(
+    fn_name: &str,
+    args: &FunctionArguments,
+    table: &Table,
+    rowid: i64,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let arg_list = match args {
+        FunctionArguments::List(l) => &l.args,
+        _ => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() expects exactly two vector arguments"
+            )));
+        }
+    };
+    if arg_list.len() != 2 {
+        return Err(SQLRiteError::General(format!(
+            "{fn_name}() expects exactly 2 arguments, got {}",
+            arg_list.len()
+        )));
+    }
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(2);
+    for (i, arg) in arg_list.iter().enumerate() {
+        let expr = match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            other => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "{fn_name}() argument {i} has unsupported shape: {other:?}"
+                )));
+            }
+        };
+        let val = eval_expr(expr, table, rowid)?;
+        match val {
+            Value::Vector(v) => out.push(v),
+            other => {
+                return Err(SQLRiteError::General(format!(
+                    "{fn_name}() argument {i} is not a vector: got {}",
+                    other.to_display_string()
+                )));
+            }
+        }
+    }
+    let b = out.pop().unwrap();
+    let a = out.pop().unwrap();
+    if a.len() != b.len() {
+        return Err(SQLRiteError::General(format!(
+            "{fn_name}(): vector dimensions don't match (lhs={}, rhs={})",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok((a, b))
+}
+
+/// Euclidean (L2) distance: √Σ(aᵢ − bᵢ)².
+/// Smaller-is-closer; identical vectors return 0.0.
+pub(crate) fn vec_distance_l2(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+/// Cosine distance: 1 − (a·b) / (‖a‖·‖b‖).
+/// Smaller-is-closer; identical (non-zero) vectors return 0.0,
+/// orthogonal vectors return 1.0, opposite-direction vectors return 2.0.
+///
+/// Errors if either vector has zero magnitude — cosine similarity is
+/// undefined for the zero vector and silently returning NaN would
+/// poison `ORDER BY` ranking. Callers who want the silent-NaN
+/// behavior can compute `vec_distance_dot(a, b) / (norm(a) * norm(b))`
+/// themselves.
+pub(crate) fn vec_distance_cosine(a: &[f32], b: &[f32]) -> Result<f32> {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f32;
+    let mut norm_a_sq = 0.0f32;
+    let mut norm_b_sq = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a_sq += a[i] * a[i];
+        norm_b_sq += b[i] * b[i];
+    }
+    let denom = (norm_a_sq * norm_b_sq).sqrt();
+    if denom == 0.0 {
+        return Err(SQLRiteError::General(
+            "vec_distance_cosine() is undefined for zero-magnitude vectors".to_string(),
+        ));
+    }
+    Ok(1.0 - dot / denom)
+}
+
+/// Negated dot product: −(a·b).
+/// pgvector convention — negated so smaller-is-closer like L2 / cosine.
+/// For unit-norm vectors `vec_distance_dot(a, b) == vec_distance_cosine(a, b) - 1`.
+pub(crate) fn vec_distance_dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    -dot
 }
 
 /// Evaluates an integer/real arithmetic op. NULL on either side propagates.
@@ -764,5 +964,103 @@ fn convert_literal(v: &sqlparser::ast::Value) -> Result<Value> {
         other => Err(SQLRiteError::NotImplemented(format!(
             "unsupported literal value: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Phase 7b — Vector distance function math
+    // -----------------------------------------------------------------
+
+    /// Float comparison helper — distance results need a small epsilon
+    /// because we accumulate sums across many f32 multiplies.
+    fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() < eps
+    }
+
+    #[test]
+    fn vec_distance_l2_identical_is_zero() {
+        let v = vec![0.1, 0.2, 0.3];
+        assert_eq!(vec_distance_l2(&v, &v), 0.0);
+    }
+
+    #[test]
+    fn vec_distance_l2_unit_basis_is_sqrt2() {
+        // [1, 0] vs [0, 1]: distance = √((1-0)² + (0-1)²) = √2 ≈ 1.414
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(approx_eq(vec_distance_l2(&a, &b), 2.0_f32.sqrt(), 1e-6));
+    }
+
+    #[test]
+    fn vec_distance_l2_known_value() {
+        // [0, 0, 0] vs [3, 4, 0]: √(9 + 16 + 0) = 5 (the classic 3-4-5 triangle).
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![3.0, 4.0, 0.0];
+        assert!(approx_eq(vec_distance_l2(&a, &b), 5.0, 1e-6));
+    }
+
+    #[test]
+    fn vec_distance_cosine_identical_is_zero() {
+        let v = vec![0.1, 0.2, 0.3];
+        let d = vec_distance_cosine(&v, &v).unwrap();
+        assert!(approx_eq(d, 0.0, 1e-6), "cos(v,v) = {d}, expected ≈ 0");
+    }
+
+    #[test]
+    fn vec_distance_cosine_orthogonal_is_one() {
+        // Two orthogonal unit vectors should have cosine distance = 1.0
+        // (cosine similarity = 0 → distance = 1 - 0 = 1).
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(approx_eq(vec_distance_cosine(&a, &b).unwrap(), 1.0, 1e-6));
+    }
+
+    #[test]
+    fn vec_distance_cosine_opposite_is_two() {
+        // a and -a have cosine similarity = -1 → distance = 1 - (-1) = 2.
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![-1.0, 0.0, 0.0];
+        assert!(approx_eq(vec_distance_cosine(&a, &b).unwrap(), 2.0, 1e-6));
+    }
+
+    #[test]
+    fn vec_distance_cosine_zero_magnitude_errors() {
+        // Cosine is undefined for the zero vector — error rather than NaN.
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        let err = vec_distance_cosine(&a, &b).unwrap_err();
+        assert!(format!("{err}").contains("zero-magnitude"));
+    }
+
+    #[test]
+    fn vec_distance_dot_negates() {
+        // a·b = 1*4 + 2*5 + 3*6 = 32. Negated → -32.
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert!(approx_eq(vec_distance_dot(&a, &b), -32.0, 1e-6));
+    }
+
+    #[test]
+    fn vec_distance_dot_orthogonal_is_zero() {
+        // Orthogonal vectors have dot product 0 → negated is also 0.
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert_eq!(vec_distance_dot(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn vec_distance_dot_unit_norm_matches_cosine_minus_one() {
+        // For unit-norm vectors: dot(a,b) = cos(a,b)
+        // → -dot(a,b) = -cos(a,b) = (1 - cos(a,b)) - 1 = vec_distance_cosine(a,b) - 1.
+        // Useful sanity check that the two functions agree on unit vectors.
+        let a = vec![0.6f32, 0.8]; // unit norm: √(0.36+0.64) = 1
+        let b = vec![0.8f32, 0.6]; // unit norm too
+        let dot = vec_distance_dot(&a, &b);
+        let cos = vec_distance_cosine(&a, &b).unwrap();
+        assert!(approx_eq(dot, cos - 1.0, 1e-5));
     }
 }

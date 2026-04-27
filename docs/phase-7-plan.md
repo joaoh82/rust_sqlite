@@ -106,12 +106,17 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 - `<=>`  → `vec_distance_cosine`
 - `<#>`  → `vec_distance_dot`
 
+> **Scope correction (2026-04-27, during 7b implementation):** Operators turned out to be a much bigger parser change than Q6 anticipated. sqlparser-rs (current pinned version) **fails outright** on `<->` and `<#>` ("Expected: an expression, found: ->"). Only `<=>` parses, as MySQL's `Spaceship` (null-safe equality). Supporting all three operators requires either a fork of sqlparser to extend the SQLite dialect, or a string-preprocessing pass that rewrites operators to function calls before handing SQL to the parser — neither is the "tiny parser change" Q6 estimated.
+>
+> **Decision:** ship 7b with **functions only**. Operators are deferred to a follow-up sub-phase **7b.1**. The KNN use case (`ORDER BY vec_distance_l2(col, [...]) LIMIT k`) still works — just verbose. When 7b.1 lands, queries can switch from function-call form to operator form without any other behavior change.
+
 **Decisions:**
 
 - **Dispatch in the existing expression evaluator.** No new function-registration framework — these are built-in functions like `||` is.
-- **Operators land in the parser as new infix tokens.** sqlparser's SQLite dialect doesn't have these; we either extend the dialect or post-process the AST. Either is fine.
+- **Operators land in 7b.1, not 7b.** See scope-correction note above.
+- **`ORDER BY` widened to accept arbitrary expressions** as part of 7b. Pre-7b, the parser restricted ORDER BY to bare column refs; without expression support, KNN queries would have been impossible. New shape: `eval_expr` is called per-row to produce sort keys. This is a strict superset — `ORDER BY col` still works because `Expr::Identifier` takes the same path.
 
-**LOC estimate:** ~250 lines.
+**LOC estimate:** ~250 lines for the functions; another ~50 for the ORDER BY parser extension. Total ~300 LOC, slightly over Q-time estimate.
 
 **Tests:** all three distance metrics against hand-computed values; operator parsing; KNN result ordering.
 
@@ -296,10 +301,11 @@ let rows = conn.execute(&resp.sql)?;
 ## Implementation order + dependencies
 
 ```
-7a (VECTOR type)           — independent, foundational
-  └── 7b (distances)       — needs 7a
-        └── 7c (KNN exec)  — needs 7b
-              └── 7d (HNSW)— needs 7b/7c
+7a (VECTOR type)              — independent, foundational
+  └── 7b (distance functions) — needs 7a
+        └── 7b.1 (operators)  — sugar over 7b; deferred from 7b per scope correction
+        └── 7c (KNN exec opt) — needs 7b (operators not required)
+              └── 7d (HNSW)   — needs 7b/7c
 
 7e (JSON)                  — independent, can interleave anywhere
 
