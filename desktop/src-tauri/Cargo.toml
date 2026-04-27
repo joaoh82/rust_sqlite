@@ -1,6 +1,6 @@
 [package]
 name = "sqlrite-desktop"
-version = "0.1.12"
+version = "0.1.13"
 description = "SQLRite desktop app — Tauri 2 shell around the engine"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
