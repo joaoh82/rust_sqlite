@@ -125,7 +125,7 @@ FROM <table>
 
 - **Projection**: `*` (all columns in declaration order) or a bare column list. Columns not declared on the table are rejected.
 - **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering).
-- **`ORDER BY`**: single column, `ASC` (default) or `DESC`. Sort key types must match; mixing `INTEGER` and `TEXT` across rows under a single `ORDER BY` is a runtime error.
+- **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. The sort key can be a bare column reference OR any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. Sort key types must match; mixing `INTEGER` and `TEXT` across rows under a single `ORDER BY` is a runtime error.
 - **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows).
 
 ### Index probing
@@ -140,7 +140,7 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 - **`DISTINCT`**
 - **`LIKE`**, **`IN`**, **`IS NULL`** / **`IS NOT NULL`**, `BETWEEN`
 - **Expressions in the projection list** (`SELECT age + 1 FROM users`) — projection is bare column references only
-- **Multi-column `ORDER BY`**, `NULLS FIRST/LAST`
+- **Multi-column `ORDER BY`**, `NULLS FIRST/LAST` (single sort key only; the sort key itself can be an expression as of Phase 7b)
 - **`OFFSET`**
 - **Column aliases** (`SELECT name AS n FROM users`)
 
@@ -195,6 +195,26 @@ Expressions work inside `WHERE` (both in `SELECT`, `UPDATE`, `DELETE`) and on th
 ### Literals
 
 Same set accepted by `INSERT` (see [Value literals accepted](#value-literals-accepted)).
+
+### Built-in functions
+
+| Function | Returns | Notes |
+|---|---|---|
+| `vec_distance_l2(a, b)` | Real (f64) | Euclidean distance √Σ(aᵢ−bᵢ)². Smaller is closer. *(Phase 7b)* |
+| `vec_distance_cosine(a, b)` | Real (f64) | Cosine distance `1 − (a·b) / (‖a‖·‖b‖)`. Errors on zero-magnitude vectors (cosine is undefined). Smaller is closer; identical vectors return 0.0, orthogonal vectors return 1.0. *(Phase 7b)* |
+| `vec_distance_dot(a, b)` | Real (f64) | Negated dot product `−(a·b)`. Negation makes "smaller is closer" consistent with the others. For unit-norm vectors equals `vec_distance_cosine(a, b) - 1`. *(Phase 7b)* |
+
+All three vector-distance functions take exactly two arguments, both of which must be vectors of the same dimension. Either argument can be a column reference (`embedding`), a bracket-array literal (`[0.1, 0.2, 0.3]`), or any sub-expression that evaluates to a vector. Mismatched dimensions error with `vector dimensions don't match (lhs=N, rhs=M)`.
+
+The KNN ranking pattern that motivates this set:
+
+```sql
+SELECT id, title FROM docs
+ORDER BY vec_distance_l2(embedding, [0.1, 0.2, ..., 0.0])
+LIMIT 10;
+```
+
+> **Operator forms (`<->` `<=>` `<#>`) are not supported yet.** They're the de facto pgvector convention but blocked on a sqlparser limitation — will land as a Phase 7b.1 follow-up. Use the function-call form for now.
 
 ### Type coercion in arithmetic
 
