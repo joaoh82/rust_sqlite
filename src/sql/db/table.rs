@@ -143,6 +143,11 @@ pub struct HnswIndexEntry {
     pub column_name: String,
     /// The graph itself.
     pub index: HnswIndex,
+    /// Phase 7d.3 — true iff a DELETE or UPDATE-on-vector-col has
+    /// invalidated the graph since the last rebuild. INSERT maintains
+    /// the graph incrementally and leaves this false. The next save
+    /// rebuilds dirty indexes from current rows before serializing.
+    pub needs_rebuild: bool,
 }
 
 impl Table {
