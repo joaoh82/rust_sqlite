@@ -1377,28 +1377,39 @@ mod tests {
         assert!(resp.contains("1 row returned"), "got: {resp}");
     }
 
+    // Phase 7d.3 — DELETE / UPDATE on HNSW-indexed tables now works.
+    // The 7d.2 versions of these tests asserted a refusal; replaced
+    // with assertions that the operation succeeds + the index entry's
+    // needs_rebuild flag flipped so the next save will rebuild.
+
     #[test]
-    fn delete_on_hnsw_indexed_table_errors_with_helpful_message() {
+    fn delete_on_hnsw_indexed_table_succeeds_and_marks_dirty() {
         let mut db = seed_hnsw_table();
         process_command("CREATE INDEX ix_e ON docs USING hnsw (e);", &mut db).unwrap();
-        let err = process_command("DELETE FROM docs WHERE id = 1;", &mut db).unwrap_err();
-        let msg = format!("{err}");
+        let resp = process_command("DELETE FROM docs WHERE id = 1;", &mut db).unwrap();
+        assert!(resp.contains("1 row"), "expected 1 row deleted: {resp}");
+
+        let docs = db.get_table("docs".to_string()).unwrap();
+        let entry = docs.hnsw_indexes.iter().find(|e| e.name == "ix_e").unwrap();
         assert!(
-            msg.to_lowercase().contains("hnsw") && msg.contains("ix_e"),
-            "expected error mentioning HNSW + index name; got: {msg}"
+            entry.needs_rebuild,
+            "DELETE should have marked HNSW index dirty for rebuild on next save"
         );
     }
 
     #[test]
-    fn update_on_hnsw_indexed_table_errors_with_helpful_message() {
+    fn update_on_hnsw_indexed_vector_col_succeeds_and_marks_dirty() {
         let mut db = seed_hnsw_table();
         process_command("CREATE INDEX ix_e ON docs USING hnsw (e);", &mut db).unwrap();
-        let err =
-            process_command("UPDATE docs SET e = [9.0, 9.0] WHERE id = 1;", &mut db).unwrap_err();
-        let msg = format!("{err}");
+        let resp =
+            process_command("UPDATE docs SET e = [9.0, 9.0] WHERE id = 1;", &mut db).unwrap();
+        assert!(resp.contains("1 row"), "expected 1 row updated: {resp}");
+
+        let docs = db.get_table("docs".to_string()).unwrap();
+        let entry = docs.hnsw_indexes.iter().find(|e| e.name == "ix_e").unwrap();
         assert!(
-            msg.to_lowercase().contains("hnsw"),
-            "expected error mentioning HNSW; got: {msg}"
+            entry.needs_rebuild,
+            "UPDATE on the vector column should have marked HNSW index dirty"
         );
     }
 

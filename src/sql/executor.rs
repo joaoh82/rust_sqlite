@@ -178,26 +178,6 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
     };
     let table_name = extract_single_table_name(tables)?;
 
-    // Phase 7d.2 limitation: HNSW lacks an in-place delete-node operation.
-    // True deletion needs either soft-delete + tombstones or a graph rebuild
-    // — both nontrivial. Until 7d.3 lands persistence we don't have a
-    // natural rebuild trigger either. So: refuse DELETE on tables carrying
-    // any HNSW index, with a message that points at the workaround
-    // (DROP the index, DELETE, recreate).
-    {
-        let table = db.get_table(table_name.clone()).map_err(|_| {
-            SQLRiteError::General(format!("DELETE references unknown table '{table_name}'"))
-        })?;
-        if !table.hnsw_indexes.is_empty() {
-            let names: Vec<&str> = table.hnsw_indexes.iter().map(|e| e.name.as_str()).collect();
-            return Err(SQLRiteError::NotImplemented(format!(
-                "DELETE on tables with HNSW indexes is not supported yet \
-                 (Phase 7d.3 follow-up). DROP the index first, then DELETE, then re-CREATE. \
-                 Table '{table_name}' currently has: {names:?}"
-            )));
-        }
-    }
-
     // Compute matching rowids with an immutable borrow, then mutate.
     let matching: Vec<i64> = {
         let table = db
@@ -224,6 +204,15 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
     for rowid in &matching {
         table.delete_row(*rowid);
     }
+    // Phase 7d.3 — any DELETE invalidates every HNSW index on this
+    // table (the deleted node could still appear in other nodes'
+    // neighbor lists, breaking subsequent searches). Mark dirty so
+    // the next save rebuilds from current rows before serializing.
+    if !matching.is_empty() {
+        for entry in &mut table.hnsw_indexes {
+            entry.needs_rebuild = true;
+        }
+    }
     Ok(matching.len())
 }
 
@@ -249,25 +238,6 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     }
 
     let table_name = extract_table_name(table)?;
-
-    // Phase 7d.2 limitation (same shape as DELETE above): we have no
-    // in-place UPDATE-an-HNSW-node primitive. UPDATE on a column NOT
-    // covered by HNSW is fine in principle, but the simplest MVP is
-    // refuse-everything-when-HNSW-is-present. Re-evaluate in 7d.3 once
-    // persistence + rebuild is in.
-    {
-        let tbl = db.get_table(table_name.clone()).map_err(|_| {
-            SQLRiteError::General(format!("UPDATE references unknown table '{table_name}'"))
-        })?;
-        if !tbl.hnsw_indexes.is_empty() {
-            let names: Vec<&str> = tbl.hnsw_indexes.iter().map(|e| e.name.as_str()).collect();
-            return Err(SQLRiteError::NotImplemented(format!(
-                "UPDATE on tables with HNSW indexes is not supported yet \
-                 (Phase 7d.3 follow-up). DROP the index first if you need to mutate. \
-                 Table '{table_name}' currently has: {names:?}"
-            )));
-        }
-    }
 
     // Resolve assignment targets to plain column names and verify they exist.
     let mut parsed_assignments: Vec<(String, Expr)> = Vec::with_capacity(assignments.len());
@@ -335,6 +305,24 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     for (rowid, values) in &work {
         for (col, v) in values {
             tbl.set_value(col, *rowid, v.clone())?;
+        }
+    }
+
+    // Phase 7d.3 — UPDATE may have changed a vector column that an
+    // HNSW index covers. Mark every covering index dirty so save
+    // rebuilds from current rows. (Updates that only touched
+    // non-vector columns also mark dirty, which is over-conservative
+    // but harmless — the rebuild walks rows anyway, and the cost is
+    // only paid on save.)
+    if !work.is_empty() {
+        let updated_columns: std::collections::HashSet<&str> = work
+            .iter()
+            .flat_map(|(_, values)| values.iter().map(|(c, _)| c.as_str()))
+            .collect();
+        for entry in &mut tbl.hnsw_indexes {
+            if updated_columns.contains(entry.column_name.as_str()) {
+                entry.needs_rebuild = true;
+            }
         }
     }
     Ok(work.len())
@@ -609,6 +597,8 @@ fn create_hnsw_index(
         name: index_name.to_string(),
         column_name: column_name.to_string(),
         index: idx,
+        // Freshly built — no DELETE/UPDATE has invalidated it yet.
+        needs_rebuild: false,
     });
     Ok(index_name.to_string())
 }

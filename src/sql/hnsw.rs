@@ -202,6 +202,50 @@ impl HnswIndex {
         self.nodes.len()
     }
 
+    /// Phase 7d.3 — produces (node_id, layers) pairs in ascending node_id
+    /// order, suitable for serializing the graph to disk via the
+    /// `HnswNodeCell` wire format. The graph's metadata
+    /// (entry_point + top_layer) is recoverable from the nodes alone:
+    /// top_layer = max(max_layer); entry_point = any node at top_layer.
+    /// So we don't ship a separate metadata cell.
+    pub fn serialize_nodes(&self) -> Vec<(i64, Vec<Vec<i64>>)> {
+        let mut out: Vec<(i64, Vec<Vec<i64>>)> = self
+            .nodes
+            .iter()
+            .map(|(id, n)| (*id, n.layers.clone()))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// Phase 7d.3 — rebuilds an HnswIndex from a stream of (node_id, layers)
+    /// pairs as produced by `serialize_nodes` and round-tripped through
+    /// `HnswNodeCell` encode/decode. The rebuilt index has the same nodes,
+    /// same neighbor lists, same entry_point + top_layer as the source.
+    /// `seed` is fresh; the deserialized index is never inserted into via
+    /// the algorithmic `insert` path so the seed only matters if a caller
+    /// later calls `insert` after deserializing (then it controls layer
+    /// assignment for the appended node).
+    pub fn from_persisted_nodes<I>(distance: DistanceMetric, seed: u64, nodes: I) -> Self
+    where
+        I: IntoIterator<Item = (i64, Vec<Vec<i64>>)>,
+    {
+        let mut idx = Self::new(distance, seed);
+        let mut top_layer = 0usize;
+        let mut entry_point: Option<i64> = None;
+        for (id, layers) in nodes {
+            let max_layer = layers.len().saturating_sub(1);
+            if max_layer > top_layer || entry_point.is_none() {
+                top_layer = max_layer;
+                entry_point = Some(id);
+            }
+            idx.nodes.insert(id, Node { layers });
+        }
+        idx.top_layer = top_layer;
+        idx.entry_point = entry_point;
+        idx
+    }
+
     /// Inserts a node into the graph. The node id must be unique;
     /// re-inserting an existing id is a no-op (returns without error).
     /// `vec` is the new node's vector; `get_vec` looks up the vector

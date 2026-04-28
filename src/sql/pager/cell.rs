@@ -57,6 +57,21 @@ pub const KIND_LOCAL: u8 = 0x01;
 pub const KIND_OVERFLOW: u8 = 0x02;
 pub const KIND_INTERIOR: u8 = 0x03;
 pub const KIND_INDEX: u8 = 0x04;
+/// Phase 7d.3: a single HNSW node's per-layer neighbor lists,
+/// serialized into one cell. Body layout (after the shared
+/// `cell_length | kind_tag` prefix):
+///
+/// ```text
+///   node_id       zigzag varint   the rowid this graph node represents
+///   max_layer     varint          highest layer this node lives in
+///   for each layer 0..=max_layer:
+///     count       varint          number of neighbors at this layer
+///     for each:   zigzag varint   neighbor node_id
+/// ```
+///
+/// `peek_rowid` works uniformly on this kind because it just reads
+/// the first varint after the kind tag — exactly the `node_id` here.
+pub const KIND_HNSW: u8 = 0x05;
 
 /// Value type tag stored in each non-NULL value block.
 pub mod tag {

@@ -34,6 +34,8 @@ pub mod cell;
 pub mod file;
 pub mod header;
 #[allow(dead_code)]
+pub mod hnsw_cell;
+#[allow(dead_code)]
 pub mod index_cell;
 #[allow(dead_code)]
 pub mod interior_page;
@@ -158,7 +160,7 @@ pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -
     // and route to a graph-rebuild instead of the B-Tree-cell load.
     for row in index_rows {
         if create_index_sql_uses_hnsw(&row.sql) {
-            rebuild_hnsw_index(&mut db, &row)?;
+            rebuild_hnsw_index(&mut db, &pager, &row)?;
         } else {
             attach_index(&mut db, &pager, row)?;
         }
@@ -180,6 +182,12 @@ struct IndexCatalogRow {
 /// Persists `db` to disk. Same diff-commit behavior as before: only pages
 /// whose bytes actually changed get written.
 pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
+    // Phase 7d.3 — rebuild any HNSW index that DELETE / UPDATE-on-vector
+    // marked dirty. Done up front under the &mut Database borrow we
+    // already hold, before the immutable iteration loops below need
+    // their own borrow.
+    rebuild_dirty_hnsw_indexes(db);
+
     let same_path = db.source_path.as_deref() == Some(path);
     let mut pager = if same_path {
         match db.pager.take() {
@@ -244,12 +252,14 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
         });
     }
 
-    // 2b. Phase 7d.2: persist HNSW indexes' CREATE INDEX SQL into
-    //     sqlrite_master so reopen reconstructs them. The graph itself
-    //     isn't persisted yet — `rootpage = 0` and the rebuild path
-    //     re-runs the SQL against current rows. Phase 7d.3 will write
-    //     the graph as cell-encoded pages and replace this with a real
-    //     rootpage + load-from-disk path.
+    // 2b. Phase 7d.3: persist HNSW indexes as their own cell-encoded
+    //     page trees, with the rootpage recorded in sqlrite_master.
+    //     Reopen loads the graph back from cells (fast, exact match)
+    //     instead of rebuilding from rows.
+    //
+    //     Dirty indexes (set by DELETE / UPDATE-on-vector-col) are
+    //     rebuilt from current rows BEFORE staging, so the on-disk
+    //     graph reflects the current row set.
     let mut hnsw_entries: Vec<(&Table, &crate::sql::db::table::HnswIndexEntry)> = Vec::new();
     for table in db.tables.values() {
         for entry in &table.hnsw_indexes {
@@ -259,6 +269,8 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     hnsw_entries
         .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
     for (table, entry) in hnsw_entries {
+        let (rootpage, new_next) = stage_hnsw_btree(&mut pager, &entry.index, next_free_page)?;
+        next_free_page = new_next;
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: entry.name.clone(),
@@ -266,7 +278,7 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
                 "CREATE INDEX {} ON {} USING hnsw ({})",
                 entry.name, table.tb_name, entry.column_name
             ),
-            rootpage: 0, // no on-disk graph yet (Phase 7d.3)
+            rootpage,
             last_rowid: 0,
         });
     }
@@ -638,12 +650,22 @@ fn create_index_sql_uses_hnsw(sql: &str) -> bool {
     matches!(using, Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw"))
 }
 
-/// Replays a CREATE INDEX … USING hnsw statement on a freshly-loaded
-/// database, rebuilding the in-memory HNSW graph from the table's
-/// current rows. Phase 7d.2 only — Phase 7d.3 will replace this with
-/// a load-from-disk path that reads the persisted graph.
-fn rebuild_hnsw_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
+/// Loads (or rebuilds) an HNSW index on database open. Two paths:
+///
+///   - **rootpage != 0** (Phase 7d.3 default): the graph is persisted
+///     as cell-encoded pages. Read every node directly via
+///     `load_hnsw_nodes` and reconstruct the index — fast, zero
+///     algorithm runs, exact bit-for-bit reproduction of what was saved.
+///
+///   - **rootpage == 0** (compatibility): no on-disk graph, e.g. for
+///     files saved by Phase 7d.2 before persistence landed. Replay the
+///     CREATE INDEX SQL through `execute_create_index`, which walks the
+///     table's current rows and populates a fresh graph. Slower but
+///     correctness-equivalent on the first save with the new code.
+fn rebuild_hnsw_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) -> Result<()> {
+    use crate::sql::db::table::HnswIndexEntry;
     use crate::sql::executor::execute_create_index;
+    use crate::sql::hnsw::{DistanceMetric, HnswIndex};
     use sqlparser::ast::Statement;
 
     let dialect = SQLiteDialect {};
@@ -654,14 +676,168 @@ fn rebuild_hnsw_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
             row.sql
         )));
     };
-    // execute_create_index walks the table's existing rows and
-    // populates the new HnswIndex via the same code path used at
-    // user-issued CREATE INDEX time. The graph is identical to what
-    // the user originally got at index-creation; only the random
-    // RNG path through the geometric layer-assignment differs (we
-    // seed from the index name, so it's actually deterministic).
-    execute_create_index(&stmt, db)?;
+
+    if row.rootpage == 0 {
+        // Compatibility path — no persisted graph; walk current rows.
+        execute_create_index(&stmt, db)?;
+        return Ok(());
+    }
+
+    // Persistence path — read the cell tree, deserialize.
+    let nodes = load_hnsw_nodes(pager, row.rootpage)?;
+    let index = HnswIndex::from_persisted_nodes(DistanceMetric::L2, 0xC0FFEE, nodes);
+
+    // Parse the CREATE INDEX to know which table + column to attach to
+    // — same shape as the row-walk path; we just don't execute it.
+    let (tbl_name, col_name) = parse_hnsw_create_index_sql(&row.sql)?;
+    let table_mut = db.get_table_mut(tbl_name.clone()).map_err(|_| {
+        SQLRiteError::Internal(format!(
+            "HNSW index '{}' references unknown table '{tbl_name}'",
+            row.name
+        ))
+    })?;
+    table_mut.hnsw_indexes.push(HnswIndexEntry {
+        name: row.name.clone(),
+        column_name: col_name,
+        index,
+        needs_rebuild: false,
+    });
     Ok(())
+}
+
+/// Phase 7d.3 — Phase-7d.3-side helper: walk every leaf in the HNSW
+/// page tree at `root_page` and decode each cell as a node. Returns
+/// the (node_id, layers) tuples in slot-order (already ascending by
+/// node_id since they were staged that way). The caller hands them to
+/// `HnswIndex::from_persisted_nodes`.
+fn load_hnsw_nodes(pager: &Pager, root_page: u32) -> Result<Vec<(i64, Vec<Vec<i64>>)>> {
+    use crate::sql::pager::hnsw_cell::HnswNodeCell;
+
+    let mut nodes: Vec<(i64, Vec<Vec<i64>>)> = Vec::new();
+    let first_leaf = find_leftmost_leaf(pager, root_page)?;
+    let mut current = first_leaf;
+    while current != 0 {
+        let page_buf = pager
+            .read_page(current)
+            .ok_or_else(|| SQLRiteError::Internal(format!("missing HNSW leaf page {current}")))?;
+        if page_buf[0] != PageType::TableLeaf as u8 {
+            return Err(SQLRiteError::Internal(format!(
+                "page {current} tagged {} but expected TableLeaf (HNSW)",
+                page_buf[0]
+            )));
+        }
+        let next_leaf = u32::from_le_bytes(page_buf[1..5].try_into().unwrap());
+        let payload: &[u8; PAYLOAD_PER_PAGE] = (&page_buf[PAGE_HEADER_SIZE..])
+            .try_into()
+            .map_err(|_| SQLRiteError::Internal("HNSW leaf payload size".to_string()))?;
+        let leaf = TablePage::from_bytes(payload);
+        for slot in 0..leaf.slot_count() {
+            let offset = leaf.slot_offset_raw(slot)?;
+            let (cell, _) = HnswNodeCell::decode(leaf.as_bytes(), offset)?;
+            nodes.push((cell.node_id, cell.layers));
+        }
+        current = next_leaf;
+    }
+    Ok(nodes)
+}
+
+/// Pulls (table_name, column_name) out of a `CREATE INDEX … USING hnsw (col)`
+/// SQL string. Used by the persistence path on open to know where to
+/// attach the loaded graph. Same shape as `parse_create_index_sql` for
+/// regular indexes — only the assertion differs (we don't care about
+/// UNIQUE for HNSW).
+fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String)> {
+    use sqlparser::ast::{CreateIndex, Expr, Statement};
+
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
+    let Some(Statement::CreateIndex(CreateIndex {
+        table_name,
+        columns,
+        ..
+    })) = ast.pop()
+    else {
+        return Err(SQLRiteError::Internal(format!(
+            "sqlrite_master HNSW row's SQL isn't a CREATE INDEX: {sql}"
+        )));
+    };
+    if columns.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "multi-column HNSW indexes aren't supported yet".to_string(),
+        ));
+    }
+    let col = match &columns[0].column.expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| p.value.clone()).unwrap_or_default()
+        }
+        other => {
+            return Err(SQLRiteError::Internal(format!(
+                "unsupported HNSW indexed column expression: {other:?}"
+            )));
+        }
+    };
+    Ok((table_name.to_string(), col))
+}
+
+/// Phase 7d.3 — rebuilds in-place any HnswIndexEntry whose
+/// `needs_rebuild` flag is set (DELETE / UPDATE-on-vector marked it).
+/// Walks the table's current Vec<f32> column storage and runs the
+/// HNSW algorithm fresh. Called at the top of `save_database` before
+/// any immutable borrows of `db` start.
+///
+/// Cost: O(N · ef_construction · log N) per dirty index. Fine for
+/// small tables, expensive for ≥100k-row tables — matches the
+/// trade-off SQLite makes for FTS5: dirtying-and-rebuilding is the
+/// MVP, more sophisticated incremental delete strategies (soft-delete
+/// + tombstones, neighbor reconnection) are future polish.
+fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
+    use crate::sql::hnsw::{DistanceMetric, HnswIndex};
+
+    for table in db.tables.values_mut() {
+        // Snapshot which (index_name, column) pairs need rebuilding,
+        // before we go grabbing column data — keeps the borrow
+        // structure simple.
+        let dirty: Vec<(String, String)> = table
+            .hnsw_indexes
+            .iter()
+            .filter(|e| e.needs_rebuild)
+            .map(|e| (e.name.clone(), e.column_name.clone()))
+            .collect();
+        if dirty.is_empty() {
+            continue;
+        }
+
+        for (idx_name, col_name) in dirty {
+            // Snapshot every (rowid, vec) for this column.
+            let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+            {
+                let row_data = table.rows.lock().expect("rows mutex poisoned");
+                if let Some(Row::Vector(map)) = row_data.get(&col_name) {
+                    for (id, v) in map.iter() {
+                        vectors.push((*id, v.clone()));
+                    }
+                }
+            }
+            // Pre-build a HashMap for the get_vec closure so we don't
+            // pay O(N) lookup per insert call.
+            let snapshot: std::collections::HashMap<i64, Vec<f32>> =
+                vectors.iter().cloned().collect();
+
+            let mut new_idx = HnswIndex::new(DistanceMetric::L2, 0xC0FFEE);
+            // Sort by id so the rebuild is deterministic across runs.
+            vectors.sort_by_key(|(id, _)| *id);
+            for (id, v) in &vectors {
+                new_idx.insert(*id, v, |q| snapshot.get(&q).cloned().unwrap_or_default());
+            }
+
+            // Replace the entry's index + clear the dirty flag.
+            if let Some(entry) = table.hnsw_indexes.iter_mut().find(|e| e.name == idx_name) {
+                entry.index = new_idx;
+                entry.needs_rebuild = false;
+            }
+        }
+    }
 }
 
 /// Cheap clone helper — `DataType` doesn't derive `Clone` elsewhere.
@@ -749,6 +925,85 @@ fn stage_index_leaves(
         }
         current_leaf.insert_entry(rowid, &entry_bytes)?;
         current_max_rowid = Some(rowid);
+    }
+
+    emit_leaf(pager, current_leaf_page, &current_leaf, 0);
+    leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+    Ok((leaves, next_free_page))
+}
+
+/// Phase 7d.3 — stages an HNSW index's page tree at `start_page`.
+/// Each leaf cell is a `KIND_HNSW` entry carrying one node's
+/// (node_id, layers). Returns `(root_page, next_free_page)`.
+///
+/// Tree shape is identical to `stage_index_btree` — chained leaves +
+/// optional interior layers. The slot directory binary-searches by
+/// node_id (which is the cell's "rowid" in `Cell::peek_rowid` terms),
+/// so reads can locate any node in O(log N) once 7d.4-or-later
+/// optimizes the load path to lazy-fetch instead of read-all.
+/// Today, `load_hnsw_nodes` reads the entire tree on open.
+fn stage_hnsw_btree(
+    pager: &mut Pager,
+    idx: &crate::sql::hnsw::HnswIndex,
+    start_page: u32,
+) -> Result<(u32, u32)> {
+    let (leaves, mut next_free_page) = stage_hnsw_leaves(pager, idx, start_page)?;
+    if leaves.len() == 1 {
+        return Ok((leaves[0].0, next_free_page));
+    }
+    let mut level: Vec<(u32, i64)> = leaves;
+    while level.len() > 1 {
+        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
+        next_free_page = new_next_free;
+        level = next_level;
+    }
+    Ok((level[0].0, next_free_page))
+}
+
+/// Packs HNSW nodes into a sibling-chained run of `TableLeaf` pages.
+/// `serialize_nodes` already returns nodes in ascending node_id order,
+/// so the slot directory's rowid ordering stays valid.
+fn stage_hnsw_leaves(
+    pager: &mut Pager,
+    idx: &crate::sql::hnsw::HnswIndex,
+    start_page: u32,
+) -> Result<(Vec<(u32, i64)>, u32)> {
+    use crate::sql::pager::hnsw_cell::HnswNodeCell;
+
+    let mut leaves: Vec<(u32, i64)> = Vec::new();
+    let mut current_leaf = TablePage::empty();
+    let mut current_leaf_page = start_page;
+    let mut current_max_rowid: Option<i64> = None;
+    let mut next_free_page = start_page + 1;
+
+    let serialized = idx.serialize_nodes();
+
+    // Empty index → emit a single empty leaf page so the rootpage
+    // pointer in sqlrite_master stays nonzero (== "graph is persisted,
+    // it just happens to be empty"). load_hnsw_nodes is fine with an
+    // empty leaf — slot_count() returns 0.
+    for (node_id, layers) in serialized {
+        let cell = HnswNodeCell::new(node_id, layers);
+        let entry_bytes = cell.encode()?;
+
+        if !current_leaf.would_fit(entry_bytes.len()) {
+            let next_leaf_page_num = next_free_page;
+            emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
+            leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+            current_leaf = TablePage::empty();
+            current_leaf_page = next_leaf_page_num;
+            next_free_page += 1;
+
+            if !current_leaf.would_fit(entry_bytes.len()) {
+                return Err(SQLRiteError::Internal(format!(
+                    "HNSW node {node_id} cell of {} bytes exceeds empty-page capacity {}",
+                    entry_bytes.len(),
+                    current_leaf.free_space()
+                )));
+            }
+        }
+        current_leaf.insert_entry(node_id, &entry_bytes)?;
+        current_max_rowid = Some(node_id);
     }
 
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
@@ -1137,11 +1392,10 @@ mod tests {
 
     #[test]
     fn round_trip_rebuilds_hnsw_index_from_create_sql() {
-        // Phase 7d.2: HNSW indexes don't yet persist their graph (that's
-        // 7d.3), but the CREATE INDEX SQL goes into sqlrite_master and the
-        // open path re-runs it to rebuild the graph from current rows.
-        // After a save+reopen, the index entry should be back, with the
-        // same column + the same population.
+        // Phase 7d.3: HNSW indexes now persist their graph as cell-encoded
+        // pages. After save+reopen the index entry reattaches with the
+        // same column + same node count, loaded directly from disk
+        // instead of re-walking rows.
         let path = tmp_path("hnsw_roundtrip");
 
         // Build, populate, index, save.
@@ -1174,10 +1428,14 @@ mod tests {
             let entry = &table.hnsw_indexes[0];
             assert_eq!(entry.name, "ix_e");
             assert_eq!(entry.column_name, "e");
-            assert_eq!(entry.index.len(), 5, "rebuilt graph should hold all 5 rows");
+            assert_eq!(entry.index.len(), 5, "loaded graph should hold all 5 rows");
+            assert!(
+                !entry.needs_rebuild,
+                "fresh load should not be marked dirty"
+            );
         }
 
-        // Quick functional check: KNN query through the rebuilt index
+        // Quick functional check: KNN query through the loaded index
         // returns results.
         let resp = process_command(
             "SELECT id FROM docs ORDER BY vec_distance_l2(e, [1.0, 0.0]) ASC LIMIT 3;",
@@ -1185,6 +1443,58 @@ mod tests {
         )
         .unwrap();
         assert!(resp.contains("3 rows returned"), "got: {resp}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_then_save_then_reopen_excludes_deleted_node_from_hnsw() {
+        // Phase 7d.3 — DELETE marks HNSW dirty; save rebuilds it from
+        // current rows + serializes; reopen loads the post-delete graph.
+        // After all that, the deleted rowid must NOT come back from a
+        // KNN query.
+        let path = tmp_path("hnsw_delete_rebuild");
+        let mut db = Database::new("test".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(2));",
+            &mut db,
+        )
+        .unwrap();
+        for v in &["[1.0, 0.0]", "[2.0, 0.0]", "[3.0, 0.0]", "[4.0, 0.0]"] {
+            process_command(&format!("INSERT INTO docs (e) VALUES ({v});"), &mut db).unwrap();
+        }
+        process_command("CREATE INDEX ix_e ON docs USING hnsw (e);", &mut db).unwrap();
+
+        // Delete row 1 (the closest match to [0.5, 0.0]).
+        process_command("DELETE FROM docs WHERE id = 1;", &mut db).unwrap();
+        // Confirm it marked dirty.
+        let dirty_before_save = db.tables["docs"].hnsw_indexes[0].needs_rebuild;
+        assert!(dirty_before_save, "DELETE should mark dirty");
+
+        save_database(&mut db, &path).expect("save");
+        // Confirm save cleared the dirty flag.
+        let dirty_after_save = db.tables["docs"].hnsw_indexes[0].needs_rebuild;
+        assert!(!dirty_after_save, "save should clear dirty");
+        drop(db);
+
+        // Reopen, query for the closest match. Row 1 is gone; row 2
+        // (id=2, vector [2.0, 0.0]) should now be the nearest.
+        let loaded = open_database(&path, "test".to_string()).expect("open");
+        let docs = loaded.get_table("docs".to_string()).expect("docs");
+
+        // Row 1 must not appear in any storage anymore.
+        assert!(
+            !docs.rowids().contains(&1),
+            "deleted row 1 should not be in row storage"
+        );
+        assert_eq!(docs.rowids().len(), 3, "should have 3 surviving rows");
+
+        // The HNSW index must also have shed the deleted node.
+        assert_eq!(
+            docs.hnsw_indexes[0].index.len(),
+            3,
+            "HNSW graph should have shed the deleted node"
+        );
 
         cleanup(&path);
     }
