@@ -1,5 +1,6 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
+use crate::sql::hnsw::HnswIndex;
 use crate::sql::parser::create::CreateQuery;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -118,10 +119,30 @@ pub struct Table {
     /// add more. Looking up an index: iterate by column name, or by index
     /// name via `Table::index_by_name`.
     pub secondary_indexes: Vec<SecondaryIndex>,
+    /// HNSW indexes on VECTOR columns (Phase 7d.2). Maintained in lockstep
+    /// with row storage on INSERT (incremental); rebuilt on open from the
+    /// persisted CREATE INDEX SQL. The graph itself is NOT yet persisted —
+    /// see Phase 7d.3 for cell-encoded graph storage.
+    pub hnsw_indexes: Vec<HnswIndexEntry>,
     /// ROWID of most recent insert.
     pub last_rowid: i64,
     /// PRIMARY KEY column name, or "-1" if the table has no PRIMARY KEY.
     pub primary_key: String,
+}
+
+/// One HNSW index attached to a table. Phase 7d.2 only supports L2
+/// distance; cosine and dot are 7d.x follow-ups (would require either
+/// distinct USING methods like `hnsw_cosine` or a `WITH (metric = …)`
+/// clause — see `docs/phase-7-plan.md` for the deferred decision).
+#[derive(Debug, Clone)]
+pub struct HnswIndexEntry {
+    /// User-supplied name from `CREATE INDEX <name> …`. Unique across
+    /// both `secondary_indexes` and `hnsw_indexes` on a given table.
+    pub name: String,
+    /// The VECTOR column this index covers.
+    pub column_name: String,
+    /// The graph itself.
+    pub index: HnswIndex,
 }
 
 impl Table {
@@ -194,6 +215,11 @@ impl Table {
             columns: table_cols,
             rows: table_rows,
             secondary_indexes,
+            // HNSW indexes only land via explicit CREATE INDEX … USING hnsw
+            // statements (Phase 7d.2); never auto-created at CREATE TABLE
+            // time, because there's no UNIQUE-style constraint that
+            // implies a vector index.
+            hnsw_indexes: Vec::new(),
             last_rowid: 0,
             primary_key,
         }
@@ -217,6 +243,10 @@ impl Table {
             columns: self.columns.clone(),
             rows: Arc::new(Mutex::new(cloned_rows)),
             secondary_indexes: self.secondary_indexes.clone(),
+            // HnswIndexEntry derives Clone, so the snapshot owns its own
+            // graph copy. Phase 4f's snapshot-rollback semantics require
+            // the snapshot to be fully decoupled from live state.
+            hnsw_indexes: self.hnsw_indexes.clone(),
             last_rowid: self.last_rowid,
             primary_key: self.primary_key.clone(),
         }
@@ -813,14 +843,55 @@ impl Table {
 
             // Step 2: maintain the secondary index (if any). insert() is a
             // no-op for Value::Null and cheap for other value kinds.
-            if let Some(v) = typed_value {
+            if let Some(v) = typed_value.clone() {
                 if let Some(idx) = self.index_for_column_mut(key) {
                     idx.insert(&v, next_rowid)?;
                 }
             }
+
+            // Step 3 (Phase 7d.2): maintain any HNSW indexes on this column.
+            // The HNSW algorithm needs access to other rows' vectors when
+            // wiring up neighbor edges, so build a get_vec closure that
+            // pulls from the table's row storage (which we *just* updated
+            // with the new value).
+            if let Some(Value::Vector(new_vec)) = typed_value {
+                self.maintain_hnsw_on_insert(key, next_rowid, &new_vec);
+            }
         }
         self.last_rowid = next_rowid;
         Ok(())
+    }
+
+    /// After a row insert, push the new (rowid, vector) into every HNSW
+    /// index whose column matches `column`. Split out of `insert_row` so
+    /// the borrowing dance — we need both `&self.rows` (read other
+    /// vectors) and `&mut self.hnsw_indexes` (insert into the graph) —
+    /// stays localized.
+    fn maintain_hnsw_on_insert(&mut self, column: &str, rowid: i64, new_vec: &[f32]) {
+        // Snapshot the current vector storage so the get_vec closure
+        // doesn't fight with `&mut self.hnsw_indexes`. For a typical
+        // HNSW insert we touch ef_construction × log(N) other vectors,
+        // so the snapshot cost is small relative to the graph wiring.
+        let mut vec_snapshot: HashMap<i64, Vec<f32>> = HashMap::new();
+        {
+            let row_data = self.rows.lock().expect("rows mutex poisoned");
+            if let Some(Row::Vector(map)) = row_data.get(column) {
+                for (id, v) in map.iter() {
+                    vec_snapshot.insert(*id, v.clone());
+                }
+            }
+        }
+        // The new row was just written into row storage — make sure the
+        // snapshot reflects it (it should, but defensive).
+        vec_snapshot.insert(rowid, new_vec.to_vec());
+
+        for entry in &mut self.hnsw_indexes {
+            if entry.column_name == column {
+                entry.index.insert(rowid, new_vec, |id| {
+                    vec_snapshot.get(&id).cloned().unwrap_or_default()
+                });
+            }
+        }
     }
 
     /// Print the table schema to standard output in a pretty formatted way.
