@@ -3511,6 +3511,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",
@@ -3757,6 +3758,7 @@ dependencies = [
  "prettytable-rs",
  "rustyline",
  "rustyline-derive",
+ "serde_json",
  "sqlparser",
  "thiserror 2.0.18",
 ]

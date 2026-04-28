@@ -375,6 +375,7 @@ fn table_to_create_sql(table: &Table) -> String {
             DataType::Real => "REAL".to_string(),
             DataType::Bool => "BOOLEAN".to_string(),
             DataType::Vector(dim) => format!("VECTOR({dim})"),
+            DataType::Json => "JSON".to_string(),
             DataType::None | DataType::Invalid => "TEXT".to_string(),
         };
         let mut piece = format!("{} {}", c.column_name, ty);
@@ -432,6 +433,9 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
                 DataType::Real => Row::Real(BTreeMap::new()),
                 DataType::Bool => Row::Bool(BTreeMap::new()),
                 DataType::Vector(_dim) => Row::Vector(BTreeMap::new()),
+                // JSON columns reuse Text storage — see Table::new and
+                // Phase 7e's scope-correction note.
+                DataType::Json => Row::Text(BTreeMap::new()),
                 DataType::None | DataType::Invalid => Row::None,
             };
             map.insert(col.column_name.clone(), row);
@@ -848,6 +852,7 @@ fn clone_datatype(dt: &DataType) -> DataType {
         DataType::Real => DataType::Real,
         DataType::Bool => DataType::Bool,
         DataType::Vector(dim) => DataType::Vector(*dim),
+        DataType::Json => DataType::Json,
         DataType::None => DataType::None,
         DataType::Invalid => DataType::Invalid,
     }
@@ -1386,6 +1391,56 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![0.1f32, 0.2, 0.3]);
         assert_eq!(rows[1], vec![1.5f32, -2.0, 3.5]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn round_trip_preserves_json_column() {
+        // Phase 7e — JSON columns are stored as Text under the hood with
+        // INSERT-time validation. Save + reopen should preserve the
+        // schema (DataType::Json) and the underlying text bytes; a
+        // post-reopen json_extract should still resolve paths correctly.
+        let path = tmp_path("json_roundtrip");
+
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, payload JSON);",
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                r#"INSERT INTO docs (payload) VALUES ('{"name": "alice", "tags": ["rust","sql"]}');"#,
+                &mut db,
+            )
+            .unwrap();
+            save_database(&mut db, &path).expect("save");
+        }
+
+        let mut loaded = open_database(&path, "test".to_string()).expect("open");
+        let docs = loaded.get_table("docs".to_string()).expect("docs");
+
+        // Schema: column declared as JSON, restored with the same type.
+        let payload_col = docs
+            .columns
+            .iter()
+            .find(|c| c.column_name == "payload")
+            .unwrap();
+        assert!(
+            matches!(payload_col.datatype, DataType::Json),
+            "expected DataType::Json, got {:?}",
+            payload_col.datatype
+        );
+
+        // json_extract works against the reopened data — exercises the
+        // full Text-storage + serde_json::from_str path post-reopen.
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.name') = 'alice';"#,
+            &mut loaded,
+        )
+        .expect("select via json_extract after reopen");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
 
         cleanup(&path);
     }

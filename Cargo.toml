@@ -82,6 +82,14 @@ log = "0.4"
 sqlparser = "0.61"
 thiserror = "2.0"
 prettytable-rs = "0.10"
+# Phase 7e: JSON column type. `serde_json` powers both the validation
+# step at INSERT time (parse-and-discard to confirm the text is valid
+# JSON) and the path extraction inside the json_extract / json_type
+# / json_array_length / json_object_keys SQL functions. `preserve_order`
+# keeps object keys in insertion order so json_object_keys output is
+# stable; without it, BTreeMap-backed Maps would alphabetically sort,
+# which surprises callers re-serializing the same JSON.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # CLI-only deps (feature-gated). `optional = true` + the `cli`
 # feature above means these only land in the dep graph when

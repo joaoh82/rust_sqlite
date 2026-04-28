@@ -112,6 +112,11 @@ impl CreateQuery {
                         DataType::Float(_precision) => "Real".to_string(),
                         DataType::Double(_) => "Real".to_string(),
                         DataType::Decimal(_) => "Real".to_string(),
+                        // Phase 7e — `JSON` parses as a unit variant in
+                        // sqlparser's DataType enum. JSONB is treated as
+                        // an alias (matches PostgreSQL's permissive
+                        // behaviour); both store as text under the hood.
+                        DataType::JSON | DataType::JSONB => "Json".to_string(),
                         // Phase 7a — `VECTOR(N)` parses as Custom("VECTOR", ["N"]).
                         // sqlparser's SQLite dialect doesn't have a built-in
                         // Vector variant; Custom is what unrecognized type

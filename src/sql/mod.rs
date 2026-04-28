@@ -1569,4 +1569,232 @@ mod tests {
             "expected error mentioning function name, got: {msg}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Phase 7e — JSON column type + path-extraction functions
+    // -----------------------------------------------------------------
+
+    fn seed_json_table() -> Database {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, payload JSON);",
+            &mut db,
+        )
+        .expect("create json table");
+        db
+    }
+
+    #[test]
+    fn json_column_round_trip_primitive_values() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"name": "alice", "age": 30}');"#,
+            &mut db,
+        )
+        .expect("insert json");
+        let docs = db.get_table("docs".to_string()).unwrap();
+        let rowids = docs.rowids();
+        assert_eq!(rowids.len(), 1);
+        // Stored verbatim as Text underneath.
+        match docs.get_value("payload", rowids[0]) {
+            Some(Value::Text(s)) => {
+                assert!(s.contains("alice"), "expected JSON text to round-trip: {s}");
+            }
+            other => panic!("expected Value::Text holding JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_insert_rejects_invalid_json() {
+        let mut db = seed_json_table();
+        let err = process_command(
+            "INSERT INTO docs (payload) VALUES ('not-valid-json{');",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("json") && msg.contains("payload"),
+            "expected JSON validation error mentioning column, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn json_extract_object_field() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"name": "alice", "age": 30}');"#,
+            &mut db,
+        )
+        .unwrap();
+        // We don't have function calls in projection (yet), so test
+        // the function via WHERE.
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.name') = 'alice';"#,
+            &mut db,
+        )
+        .expect("select via json_extract");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.age') = 30;"#,
+            &mut db,
+        )
+        .expect("select via numeric json_extract");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn json_extract_array_index_and_nested() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"tags": ["rust", "sql", "vectors"], "meta": {"author": "joao"}}');"#,
+            &mut db,
+        )
+        .unwrap();
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.tags[0]') = 'rust';"#,
+            &mut db,
+        )
+        .expect("select via array index");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.meta.author') = 'joao';"#,
+            &mut db,
+        )
+        .expect("select via nested object");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn json_extract_missing_path_returns_null() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"name": "alice"}');"#,
+            &mut db,
+        )
+        .unwrap();
+        // Missing key under WHERE returns NULL → predicate is false →
+        // 0 rows returned. (Standard SQL three-valued logic.)
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, '$.missing') = 'something';"#,
+            &mut db,
+        )
+        .expect("select with missing path");
+        assert!(resp.contains("0 rows returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn json_extract_malformed_path_errors() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"a": 1}');"#,
+            &mut db,
+        )
+        .unwrap();
+        // Path doesn't start with '$' — syntax error.
+        let err = process_command(
+            r#"SELECT id FROM docs WHERE json_extract(payload, 'a.b') = 1;"#,
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("'$'"));
+    }
+
+    #[test]
+    fn json_array_length_on_array() {
+        // Note: json_array_length used in WHERE clause where it can be
+        // compared; that exercises the function dispatch end-to-end.
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"tags": ["a", "b", "c"]}');"#,
+            &mut db,
+        )
+        .unwrap();
+        let resp = process_command(
+            r#"SELECT id FROM docs WHERE json_array_length(payload, '$.tags') = 3;"#,
+            &mut db,
+        )
+        .expect("select via array_length");
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn json_array_length_on_non_array_errors() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"tags": "not-an-array"}');"#,
+            &mut db,
+        )
+        .unwrap();
+        let err = process_command(
+            r#"SELECT id FROM docs WHERE json_array_length(payload, '$.tags') = 1;"#,
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("non-array"),
+            "expected non-array error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn json_type_recognizes_each_kind() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"o": {}, "a": [], "s": "x", "i": 1, "f": 1.5, "t": true, "n": null}');"#,
+            &mut db,
+        )
+        .unwrap();
+        let cases = &[
+            ("$.o", "object"),
+            ("$.a", "array"),
+            ("$.s", "text"),
+            ("$.i", "integer"),
+            ("$.f", "real"),
+            ("$.t", "true"),
+            ("$.n", "null"),
+        ];
+        for (path, expected_type) in cases {
+            let sql = format!(
+                "SELECT id FROM docs WHERE json_type(payload, '{path}') = '{expected_type}';"
+            );
+            let resp =
+                process_command(&sql, &mut db).unwrap_or_else(|e| panic!("path {path}: {e}"));
+            assert!(
+                resp.contains("1 row returned"),
+                "path {path} expected type {expected_type}; got response: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_on_json_column_revalidates() {
+        let mut db = seed_json_table();
+        process_command(
+            r#"INSERT INTO docs (payload) VALUES ('{"a": 1}');"#,
+            &mut db,
+        )
+        .unwrap();
+        // Valid JSON update succeeds.
+        process_command(
+            r#"UPDATE docs SET payload = '{"a": 2, "b": 3}' WHERE id = 1;"#,
+            &mut db,
+        )
+        .expect("valid JSON UPDATE");
+        // Invalid JSON in UPDATE is rejected with the same shape of
+        // error as INSERT.
+        let err = process_command(
+            r#"UPDATE docs SET payload = 'not-json{' WHERE id = 1;"#,
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("json") && msg.contains("payload"),
+            "got: {msg}"
+        );
+    }
 }
