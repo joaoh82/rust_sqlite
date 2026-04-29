@@ -69,6 +69,65 @@ console.log(ro.readonly); // → true
 ro.exec('INSERT INTO users (name) VALUES (...)'); // → Error: ...read-only...
 ```
 
+### Vector columns + KNN (Phase 7a–7d)
+
+`VECTOR(N)` storage class plus `vec_distance_l2` / `vec_distance_cosine` / `vec_distance_dot` distance functions. Vector literals are bracket arrays: `[0.1, 0.2, ...]`.
+
+```js
+db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(384))');
+db.prepare("INSERT INTO docs (id, embedding) VALUES (1, [0.1, 0.2, ..., 0.0])").run();
+
+const nearest = db
+  .prepare(`
+    SELECT id FROM docs
+     ORDER BY vec_distance_l2(embedding, [0.1, 0.2, ..., 0.0])
+     LIMIT 10
+  `)
+  .all();
+```
+
+Build an HNSW index for sub-linear KNN — the executor probes it automatically when the query shape matches:
+
+```js
+db.exec('CREATE INDEX idx_docs_emb ON docs USING hnsw (embedding)');
+```
+
+### JSON columns (Phase 7e)
+
+`JSON` (and `JSONB` as an alias) columns store text, validated at INSERT/UPDATE time. Read with `json_extract` / `json_type` / `json_array_length` / `json_object_keys`. Path subset: `$`, `.key`, `[N]`, chained.
+
+```js
+db.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, payload JSON)');
+db.prepare(
+  `INSERT INTO events (payload) VALUES ('{"user": {"name": "alice"}, "score": 42}')`
+).run();
+
+const row = db
+  .prepare("SELECT json_extract(payload, '$.user.name') AS name FROM events")
+  .get();
+// → { name: 'alice' }
+```
+
+> `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
+
+### Natural-language → SQL (Phase 7g — *coming soon*)
+
+The Phase 7g.2-7g.8 wave adds `db.ask()` / `db.askRun()` wrappers around the new [`sqlrite-ask`](https://crates.io/crates/sqlrite-ask) Rust crate via napi-rs. Today it's available only from Rust; the Node wrapper lands in 7g.5 and will look like:
+
+```js
+// 7g.5 preview — not yet released
+import { Database, AskConfig } from '@joaoh82/sqlrite';
+
+const db   = new Database('foo.sqlrite');
+const cfg  = AskConfig.fromEnv();              // SQLRITE_LLM_API_KEY etc.
+const resp = db.ask('How many users are over 30?', cfg);
+console.log(resp.sql);          // "SELECT COUNT(*) FROM users WHERE age > 30"
+console.log(resp.explanation);  // "Counts users over the age threshold."
+
+// Convenience:
+const rows = db.askRun('How many users are over 30?', cfg).all();
+```
+
 ## API surface
 
 | JS                                   | Purpose                                        |

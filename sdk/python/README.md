@@ -62,6 +62,64 @@ conn = sqlrite.connect_read_only("foo.sqlrite")
 # connections on the same file coexist (shared OS lock).
 ```
 
+### Vector columns + KNN (Phase 7a–7d)
+
+The engine ships with a fixed-dimension `VECTOR(N)` storage class and three distance functions (`vec_distance_l2`, `vec_distance_cosine`, `vec_distance_dot`). Plain `cursor.execute(...)` is all you need from Python — values come back as Python lists of floats.
+
+```python
+cur.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(384))")
+cur.execute("INSERT INTO docs (id, embedding) VALUES (1, [0.1, 0.2, ..., 0.0])")  # 384 floats
+cur.execute("""
+    SELECT id FROM docs
+     ORDER BY vec_distance_l2(embedding, [0.1, 0.2, ..., 0.0])
+     LIMIT 10
+""")
+for row in cur:
+    print(row)
+```
+
+For larger collections, build an HNSW index — the executor will use it automatically when the `WHERE`/`ORDER BY` shape matches:
+
+```python
+cur.execute("CREATE INDEX idx_docs_emb ON docs USING hnsw (embedding)")
+```
+
+### JSON columns (Phase 7e)
+
+`JSON` (and `JSONB` as an alias) columns store text, validated at INSERT/UPDATE time. Read with `json_extract` / `json_type` / `json_array_length` / `json_object_keys`. Path subset: `$`, `.key`, `[N]`, chained.
+
+```python
+cur.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, payload JSON)")
+cur.execute(
+    "INSERT INTO events (payload) VALUES "
+    "('{\"user\": {\"name\": \"alice\"}, \"score\": 42}')"
+)
+cur.execute(
+    "SELECT json_extract(payload, '$.user.name'), json_type(payload, '$.score') FROM events"
+)
+print(cur.fetchall())  # [('alice', 'integer')]
+```
+
+> `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
+
+### Natural-language → SQL (Phase 7g — *coming soon*)
+
+The Phase 7g.2-7g.8 wave adds a Python-native `conn.ask()` that wraps the new `sqlrite-ask` Rust crate via PyO3. Today it's available only from Rust ([`sqlrite-ask` on crates.io](https://crates.io/crates/sqlrite-ask)); the Python wrapper lands in 7g.4 and will look like:
+
+```python
+# 7g.4 preview — not yet released
+import sqlrite
+
+conn = sqlrite.connect("foo.sqlrite")
+cfg  = sqlrite.AskConfig.from_env()           # SQLRITE_LLM_API_KEY etc.
+resp = conn.ask("How many users are over 30?", cfg)
+print(resp.sql)          # "SELECT COUNT(*) FROM users WHERE age > 30"
+print(resp.explanation)  # "Counts users over the age threshold."
+
+# Convenience:
+rows = conn.ask_run("How many users are over 30?", cfg).fetchall()
+```
+
 ## API surface
 
 | Function / Method                | Purpose                                          |

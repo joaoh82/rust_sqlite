@@ -82,6 +82,64 @@ defer ro.Close()
 // Reads work; any Exec throws with "read-only" in the message.
 ```
 
+### Vector columns + KNN (Phase 7a–7d)
+
+`VECTOR(N)` storage class plus `vec_distance_l2` / `vec_distance_cosine` / `vec_distance_dot` distance functions. Vector literals are JSON-style bracket arrays `[0.1, 0.2, ...]`. Today the Go side bridges them as text — `database/sql` doesn't yet have a typed accessor for vectors:
+
+```go
+db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(384))`)
+db.Exec(`INSERT INTO docs (id, embedding) VALUES (1, [0.1, 0.2, ..., 0.0])`)
+
+rows, _ := db.Query(`
+    SELECT id FROM docs
+     ORDER BY vec_distance_l2(embedding, [0.1, 0.2, ..., 0.0])
+     LIMIT 10
+`)
+defer rows.Close()
+for rows.Next() {
+    var id int64
+    rows.Scan(&id)
+}
+```
+
+For larger collections, build an HNSW index — the executor uses it automatically:
+
+```go
+db.Exec(`CREATE INDEX idx_docs_emb ON docs USING hnsw (embedding)`)
+```
+
+### JSON columns (Phase 7e)
+
+`JSON` (and `JSONB` as an alias) columns are validated at INSERT/UPDATE time. Read with `json_extract` / `json_type` / `json_array_length` / `json_object_keys`. Path subset: `$`, `.key`, `[N]`, chained.
+
+```go
+db.Exec(`CREATE TABLE events (id INTEGER PRIMARY KEY, payload JSON)`)
+db.Exec(`INSERT INTO events (payload) VALUES ('{"user": {"name": "alice"}, "score": 42}')`)
+
+var name string
+db.QueryRow(`SELECT json_extract(payload, '$.user.name') FROM events`).Scan(&name)
+fmt.Println(name) // alice
+```
+
+> `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
+
+### Natural-language → SQL (Phase 7g — *coming soon*)
+
+The Phase 7g.2-7g.8 wave adds `sqlrite.Ask(db, ...)` / `sqlrite.AskRun(db, ...)` that wrap the new [`sqlrite-ask`](https://crates.io/crates/sqlrite-ask) Rust crate through cgo. Today it's available only from Rust; the Go wrapper lands in 7g.6 and will look like:
+
+```go
+// 7g.6 preview — not yet released
+import "github.com/joaoh82/rust_sqlite/sdk/go"
+
+cfg := sqlrite.AskConfigFromEnv()                // SQLRITE_LLM_API_KEY etc.
+resp, err := sqlrite.Ask(db, "How many users are over 30?", cfg)
+fmt.Println(resp.SQL)         // "SELECT COUNT(*) FROM users WHERE age > 30"
+fmt.Println(resp.Explanation) // "Counts users over the age threshold."
+
+// Convenience:
+rows, _ := sqlrite.AskRun(db, "How many users are over 30?", cfg)
+```
+
 ## API surface
 
 | Symbol                                  | Purpose                                        |

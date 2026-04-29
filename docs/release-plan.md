@@ -72,18 +72,26 @@ GitHub Releases by product ("show me every Python release").
 |-----------------|------------------------|--------------------------------------------------|
 | Rust engine     | `sqlrite-vX.Y.Z`       | crates.io + GitHub Release                       |
 | C FFI shim      | `sqlrite-ffi-vX.Y.Z`   | GitHub Release (per-platform tarballs)           |
+| `sqlrite-ask`   | `sqlrite-ask-vX.Y.Z`   | crates.io + GitHub Release                       |
 | Python SDK      | `sqlrite-py-vX.Y.Z`    | PyPI + GitHub Release                            |
 | Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm (`@joaoh82/sqlrite`) + GitHub Release        |
 | Go SDK          | `sdk/go/vX.Y.Z`        | Git tag (no registry) + GitHub Release assets    |
 | WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`@joaoh82/sqlrite-wasm`) + GitHub Release   |
 | Desktop app     | `sqlrite-desktop-vX.Y.Z` | GitHub Release (unsigned installers)           |
-| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other seven; acts as the "this was release 0.2.0" anchor) |
+| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other eight; acts as the "this was release 0.2.0" anchor) |
 
-All eight tags point at the same commit — the merge commit of the
+All nine tags point at the same commit — the merge commit of the
 release PR. The meta tag is the umbrella release users can link to
-in announcements; the seven per-product tags are for tooling
+in announcements; the eight per-product tags are for tooling
 (crates.io, Go module proxy, npm dist-tags, etc.) that expects a
 specific format.
+
+> **`sqlrite-ask` joined the lockstep wave in v0.1.17 (Phase 7g.1).** Gets
+> its own tag and crates.io publish but ships in lockstep with everything
+> else — same version every wave. `publish-ask` runs after `publish-crate`
+> in `release.yml` because crates.io rejects publishes whose path-deps
+> haven't yet resolved at the same version. `sqlrite-mcp` (Phase 7h) will
+> add a ninth product line on the same pattern.
 
 ## Version bumping: exact file list
 
@@ -95,6 +103,7 @@ matching new value:
 |------------------------------------------|---------------------------------------------|
 | `Cargo.toml` (root)                      | `[package].version`                         |
 | `sqlrite-ffi/Cargo.toml`                 | `[package].version`                         |
+| `sqlrite-ask/Cargo.toml`                 | `[package].version`                         |
 | `sdk/python/Cargo.toml`                  | `[package].version`                         |
 | `sdk/python/pyproject.toml`              | `[project].version`                         |
 | `sdk/nodejs/Cargo.toml`                  | `[package].version`                         |

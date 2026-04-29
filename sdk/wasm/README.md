@@ -56,6 +56,63 @@ if (looksGood) {
 console.log(db.inTransaction);  // false once COMMIT / ROLLBACK runs
 ```
 
+### Vector columns + KNN (Phase 7a–7d)
+
+`VECTOR(N)` storage class plus `vec_distance_l2` / `vec_distance_cosine` / `vec_distance_dot` distance functions. Vector literals are bracket arrays.
+
+```js
+db.exec("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(384))");
+db.exec("INSERT INTO docs (id, embedding) VALUES (1, [0.1, 0.2, ..., 0.0])");
+
+const top10 = db.query(`
+  SELECT id FROM docs
+   ORDER BY vec_distance_l2(embedding, [0.1, 0.2, ..., 0.0])
+   LIMIT 10
+`);
+```
+
+HNSW indexes work in the WASM build too — CPU-only, no SIMD on `wasm32`, but algorithmically identical:
+
+```js
+db.exec("CREATE INDEX idx_docs_emb ON docs USING hnsw (embedding)");
+```
+
+### JSON columns (Phase 7e)
+
+`JSON` / `JSONB` columns are validated at INSERT time. Use `json_extract` / `json_type` / `json_array_length` / `json_object_keys`. Path subset: `$`, `.key`, `[N]`, chained.
+
+```js
+db.exec("CREATE TABLE events (id INTEGER PRIMARY KEY, payload JSON)");
+db.exec(`INSERT INTO events (payload) VALUES ('{"user": {"name": "alice"}, "score": 42}')`);
+
+const rows = db.query(`SELECT json_extract(payload, '$.user.name') AS name FROM events`);
+// → [{ name: 'alice' }]
+```
+
+### Natural-language → SQL (Phase 7g.7 — *coming soon, JS-callback shape*)
+
+Per Phase 7 plan Q9, the WASM SDK gets a different `ask()` shape than the other SDKs: the WASM module does the schema-aware prompt construction in-page, but **does NOT** make the HTTP request itself. The caller passes a JS function (typically routed through their own backend) to do the actual fetch. That keeps the API key out of the browser and avoids the CORS dead end (Anthropic doesn't serve CORS headers on `api.anthropic.com`).
+
+```js
+// 7g.7 preview — not yet released. The exact callback shape may shift.
+import { Database } from '@joaoh82/sqlrite-wasm';
+
+const db = new Database();
+const prompt = db.askPrompt('How many users are over 30?');
+// → { system: [...], messages: [...] }
+
+// Caller routes this through their own backend (which holds the key)
+const completion = await fetch('/api/llm/complete', {
+  method: 'POST',
+  body: JSON.stringify(prompt),
+}).then(r => r.json());
+
+const resp = db.askParse(completion.text);
+// → { sql: 'SELECT COUNT(*) FROM users WHERE age > 30', explanation: '...' }
+```
+
+The browser tab never sees the API key, never POSTs to a third-party LLM endpoint, and never deals with CORS. The `sdk/wasm/README.md` will get a complete worked example (browser → backend proxy → LLM provider → response back to WASM) when 7g.7 lands.
+
 ## API surface
 
 | JS                              | Purpose                                              |
