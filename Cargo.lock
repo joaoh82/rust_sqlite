@@ -3737,7 +3737,7 @@ dependencies = [
 
 [[package]]
 name = "sqlrite-desktop"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "serde",
  "serde_json",
@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "sqlrite-engine"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "clap",
  "env_logger",
@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "sqlrite-ffi"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "cbindgen",
  "sqlrite-engine",
@@ -3773,7 +3773,7 @@ dependencies = [
 
 [[package]]
 name = "sqlrite-nodejs"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "napi",
  "napi-build",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "sqlrite-python"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "pyo3",
  "sqlrite-engine",
