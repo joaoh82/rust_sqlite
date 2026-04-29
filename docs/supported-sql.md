@@ -35,6 +35,7 @@ CREATE TABLE <name> (<col> <type> [column_constraint]* [, ...]);
 | `REAL`, `FLOAT`, `DOUBLE`, `DECIMAL` | Real (f64) | Double-precision; `DECIMAL(p,s)` precision/scale parsed and ignored |
 | `BOOLEAN` | Boolean | Stored compactly in the null bitmap's sibling bits; accepts `TRUE` / `FALSE` |
 | `VECTOR(N)` | Vector (Vec\<f32\>, fixed dim N) | **Phase 7a.** Dense f32 array of fixed dimension. `N` is required and must be ≥ 1. Inserted as bracket-array literals `[0.1, 0.2, ...]`. Dimension is enforced at INSERT/UPDATE; mismatched-length values are rejected. Distance functions and ANN indexing land in 7b–7d. |
+| `JSON`, `JSONB` | Text (canonical JSON) | **Phase 7e.** JSON document stored as canonical UTF-8 text — same as SQLite's JSON1 extension (Q3 scope correction since bincode was removed in Phase 3c). INSERT/UPDATE values are validated via `serde_json::from_str`; malformed JSON is rejected with a typed error and no row is written. `JSONB` is accepted as an alias for `JSON` (PostgreSQL convention; both store as text in our case). Path-style read access via the `json_extract` / `json_type` / `json_array_length` / `json_object_keys` functions below. |
 
 ### Column constraints
 
@@ -203,6 +204,10 @@ Same set accepted by `INSERT` (see [Value literals accepted](#value-literals-acc
 | `vec_distance_l2(a, b)` | Real (f64) | Euclidean distance √Σ(aᵢ−bᵢ)². Smaller is closer. *(Phase 7b)* |
 | `vec_distance_cosine(a, b)` | Real (f64) | Cosine distance `1 − (a·b) / (‖a‖·‖b‖)`. Errors on zero-magnitude vectors (cosine is undefined). Smaller is closer; identical vectors return 0.0, orthogonal vectors return 1.0. *(Phase 7b)* |
 | `vec_distance_dot(a, b)` | Real (f64) | Negated dot product `−(a·b)`. Negation makes "smaller is closer" consistent with the others. For unit-norm vectors equals `vec_distance_cosine(a, b) - 1`. *(Phase 7b)* |
+| `json_extract(json, path)` | Depends on the resolved node | Walks `path` over `json` and returns the resolved value coerced to the closest SQL type — JSON strings → `TEXT`, numbers → `INTEGER` / `REAL`, booleans → `BOOLEAN`, `null` → `NULL`, and composites (`object` / `array`) → their canonical JSON-text serialization. Path defaults to `$` when only one argument is supplied. A path that doesn't resolve returns `NULL`. *(Phase 7e)* |
+| `json_type(json[, path])` | Text | One of `'object'`, `'array'`, `'string'`, `'integer'`, `'real'`, `'true'`, `'false'`, `'null'`. Path defaults to `$`. *(Phase 7e)* |
+| `json_array_length(json[, path])` | Integer | Number of elements in the JSON array at `path`. Errors if the resolved node is not an array. Path defaults to `$`. *(Phase 7e)* |
+| `json_object_keys(json[, path])` | Text (JSON-array string) | Returns the object's keys as a JSON-array text in insertion order — e.g. `'["a","b","c"]'`. Path defaults to `$`. **Diverges from SQLite**, which exposes keys as a *table-valued* function (one row per key). SQLRite has no set-returning functions yet, so we return the keys as a JSON array and let callers parse if needed. *(Phase 7e)* |
 
 All three vector-distance functions take exactly two arguments, both of which must be vectors of the same dimension. Either argument can be a column reference (`embedding`), a bracket-array literal (`[0.1, 0.2, 0.3]`), or any sub-expression that evaluates to a vector. Mismatched dimensions error with `vector dimensions don't match (lhs=N, rhs=M)`.
 
@@ -215,6 +220,34 @@ LIMIT 10;
 ```
 
 > **Operator forms (`<->` `<=>` `<#>`) are not supported yet.** They're the de facto pgvector convention but blocked on a sqlparser limitation — will land as a Phase 7b.1 follow-up. Use the function-call form for now.
+
+#### JSON path syntax
+
+The `json_*` functions accept a string path argument with a small subset of JSONPath:
+
+| Token | Meaning |
+|---|---|
+| `$` | Root of the document (default if path is omitted). |
+| `.key` | Object member access. Bare keys only — no quoted-string variant yet. |
+| `[N]` | Array index (0-based). Negative indices are not supported. |
+
+Tokens chain naturally: `$.user.tags[0]`, `$[2].name`, `$.matrix[1][0]`. A malformed path (unbalanced brackets, missing `$`) errors at runtime with a typed message; a well-formed path that simply doesn't resolve returns `NULL`.
+
+```sql
+CREATE TABLE events (id INTEGER PRIMARY KEY, payload JSON);
+
+INSERT INTO events (payload) VALUES
+  ('{"user": {"name": "alice", "tags": ["admin", "ops"]}, "score": 42}'),
+  ('{"user": {"name": "bob", "tags": []}, "score": 7}');
+
+SELECT id,
+       json_extract(payload, '$.user.name') AS name,
+       json_extract(payload, '$.user.tags[0]') AS first_tag,
+       json_array_length(payload, '$.user.tags') AS tag_count,
+       json_type(payload, '$.score') AS score_type
+  FROM events
+ WHERE json_extract(payload, '$.user.name') = 'alice';
+```
 
 ### Type coercion in arithmetic
 

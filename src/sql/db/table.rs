@@ -26,6 +26,16 @@ pub enum DataType {
     /// declared dimension; every value stored in the column must have
     /// exactly that many elements.
     Vector(usize),
+    /// Phase 7e — JSON column. Stored as canonical UTF-8 text (matches
+    /// SQLite's JSON1 extension), validated at INSERT time. The
+    /// `json_extract` family of functions parses on demand and returns
+    /// either a primitive `Value` (Integer / Real / Text / Bool / Null)
+    /// or a Text value carrying the JSON-encoded sub-object/array.
+    /// Q3 originally specified `bincoded serde_json::Value`, but bincode
+    /// was removed from the engine in Phase 3c — see the scope-correction
+    /// note in `docs/phase-7-plan.md` for the rationale on switching to
+    /// text storage.
+    Json,
     None,
     Invalid,
 }
@@ -44,6 +54,7 @@ impl DataType {
             "text" => DataType::Text,
             "real" => DataType::Real,
             "bool" => DataType::Bool,
+            "json" => DataType::Json,
             "none" => DataType::None,
             other if other.starts_with("vector(") && other.ends_with(')') => {
                 // Strip the `vector(` prefix and trailing `)`, parse what's
@@ -77,6 +88,7 @@ impl DataType {
             DataType::Real => "Real".to_string(),
             DataType::Bool => "Bool".to_string(),
             DataType::Vector(dim) => format!("vector({dim})"),
+            DataType::Json => "Json".to_string(),
             DataType::None => "None".to_string(),
             DataType::Invalid => "Invalid".to_string(),
         }
@@ -91,6 +103,7 @@ impl fmt::Display for DataType {
             DataType::Real => f.write_str("Real"),
             DataType::Bool => f.write_str("Boolean"),
             DataType::Vector(dim) => write!(f, "Vector({dim})"),
+            DataType::Json => f.write_str("Json"),
             DataType::None => f.write_str("None"),
             DataType::Invalid => f.write_str("Invalid"),
         }
@@ -183,6 +196,12 @@ impl Table {
                 // itself doesn't carry the dim — every stored Vec<f32>
                 // already has it via .len().
                 DataType::Vector(_dim) => Row::Vector(BTreeMap::new()),
+                // Phase 7e — JSON columns reuse Text storage (with
+                // INSERT-time validation that the bytes parse as JSON).
+                // No new Row variant; json_extract / json_type / etc.
+                // re-parse from text on demand. See `docs/phase-7-plan.md`
+                // Q3's scope-correction note for the storage choice.
+                DataType::Json => Row::Text(BTreeMap::new()),
                 DataType::Invalid | DataType::None => Row::None,
             };
             table_rows
@@ -540,7 +559,16 @@ impl Table {
                 (Row::Real(m), Value::Integer(v), _) => {
                     m.insert(rowid, *v as f32);
                 }
-                (Row::Text(m), Value::Text(v), _) => {
+                (Row::Text(m), Value::Text(v), dt) => {
+                    // Phase 7e — UPDATE on a JSON column also validates
+                    // the new text is well-formed JSON, mirroring INSERT.
+                    if matches!(dt, DataType::Json) {
+                        if let Err(e) = serde_json::from_str::<serde_json::Value>(v) {
+                            return Err(SQLRiteError::General(format!(
+                                "Type mismatch: expected JSON for column '{column}', got '{v}': {e}"
+                            )));
+                        }
+                    }
                     m.insert(rowid, v.clone());
                 }
                 (Row::Bool(m), Value::Bool(v), _) => {
@@ -654,6 +682,14 @@ impl Table {
                         )));
                     }
                     Value::Vector(parsed_vec)
+                }
+                DataType::Json => {
+                    // JSON values stored as Text. UNIQUE on a JSON column
+                    // compares the canonical text representation
+                    // verbatim — `{"a": 1}` and `{"a":1}` are distinct.
+                    // Document this if anyone actually requests UNIQUE
+                    // JSON; for MVP, treat-as-text is fine.
+                    Value::Text(val.clone())
                 }
                 DataType::None | DataType::Invalid => {
                     return Err(SQLRiteError::Internal(format!(
@@ -784,6 +820,19 @@ impl Table {
                         Some(Value::Integer(parsed as i64))
                     }
                     Row::Text(tree) => {
+                        // Phase 7e — JSON columns also reach here (they
+                        // share Row::Text storage with TEXT columns).
+                        // Validate the value parses as JSON before
+                        // storing; otherwise we'd happily write
+                        // `not-json-at-all` and only fail when
+                        // json_extract tried to parse it later.
+                        if matches!(self.columns[i].datatype, DataType::Json) && val != "Null" {
+                            if let Err(e) = serde_json::from_str::<serde_json::Value>(&val) {
+                                return Err(SQLRiteError::General(format!(
+                                    "Type mismatch: expected JSON for column '{key}', got '{val}': {e}"
+                                )));
+                            }
+                        }
                         tree.insert(next_rowid, val.to_string());
                         // "Null" sentinel stays out of the index — it isn't a
                         // real user value.

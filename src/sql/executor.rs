@@ -624,6 +624,7 @@ fn clone_datatype(dt: &DataType) -> DataType {
         DataType::Real => DataType::Real,
         DataType::Bool => DataType::Bool,
         DataType::Vector(dim) => DataType::Vector(*dim),
+        DataType::Json => DataType::Json,
         DataType::None => DataType::None,
         DataType::Invalid => DataType::Invalid,
     }
@@ -1201,10 +1202,301 @@ fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> 
             // other reals via the existing arithmetic + comparison paths.
             Ok(Value::Real(dist as f64))
         }
+        // Phase 7e — JSON functions. All four parse the JSON text on
+        // demand (we don't cache parsed values), then resolve a path
+        // (default `$` = root). The path resolver handles `.key` for
+        // object access and `[N]` for array index. SQLite-style.
+        "json_extract" => json_fn_extract(&name, &func.args, table, rowid),
+        "json_type" => json_fn_type(&name, &func.args, table, rowid),
+        "json_array_length" => json_fn_array_length(&name, &func.args, table, rowid),
+        "json_object_keys" => json_fn_object_keys(&name, &func.args, table, rowid),
         other => Err(SQLRiteError::NotImplemented(format!(
             "unknown function: {other}(...)"
         ))),
     }
+}
+
+// -----------------------------------------------------------------
+// Phase 7e — JSON path-extraction functions
+// -----------------------------------------------------------------
+
+/// Extracts the JSON-typed text + optional path string out of a
+/// function call's args. Used by all four json_* functions.
+///
+/// Arity rules (matching SQLite JSON1):
+///   - 1 arg  → JSON value, path defaults to `$` (root)
+///   - 2 args → (JSON value, path text)
+///
+/// Returns `(json_text, path)` so caller can serde_json::from_str
+/// + walk_json_path on it.
+fn extract_json_and_path(
+    fn_name: &str,
+    args: &FunctionArguments,
+    table: &Table,
+    rowid: i64,
+) -> Result<(String, String)> {
+    let arg_list = match args {
+        FunctionArguments::List(l) => &l.args,
+        _ => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() expects 1 or 2 arguments"
+            )));
+        }
+    };
+    if !(arg_list.len() == 1 || arg_list.len() == 2) {
+        return Err(SQLRiteError::General(format!(
+            "{fn_name}() expects 1 or 2 arguments, got {}",
+            arg_list.len()
+        )));
+    }
+    // Evaluate first arg → must produce text.
+    let first_expr = match &arg_list[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        other => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "{fn_name}() argument 0 has unsupported shape: {other:?}"
+            )));
+        }
+    };
+    let json_text = match eval_expr(first_expr, table, rowid)? {
+        Value::Text(s) => s,
+        Value::Null => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() called on NULL — JSON column has no value for this row"
+            )));
+        }
+        other => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() argument 0 is not JSON-typed: got {}",
+                other.to_display_string()
+            )));
+        }
+    };
+
+    // Path defaults to root `$` when omitted.
+    let path = if arg_list.len() == 2 {
+        let path_expr = match &arg_list[1] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            other => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "{fn_name}() argument 1 has unsupported shape: {other:?}"
+                )));
+            }
+        };
+        match eval_expr(path_expr, table, rowid)? {
+            Value::Text(s) => s,
+            other => {
+                return Err(SQLRiteError::General(format!(
+                    "{fn_name}() path argument must be a string literal, got {}",
+                    other.to_display_string()
+                )));
+            }
+        }
+    } else {
+        "$".to_string()
+    };
+
+    Ok((json_text, path))
+}
+
+/// Walks a `serde_json::Value` along a JSONPath subset:
+///   - `$` is the root
+///   - `.key` for object access (key may not contain `.` or `[`)
+///   - `[N]` for array index (N a non-negative integer)
+///   - chains arbitrarily: `$.foo.bar[0].baz`
+///
+/// Returns `Ok(None)` for "path didn't match anything" (NULL in SQL),
+/// `Err` for malformed paths. Matches SQLite JSON1's semantic
+/// distinction: missing-key = NULL, malformed-path = error.
+fn walk_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Result<Option<&'a serde_json::Value>> {
+    let mut chars = path.chars().peekable();
+    if chars.next() != Some('$') {
+        return Err(SQLRiteError::General(format!(
+            "JSON path must start with '$', got `{path}`"
+        )));
+    }
+    let mut current = value;
+    while let Some(&c) = chars.peek() {
+        match c {
+            '.' => {
+                chars.next();
+                let mut key = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == '.' || c == '[' {
+                        break;
+                    }
+                    key.push(c);
+                    chars.next();
+                }
+                if key.is_empty() {
+                    return Err(SQLRiteError::General(format!(
+                        "JSON path has empty key after '.' in `{path}`"
+                    )));
+                }
+                match current.get(&key) {
+                    Some(v) => current = v,
+                    None => return Ok(None),
+                }
+            }
+            '[' => {
+                chars.next();
+                let mut idx_str = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ']' {
+                        break;
+                    }
+                    idx_str.push(c);
+                    chars.next();
+                }
+                if chars.next() != Some(']') {
+                    return Err(SQLRiteError::General(format!(
+                        "JSON path has unclosed `[` in `{path}`"
+                    )));
+                }
+                let idx: usize = idx_str.trim().parse().map_err(|_| {
+                    SQLRiteError::General(format!(
+                        "JSON path has non-integer index `[{idx_str}]` in `{path}`"
+                    ))
+                })?;
+                match current.get(idx) {
+                    Some(v) => current = v,
+                    None => return Ok(None),
+                }
+            }
+            other => {
+                return Err(SQLRiteError::General(format!(
+                    "JSON path has unexpected character `{other}` in `{path}` \
+                     (expected `.`, `[`, or end-of-path)"
+                )));
+            }
+        }
+    }
+    Ok(Some(current))
+}
+
+/// Converts a serde_json scalar to a SQLRite Value. For composite
+/// types (object, array) returns the JSON-encoded text — callers
+/// pattern-match on shape from the calling json_* function.
+fn json_value_to_sql(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            // Match SQLite: integer if it fits an i64, else f64.
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Real(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        // Objects + arrays come out as JSON-encoded text. Same as
+        // SQLite's json_extract: composite results round-trip through
+        // text rather than being modeled as a richer Value type.
+        composite => Value::Text(composite.to_string()),
+    }
+}
+
+fn json_fn_extract(
+    name: &str,
+    args: &FunctionArguments,
+    table: &Table,
+    rowid: i64,
+) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
+        SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
+    })?;
+    match walk_json_path(&parsed, &path)? {
+        Some(v) => Ok(json_value_to_sql(v)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn json_fn_type(name: &str, args: &FunctionArguments, table: &Table, rowid: i64) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
+        SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
+    })?;
+    let resolved = match walk_json_path(&parsed, &path)? {
+        Some(v) => v,
+        None => return Ok(Value::Null),
+    };
+    let ty = match resolved {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(true) => "true",
+        serde_json::Value::Bool(false) => "false",
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "integer"
+            } else {
+                "real"
+            }
+        }
+        serde_json::Value::String(_) => "text",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    Ok(Value::Text(ty.to_string()))
+}
+
+fn json_fn_array_length(
+    name: &str,
+    args: &FunctionArguments,
+    table: &Table,
+    rowid: i64,
+) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
+        SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
+    })?;
+    let resolved = match walk_json_path(&parsed, &path)? {
+        Some(v) => v,
+        None => return Ok(Value::Null),
+    };
+    match resolved.as_array() {
+        Some(arr) => Ok(Value::Integer(arr.len() as i64)),
+        None => Err(SQLRiteError::General(format!(
+            "{name}() resolved to a non-array value at path `{path}`"
+        ))),
+    }
+}
+
+fn json_fn_object_keys(
+    name: &str,
+    args: &FunctionArguments,
+    table: &Table,
+    rowid: i64,
+) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
+        SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
+    })?;
+    let resolved = match walk_json_path(&parsed, &path)? {
+        Some(v) => v,
+        None => return Ok(Value::Null),
+    };
+    let obj = resolved.as_object().ok_or_else(|| {
+        SQLRiteError::General(format!(
+            "{name}() resolved to a non-object value at path `{path}`"
+        ))
+    })?;
+    // SQLite's json_object_keys is a table-valued function (one row
+    // per key). Without set-returning function support we can't
+    // reproduce that shape; instead return the keys as a JSON array
+    // text. Caller can iterate via json_array_length + json_extract,
+    // or just treat it as a serialized list. Document this divergence
+    // in supported-sql.md.
+    let keys: Vec<serde_json::Value> = obj
+        .keys()
+        .map(|k| serde_json::Value::String(k.clone()))
+        .collect();
+    Ok(Value::Text(serde_json::Value::Array(keys).to_string()))
 }
 
 /// Extracts exactly two `Vec<f32>` arguments from a function call,

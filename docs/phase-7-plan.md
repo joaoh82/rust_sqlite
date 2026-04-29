@@ -170,14 +170,14 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 
 ---
 
-### 7e — JSON column type + path queries
+### ✅ 7e — JSON column type + path queries
 
-**What.** New `JSON` data type. Store as bincoded `serde_json::Value` (or as a parsed AST — see open questions). Support a small set of extraction functions:
+**What.** New `JSON` data type. Stored as canonical UTF-8 text and validated at INSERT/UPDATE time via `serde_json::from_str`. The four path-extraction functions parse on demand:
 
 - `json_extract(col, '$.path')` — returns the value at the path, NULL if absent
-- `json_array_length(col, '$.path')` — array length, NULL for non-array
-- `json_object_keys(col, '$.path')` — TEXT array of keys, NULL for non-object
-- `json_type(col, '$.path')` — `'null'`, `'bool'`, `'number'`, `'string'`, `'array'`, `'object'`
+- `json_array_length(col, '$.path')` — array length, NULL for non-array, errors for non-array-with-path-resolved
+- `json_object_keys(col, '$.path')` — JSON-array text of keys (see scope-correction note in Q3 below; SQLite's set-returning shape requires features we don't have)
+- `json_type(col, '$.path')` — `'null'` / `'true'` / `'false'` / `'integer'` / `'real'` / `'text'` / `'array'` / `'object'` (matches SQLite JSON1 conventions)
 
 **Why this matters for AI-era specifically.** LLM tool-call outputs are JSON. RAG citation arrays are JSON. Agent scratchpads are JSON. Storing them as TEXT and re-parsing on every query is wasteful.
 
@@ -378,6 +378,10 @@ Q1–Q10 were resolved by the project owner on 2026-04-26. Each question keeps i
 ### Q3. JSON storage format
 
 > **Decided: bincoded `serde_json::Value`** for the MVP. JSON indexing remains a future phase.
+>
+> **Scope correction (2026-04-28, during 7e implementation):** Q3's "bincoded `Value`" answer was settled before remembering that bincode was removed from the engine in Phase 3c (cell-based encoding replaced it). Rather than re-add bincode for one column type, **7e ships JSON-as-canonical-text** — same as SQLite's JSON1 extension. INSERT/UPDATE call `serde_json::from_str` to validate; the four `json_*` functions re-parse on demand. Trade-off: ~2× storage vs. binary, plus per-call parse overhead — both acceptable for MVP and consistent with SQLite's choice. JSONB-style binary indexing remains a future-phase optimization, but doesn't block 7e.
+>
+> One additional 7e divergence from the original plan: `json_object_keys` is supposed to be a *table-valued function* (one row per key, like SQLite's). We don't yet support set-returning functions in the executor, so 7e returns the keys as a JSON-array text instead. Caller can iterate via `json_array_length` + `json_extract` indexing. Documented in `docs/supported-sql.md` so users see the divergence up front.
 
 - **bincoded `serde_json::Value`:** one-line implementation, fast read/write, opaque on disk.
 - **Parsed AST as cell-encoded structure:** more code, but lets us index into JSON without a full deserialize.
