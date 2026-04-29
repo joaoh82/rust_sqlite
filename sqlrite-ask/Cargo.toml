@@ -1,0 +1,69 @@
+[package]
+# Phase 7g.1 — natural-language → SQL via an LLM provider.
+#
+# This crate is intentionally kept separate from `sqlrite-engine` so
+# the engine stays pure-SQL with no HTTP / TLS / async dependencies.
+# Anyone embedding SQLRite who doesn't need `ask()` (the WASM SDK,
+# read-only build-time tooling, lean embeddings) can ignore this
+# crate entirely.
+#
+# Published to crates.io as `sqlrite-ask`. Joins the lockstep release
+# wave (`sqlrite-ask-vX.Y.Z` tag) — see `docs/release-plan.md`.
+name = "sqlrite-ask"
+version = "0.1.16"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "Natural-language → SQL adapter for sqlrite-engine. Anthropic-first; OpenAI / Ollama follow-ups."
+repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
+
+[lib]
+name = "sqlrite_ask"
+path = "src/lib.rs"
+
+[dependencies]
+# Engine — for `Connection`, `Database`, `Table`, `DataType`. We
+# introspect `Database.tables` directly to build the schema dump
+# the LLM sees; we don't go through the SQL surface (SELECT against
+# `sqlrite_master` would also work but the typed walk is cheaper +
+# more robust against future schema-catalog renames).
+#
+# `package = "sqlrite-engine"` because the crate publishes under that
+# name on crates.io (the `sqlrite` name was taken on the registry —
+# see Phase 6d retrospective). The import alias `sqlrite` keeps
+# `use sqlrite::…` working in this crate's source.
+#
+# `default-features = false` skips the engine's `cli` (rustyline +
+# clap + env_logger) and `file-locks` (fs2) features — sqlrite-ask
+# never spawns a REPL or opens a database itself; the caller passes
+# in an already-opened `&Connection`. Avoids pulling those deps
+# transitively into anyone who uses sqlrite-ask without the engine
+# REPL.
+sqlrite = { package = "sqlrite-engine", path = "..", default-features = false }
+
+# JSON request/response shapes for the Anthropic Messages API. We
+# could write the JSON by hand, but `serde_json` is already a
+# transitive dep via the engine (Phase 7e — JSON column type), so
+# this is free.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Sync HTTPS client. `ureq` 2.x is pure-Rust + rustls — no system
+# OpenSSL, no tokio, no async runtime. Per `ask()` call we make
+# exactly one POST to api.anthropic.com, so the sync surface is a
+# perfect fit. Rolling our own JSON types over ureq is ~120 LOC
+# vs. ~400 LOC + tokio + reqwest::blocking via an SDK.
+ureq = { version = "2", features = ["json", "tls"] }
+
+# Typed errors — same crate the engine uses for `SQLRiteError`, so
+# the AskError variants compose cleanly with the engine's error
+# tree via `#[from]`.
+thiserror = "2"
+
+[dev-dependencies]
+# Throwaway tiny localhost HTTP server for the integration test
+# that exercises the real ureq path. Avoids hitting api.anthropic.com
+# from CI (no network egress + no API key in test runners). Stays
+# in `dev-dependencies` so it doesn't ship to consumers.
+tiny_http = "0.12"

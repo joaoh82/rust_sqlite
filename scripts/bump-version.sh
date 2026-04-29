@@ -5,11 +5,12 @@
 # Usage:
 #     scripts/bump-version.sh 0.2.0
 #
-# Rewrites the version field in every manifest that carries one (seven
-# Cargo.toml / pyproject.toml files, plus three JSON manifests — ten
-# files total). Then you run `cargo build` yourself to refresh
-# Cargo.lock. Idempotent: running twice with the same version is a
-# no-op; running twice with different versions lands on the second.
+# Rewrites the version field in every manifest that carries one
+# (eight Cargo.toml / pyproject.toml files, plus three JSON manifests
+# — eleven files total). Then you run `cargo build` yourself to
+# refresh Cargo.lock. Idempotent: running twice with the same version
+# is a no-op; running twice with different versions lands on the
+# second.
 #
 # Used by:
 #   - `release-pr.yml` GitHub Actions workflow as the version-bump
@@ -67,6 +68,7 @@ cd "$REPO_ROOT"
 TOML_FILES=(
     "Cargo.toml"
     "sqlrite-ffi/Cargo.toml"
+    "sqlrite-ask/Cargo.toml"
     "sdk/python/Cargo.toml"
     "sdk/python/pyproject.toml"
     "sdk/nodejs/Cargo.toml"

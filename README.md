@@ -158,6 +158,32 @@ Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 | `.read FILENAME` | later |
 | `.ast QUERY` | later |
 
+#### Natural-language → SQL (`sqlrite-ask`)
+
+*Phase 7g.1.* The companion crate [`sqlrite-ask`](sqlrite-ask/) turns a natural-language question into a SQL query against your database, using the [Anthropic API](https://docs.anthropic.com/) for the actual generation.
+
+```toml
+[dependencies]
+sqlrite-engine = "0.1"
+sqlrite-ask    = "0.1"
+```
+
+```rust
+use sqlrite::Connection;
+use sqlrite_ask::{AskConfig, ConnectionAskExt};
+
+let conn = Connection::open("foo.sqlrite")?;
+let cfg  = AskConfig::from_env()?;          // SQLRITE_LLM_API_KEY etc.
+let resp = conn.ask("How many users are over 30?", &cfg)?;
+println!("Generated SQL: {}", resp.sql);
+println!("Why: {}",          resp.explanation);
+// Caller decides whether to run resp.sql — the library deliberately doesn't.
+```
+
+**Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, schema dump cached for 5 minutes via Anthropic prompt caching (configurable to 1h or off via `AskConfig::cache_ttl`). Bring your own API key — set `SQLRITE_LLM_API_KEY` or pass it on `AskConfig`.
+
+Per-product `ask()` wrappers (`.ask` REPL command, desktop "Ask" button, `conn.ask()` in the Python / Node / Go SDKs, and the MCP `ask` tool) ship in **7g.2-7g.8** as follow-up sub-phases. WASM gets a JS-callback shape so the API key never enters the browser. See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
+
 ### Roadmap
 
 The project is staged in phases, each independently shippable. A finished phase is committed to `main` before the next one starts.
@@ -236,10 +262,16 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [ ] macOS Apple Developer ID cert → `codesign` + `notarytool` in `tauri-action`
 - [ ] Windows code-signing cert → `signtool` in `tauri-action`
 
-**Phase 7 — AI-era extensions** *(research)*
-- [ ] Vector / embedding column type with an ANN index
-- [ ] Natural-language → SQL front-end that emits queries against this engine
-- [ ] Other agent-era ideas as they emerge
+**Phase 7 — AI-era extensions** *(in progress — full plan in [`docs/phase-7-plan.md`](docs/phase-7-plan.md))*
+- [x] **7a — `VECTOR(N)` column type** *(v0.1.10)*: dense f32 vectors with bracket-array literal syntax (`[0.1, 0.2, ...]`); file format bumped to v4
+- [x] **7b — Distance functions** *(v0.1.11)*: `vec_distance_l2/cosine/dot` + `ORDER BY <expr> LIMIT k` so KNN queries work end-to-end
+- [x] **7c — Bounded-heap top-k optimization** *(v0.1.12)*
+- [x] **7d — HNSW ANN index** *(v0.1.13–15)*: `CREATE INDEX … USING hnsw (col)`; recall@10 ≥ 0.95 at default `M=16, ef_construction=200, ef_search=50`; persisted as a `KIND_HNSW` cell tree
+- [x] **7e — JSON column type + path queries** *(v0.1.16)*: `JSON` / `JSONB` columns stored as canonical text; `json_extract` / `json_type` / `json_array_length` / `json_object_keys`; `$.key`, `[N]`, chained JSONPath subset
+- [x] **7g.1 — `sqlrite-ask` crate** *(this wave)*: foundational natural-language → SQL via the [Anthropic API](https://docs.anthropic.com/) (Sonnet 4.6 by default), prompt-cached schema dump, sync `ureq` HTTP. Public surface: `sqlrite_ask::ask(conn, q, &cfg)` or `conn.ask(q, &cfg)` via `ConnectionAskExt`.
+- [ ] **7g.2-7g.8** — per-product `ask()` adapters: REPL `.ask`, desktop "Ask" button, Python/Node/Go/WASM SDKs, MCP `ask` tool
+- [ ] **7h** — MCP server adapter (`sqlrite-mcp` binary)
+- [ ] *(deferred to Phase 8)* Full-text search with BM25 + hybrid retrieval
 
 **Possible extras** *(no committed phase)*
 - Joins (`INNER`, `LEFT OUTER`, `CROSS` — SQLite does not support `RIGHT`/`FULL OUTER`)

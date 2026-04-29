@@ -71,6 +71,53 @@ See [Phase 4f notes in roadmap.md](roadmap.md) for the snapshot semantics and th
 - **Parameter binding.** `stmt.query(&[&"alice"])` is the intended shape but the current implementation takes no arguments — use string interpolation for now. Parameter binding lands with the cursor refactor.
 - **Cursor abstraction.** The Pager still eagerly loads every row at open time; `Rows` today wraps an in-memory `Vec`. Phase 5a's follow-up refactor streams rows through the B-Tree on demand — same public API, much lower memory for big SELECTs.
 
+### Natural-language → SQL via `sqlrite-ask` (Phase 7g.1)
+
+The companion crate [`sqlrite-ask`](../sqlrite-ask/) layers a natural-language → SQL helper on top of the engine. Engine stays pure-SQL with no HTTP / TLS / async deps; anyone who doesn't need `ask()` can ignore the crate entirely.
+
+```toml
+[dependencies]
+sqlrite-engine = "0.1"
+sqlrite-ask    = "0.1"
+```
+
+```rust
+use sqlrite::Connection;
+use sqlrite_ask::{AskConfig, AskResponse, ConnectionAskExt};
+
+let conn = Connection::open("foo.sqlrite")?;
+let cfg  = AskConfig::from_env()?;          // reads SQLRITE_LLM_API_KEY etc.
+let resp: AskResponse = conn.ask("How many users are over 30?", &cfg)?;
+
+println!("Generated SQL: {}", resp.sql);
+println!("Rationale: {}",     resp.explanation);
+println!("Tokens: in={}, out={}, cache_hit={}",
+    resp.usage.input_tokens,
+    resp.usage.output_tokens,
+    resp.usage.cache_read_input_tokens);
+
+// Caller decides whether to execute the generated SQL — the library
+// does NOT auto-execute. SDK convenience wrappers (Python's
+// `conn.ask_run()`, Node's `db.askRun()`, etc.) add a one-shot
+// generate-and-execute helper, but the default Rust API is
+// "generate, return, let me decide".
+let mut conn = conn;  // need &mut for execute
+let _ = conn.execute(&resp.sql)?;
+```
+
+**What `sqlrite-ask` provides:**
+
+- `ask(conn, question, config) -> AskResponse` — free function entry point.
+- `Connection::ask(question, config)` via the `ConnectionAskExt` trait — same flow, method syntax.
+- `AskConfig::from_env()` — reads `SQLRITE_LLM_PROVIDER` / `_API_KEY` / `_MODEL` / `_MAX_TOKENS` / `_CACHE_TTL` with sensible defaults.
+- `AnthropicProvider` — sync `ureq` POST to `https://api.anthropic.com/v1/messages`. The crate is provider-pluggable (a `Provider` trait + `Request` / `Response` types), with OpenAI and Ollama follow-ups planned for later 7g sub-phases.
+- Schema-aware prompt construction — walks `Database.tables` deterministically (alphabetical) and emits a `<schema>...</schema>` block with `cache_control: ephemeral`, so the schema dump is served from Anthropic's prompt cache after the first call.
+- Output parser tolerant to fenced JSON (`` ```json … ``` ``) or JSON-with-leading-prose, in addition to strict JSON.
+
+**Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, 5-minute prompt-cache TTL. Configurable via `AskConfig`.
+
+**Per-product wrappers ship in 7g.2-7g.8** — REPL `.ask`, desktop "Ask" button, Python/Node/Go SDKs `conn.ask()`, WASM SDK with a JS-callback shape (so the API key stays out of the browser tab), and the MCP `ask` tool.
+
 ## The C FFI (Phase 5b)
 
 The `sqlrite-ffi/` crate wraps the Rust API in a C ABI that every non-Rust SDK binds against. Build the shared library:

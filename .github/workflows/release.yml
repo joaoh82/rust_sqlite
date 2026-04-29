@@ -126,6 +126,7 @@ jobs:
           TAGS=(
             "sqlrite-v$V"
             "sqlrite-ffi-v$V"
+            "sqlrite-ask-v$V"
             "sqlrite-desktop-v$V"
             "sqlrite-py-v$V"
             "sqlrite-node-v$V"
@@ -194,6 +195,73 @@ jobs:
             // The [lib] name stays `sqlrite`, so the import alias is
             // the short one even though the package name is longer.
             use sqlrite::{Database, ExecutionResult};
+            ```
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a': publish the `sqlrite-ask` crate (Phase 7g.1) — natural-
+  # language → SQL adapter built on top of the engine. Same shape as
+  # `publish-crate` above; separate job so a registry hiccup on one
+  # doesn't block the other and re-runs are surgical.
+  #
+  # Crate name on crates.io: `sqlrite-ask`. Library name (the `use`
+  # path): `sqlrite_ask`. No alias-renaming this time — the short
+  # name was available unlike `sqlrite` (see Phase 6d retrospective
+  # for why the engine had to rename).
+  publish-ask:
+    name: Publish sqlrite-ask crate to crates.io
+    needs: [detect, tag-all, publish-crate]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-ask
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # `--no-verify` mirrors `publish-crate` — Release-PR CI
+        # already validated this commit.
+        #
+        # `needs: [..., publish-crate]` is load-bearing: sqlrite-ask
+        # depends on sqlrite-engine, and crates.io rejects publishes
+        # whose path-deps haven't yet resolved to a published version
+        # at the same number. Sequencing makes the dep visible by the
+        # time we publish.
+        run: cargo publish -p sqlrite-ask --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-ask-v${{ needs.detect.outputs.version }}
+          name: sqlrite-ask v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite-ask/${{ needs.detect.outputs.version }}
+
+            Natural-language → SQL adapter for SQLRite. Anthropic-first; OpenAI / Ollama follow-ups.
+
+            ```toml
+            [dependencies]
+            sqlrite-engine = "${{ needs.detect.outputs.version }}"
+            sqlrite-ask    = "${{ needs.detect.outputs.version }}"
+            ```
+
+            ```rust
+            use sqlrite::Connection;
+            use sqlrite_ask::{AskConfig, ConnectionAskExt};
+
+            let conn = Connection::open("foo.sqlrite")?;
+            let cfg  = AskConfig::from_env()?;        // SQLRITE_LLM_API_KEY etc.
+            let resp = conn.ask("How many users are over 30?", &cfg)?;
+            println!("Generated SQL: {}", resp.sql);
             ```
 
             See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
@@ -1223,7 +1291,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
+    needs: [detect, publish-crate, publish-ask, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
