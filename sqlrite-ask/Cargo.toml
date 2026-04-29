@@ -40,7 +40,29 @@ path = "src/lib.rs"
 # in an already-opened `&Connection`. Avoids pulling those deps
 # transitively into anyone who uses sqlrite-ask without the engine
 # REPL.
-sqlrite = { package = "sqlrite-engine", path = "..", default-features = false }
+#
+# **`version = "0.1"` is required for `cargo publish`.** Without a
+# version requirement on a path-dep, `cargo publish` rejects the
+# manifest with:
+#
+#     error: failed to verify manifest at sqlrite-ask/Cargo.toml
+#     Caused by:
+#       all dependencies must have a version requirement specified
+#       when publishing.
+#       dependency `sqlrite-engine` does not specify a version
+#
+# That's the exact error v0.1.17 hit on the first attempted publish
+# (publish-ask job). `sqlrite-ffi` doesn't need this because it
+# never publishes to crates.io — it ships as GitHub Release
+# tarballs only. `sqlrite-ask` is the first crate-besides-the-
+# engine that actually goes to the registry.
+#
+# Why caret `"0.1"` rather than the exact pinned version: the
+# whole 0.1.x line is lockstep-released, so any 0.1.y on crates.io
+# is compatible with sqlrite-ask 0.1.x. Caret avoids touching this
+# line every release. Bump to `"0.2"` at the next major (whenever
+# Phase 7 closes); same for 1.0.
+sqlrite = { package = "sqlrite-engine", version = "0.1", path = "..", default-features = false }
 
 # JSON request/response shapes for the Anthropic Messages API. We
 # could write the JSON by hand, but `serde_json` is already a
