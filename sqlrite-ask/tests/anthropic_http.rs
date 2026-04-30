@@ -12,8 +12,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use sqlrite::Connection;
-use sqlrite_ask::{AskConfig, AskError, CacheTtl, ask};
+use sqlrite_ask::{AskConfig, AskError, CacheTtl, ask_with_schema};
+
+/// Schema string the integration tests hand to `ask_with_schema`.
+/// Same shape the engine's `dump_schema` would produce on a
+/// freshly-created `users` table — close enough that the asserts
+/// against the request body still pass while keeping this test
+/// engine-dep-free.
+const TEST_SCHEMA: &str = "\
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
+";
 
 struct Mock {
     server: Arc<tiny_http::Server>,
@@ -104,9 +115,6 @@ const SUCCESS_BODY: &str = r#"{
 #[test]
 fn end_to_end_against_localhost_mock() {
     let mock = Mock::start(200, SUCCESS_BODY);
-    let mut conn = Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-        .unwrap();
 
     let config = AskConfig {
         api_key: Some("test-key".to_string()),
@@ -114,7 +122,7 @@ fn end_to_end_against_localhost_mock() {
         ..AskConfig::default()
     };
 
-    let resp = ask(&conn, "list all users", &config).expect("ask succeeds");
+    let resp = ask_with_schema(TEST_SCHEMA, "list all users", &config).expect("ask succeeds");
     assert_eq!(resp.sql, "SELECT * FROM users");
     assert_eq!(resp.explanation, "reads all users");
     assert_eq!(resp.usage.input_tokens, 1234);
@@ -165,7 +173,6 @@ fn end_to_end_against_localhost_mock() {
 #[test]
 fn cache_ttl_one_hour_propagates_to_request() {
     let mock = Mock::start(200, SUCCESS_BODY);
-    let conn = Connection::open_in_memory().unwrap();
 
     let config = AskConfig {
         api_key: Some("test-key".to_string()),
@@ -174,7 +181,7 @@ fn cache_ttl_one_hour_propagates_to_request() {
         ..AskConfig::default()
     };
 
-    let _ = ask(&conn, "anything", &config).unwrap();
+    let _ = ask_with_schema(TEST_SCHEMA, "anything", &config).unwrap();
     let captured = mock.captured().unwrap();
     assert_eq!(captured.body["system"][1]["cache_control"]["ttl"], "1h");
 }
@@ -185,14 +192,13 @@ fn api_error_response_is_surfaced() {
         400,
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens too large"}}"#,
     );
-    let conn = Connection::open_in_memory().unwrap();
     let config = AskConfig {
         api_key: Some("test-key".to_string()),
         base_url: Some(mock.addr.clone()),
         ..AskConfig::default()
     };
 
-    let err = ask(&conn, "anything", &config).unwrap_err();
+    let err = ask_with_schema(TEST_SCHEMA, "anything", &config).unwrap_err();
     match err {
         AskError::ApiStatus { status, detail } => {
             assert_eq!(status, 400);
@@ -225,13 +231,12 @@ fn http_transport_error_is_surfaced() {
     // belt-and-braces.
     std::thread::sleep(Duration::from_millis(10));
 
-    let conn = Connection::open_in_memory().unwrap();
     let config = AskConfig {
         api_key: Some("test-key".to_string()),
         base_url: Some(format!("http://127.0.0.1:{port}")),
         ..AskConfig::default()
     };
-    let err = ask(&conn, "anything", &config).unwrap_err();
+    let err = ask_with_schema(TEST_SCHEMA, "anything", &config).unwrap_err();
     assert!(
         matches!(err, AskError::Http(_)),
         "expected Http error, got {err:?}"

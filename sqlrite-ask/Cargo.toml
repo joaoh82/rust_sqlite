@@ -23,51 +23,23 @@ name = "sqlrite_ask"
 path = "src/lib.rs"
 
 [dependencies]
-# Engine — for `Connection`, `Database`, `Table`, `DataType`. We
-# introspect `Database.tables` directly to build the schema dump
-# the LLM sees; we don't go through the SQL surface (SELECT against
-# `sqlrite_master` would also work but the typed walk is cheaper +
-# more robust against future schema-catalog renames).
+# **No engine dep as of v0.1.19 (Phase 7g.2 structural fix).**
+# `sqlrite-ask` is now pure: takes a `&str` schema dump + a `&str`
+# question, returns generated SQL. The `Connection` / `Database`
+# integration moved to the engine itself, gated behind the engine's
+# new `ask` feature. Why: cargo's static cycle detection rejected
+# `sqlrite-engine[bin] → sqlrite-ask → sqlrite-engine[lib]` even
+# with `optional = true` on the engine side. Pure crate breaks the
+# cycle structurally.
 #
-# `package = "sqlrite-engine"` because the crate publishes under that
-# name on crates.io (the `sqlrite` name was taken on the registry —
-# see Phase 6d retrospective). The import alias `sqlrite` keeps
-# `use sqlrite::…` working in this crate's source.
-#
-# `default-features = false` skips the engine's `cli` (rustyline +
-# clap + env_logger) and `file-locks` (fs2) features — sqlrite-ask
-# never spawns a REPL or opens a database itself; the caller passes
-# in an already-opened `&Connection`. Avoids pulling those deps
-# transitively into anyone who uses sqlrite-ask without the engine
-# REPL.
-#
-# **`version = "0.1"` is required for `cargo publish`.** Without a
-# version requirement on a path-dep, `cargo publish` rejects the
-# manifest with:
-#
-#     error: failed to verify manifest at sqlrite-ask/Cargo.toml
-#     Caused by:
-#       all dependencies must have a version requirement specified
-#       when publishing.
-#       dependency `sqlrite-engine` does not specify a version
-#
-# That's the exact error v0.1.17 hit on the first attempted publish
-# (publish-ask job). `sqlrite-ffi` doesn't need this because it
-# never publishes to crates.io — it ships as GitHub Release
-# tarballs only. `sqlrite-ask` is the first crate-besides-the-
-# engine that actually goes to the registry.
-#
-# Why caret `"0.1"` rather than the exact pinned version: the
-# whole 0.1.x line is lockstep-released, so any 0.1.y on crates.io
-# is compatible with sqlrite-ask 0.1.x. Caret avoids touching this
-# line every release. Bump to `"0.2"` at the next major (whenever
-# Phase 7 closes); same for 1.0.
-sqlrite = { package = "sqlrite-engine", version = "0.1", path = "..", default-features = false }
+# Migration for v0.1.18 callers: `use sqlrite_ask::ConnectionAskExt`
+# becomes `use sqlrite::ConnectionAskExt` (after enabling the
+# engine's `ask` feature). API signature unchanged. See PR #60
+# retrospective in `docs/roadmap.md`.
 
-# JSON request/response shapes for the Anthropic Messages API. We
-# could write the JSON by hand, but `serde_json` is already a
-# transitive dep via the engine (Phase 7e — JSON column type), so
-# this is free.
+# JSON request/response shapes for the Anthropic Messages API.
+# Could be hand-rolled but the request body has nested arrays of
+# tagged-enum content blocks — serde derives are worth the dep.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -78,9 +50,9 @@ serde_json = "1"
 # vs. ~400 LOC + tokio + reqwest::blocking via an SDK.
 ureq = { version = "2", features = ["json", "tls"] }
 
-# Typed errors — same crate the engine uses for `SQLRiteError`, so
-# the AskError variants compose cleanly with the engine's error
-# tree via `#[from]`.
+# Typed errors. (Same crate the engine uses, so consumers that
+# enable the engine's `ask` feature can layer their own thiserror
+# wrapper without version skew.)
 thiserror = "2"
 
 [dev-dependencies]

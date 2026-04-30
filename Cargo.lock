@@ -3808,7 +3808,6 @@ version = "0.1.18"
 dependencies = [
  "serde",
  "serde_json",
- "sqlrite-engine",
  "thiserror 2.0.18",
  "tiny_http",
  "ureq",
@@ -3839,6 +3838,7 @@ dependencies = [
  "rustyline-derive",
  "serde_json",
  "sqlparser",
+ "sqlrite-ask",
  "thiserror 2.0.18",
 ]
 

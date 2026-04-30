@@ -1,47 +1,43 @@
-//! Schema introspection — turn an open `Connection` into a textual
-//! schema dump the LLM can ground its SQL generation on.
+//! Schema introspection — turn an open `Connection` (or raw
+//! `Database`) into the textual schema dump the LLM uses to ground
+//! its SQL generation.
 //!
 //! ## Why we don't `SELECT FROM sqlrite_master`
 //!
 //! The `sqlrite_master` catalog persists the original `CREATE TABLE`
 //! SQL, so reflecting via SQL would work. But we already have the
-//! same information typed in `Database.tables` (declared columns,
-//! primary key, NOT NULL / UNIQUE, vector dimensions, …) — going
-//! through SQL would mean parsing the round-tripped CREATE statement
-//! a second time. Walking the typed structure is cheaper and matches
-//! whatever the engine considers authoritative *right now* (a
-//! relevant distinction inside an open transaction, where the
-//! catalog's persisted state may already be stale).
+//! same information typed in `Database.tables` — going through SQL
+//! would mean parsing the round-tripped CREATE statement a second
+//! time. Walking the typed structure is cheaper and matches what
+//! the engine considers authoritative *right now* (relevant inside
+//! an open transaction, where the persisted catalog may already be
+//! stale relative to the in-memory snapshot).
 //!
 //! ## Determinism (matters for prompt caching)
 //!
 //! Tables are dumped in alphabetical order, columns in declaration
 //! order. The output is byte-stable for a fixed schema — that's
 //! what lets `cache_control: ephemeral` actually hit on repeat
-//! calls. Any change to the dump format (adding a clause, changing
-//! whitespace) will invalidate the cache once for everyone, but
-//! steady-state hits are cheap.
+//! calls. Any change to the format invalidates the cache once for
+//! everyone, but steady-state hits are cheap.
 
 use std::fmt::Write;
 
-use sqlrite::Connection;
-use sqlrite::sql::db::database::Database;
-use sqlrite::sql::db::table::{DataType, Table};
+use crate::Connection;
+use crate::sql::db::database::Database;
+use crate::sql::db::table::{DataType, Table};
 
-/// Render the schema of every user-visible table as a sequence of
-/// `CREATE TABLE … (…);` statements, sorted alphabetically by name.
-///
-/// The internal `sqlrite_master` catalog is filtered out — the LLM
-/// doesn't need to know about it and including it would confuse the
-/// generation.
-pub fn dump_schema(conn: &Connection) -> String {
-    dump_database(conn.database())
+/// Render the schema of every user-visible table on `conn` as a
+/// sequence of `CREATE TABLE … (…);` statements, sorted
+/// alphabetically by table name.
+pub fn dump_schema_for_connection(conn: &Connection) -> String {
+    dump_schema_for_database(conn.database())
 }
 
-/// Same as [`dump_schema`], but takes a `Database` reference directly.
-/// Useful for callers that already hold a `Database` (e.g., advanced
-/// embedders bypassing the public `Connection` API).
-pub fn dump_database(db: &Database) -> String {
+/// Same as [`dump_schema_for_connection`], but takes a `Database`
+/// reference directly. Used by the REPL's `.ask` meta-command
+/// (which holds `&Database`, not `&Connection`).
+pub fn dump_schema_for_database(db: &Database) -> String {
     let mut names: Vec<&str> = db
         .tables
         .keys()
@@ -66,13 +62,13 @@ pub fn dump_database(db: &Database) -> String {
 
 /// Format one `Table` as a single `CREATE TABLE` statement.
 ///
-/// We don't emit the secondary-index DDL here — indexes are an
-/// implementation detail of `WHERE col = literal` performance, not
-/// something the LLM needs to reason about when choosing what columns
-/// to project or filter on. (HNSW indexes are different — they affect
-/// what queries are even *possible* efficiently. Phase 7g.x follow-up
-/// will add an `[indexed: hnsw, M=16, ef=200]` annotation on indexed
-/// vector columns once the prompt budget can absorb it.)
+/// Secondary indexes are deliberately not included — they're a
+/// `WHERE col = literal` performance concern, not something the LLM
+/// needs to reason about when choosing what columns to project or
+/// filter on. (HNSW indexes affect what queries are even *possible*
+/// efficiently. A future follow-up can add an `[indexed: hnsw,
+/// M=16, ef=200]` annotation on indexed vector columns once the
+/// prompt budget can absorb it.)
 fn format_create_table(table: &Table, out: &mut String) {
     let _ = writeln!(out, "CREATE TABLE {} (", table.tb_name);
     for (i, col) in table.columns.iter().enumerate() {
@@ -83,7 +79,7 @@ fn format_create_table(table: &Table, out: &mut String) {
         }
         if col.is_unique && !col.is_pk {
             // PRIMARY KEY already implies UNIQUE; SQLite's reflection
-            // never double-prints it and neither do we.
+            // doesn't double-print it and neither do we.
             clauses.push("UNIQUE");
         }
         if col.not_null && !col.is_pk {
@@ -136,7 +132,7 @@ fn render_datatype(dt: &DataType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlrite::Connection;
+    use crate::Connection;
 
     fn open() -> Connection {
         Connection::open_in_memory().expect("open in-memory db")
@@ -145,7 +141,7 @@ mod tests {
     #[test]
     fn empty_schema_returns_empty_string() {
         let conn = open();
-        assert_eq!(dump_schema(&conn), "");
+        assert_eq!(dump_schema_for_connection(&conn), "");
     }
 
     #[test]
@@ -155,7 +151,7 @@ mod tests {
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)",
         )
         .unwrap();
-        let dump = dump_schema(&conn);
+        let dump = dump_schema_for_connection(&conn);
         assert!(dump.contains("CREATE TABLE users ("), "got: {dump}");
         assert!(dump.contains("id INTEGER PRIMARY KEY"));
         assert!(dump.contains("name TEXT NOT NULL"));
@@ -169,7 +165,7 @@ mod tests {
             "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(384), payload JSON)",
         )
         .unwrap();
-        let dump = dump_schema(&conn);
+        let dump = dump_schema_for_connection(&conn);
         assert!(dump.contains("embedding VECTOR(384)"), "got: {dump}");
         assert!(dump.contains("payload JSON"), "got: {dump}");
     }
@@ -183,7 +179,7 @@ mod tests {
             .unwrap();
         conn.execute("CREATE TABLE mango (id INTEGER PRIMARY KEY)")
             .unwrap();
-        let dump = dump_schema(&conn);
+        let dump = dump_schema_for_connection(&conn);
         let alpha = dump.find("CREATE TABLE alpha").unwrap();
         let mango = dump.find("CREATE TABLE mango").unwrap();
         let zebra = dump.find("CREATE TABLE zebra").unwrap();
@@ -198,7 +194,7 @@ mod tests {
         let mut conn = open();
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
             .unwrap();
-        let dump = dump_schema(&conn);
+        let dump = dump_schema_for_connection(&conn);
         assert!(
             !dump.contains("sqlrite_master"),
             "internal catalog leaked: {dump}"
@@ -208,9 +204,10 @@ mod tests {
     #[test]
     fn dump_is_byte_stable_across_calls() {
         // The whole point of putting the schema dump behind a
-        // `cache_control: ephemeral` breakpoint is that this is true.
-        // If sort order ever becomes non-deterministic (e.g. by walking
-        // the HashMap directly), prompt caching silently degrades.
+        // `cache_control: ephemeral` breakpoint is that this is
+        // true. If sort order ever becomes non-deterministic
+        // (e.g. by walking the HashMap directly), prompt caching
+        // silently degrades.
         let mut conn = open();
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
             .unwrap();
@@ -218,9 +215,9 @@ mod tests {
             .unwrap();
         conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, z BOOLEAN)")
             .unwrap();
-        let first = dump_schema(&conn);
+        let first = dump_schema_for_connection(&conn);
         for _ in 0..20 {
-            assert_eq!(dump_schema(&conn), first);
+            assert_eq!(dump_schema_for_connection(&conn), first);
         }
     }
 }

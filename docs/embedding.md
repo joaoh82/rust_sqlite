@@ -71,19 +71,21 @@ See [Phase 4f notes in roadmap.md](roadmap.md) for the snapshot semantics and th
 - **Parameter binding.** `stmt.query(&[&"alice"])` is the intended shape but the current implementation takes no arguments — use string interpolation for now. Parameter binding lands with the cursor refactor.
 - **Cursor abstraction.** The Pager still eagerly loads every row at open time; `Rows` today wraps an in-memory `Vec`. Phase 5a's follow-up refactor streams rows through the B-Tree on demand — same public API, much lower memory for big SELECTs.
 
-### Natural-language → SQL via `sqlrite-ask` (Phase 7g.1)
+### Natural-language → SQL — `sqlrite::ask` + `sqlrite-ask`
 
-The companion crate [`sqlrite-ask`](../sqlrite-ask/) layers a natural-language → SQL helper on top of the engine. Engine stays pure-SQL with no HTTP / TLS / async deps; anyone who doesn't need `ask()` can ignore the crate entirely.
+*Phases 7g.1 + 7g.2.* The companion crate [`sqlrite-ask`](../sqlrite-ask/) provides the LLM-talking machinery (provider adapters, prompt construction, response parsing) over a deliberately small surface — `&str` schema in, generated SQL out. The engine wraps it under a new `ask` feature (default-on) so library users get the ergonomic `Connection::ask` form without composing the schema dump themselves.
 
 ```toml
 [dependencies]
+# `ask` is a default feature on sqlrite-engine; opt out with
+# default-features = false if you don't want the LLM stack pulled in.
 sqlrite-engine = "0.1"
 sqlrite-ask    = "0.1"
 ```
 
 ```rust
-use sqlrite::Connection;
-use sqlrite_ask::{AskConfig, AskResponse, ConnectionAskExt};
+use sqlrite::{Connection, ConnectionAskExt};
+use sqlrite_ask::{AskConfig, AskResponse};
 
 let conn = Connection::open("foo.sqlrite")?;
 let cfg  = AskConfig::from_env()?;          // reads SQLRITE_LLM_API_KEY etc.
@@ -105,18 +107,20 @@ let mut conn = conn;  // need &mut for execute
 let _ = conn.execute(&resp.sql)?;
 ```
 
-**What `sqlrite-ask` provides:**
+**Where what lives:**
 
-- `ask(conn, question, config) -> AskResponse` — free function entry point.
-- `Connection::ask(question, config)` via the `ConnectionAskExt` trait — same flow, method syntax.
-- `AskConfig::from_env()` — reads `SQLRITE_LLM_PROVIDER` / `_API_KEY` / `_MODEL` / `_MAX_TOKENS` / `_CACHE_TTL` with sensible defaults.
-- `AnthropicProvider` — sync `ureq` POST to `https://api.anthropic.com/v1/messages`. The crate is provider-pluggable (a `Provider` trait + `Request` / `Response` types), with OpenAI and Ollama follow-ups planned for later 7g sub-phases.
-- Schema-aware prompt construction — walks `Database.tables` deterministically (alphabetical) and emits a `<schema>...</schema>` block with `cache_control: ephemeral`, so the schema dump is served from Anthropic's prompt cache after the first call.
-- Output parser tolerant to fenced JSON (`` ```json … ``` ``) or JSON-with-leading-prose, in addition to strict JSON.
+| Crate | Provides |
+|---|---|
+| `sqlrite-engine` (with `ask` feature) | `sqlrite::ConnectionAskExt`, `sqlrite::ask::ask` / `ask_with_database` / `ask_with_provider` / `ask_with_database_and_provider`, `sqlrite::ask::schema::dump_schema_for_connection` / `_for_database`. Pure engine-side glue: dump schema → call into `sqlrite-ask`. |
+| `sqlrite-ask` | `ask_with_schema` / `ask_with_schema_and_provider`, `AskConfig`, `AskResponse`, `AskError`, `Provider` trait + `AnthropicProvider`. Pure `&str` inputs, no engine dep — keeps the LLM stack independently testable + plugable. |
 
-**Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, 5-minute prompt-cache TTL. Configurable via `AskConfig`.
+**Provider:** Anthropic only in 7g.1; the `Provider` trait lets OpenAI / Ollama slot in without touching consumers. `AnthropicProvider` does sync `ureq` POSTs to `/v1/messages`. **Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, 5-minute prompt-cache TTL on the schema dump (configurable via `AskConfig::cache_ttl` / `SQLRITE_LLM_CACHE_TTL`).
 
-**Per-product wrappers ship in 7g.2-7g.8** — REPL `.ask`, desktop "Ask" button, Python/Node/Go SDKs `conn.ask()`, WASM SDK with a JS-callback shape (so the API key stays out of the browser tab), and the MCP `ask` tool.
+**Why the split** (Phase 7g.2 retro): the REPL binary needed to import the LLM crate to wire up `.ask`, but `sqlrite-ask` 0.1.18 imported `sqlrite-engine` for the `Connection` integration. That's a cargo cycle (`engine[bin] → sqlrite-ask → engine[lib]`) — even with `optional = true`, the static cycle detector rejects the graph. Flipping the dep direction broke it: `sqlrite-ask` is pure now, the engine carries the integration weight behind a feature flag. See `docs/roadmap.md` for the full retrospective.
+
+**REPL surface** *(7g.2)*: type `.ask <question>` at the prompt. Prints generated SQL + rationale, asks `Run? [Y/n]`, executes through the same `process_command` pipeline as a typed statement on confirm. Requires `SQLRITE_LLM_API_KEY`.
+
+**Per-product wrappers ship in 7g.3-7g.8** — desktop "Ask" button, Python/Node/Go SDKs `conn.ask()`, WASM SDK with a JS-callback shape (so the API key stays out of the browser tab), and the MCP `ask` tool.
 
 ## The C FFI (Phase 5b)
 

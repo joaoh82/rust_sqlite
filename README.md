@@ -155,12 +155,13 @@ Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 | `.open FILENAME` | working — opens an existing `.sqlrite` file or creates a fresh one; **auto-save is enabled from this point on** |
 | `.save FILENAME` | working — explicit flush (rarely needed once `.open` is in play) |
 | `.tables` | working |
+| `.ask <QUESTION>` | working — natural-language → SQL via the configured LLM (Anthropic by default). Prints generated SQL + rationale, prompts `Run? [Y/n]`, runs through the same pipeline as a typed statement on confirm. Requires `SQLRITE_LLM_API_KEY` in the environment. *Phase 7g.2.* |
 | `.read FILENAME` | later |
 | `.ast QUERY` | later |
 
 #### Natural-language → SQL (`sqlrite-ask`)
 
-*Phase 7g.1.* The companion crate [`sqlrite-ask`](sqlrite-ask/) turns a natural-language question into a SQL query against your database, using the [Anthropic API](https://docs.anthropic.com/) for the actual generation.
+*Phase 7g.1 / 7g.2.* The companion crate [`sqlrite-ask`](sqlrite-ask/) — pure-Rust over `&str` schemas + questions — provides the LLM-talking machinery. The engine integrates it via the `ask` feature (default-on), exposing `Connection::ask` for ergonomic library use:
 
 ```toml
 [dependencies]
@@ -169,8 +170,8 @@ sqlrite-ask    = "0.1"
 ```
 
 ```rust
-use sqlrite::Connection;
-use sqlrite_ask::{AskConfig, ConnectionAskExt};
+use sqlrite::{Connection, ConnectionAskExt};
+use sqlrite_ask::AskConfig;
 
 let conn = Connection::open("foo.sqlrite")?;
 let cfg  = AskConfig::from_env()?;          // SQLRITE_LLM_API_KEY etc.
@@ -182,7 +183,7 @@ println!("Why: {}",          resp.explanation);
 
 **Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, schema dump cached for 5 minutes via Anthropic prompt caching (configurable to 1h or off via `AskConfig::cache_ttl`). Bring your own API key — set `SQLRITE_LLM_API_KEY` or pass it on `AskConfig`.
 
-Per-product `ask()` wrappers (`.ask` REPL command, desktop "Ask" button, `conn.ask()` in the Python / Node / Go SDKs, and the MCP `ask` tool) ship in **7g.2-7g.8** as follow-up sub-phases. WASM gets a JS-callback shape so the API key never enters the browser. See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
+In the REPL: `.ask <question>`. From an open `Connection` (this section). Per-product wrappers — desktop "Ask" button, `conn.ask()` in the Python / Node / Go SDKs, MCP `ask` tool, WASM with a JS-callback shape so the API key never enters the browser — ship in **7g.3-7g.8** as follow-up sub-phases. See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
 
 ### Roadmap
 
@@ -268,8 +269,9 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [x] **7c — Bounded-heap top-k optimization** *(v0.1.12)*
 - [x] **7d — HNSW ANN index** *(v0.1.13–15)*: `CREATE INDEX … USING hnsw (col)`; recall@10 ≥ 0.95 at default `M=16, ef_construction=200, ef_search=50`; persisted as a `KIND_HNSW` cell tree
 - [x] **7e — JSON column type + path queries** *(v0.1.16)*: `JSON` / `JSONB` columns stored as canonical text; `json_extract` / `json_type` / `json_array_length` / `json_object_keys`; `$.key`, `[N]`, chained JSONPath subset
-- [x] **7g.1 — `sqlrite-ask` crate** *(this wave)*: foundational natural-language → SQL via the [Anthropic API](https://docs.anthropic.com/) (Sonnet 4.6 by default), prompt-cached schema dump, sync `ureq` HTTP. Public surface: `sqlrite_ask::ask(conn, q, &cfg)` or `conn.ask(q, &cfg)` via `ConnectionAskExt`.
-- [ ] **7g.2-7g.8** — per-product `ask()` adapters: REPL `.ask`, desktop "Ask" button, Python/Node/Go/WASM SDKs, MCP `ask` tool
+- [x] **7g.1 — `sqlrite-ask` crate** *(v0.1.18)*: foundational natural-language → SQL via the [Anthropic API](https://docs.anthropic.com/) (Sonnet 4.6 by default), prompt-cached schema dump, sync `ureq` HTTP.
+- [x] **7g.2 — REPL `.ask` + dep-direction flip** *(this wave)*: `.ask <question>` meta-command with `Run? [Y/n]` confirmation. The wiring required dropping the engine dep from `sqlrite-ask` (cargo cycle) — `sqlrite-ask` is now pure over `&str` schemas; the `Connection`/`Database` integration moved to the engine's new `ask` feature. Public surface for callers: `use sqlrite::{Connection, ConnectionAskExt}`.
+- [ ] **7g.3-7g.8** — per-product `ask()` adapters: desktop "Ask" button, Python/Node/Go/WASM SDKs, MCP `ask` tool
 - [ ] **7h** — MCP server adapter (`sqlrite-mcp` binary)
 - [ ] *(deferred to Phase 8)* Full-text search with BM25 + hybrid retrieval
 
