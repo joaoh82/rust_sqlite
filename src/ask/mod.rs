@@ -38,14 +38,23 @@
 //!   for callers who don't want to bring the trait into scope, or
 //!   who hold a `&Database` directly (the REPL binary does this).
 
-use sqlrite_ask::{
-    AskConfig, AskError, AskResponse, Provider, ask_with_schema, ask_with_schema_and_provider,
-};
+use sqlrite_ask::{ask_with_schema, ask_with_schema_and_provider};
 
 use crate::Connection;
 use crate::sql::db::database::Database;
 
 pub mod schema;
+
+// Re-export the public surface from sqlrite-ask. Lets callers reach
+// these without listing `sqlrite-ask` as a direct dep — convenient
+// for the Tauri desktop app, the SDK adapters, and any Rust embedder
+// who already pulls the engine in. They can keep saying
+// `use sqlrite::ask::AskConfig` instead of dragging the second crate
+// in just for one type.
+pub use sqlrite_ask::{
+    AnthropicProvider, AskConfig, AskError, AskResponse, CacheTtl, Provider, ProviderKind, Request,
+    Response, Usage,
+};
 
 /// Extension trait adding `Connection::ask` to
 /// [`crate::Connection`]. Bring it into scope with

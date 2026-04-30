@@ -31,6 +31,19 @@
   let errorMessage = $state<string | null>(null);
   let running = $state<boolean>(false);
 
+  // Phase 7g.3 — Ask… composer state. The composer is a small panel
+  // that slides in above the editor when the user clicks "Ask…".
+  // Submitting calls the `ask_sql` Tauri command (which runs schema
+  // introspection + the LLM call server-side, so the API key stays
+  // out of the webview), then drops the generated SQL into the
+  // editor for the user to review + run.
+  let askVisible = $state<boolean>(false);
+  let askQuestion = $state<string>("");
+  let askExplanation = $state<string | null>(null);
+  let askInputRef = $state<HTMLTextAreaElement | null>(null);
+  let asking = $state<boolean>(false);
+  type AskResult = { sql: string; explanation: string };
+
   // Editor refs and derived line numbers for the gutter. We derive a
   // dense `[1, 2, …, n]` array so Svelte's {#each} iterates every slot
   // — a sparse `Array(n)` would skip indices.
@@ -280,6 +293,67 @@
     }
   }
 
+  // Phase 7g.3 — Ask composer handlers.
+
+  /** Toggle the Ask composer. Focuses the question input on open. */
+  async function onAskClick() {
+    askVisible = !askVisible;
+    if (askVisible) {
+      // Clear any prior explanation when reopening, but preserve the
+      // question — the user might want to tweak + retry rather than
+      // retype from scratch.
+      askExplanation = null;
+      errorMessage = null;
+      await tick();
+      askInputRef?.focus();
+    }
+  }
+
+  /** Submit the natural-language question to the backend. */
+  async function onAskSubmit() {
+    const question = askQuestion.trim();
+    if (!question) return;
+    asking = true;
+    errorMessage = null;
+    askExplanation = null;
+    try {
+      const resp = await invoke<AskResult>("ask_sql", { question });
+      if (resp.sql.trim().length === 0) {
+        // Model declined to generate SQL for this schema. Surface
+        // its rationale in the same slot we'd use for a successful
+        // explanation; don't touch the editor.
+        askExplanation =
+          resp.explanation || "(model declined to generate SQL)";
+      } else {
+        // Drop the generated SQL into the editor (don't auto-run —
+        // user reviews + clicks Run themselves). Stash the
+        // explanation so the user can see why they got that query.
+        sql = resp.sql;
+        askExplanation = resp.explanation || null;
+        // Move focus back to the editor so Cmd/Ctrl+Enter just works.
+        await tick();
+        textareaRef?.focus();
+      }
+    } catch (err) {
+      errorMessage = String(err);
+    } finally {
+      asking = false;
+    }
+  }
+
+  /** Cmd/Ctrl+Enter in the question input submits. Esc closes. */
+  function onAskKey(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      onAskSubmit();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      askVisible = false;
+    }
+  }
+
   onMount(() => {
     refreshTables();
   });
@@ -347,6 +421,41 @@
 
     <section class="main">
       <div class="editor">
+        {#if askVisible}
+          <div class="ask-panel">
+            <div class="ask-header">
+              <span class="ask-title">Ask</span>
+              <span class="ask-hint">
+                Natural-language → SQL · Submit: ⌘↵ · Close: Esc
+              </span>
+              <button
+                class="ask-close"
+                onclick={() => (askVisible = false)}
+                aria-label="Close Ask panel"
+              >×</button>
+            </div>
+            <textarea
+              bind:this={askInputRef}
+              bind:value={askQuestion}
+              onkeydown={onAskKey}
+              placeholder="e.g. How many users are over 30?"
+              rows="2"
+              spellcheck="false"
+            ></textarea>
+            <div class="ask-actions">
+              {#if askExplanation}
+                <span class="ask-explanation">{askExplanation}</span>
+              {:else}
+                <span class="ask-explanation muted">
+                  Generated SQL replaces the editor contents — review before running.
+                </span>
+              {/if}
+              <button onclick={onAskSubmit} disabled={asking || !askQuestion.trim()}>
+                {asking ? "Generating…" : "Generate SQL"}
+              </button>
+            </div>
+          </div>
+        {/if}
         <div class="editor-surface">
           <div class="gutter" bind:this={gutterRef} aria-hidden="true">
             {#each lineNumbers as n (n)}
@@ -366,6 +475,9 @@
           <span class="shortcut-hint">
             Run: ⌘↵ · Comment: ⌘/{hasSelection ? " · selection only" : ""}
           </span>
+          <button class="ask-button" onclick={onAskClick} disabled={asking}>
+            {askVisible ? "Hide Ask" : "Ask…"}
+          </button>
           <button onclick={onRunSql} disabled={running}>
             {#if running}Running…{:else if hasSelection}Run selection{:else}Run{/if}
           </button>
