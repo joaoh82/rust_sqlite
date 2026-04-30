@@ -1,56 +1,80 @@
 //! `sqlrite-ask` — natural-language → SQL adapter for SQLRite.
 //!
-//! Phase 7g.1 (foundational). One sync call:
+//! **Phase 7g.2 made this crate pure** — it no longer depends on
+//! `sqlrite-engine`. The canonical API takes a `&str` schema dump
+//! (built however you like — see `sqlrite::ConnectionAskExt::ask`
+//! for the engine-side helper that wraps it):
 //!
 //! ```no_run
-//! use sqlrite::Connection;
-//! use sqlrite_ask::{ask, AskConfig};
+//! use sqlrite_ask::{ask_with_schema, AskConfig};
 //!
-//! let conn = Connection::open("foo.sqlrite")?;
-//! let config = AskConfig::from_env()?;  // reads SQLRITE_LLM_API_KEY etc.
-//! let response = ask(&conn, "How many users are over 30?", &config)?;
-//! println!("Generated SQL: {}", response.sql);
-//! println!("Why: {}", response.explanation);
+//! let schema = "\
+//! CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  name TEXT NOT NULL\n);\n";
+//! let cfg  = AskConfig::from_env()?;          // reads SQLRITE_LLM_API_KEY etc.
+//! let resp = ask_with_schema(schema, "How many users?", &cfg)?;
+//! println!("{}", resp.sql);
 //! # Ok::<(), sqlrite_ask::AskError>(())
 //! ```
 //!
+//! For the engine-integrated form (`conn.ask("...", &cfg)`), enable
+//! the `sqlrite-engine` crate's `ask` feature and bring its
+//! `ConnectionAskExt` trait into scope:
+//!
+//! ```ignore
+//! use sqlrite::{Connection, ConnectionAskExt};
+//! use sqlrite_ask::AskConfig;
+//!
+//! let conn = Connection::open("foo.sqlrite")?;
+//! let cfg  = AskConfig::from_env()?;
+//! let resp = conn.ask("How many users?", &cfg)?;
+//! ```
+//!
+//! ## Why the split (Phase 7g.2 retro)
+//!
+//! Wiring the REPL's `.ask` meta-command would have required the
+//! engine binary to depend on `sqlrite-ask`, but `sqlrite-ask`
+//! already depended on `sqlrite-engine` (for `Connection`,
+//! `Database`, `Table`). Cargo's static cycle detection rejects that
+//! shape even with `optional = true`. Solution: keep this crate pure
+//! over `&str` inputs, move the engine integration (schema dump +
+//! `ConnectionAskExt`) into `sqlrite-engine` itself behind an `ask`
+//! feature. Now there's one direction of dep flow: engine →
+//! sqlrite-ask, never the other way.
+//!
 //! ## What this crate is
 //!
-//! - Reflects the schema of an open `Connection` into CREATE TABLE
-//!   text the LLM can ground on.
-//! - Wraps that schema in a stable system prompt with an
-//!   `cache_control: ephemeral` breakpoint so the schema dump is
-//!   served from Anthropic's prompt cache after the first call.
-//! - Sends one HTTP POST to the LLM provider per `ask()` call.
-//! - Parses the response into `AskResponse { sql, explanation }`.
+//! - Provider adapters (Anthropic now; OpenAI / Ollama later) that
+//!   POST one HTTP request to a chat-completion endpoint per `ask()`
+//!   call.
+//! - Prompt construction with a `cache_control: ephemeral`
+//!   breakpoint on the schema block, so repeat calls against the
+//!   same schema served from Anthropic's prompt cache.
+//! - Output parsing tolerant to fenced JSON / leading prose / strict
+//!   JSON (model output drifts even with strict instructions).
+//! - `AskConfig` (env vars + explicit overrides), `AskResponse {
+//!   sql, explanation, usage }`, `AskError`.
 //!
 //! ## What this crate is NOT
 //!
-//! - **Not an executor.** The library deliberately does not run the
-//!   generated SQL — the caller decides whether to execute it. SDK
-//!   layers (`Python.Connection.ask_run`, `Node.db.askRun`, etc.)
-//!   add a one-shot generate-and-execute helper for the common
-//!   case, but the default API is "generate, return, let me decide".
+//! - **Not an executor.** The caller decides whether to run the
+//!   generated SQL. SDK convenience wrappers (`Python.Connection
+//!   .ask_run`, `Node.db.askRun`, etc.) layer that on top.
 //! - **Not multi-turn.** Stateless — every call is a fresh prompt.
-//! - **Not multi-provider yet.** Anthropic-first per Phase 7 plan
-//!   Q4. OpenAI + Ollama follow-ups slot into [`provider`] without
-//!   changing the public surface.
+//! - **Not engine-coupled.** Schema introspection lives on the
+//!   engine side as of v0.1.19 — see `sqlrite::ConnectionAskExt`.
 //!
 //! ## Configuration
 //!
 //! [`AskConfig`] resolves in this priority order:
-//! 1. Explicit values you set on the struct (`AskConfig { api_key: Some(...), .. }`)
-//! 2. Environment variables (`SQLRITE_LLM_*`)
+//! 1. Explicit values on the struct.
+//! 2. Environment variables (`SQLRITE_LLM_*`).
 //! 3. Built-in defaults (model = `claude-sonnet-4-6`, max_tokens = 1024,
-//!    cache TTL = 5 min)
+//!    cache TTL = 5 min).
 
 use std::env;
 
-use sqlrite::Connection;
-
 mod prompt;
 mod provider;
-pub mod schema;
 
 pub use provider::anthropic::AnthropicProvider;
 pub use provider::{Provider, Request, Response, Usage};
@@ -237,50 +261,25 @@ pub enum AskError {
     #[error("model output JSON missing required field '{0}'")]
     OutputMissingField(&'static str),
 
-    #[error("schema introspection failed: {0}")]
-    Schema(String),
-
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error(transparent)]
-    Engine(#[from] sqlrite::SQLRiteError),
-}
-
-/// Extension trait that adds [`ConnectionAskExt::ask`] to
-/// [`sqlrite::Connection`]. Lives here (not on the engine) to keep the
-/// engine free of HTTP / TLS / serde deps. Bring it into scope with
-/// `use sqlrite_ask::ConnectionAskExt;`.
-pub trait ConnectionAskExt {
-    /// Generate SQL from a natural-language question. Equivalent to
-    /// the free-function [`ask`] but reads as a method:
-    ///
-    /// ```no_run
-    /// use sqlrite::Connection;
-    /// use sqlrite_ask::{AskConfig, ConnectionAskExt};
-    ///
-    /// let conn = Connection::open("foo.sqlrite")?;
-    /// let cfg = AskConfig::from_env()?;
-    /// let resp = conn.ask("how many users are over 30?", &cfg)?;
-    /// # Ok::<(), sqlrite_ask::AskError>(())
-    /// ```
-    fn ask(&self, question: &str, config: &AskConfig) -> Result<AskResponse, AskError>;
-}
-
-impl ConnectionAskExt for Connection {
-    fn ask(&self, question: &str, config: &AskConfig) -> Result<AskResponse, AskError> {
-        ask(self, question, config)
-    }
 }
 
 /// One-shot natural-language → SQL.
 ///
-/// Walks `conn`'s schema, builds a cache-friendly prompt, calls the
-/// configured LLM, parses the JSON-shaped reply into [`AskResponse`].
+/// You pass the schema dump as a string (typically produced by the
+/// engine's `sqlrite::ConnectionAskExt` / `dump_schema_for_database`
+/// helper, but any string format the model can read is fine) and the
+/// user's question. Returns the generated SQL plus a one-sentence
+/// rationale plus token usage for cache-hit verification.
 ///
 /// The library does **not** execute the returned SQL — that's the
 /// caller's call. See module docs for rationale.
-pub fn ask(conn: &Connection, question: &str, config: &AskConfig) -> Result<AskResponse, AskError> {
+pub fn ask_with_schema(
+    schema_dump: &str,
+    question: &str,
+    config: &AskConfig,
+) -> Result<AskResponse, AskError> {
     let api_key = config.api_key.clone().ok_or(AskError::MissingApiKey)?;
 
     let provider = match config.provider {
@@ -290,22 +289,25 @@ pub fn ask(conn: &Connection, question: &str, config: &AskConfig) -> Result<AskR
         },
     };
 
-    ask_with_provider(conn, question, config, &provider)
+    ask_with_schema_and_provider(schema_dump, question, config, &provider)
 }
 
-/// Lower-level entry point — same flow, but you supply the provider.
+/// Lower-level entry point — same flow as [`ask_with_schema`], but
+/// you supply the provider directly.
 ///
 /// Used by the test suite (which passes a `MockProvider`) and by
 /// advanced callers who want to drive a custom backend (an internal
-/// LLM gateway, a recorded-replay test harness, etc.).
-pub fn ask_with_provider<P: Provider>(
-    conn: &Connection,
+/// LLM gateway, a recorded-replay test harness, a non-Anthropic
+/// provider not yet wired into [`ProviderKind`], etc.). This is the
+/// canonical inner function — every other entry point in this module
+/// reduces to this one.
+pub fn ask_with_schema_and_provider<P: Provider>(
+    schema_dump: &str,
     question: &str,
     config: &AskConfig,
     provider: &P,
 ) -> Result<AskResponse, AskError> {
-    let schema_dump = schema::dump_schema(conn);
-    let system = build_system(&schema_dump, config.cache_ttl.into_marker());
+    let system = build_system(schema_dump, config.cache_ttl.into_marker());
     let messages = [UserMessage::new(question)];
 
     let req = ProviderRequest {
@@ -414,11 +416,19 @@ fn extract_first_json_object(s: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
-    use sqlrite::Connection;
 
-    fn open() -> Connection {
-        Connection::open_in_memory().unwrap()
-    }
+    /// A small fixed schema string. After the v0.1.19 split this
+    /// crate doesn't depend on `sqlrite-engine`, so we no longer
+    /// open an in-memory DB to introspect — we just hand a literal
+    /// schema dump in. (The engine-side helper that produces these
+    /// from a `&Database` is tested separately under `sqlrite-engine
+    /// ::ask::schema`.)
+    const FIXTURE_SCHEMA: &str = "\
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
+";
 
     fn cfg() -> AskConfig {
         AskConfig {
@@ -429,26 +439,21 @@ mod tests {
 
     #[test]
     fn ask_with_mock_provider_returns_parsed_sql() {
-        let mut conn = open();
-        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-            .unwrap();
-
         let provider = MockProvider::new(
             r#"{"sql": "SELECT COUNT(*) FROM users", "explanation": "counts users"}"#,
         );
-
-        let resp = ask_with_provider(&conn, "how many users?", &cfg(), &provider).unwrap();
+        let resp =
+            ask_with_schema_and_provider(FIXTURE_SCHEMA, "how many users?", &cfg(), &provider)
+                .unwrap();
         assert_eq!(resp.sql, "SELECT COUNT(*) FROM users");
         assert_eq!(resp.explanation, "counts users");
     }
 
     #[test]
     fn schema_dump_appears_in_system_block() {
-        let mut conn = open();
-        conn.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
-            .unwrap();
+        let schema = "CREATE TABLE widgets (\n  id INTEGER PRIMARY KEY,\n  name TEXT\n);\n";
         let provider = MockProvider::new(r#"{"sql": "", "explanation": ""}"#);
-        let _ = ask_with_provider(&conn, "anything", &cfg(), &provider).unwrap();
+        let _ = ask_with_schema_and_provider(schema, "anything", &cfg(), &provider).unwrap();
 
         let captured = provider.last_request.borrow().clone().unwrap();
         let schema_block = &captured.system_blocks[1];
@@ -461,30 +466,27 @@ mod tests {
 
     #[test]
     fn cache_ttl_off_omits_cache_control() {
-        let conn = open();
         let provider = MockProvider::new(r#"{"sql": "", "explanation": ""}"#);
         let mut config = cfg();
         config.cache_ttl = CacheTtl::Off;
-        let _ = ask_with_provider(&conn, "test", &config, &provider).unwrap();
+        let _ = ask_with_schema_and_provider(FIXTURE_SCHEMA, "test", &config, &provider).unwrap();
         let captured = provider.last_request.borrow().clone().unwrap();
         assert!(!captured.schema_block_has_cache_control);
     }
 
     #[test]
     fn cache_ttl_5m_sets_cache_control() {
-        let conn = open();
         let provider = MockProvider::new(r#"{"sql": "", "explanation": ""}"#);
-        let _ = ask_with_provider(&conn, "test", &cfg(), &provider).unwrap();
+        let _ = ask_with_schema_and_provider(FIXTURE_SCHEMA, "test", &cfg(), &provider).unwrap();
         let captured = provider.last_request.borrow().clone().unwrap();
         assert!(captured.schema_block_has_cache_control);
     }
 
     #[test]
     fn user_question_arrives_in_messages_unchanged() {
-        let conn = open();
         let provider = MockProvider::new(r#"{"sql": "", "explanation": ""}"#);
         let q = "Find users with email containing '@example.com'";
-        let _ = ask_with_provider(&conn, q, &cfg(), &provider).unwrap();
+        let _ = ask_with_schema_and_provider(FIXTURE_SCHEMA, q, &cfg(), &provider).unwrap();
         assert_eq!(
             provider
                 .last_request
@@ -498,14 +500,12 @@ mod tests {
 
     #[test]
     fn missing_api_key_errors_clearly() {
-        let conn = open();
-        // Default has api_key: None already; just be explicit for the
-        // reader.
+        // Default has api_key: None already; explicit for the reader.
         let config = AskConfig {
             api_key: None,
             ..AskConfig::default()
         };
-        let err = ask(&conn, "test", &config).unwrap_err();
+        let err = ask_with_schema(FIXTURE_SCHEMA, "test", &config).unwrap_err();
         match err {
             AskError::MissingApiKey => {}
             other => panic!("expected MissingApiKey, got {other:?}"),

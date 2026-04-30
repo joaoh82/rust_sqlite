@@ -8,6 +8,8 @@ use crate::repl::REPLHelper;
 use sqlrite::error::{Result, SQLRiteError};
 use sqlrite::sql::db::database::Database;
 use sqlrite::sql::pager::{open_database, save_database};
+use sqlrite::{ask::ask_with_database, process_command};
+use sqlrite_ask::AskConfig;
 
 #[derive(Debug, PartialEq)]
 pub enum MetaCommand {
@@ -19,6 +21,11 @@ pub enum MetaCommand {
     Save(PathBuf),
     /// `.tables` — list the tables in the current database.
     Tables,
+    /// `.ask <question>` — natural-language → SQL via the
+    /// configured LLM. The rest of the line after `.ask ` becomes
+    /// the question text (verbatim — including punctuation, quotes,
+    /// etc.). See [`handle_ask`] for the confirm-and-run UX.
+    Ask(String),
     /// Parsed line that didn't match any known meta-command.
     Unknown,
 }
@@ -32,6 +39,7 @@ impl fmt::Display for MetaCommand {
             MetaCommand::Open(_) => f.write_str(".open"),
             MetaCommand::Save(_) => f.write_str(".save"),
             MetaCommand::Tables => f.write_str(".tables"),
+            MetaCommand::Ask(_) => f.write_str(".ask"),
             MetaCommand::Unknown => f.write_str("Unknown command"),
         }
     }
@@ -39,7 +47,31 @@ impl fmt::Display for MetaCommand {
 
 impl MetaCommand {
     pub fn new(command: String) -> MetaCommand {
-        let args: Vec<&str> = command.split_whitespace().collect();
+        let trimmed = command.trim_end();
+        // `.ask` is parsed by stripping the prefix and keeping the
+        // rest of the line verbatim — every other meta-command splits
+        // on whitespace, but a natural-language question can contain
+        // arbitrary punctuation, multiple spaces, quoted phrases,
+        // etc., and we don't want to molest any of it.
+        if let Some(rest) = trimmed.strip_prefix(".ask") {
+            // Require at least one whitespace between `.ask` and the
+            // question — `.askfoo` is Unknown, `.ask foo` is the
+            // question "foo".
+            return match rest.chars().next() {
+                Some(c) if c.is_whitespace() => {
+                    let q = rest.trim().to_string();
+                    if q.is_empty() {
+                        MetaCommand::Unknown
+                    } else {
+                        MetaCommand::Ask(q)
+                    }
+                }
+                None => MetaCommand::Unknown, // bare ".ask" with no question
+                Some(_) => MetaCommand::Unknown, // ".askfoo"
+            };
+        }
+
+        let args: Vec<&str> = trimmed.split_whitespace().collect();
         let Some(cmd) = args.first() else {
             return MetaCommand::Unknown;
         };
@@ -73,18 +105,21 @@ pub fn handle_meta_command(
             std::process::exit(0)
         }
         MetaCommand::Help => Ok(format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             "Special commands:\n",
             ".help            - Display this message\n",
             ".open <FILENAME> - Open a SQLRite database file (creates it if missing)\n",
             ".save <FILENAME> - Write the current in-memory database to FILENAME\n",
             ".tables          - List tables in the current database\n",
+            ".ask <QUESTION>  - Generate SQL from a natural-language question (LLM)\n",
             ".exit            - Quit this application\n",
-            "\nOther meta commands (.read, .ast) are not implemented yet."
+            "\nOther meta commands (.read, .ast) are not implemented yet.\n\
+             For .ask, set SQLRITE_LLM_API_KEY in your environment first."
         )),
         MetaCommand::Open(path) => handle_open(&path, db),
         MetaCommand::Save(path) => handle_save(&path, db),
         MetaCommand::Tables => handle_tables(db),
+        MetaCommand::Ask(question) => handle_ask(&question, repl, db),
         MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(
             "Unknown command or invalid arguments. Enter '.help'".to_string(),
         )),
@@ -149,6 +184,80 @@ fn handle_tables(db: &Database) -> Result<String> {
         .join("\n"))
 }
 
+/// Handle `.ask <question>` — confirm-and-run UX:
+///
+/// 1. Build an `AskConfig` from the environment (`SQLRITE_LLM_*` vars).
+/// 2. Call into [`sqlrite::ask::ask_with_database`] — generates SQL.
+/// 3. Print the generated SQL + the model's one-sentence rationale.
+/// 4. Prompt `Run? [Y/n] ` via rustyline. Empty / `y` / `yes` → run,
+///    `n` / `no` → skip. Anything else also skips (paranoid default).
+/// 5. If confirmed, run the SQL through `process_command` (the same
+///    pipeline as a typed-out `SELECT` / `INSERT` / etc.) and return
+///    its result string. If skipped, return a short "skipped" note.
+///
+/// Returns the rendered output string for the outer dispatch loop to
+/// print. The rendered output already includes the SQL preview, the
+/// rationale, and either the query result table or the skip message.
+fn handle_ask(
+    question: &str,
+    repl: &mut Editor<REPLHelper, DefaultHistory>,
+    db: &mut Database,
+) -> Result<String> {
+    // Read env-var config. Surfaces a friendly error if e.g.
+    // SQLRITE_LLM_CACHE_TTL holds an unrecognized value. A missing
+    // SQLRITE_LLM_API_KEY is *not* surfaced here — `from_env` returns
+    // Ok(_) with `api_key: None`, and `ask_with_database` then fails
+    // with `AskError::MissingApiKey` so the user gets a clear
+    // "missing API key (set SQLRITE_LLM_API_KEY)" message instead
+    // of "config error".
+    let cfg: AskConfig =
+        AskConfig::from_env().map_err(|e| SQLRiteError::General(format!("ask: {e}")))?;
+
+    let resp = ask_with_database(db, question, &cfg)
+        .map_err(|e| SQLRiteError::General(format!("ask: {e}")))?;
+
+    if resp.sql.trim().is_empty() {
+        // Model decided the schema can't answer this question — surface
+        // its explanation rather than silently producing nothing.
+        return Ok(format!(
+            "The model declined to generate SQL for that question.\n\
+             Reason: {}",
+            if resp.explanation.is_empty() {
+                "(no explanation provided)"
+            } else {
+                resp.explanation.as_str()
+            }
+        ));
+    }
+
+    println!("Generated SQL:");
+    println!("  {}", resp.sql);
+    if !resp.explanation.is_empty() {
+        println!("Rationale: {}", resp.explanation);
+    }
+
+    // Confirm-and-run prompt. We use the same rustyline editor so
+    // history works across the prompt; `readline` blocks until the
+    // user submits a line. Ctrl-C / EOF map to the same "skip" path
+    // as a `n` answer — refusing on interrupt is the safer default
+    // when running LLM-generated SQL.
+    let answer = match repl.readline("Run? [Y/n] ") {
+        Ok(s) => s.trim().to_lowercase(),
+        Err(_) => return Ok("Skipped (input interrupted).".to_string()),
+    };
+    let confirmed = matches!(answer.as_str(), "" | "y" | "yes");
+    if !confirmed {
+        return Ok("Skipped.".to_string());
+    }
+
+    // Run the generated SQL through the same pipeline as a typed
+    // statement. process_command handles both DDL/DML (returns a
+    // status string like "INSERT Statement executed.") and SELECT
+    // (returns a rendered table). Either is fine to return up to the
+    // outer dispatch loop, which just prints what we hand back.
+    process_command(&resp.sql, db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +317,54 @@ mod tests {
             MetaCommand::new(".save my.sqlrite".to_string()),
             MetaCommand::Save(PathBuf::from("my.sqlrite"))
         );
+    }
+
+    #[test]
+    fn parse_ask_captures_question_verbatim() {
+        // Bare `.ask` is invalid — must have a question.
+        assert_eq!(MetaCommand::new(".ask".to_string()), MetaCommand::Unknown);
+        // `.ask` with empty trailing whitespace is also invalid.
+        assert_eq!(
+            MetaCommand::new(".ask   ".to_string()),
+            MetaCommand::Unknown
+        );
+        // Valid question — captured verbatim, including punctuation.
+        assert_eq!(
+            MetaCommand::new(".ask How many users are over 30?".to_string()),
+            MetaCommand::Ask("How many users are over 30?".to_string())
+        );
+        // Multiple internal spaces are preserved (after the leading
+        // ".ask " strip + trim).
+        assert_eq!(
+            MetaCommand::new(".ask  show me   users".to_string()),
+            MetaCommand::Ask("show me   users".to_string())
+        );
+        // Tab separator works.
+        assert_eq!(
+            MetaCommand::new(".ask\tcount rows".to_string()),
+            MetaCommand::Ask("count rows".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ask_rejects_no_separator() {
+        // `.askfoo` should NOT match `.ask` — it's a typo, not a
+        // question. Without this guard, every `.askXXX` line would be
+        // treated as the question "XXX" with no separator.
+        assert_eq!(
+            MetaCommand::new(".askfoo".to_string()),
+            MetaCommand::Unknown
+        );
+        assert_eq!(
+            MetaCommand::new(".asking".to_string()),
+            MetaCommand::Unknown
+        );
+    }
+
+    #[test]
+    fn ask_meta_command_displays_as_dotask() {
+        let cmd = MetaCommand::Ask("anything".to_string());
+        assert_eq!(format!("{cmd}"), ".ask");
     }
 
     #[test]

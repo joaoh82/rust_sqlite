@@ -47,13 +47,14 @@ name = "sqlrite"
 path = "src/lib.rs"
 
 # Binary target — the interactive REPL. Needs the `cli` feature
-# (default-on) so rustyline/clap/env_logger are pulled in; a
+# (rustyline/clap/env_logger) AND the `ask` feature (sqlrite-ask
+# integration for the `.ask` meta-command). Both are default-on; a
 # `--no-default-features` build (e.g. for WASM or a minimal
 # embedding) skips the bin entirely via `required-features`.
 [[bin]]
 name = "sqlrite"
 path = "src/main.rs"
-required-features = ["cli"]
+required-features = ["cli", "ask"]
 
 # Phase 5a quickstart — the canonical "how do I use this as a library?"
 # walkthrough. Run with `cargo run --example quickstart`. Lives under
@@ -72,8 +73,21 @@ path = "examples/rust/quickstart.rs"
 # `default-features = false` so rustyline, clap, env_logger, and
 # fs2 don't try to compile against wasm32-unknown-unknown (none of
 # them support that target).
-default = ["cli", "file-locks"]
+default = ["cli", "ask", "file-locks"]
 cli = ["dep:rustyline", "dep:rustyline-derive", "dep:env_logger", "dep:clap"]
+# Phase 7g.2: optional engine integration with the `sqlrite-ask`
+# natural-language → SQL crate. Adds `sqlrite::ConnectionAskExt::ask`
+# (and the schema-introspection helper that powers it) when enabled.
+# The core LLM/HTTP machinery still lives in `sqlrite-ask` itself —
+# this feature is just the thin engine-side glue (extension trait +
+# schema dump). Exists as a feature so library-only embedders
+# (Tauri without ask, the WASM SDK, lean SDK builds) don't pay the
+# `sqlrite-ask` weight by default.
+#
+# The CLI binary requires both `cli` and `ask` (see required-features
+# on the `[[bin]]` section) — `.ask` is part of the standard REPL
+# surface as of Phase 7g.2.
+ask = ["dep:sqlrite-ask"]
 file-locks = ["dep:fs2"]
 
 [dependencies]
@@ -104,3 +118,16 @@ clap = { version = "4.6", features = ["cargo"], optional = true }
 # fs2 wraps POSIX flock / Windows LockFileEx — neither exists on
 # wasm32-unknown-unknown.
 fs2 = { version = "0.4", optional = true }
+
+# Phase 7g.2: REPL `.ask` command. Optional + gated under the `cli`
+# feature because library-only embedders shouldn't have to pull in
+# the LLM stack (HTTP / TLS / extra serde derives) just to use the
+# engine. WASM builds skip it via `default-features = false` per
+# Q9's JS-callback shape — they do prompt construction in-page but
+# never make the HTTP call themselves.
+#
+# `version = "0.1"` is required for `cargo publish` — the engine
+# crate publishes to crates.io, and a path-only dep without a
+# version field fails the manifest verification step. See PR #58
+# retrospective in docs/roadmap.md.
+sqlrite-ask = { version = "0.1", path = "sqlrite-ask", optional = true }

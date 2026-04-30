@@ -50,12 +50,21 @@
 #[macro_use]
 extern crate prettytable;
 
+#[cfg(feature = "ask")]
+pub mod ask;
 pub mod connection;
 pub mod error;
 pub mod sql;
 
 // Phase 5a public API.
 pub use connection::{Connection, FromValue, OwnedRow, Row, Rows, Statement};
+
+// Phase 7g.2: re-export the `Connection::ask` extension trait at the
+// crate root when the `ask` feature is on. Lets callers write
+// `use sqlrite::ConnectionAskExt;` rather than `use sqlrite::ask::
+// ConnectionAskExt;`. Only available with the `ask` feature.
+#[cfg(feature = "ask")]
+pub use ask::ConnectionAskExt;
 
 // Underlying types useful to public-API callers (Value for typed
 // comparisons / untyped `row.get::<Value>(0)` access).
