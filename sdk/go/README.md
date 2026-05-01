@@ -123,22 +123,89 @@ fmt.Println(name) // alice
 
 > `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
 
-### Natural-language → SQL (Phase 7g — *coming soon*)
+### Natural-language → SQL (Phase 7g.6)
 
-The Phase 7g.2-7g.8 wave adds `sqlrite.Ask(db, ...)` / `sqlrite.AskRun(db, ...)` that wrap the new [`sqlrite-ask`](https://crates.io/crates/sqlrite-ask) Rust crate through cgo. Today it's available only from Rust; the Go wrapper lands in 7g.6 and will look like:
+`sqlrite.Ask(db, question, *AskConfig)` generates SQL via the configured LLM provider (Anthropic by default). `sqlrite.AskRun(db, question, *AskConfig)` is the convenience that calls `Ask` then immediately executes — returns `*sql.Rows` ready for iteration.
 
 ```go
-// 7g.6 preview — not yet released
-import "github.com/joaoh82/rust_sqlite/sdk/go"
+import (
+    "database/sql"
+    sqlrite "github.com/joaoh82/rust_sqlite/sdk/go"
+)
 
-cfg := sqlrite.AskConfigFromEnv()                // SQLRITE_LLM_API_KEY etc.
-resp, err := sqlrite.Ask(db, "How many users are over 30?", cfg)
-fmt.Println(resp.SQL)         // "SELECT COUNT(*) FROM users WHERE age > 30"
-fmt.Println(resp.Explanation) // "Counts users over the age threshold."
+db, _ := sql.Open("sqlrite", "foo.sqlrite")
+db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)`)
+db.Exec(`INSERT INTO users (name, age) VALUES ('alice', 30)`)
 
-// Convenience:
-rows, _ := sqlrite.AskRun(db, "How many users are over 30?", cfg)
+// Path 1: nil cfg → reads SQLRITE_LLM_API_KEY etc. from env.
+resp, err := sqlrite.Ask(db, "How many users are over 30?", nil)
+fmt.Println(resp.SQL)          // "SELECT COUNT(*) FROM users WHERE age > 30"
+fmt.Println(resp.Explanation)  // "Counts users older than thirty."
+
+// Path 2: explicit per-call config.
+cfg := &sqlrite.AskConfig{
+    APIKey:    "sk-ant-...",
+    Model:     "claude-haiku-4-5",
+    MaxTokens: 512,
+    CacheTTL:  "1h",          // "5m" (default) | "1h" | "off"
+}
+resp, _ := sqlrite.Ask(db, "list users over 30", cfg)
+
+// Caller decides whether to run the SQL — Ask does NOT auto-execute.
+rows, _ := db.Query(resp.SQL)
+defer rows.Close()
+
+// Or one-shot:
+rows, _ := sqlrite.AskRun(db, "list users", nil)
 ```
+
+#### Configuration
+
+Three precedence layers — explicit-wins:
+
+1. **Per-call config**: `sqlrite.Ask(db, "...", &sqlrite.AskConfig{APIKey: "..."})`
+2. **Environment vars**: `SQLRITE_LLM_PROVIDER` / `_API_KEY` / `_MODEL` / `_MAX_TOKENS` / `_CACHE_TTL` — picked up automatically when cfg is nil
+3. **Built-in defaults**: `anthropic` / `claude-sonnet-4-6` / `1024` / `5m`
+
+The config flows across cgo as a JSON string (`"api_key"`, `"model"`, etc. — snake_case, matching the FFI ABI). Adding fields later is non-breaking; older bindings ignore unknown JSON keys.
+
+#### Context-aware variants
+
+```go
+// Pass a context for connection-pool acquisition. The HTTP call to
+// the LLM is currently uncancellable (the FFI doesn't expose a
+// cancel hook yet); the ctx flows to db.Conn(ctx) and to the
+// db.QueryContext call inside AskRunContext.
+resp, err := sqlrite.AskContext(ctx, db, "list users", cfg)
+rows, err := sqlrite.AskRunContext(ctx, db, "list users", cfg)
+```
+
+#### Defaults
+
+`Provider="anthropic"`, `Model="claude-sonnet-4-6"`, `MaxTokens=1024`, `CacheTTL="5m"`. The schema dump goes inside an Anthropic prompt-cache breakpoint — repeat asks against the same DB hit the cache (verify via `resp.Usage.CacheReadInputTokens`).
+
+#### Errors
+
+Missing API key → `error` with message `"sqlrite: ask: missing API key (set SQLRITE_LLM_API_KEY ...)"`. API errors (4xx/5xx) include the status code + Anthropic's structured error type+message. `AskRun()` on an empty SQL response (model declined) returns an error rather than executing the empty string.
+
+#### What `AskResponse` carries
+
+```go
+type AskResponse struct {
+    SQL         string
+    Explanation string
+    Usage       AskUsage
+}
+
+type AskUsage struct {
+    InputTokens              uint64
+    OutputTokens             uint64
+    CacheCreationInputTokens uint64
+    CacheReadInputTokens     uint64
+}
+```
+
+`AskConfig.String()` deliberately omits the API key value — `fmt.Println(cfg)` shows `apiKey=<set>` or `apiKey=<unset>` without leaking the secret. There's no separate `cfg.HasAPIKey()` method because Go's zero-value semantics make `cfg.APIKey != ""` the idiomatic check.
 
 ## API surface
 
