@@ -32,7 +32,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test test/test.mjs"
+    "test": "node --test test/test.mjs test/test_ask.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4"

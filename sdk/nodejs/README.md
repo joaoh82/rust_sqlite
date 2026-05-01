@@ -110,23 +110,88 @@ const row = db
 
 > `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
 
-### Natural-language → SQL (Phase 7g — *coming soon*)
+### Natural-language → SQL (Phase 7g.5)
 
-The Phase 7g.2-7g.8 wave adds `db.ask()` / `db.askRun()` wrappers around the new [`sqlrite-ask`](https://crates.io/crates/sqlrite-ask) Rust crate via napi-rs. Today it's available only from Rust; the Node wrapper lands in 7g.5 and will look like:
+`db.ask(question)` generates SQL from a natural-language question via the configured LLM provider (Anthropic by default). `db.askRun(question)` is the convenience that calls `ask()` then immediately executes the generated SQL — returns rows directly.
 
 ```js
-// 7g.5 preview — not yet released
+import { Database } from '@joaoh82/sqlrite';
+
+const db = new Database('foo.sqlrite');
+db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+db.exec("INSERT INTO users (name, age) VALUES ('alice', 30)");
+
+// Reads SQLRITE_LLM_API_KEY from the environment.
+const resp = db.ask('How many users are over 30?');
+console.log(resp.sql);            // "SELECT COUNT(*) FROM users WHERE age > 30"
+console.log(resp.explanation);    // "Counts users over the age threshold."
+
+// Caller decides whether to run the SQL — ask() does NOT auto-execute.
+const rows = db.prepare(resp.sql).all();
+console.log(rows);
+
+// Or one-shot:
+const rows2 = db.askRun('list all users');
+```
+
+#### Configuration
+
+Three precedence layers — explicit-wins:
+
+1. **Per-call config**: `db.ask('...', new AskConfig({ apiKey: '...' }))`
+2. **Per-connection config**: `db.setAskConfig(cfg)` — applies to all subsequent `ask()` / `askRun()` calls on this database
+3. **Environment vars** (zero-config fallback): `SQLRITE_LLM_PROVIDER` / `_API_KEY` / `_MODEL` / `_MAX_TOKENS` / `_CACHE_TTL`
+
+```js
 import { Database, AskConfig } from '@joaoh82/sqlrite';
 
-const db   = new Database('foo.sqlrite');
-const cfg  = AskConfig.fromEnv();              // SQLRITE_LLM_API_KEY etc.
-const resp = db.ask('How many users are over 30?', cfg);
-console.log(resp.sql);          // "SELECT COUNT(*) FROM users WHERE age > 30"
-console.log(resp.explanation);  // "Counts users over the age threshold."
+// Path 1: env (zero config) — same env vars as REPL/Desktop/Python SDK
+const resp = db.ask('how many users?');
 
-// Convenience:
-const rows = db.askRun('How many users are over 30?', cfg).all();
+// Path 2: explicit per-call (highest precedence)
+const cfg = new AskConfig({
+  apiKey: 'sk-ant-...',
+  model: 'claude-haiku-4-5',
+  maxTokens: 512,
+  cacheTtl: '1h',          // "5m" (default) | "1h" | "off"
+});
+const resp = db.ask('how many users?', cfg);
+
+// Path 3: per-connection (set once, reuse)
+db.setAskConfig(cfg);
+const resp1 = db.ask('how many users?');
+const resp2 = db.ask('count by age');
+
+// Or build from env explicitly:
+const cfg = AskConfig.fromEnv();
 ```
+
+#### Defaults
+
+`provider="anthropic"`, `model="claude-sonnet-4-6"`, `maxTokens=1024`, `cacheTtl="5m"`. The schema dump goes inside an Anthropic prompt-cache breakpoint — repeat asks against the same DB hit the cache (verify via `resp.usage.cacheReadInputTokens`).
+
+#### Errors
+
+Missing API key throws `Error("missing API key (set SQLRITE_LLM_API_KEY ...)")`. API errors (4xx/5xx) bubble up as `Error` with the status code + Anthropic's structured error message. `askRun()` on an empty SQL response (model declined) throws with the model's explanation rather than executing the empty string.
+
+#### What `AskResponse` carries
+
+```ts
+interface AskResponse {
+  sql: string;              // generated SQL, or '' if model declined
+  explanation: string;      // one-sentence rationale (may be empty)
+  usage: AskUsage;
+}
+
+interface AskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+}
+```
+
+`AskConfig.toString()` deliberately omits the API key value — printing config in `console.log` won't leak the secret. Shows `apiKey=<set>` or `apiKey=null`.
 
 ## API surface
 
