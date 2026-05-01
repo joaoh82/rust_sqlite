@@ -1,6 +1,6 @@
 [package]
 name = "sqlrite-nodejs"
-version = "0.1.20"
+version = "0.1.21"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
