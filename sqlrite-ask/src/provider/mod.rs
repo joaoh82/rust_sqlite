@@ -14,6 +14,12 @@
 use crate::AskError;
 use crate::prompt::{SystemBlock, UserMessage};
 
+// Anthropic adapter is HTTP-based (sync ureq POST). The `http`
+// feature gates the whole module so wasm32 builds — which can't
+// link ureq + rustls — skip it cleanly. The WASM SDK uses Q9's
+// JS-callback shape (caller does the HTTP from JS) and never
+// instantiates this provider.
+#[cfg(feature = "http")]
 pub mod anthropic;
 
 #[cfg(test)]

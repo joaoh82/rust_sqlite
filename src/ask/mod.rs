@@ -38,19 +38,28 @@
 //!   for callers who don't want to bring the trait into scope, or
 //!   who hold a `&Database` directly (the REPL binary does this).
 
+// Schema dump is always available (no sqlrite-ask dep). The
+// `ConnectionAskExt` trait + free helper functions below are gated
+// under the engine's `ask` feature because they pull in `sqlrite-ask`
+// (HTTP transport).
+pub mod schema;
+
+#[cfg(feature = "ask")]
 use sqlrite_ask::{ask_with_schema, ask_with_schema_and_provider};
 
+#[cfg(feature = "ask")]
 use crate::Connection;
+#[cfg(feature = "ask")]
 use crate::sql::db::database::Database;
-
-pub mod schema;
 
 // Re-export the public surface from sqlrite-ask. Lets callers reach
 // these without listing `sqlrite-ask` as a direct dep — convenient
 // for the Tauri desktop app, the SDK adapters, and any Rust embedder
 // who already pulls the engine in. They can keep saying
 // `use sqlrite::ask::AskConfig` instead of dragging the second crate
-// in just for one type.
+// in just for one type. Gated under `ask` because that's the feature
+// that pulls `sqlrite-ask` into the dep graph in the first place.
+#[cfg(feature = "ask")]
 pub use sqlrite_ask::{
     AnthropicProvider, AskConfig, AskError, AskResponse, CacheTtl, Provider, ProviderKind, Request,
     Response, Usage,
@@ -60,6 +69,10 @@ pub use sqlrite_ask::{
 /// [`crate::Connection`]. Bring it into scope with
 /// `use sqlrite::ConnectionAskExt;` (the engine re-exports it at
 /// the crate root).
+///
+/// Gated under the `ask` feature — pulls in `sqlrite-ask` and its
+/// HTTP transport. WASM and other lean builds skip this entirely.
+#[cfg(feature = "ask")]
 pub trait ConnectionAskExt {
     /// Generate SQL from a natural-language question.
     ///
@@ -80,6 +93,7 @@ pub trait ConnectionAskExt {
     fn ask(&self, question: &str, config: &AskConfig) -> Result<AskResponse, AskError>;
 }
 
+#[cfg(feature = "ask")]
 impl ConnectionAskExt for Connection {
     fn ask(&self, question: &str, config: &AskConfig) -> Result<AskResponse, AskError> {
         ask(self, question, config)
@@ -88,6 +102,7 @@ impl ConnectionAskExt for Connection {
 
 /// Free-function form of [`ConnectionAskExt::ask`]. Equivalent —
 /// pick whichever shape reads better at the call site.
+#[cfg(feature = "ask")]
 pub fn ask(conn: &Connection, question: &str, config: &AskConfig) -> Result<AskResponse, AskError> {
     ask_with_database(conn.database(), question, config)
 }
@@ -96,6 +111,7 @@ pub fn ask(conn: &Connection, question: &str, config: &AskConfig) -> Result<AskR
 ///
 /// Used by the REPL binary's `.ask` meta-command, which holds a
 /// `&mut Database` rather than a `&Connection`.
+#[cfg(feature = "ask")]
 pub fn ask_with_database(
     db: &Database,
     question: &str,
@@ -108,6 +124,7 @@ pub fn ask_with_database(
 /// Lower-level entry — same flow as [`ask`] but you supply the
 /// provider. For test harnesses + advanced callers driving custom
 /// backends.
+#[cfg(feature = "ask")]
 pub fn ask_with_provider<P: Provider>(
     conn: &Connection,
     question: &str,
@@ -119,6 +136,7 @@ pub fn ask_with_provider<P: Provider>(
 
 /// Lower-level entry taking `&Database` and a provider. Canonical
 /// inner function — the others reduce to this one.
+#[cfg(feature = "ask")]
 pub fn ask_with_database_and_provider<P: Provider>(
     db: &Database,
     question: &str,

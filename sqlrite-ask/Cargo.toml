@@ -48,12 +48,33 @@ serde_json = "1"
 # exactly one POST to api.anthropic.com, so the sync surface is a
 # perfect fit. Rolling our own JSON types over ureq is ~120 LOC
 # vs. ~400 LOC + tokio + reqwest::blocking via an SDK.
-ureq = { version = "2", features = ["json", "tls"] }
+#
+# **Optional behind the `http` feature** (default-on) as of Phase
+# 7g.7. The WASM SDK pulls this crate in with `default-features =
+# false` to use just the prompt construction + response parsing —
+# ureq's sync HTTP + rustls don't compile to wasm32. WASM ships its
+# own `db.askPrompt()` / `db.askParse()` shape per Q9, where the
+# browser hands the prompt to the caller's JS HTTP function and
+# parses the result back through this crate.
+ureq = { version = "2", features = ["json", "tls"], optional = true }
 
 # Typed errors. (Same crate the engine uses, so consumers that
 # enable the engine's `ask` feature can layer their own thiserror
 # wrapper without version skew.)
 thiserror = "2"
+
+[features]
+# Default is full HTTP-capable build — the engine's `ask` feature
+# (and the Python / Node / Go SDKs) all go through `ask_with_schema`,
+# which calls into the AnthropicProvider. Disabling `http` keeps
+# only the wasm-safe parts: prompt construction (`build_system`,
+# system rules), response parsing (`parse_response`), config types
+# (`AskConfig`, `AskResponse`, `AskUsage`, `AskError`), and the
+# generic `ask_with_schema_and_provider<P>` entry that takes a
+# caller-supplied provider. The WASM SDK is the only consumer that
+# turns this off today.
+default = ["http"]
+http = ["dep:ureq"]
 
 [dev-dependencies]
 # Throwaway tiny localhost HTTP server for the integration test

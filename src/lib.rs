@@ -50,7 +50,14 @@
 #[macro_use]
 extern crate prettytable;
 
-#[cfg(feature = "ask")]
+// `sqlrite::ask` is always available — its `schema` submodule (the
+// CREATE TABLE dump used to ground the LLM's prompt) is pure-engine
+// and useful even for builds that don't enable the `ask` feature.
+// The `ConnectionAskExt` trait + `ask` / `ask_with_database`
+// helpers inside the module are gated under the feature, since
+// they pull in `sqlrite-ask`. The WASM SDK uses
+// `sqlrite::ask::schema::dump_schema_for_database` to introspect a
+// browser-side `Connection` without needing the HTTP transport.
 pub mod ask;
 pub mod connection;
 pub mod error;
