@@ -1,6 +1,6 @@
 {
   "name": "@joaoh82/sqlrite",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Node.js bindings for SQLRite — a small, embeddable SQLite clone written in Rust.",
   "main": "index.js",
   "types": "index.d.ts",
