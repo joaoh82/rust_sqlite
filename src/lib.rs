@@ -59,10 +59,12 @@ pub mod sql;
 // Phase 5a public API.
 pub use connection::{Connection, FromValue, OwnedRow, Row, Rows, Statement};
 
-// Phase 7g.2: re-export the `Connection::ask` extension trait at the
-// crate root when the `ask` feature is on. Lets callers write
-// `use sqlrite::ConnectionAskExt;` rather than `use sqlrite::ask::
-// ConnectionAskExt;`. Only available with the `ask` feature.
+// Phase 7g.2: re-export the `Connection::ask` extension trait + the
+// public `sqlrite_ask` types at the crate root when the `ask`
+// feature is on. Lets callers write `use sqlrite::{Connection,
+// ConnectionAskExt, ask::AskConfig};` rather than dragging in
+// `sqlrite-ask` as a separate dep just to reach `AskConfig`. Only
+// available with the `ask` feature.
 #[cfg(feature = "ask")]
 pub use ask::ConnectionAskExt;
 

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
+use sqlrite::ask::{AskConfig, ask_with_database};
 use sqlrite::sql::db::table::Value;
 use sqlrite::{Database, SQLRiteError, process_command};
 use tauri::{Manager, State};
@@ -45,6 +46,15 @@ struct ColumnInfo {
 struct TableInfo {
     name: String,
     columns: Vec<ColumnInfo>,
+}
+
+/// Phase 7g.3 — the response shape `ask_sql` ships back to the
+/// webview. Keep this minimal — `usage` is intentionally not
+/// serialized for now (no UI for it yet).
+#[derive(Serialize)]
+struct AskCommandResult {
+    sql: String,
+    explanation: String,
 }
 
 #[derive(Serialize)]
@@ -159,6 +169,47 @@ fn table_rows(
         })
         .collect();
     Ok(CommandResult::Rows { columns, rows })
+}
+
+/// Phase 7g.3 — natural-language → SQL via the configured LLM.
+///
+/// Flow:
+/// 1. Lock the `Database` (so the schema dump is consistent with what
+///    the user would see if they ran `.tables`).
+/// 2. Read `AskConfig` from the process's environment
+///    (`SQLRITE_LLM_API_KEY` etc.). Tauri inherits the parent shell's
+///    env when launched via `npm run tauri dev` / when launched from
+///    a terminal in production. If the var isn't set, the call fails
+///    with a clear "missing API key" message that the frontend surfaces
+///    in the existing error slot.
+/// 3. Call into `sqlrite::ask::ask_with_database` — schema dump +
+///    cache-friendly prompt + sync HTTP POST happens in the Rust
+///    backend. **The API key never crosses into the webview.** That's
+///    the security story (matches Q9's reasoning for WASM, applied
+///    here too — Tauri makes it natural).
+/// 4. Return `{ sql, explanation }`. The frontend does NOT auto-execute;
+///    it pastes the SQL into the editor and lets the user review +
+///    click Run.
+///
+/// ## What we don't do
+///
+/// - **Don't propagate token usage to the UI yet.** The `Usage` struct
+///   is in the response but the desktop UI doesn't render it. A future
+///   "show me the cost of this call" panel could pick it up; for now
+///   the same `cargo log` route works for debugging.
+/// - **Don't stream.** sqlrite-ask is one-shot per call; the UX is
+///   "spinner while running, paste result on completion". Streaming
+///   would mostly help long-form prose generation, not the short SQL
+///   strings ask() produces.
+#[tauri::command]
+fn ask_sql(question: String, state: State<'_, AppState>) -> Result<AskCommandResult, String> {
+    let cfg = AskConfig::from_env().map_err(|e| format!("ask config error: {e}"))?;
+    let locked = state.db.lock().map_err(engine_err)?;
+    let resp = ask_with_database(&*locked, &question, &cfg).map_err(engine_err)?;
+    Ok(AskCommandResult {
+        sql: resp.sql,
+        explanation: resp.explanation,
+    })
 }
 
 #[tauri::command]
@@ -303,7 +354,8 @@ fn main() {
             save_database_as,
             list_tables,
             table_rows,
-            execute_sql
+            execute_sql,
+            ask_sql,
         ])
         .run(tauri::generate_context!())
         .expect("error while running sqlrite-desktop");

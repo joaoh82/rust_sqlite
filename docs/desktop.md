@@ -125,6 +125,7 @@ The `Mutex` isn't a concurrency optimization — it's a correctness requirement.
 | `list_tables()` | Sidebar data — one entry per user table with column metadata. |
 | `table_rows(name, limit)` | Seed the result grid with up to `limit` rows from `name`. |
 | `execute_sql(sql)` | Run one SQL statement through `process_command`. Returns structured rows for SELECTs, a status string for everything else. |
+| `ask_sql(question)` | **Phase 7g.3** — Natural-language → SQL via the configured LLM (Anthropic by default). Reads `AskConfig::from_env()` and calls `sqlrite::ask::ask_with_database` against the locked engine `Database`. Schema introspection + LLM HTTP call run in the Tauri Rust backend so **the API key never crosses into the webview** — same security story as Q9's WASM JS-callback shape, applied here as a natural side effect of how Tauri's command bridge works. Returns `{ sql, explanation }`; the frontend pastes `sql` into the editor for the user to review + run. Requires `SQLRITE_LLM_API_KEY` in the process environment (Tauri inherits the parent shell's env). |
 
 ### Command / response types
 
@@ -162,6 +163,7 @@ One Svelte component — [`App.svelte`](../desktop/src/App.svelte) — renders t
   - **Line numbers**: rendered in a gutter on the left of the textarea; derived from the text content (`sql.split("\n").length`) and kept scroll-synced with the textarea via an `onscroll` handler. Font size and line height are locked between the gutter and the textarea so every line number aligns with its row.
   - **Cmd/Ctrl + Enter** — run the query. If the textarea has a non-empty selection, only the selected substring runs; otherwise the full editor contents run. Matches DataGrip / DBeaver / pgAdmin behavior. The Run button label flips to **Run selection** and the shortcut hint shows "selection only" when a selection is active so the state is visible without clicking.
   - **Cmd/Ctrl + /** — toggle SQL line comment (`-- `) on the current line or on every line of the selection. Matches VS Code / Sublime / IntelliJ convention.
+  - **Ask…** *(Phase 7g.3)* — opens a slide-in composer panel above the editor. Type a natural-language question, hit Cmd/Ctrl+Enter (or click "Generate SQL"), and the [`ask_sql`](#commands) Tauri command returns generated SQL + a one-sentence rationale. The SQL replaces the editor textarea; the rationale shows in the panel. **Generated SQL is not auto-executed** — the user reviews and clicks Run themselves. An empty SQL response (model declined the question against this schema) surfaces the model's explanation in the same slot. Esc closes the composer. Requires `SQLRITE_LLM_API_KEY` set in the environment Tauri was launched from; absence surfaces a clean "missing API key" error in the existing error slot.
 
 The textarea starts with a short comment-only placeholder so clicking Run before typing any SQL doesn't error.
 

@@ -267,6 +267,102 @@ button:disabled {
   user-select: none;
 }
 
+/* Phase 7g.3 — `Ask…` button distinguishes itself with a subtle
+ * accent so users notice the new feature without it shouting. The
+ * normal `Run` button keeps its existing primary styling. */
+.ask-button {
+  margin-right: 8px;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.ask-button:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: var(--accent);
+}
+
+/* The Ask composer slides in above the editor surface. Visually it
+ * shares the editor's panel background but is set off by a bottom
+ * border so users can see where it ends and the editor begins. */
+.ask-panel {
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ask-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ask-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.ask-hint {
+  flex: 1;
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  user-select: none;
+}
+
+/* Subtle close button — visually a hairline so it doesn't compete
+ * with the Generate button below. */
+.ask-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+}
+.ask-close:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.ask-panel textarea {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 48px;
+  outline: none;
+}
+.ask-panel textarea:focus {
+  border-color: var(--accent);
+}
+
+.ask-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ask-explanation {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg);
+}
+.ask-explanation.muted {
+  color: var(--fg-muted);
+}
+
 .output {
   flex: 1;
   min-height: 0;
