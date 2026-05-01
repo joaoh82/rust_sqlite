@@ -102,23 +102,81 @@ print(cur.fetchall())  # [('alice', 'integer')]
 
 > `json_object_keys` returns a JSON-array text rather than a table-valued result (set-returning functions aren't supported yet).
 
-### Natural-language → SQL (Phase 7g — *coming soon*)
+### Natural-language → SQL (Phase 7g.4)
 
-The Phase 7g.2-7g.8 wave adds a Python-native `conn.ask()` that wraps the new `sqlrite-ask` Rust crate via PyO3. Today it's available only from Rust ([`sqlrite-ask` on crates.io](https://crates.io/crates/sqlrite-ask)); the Python wrapper lands in 7g.4 and will look like:
+`Connection.ask(question)` generates SQL from a natural-language question via the configured LLM provider (Anthropic by default). `Connection.ask_run(question)` is the convenience that calls `ask()` then immediately executes the generated SQL.
 
 ```python
-# 7g.4 preview — not yet released
 import sqlrite
 
 conn = sqlrite.connect("foo.sqlrite")
-cfg  = sqlrite.AskConfig.from_env()           # SQLRITE_LLM_API_KEY etc.
-resp = conn.ask("How many users are over 30?", cfg)
-print(resp.sql)          # "SELECT COUNT(*) FROM users WHERE age > 30"
-print(resp.explanation)  # "Counts users over the age threshold."
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+conn.execute("INSERT INTO users (name, age) VALUES ('alice', 30)")
 
-# Convenience:
-rows = conn.ask_run("How many users are over 30?", cfg).fetchall()
+# Reads SQLRITE_LLM_API_KEY from the environment.
+resp = conn.ask("How many users are over 30?")
+print(resp.sql)            # "SELECT COUNT(*) FROM users WHERE age > 30"
+print(resp.explanation)    # "Counts users over the age threshold."
+
+# Caller decides whether to run the SQL — ask() does NOT auto-execute.
+cur = conn.cursor()
+cur.execute(resp.sql)
+print(cur.fetchall())      # [(1,)]
+
+# Or one-shot:
+rows = conn.ask_run("How many users are over 30?").fetchall()
 ```
+
+#### Configuration
+
+Three precedence layers — explicit-wins:
+
+1. **Per-call config**: `conn.ask("...", sqlrite.AskConfig(api_key="..."))`
+2. **Per-connection config**: `conn.set_ask_config(cfg)` — applies to all subsequent `ask()` / `ask_run()` calls on this connection
+3. **Environment vars** (zero-config fallback): `SQLRITE_LLM_PROVIDER` / `_API_KEY` / `_MODEL` / `_MAX_TOKENS` / `_CACHE_TTL`
+
+```python
+# Path 1: env (zero config) — same env vars as REPL/Desktop
+resp = conn.ask("how many users?")
+
+# Path 2: explicit per-call (highest precedence)
+cfg = sqlrite.AskConfig(
+    api_key="sk-ant-...",
+    model="claude-haiku-4-5",
+    max_tokens=512,
+    cache_ttl="1h",        # "5m" (default) | "1h" | "off"
+)
+resp = conn.ask("how many users?", cfg)
+
+# Path 3: per-connection (set once, reuse)
+conn.set_ask_config(cfg)
+resp = conn.ask("how many users?")     # uses cfg
+resp = conn.ask("count by age")        # uses cfg
+
+# Or build from env explicitly:
+cfg = sqlrite.AskConfig.from_env()
+```
+
+#### Defaults
+
+`provider="anthropic"`, `model="claude-sonnet-4-6"`, `max_tokens=1024`, `cache_ttl="5m"`. The schema dump goes inside an Anthropic prompt-cache breakpoint — repeat asks against the same DB hit the cache (verify via `resp.usage.cache_read_input_tokens`).
+
+#### Errors
+
+Missing API key → `sqlrite.SQLRiteError("missing API key (set SQLRITE_LLM_API_KEY ...)")`. API errors (4xx/5xx) bubble up as `SQLRiteError` with the status code + Anthropic's structured error message. `ask_run()` on an empty SQL response (model declined to generate) raises with the model's explanation rather than executing the empty string.
+
+#### What `AskResponse` carries
+
+```python
+resp.sql              # str — generated SQL, ready to execute (or '' if model declined)
+resp.explanation      # str — one-sentence rationale (may be empty)
+resp.usage.input_tokens
+resp.usage.output_tokens
+resp.usage.cache_creation_input_tokens
+resp.usage.cache_read_input_tokens
+```
+
+`AskConfig.__repr__` and `AskResponse.__repr__` deliberately don't include the API key — printing config in logs won't leak it.
 
 ## API surface
 
