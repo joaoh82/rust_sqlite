@@ -49,6 +49,10 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
+use sqlrite::ask::{
+    AskConfig as RustAskConfig, AskResponse as RustAskResponse, CacheTtl, ProviderKind, Usage,
+    ask_with_database,
+};
 use sqlrite::{Connection as RustConnection, OwnedRow, Rows, Value};
 
 // ---------------------------------------------------------------------------
@@ -91,6 +95,7 @@ fn connect(database: &str) -> PyResult<Connection> {
     };
     Ok(Connection {
         inner: Some(Mutex::new(rust_conn)),
+        ask_config: None,
     })
 }
 
@@ -102,6 +107,7 @@ fn connect_read_only(database: &str) -> PyResult<Connection> {
     let rust_conn = RustConnection::open_read_only(PathBuf::from(database)).map_err(map_err)?;
     Ok(Connection {
         inner: Some(Mutex::new(rust_conn)),
+        ask_config: None,
     })
 }
 
@@ -112,6 +118,12 @@ struct Connection {
     // connection (and release the OS-level file lock) without
     // waiting for GC. Operations on a closed connection raise.
     inner: Option<Mutex<RustConnection>>,
+    // Phase 7g.4 — per-connection ask() config. Set via
+    // `set_ask_config()` or passed per-call to `ask()` / `ask_run()`.
+    // When None, `ask()` falls back to `AskConfig::from_env()` so
+    // env-only consumers get the zero-config experience matching the
+    // REPL and Desktop surfaces.
+    ask_config: Option<RustAskConfig>,
 }
 
 impl Connection {
@@ -240,6 +252,382 @@ impl Connection {
             .lock()
             .map_err(|_| SQLRiteError::new_err("connection mutex poisoned"))?;
         Ok(locked.is_read_only())
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7g.4 — natural-language → SQL.
+    //
+    // Three entry points:
+    //   * `set_ask_config(...)` stores a config on the connection so
+    //     subsequent `ask()` calls reuse it without reconfiguring.
+    //   * `ask(question, config=None)` generates SQL — does NOT execute.
+    //     Returns an `AskResponse` with `.sql` / `.explanation` / `.usage`.
+    //   * `ask_run(question, config=None)` is the convenience that
+    //     calls `ask()` then `execute()` on the generated SQL,
+    //     returning a `Cursor` you can `.fetchall()` from.
+    //
+    // Config resolution (when `config` arg is None):
+    //   1. The per-connection `ask_config` if set via set_ask_config()
+    //   2. AskConfig::from_env() — reads SQLRITE_LLM_API_KEY etc.
+    //   3. Built-in defaults (Sonnet 4.6, max_tokens 1024, 5-min cache TTL)
+    //
+    // The schema dump + LLM HTTP call run entirely on the Rust side
+    // (no GIL re-acquisition for the duration of the network round-
+    // trip). API key is read from the AskConfig — never logged, never
+    // serialized into AskResponse, never crosses the FFI boundary
+    // back to Python (we only return sql/explanation/usage).
+
+    /// Stash an `AskConfig` on the connection. Subsequent `ask()` and
+    /// `ask_run()` calls without an explicit config use this. Pass
+    /// `None` to clear and fall back to env/defaults.
+    #[pyo3(signature = (config))]
+    fn set_ask_config(&mut self, config: Option<&AskConfig>) {
+        self.ask_config = config.map(|c| c.inner.clone());
+    }
+
+    /// Generate SQL from a natural-language question. Does **not**
+    /// execute — call `cur.execute(resp.sql)` (or `ask_run()` for
+    /// one-shot). Returns an `AskResponse` with `.sql`,
+    /// `.explanation`, and `.usage`.
+    ///
+    /// **GIL handling.** Releases the GIL for the duration of the
+    /// HTTP call. Without this, a Python-side HTTP mock server (or
+    /// any other thread) can't run concurrently with `ask()` — they'd
+    /// sit blocked waiting for the GIL while ureq waited for them
+    /// to respond. Same threading rule as the rest of PyO3 land:
+    /// hold the GIL only for Python-data work, release it for I/O.
+    #[pyo3(signature = (question, config=None))]
+    fn ask(
+        &mut self,
+        py: Python<'_>,
+        question: &str,
+        config: Option<&AskConfig>,
+    ) -> PyResult<AskResponse> {
+        let resolved = self.resolve_ask_config(config)?;
+        // Borrow the engine connection for schema dump + LLM call.
+        // `ask_with_database` takes &Database (read-only), so we
+        // hold the lock for the duration of one call.
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| SQLRiteError::new_err("cannot ask: connection is closed"))?;
+        // We can't take the mutex inside py.allow_threads (the
+        // borrow on `self` needs the GIL released semantics it
+        // doesn't have access to), so we lock first, then release
+        // the GIL across the network call. The lock guard lives
+        // through the allow_threads block — that's fine, it's a
+        // pure-Rust mutex with no Python state.
+        let locked = inner
+            .lock()
+            .map_err(|_| SQLRiteError::new_err("connection mutex poisoned"))?;
+        let resp = py
+            .allow_threads(|| ask_with_database(locked.database(), question, &resolved))
+            .map_err(map_err)?;
+        Ok(AskResponse::from_rust(resp))
+    }
+
+    /// Generate SQL **and execute it**. Returns a `Cursor` with the
+    /// results — call `.fetchall()` / `.fetchone()` / iterate. Errors
+    /// the same way `ask()` does on generation failure, and the same
+    /// way `cursor.execute()` does on bad-SQL execution failure (the
+    /// model produced something the engine can't run).
+    ///
+    /// Convenience for one-shot scripts and notebooks. For interactive
+    /// REPL-style use, prefer `ask()` + manual review (the model can
+    /// be wrong; auto-execute hides that).
+    #[pyo3(signature = (question, config=None))]
+    fn ask_run(
+        slf: Py<Self>,
+        py: Python<'_>,
+        question: &str,
+        config: Option<&AskConfig>,
+    ) -> PyResult<Cursor> {
+        let resp = {
+            let mut conn = slf.borrow_mut(py);
+            conn.ask(py, question, config)?
+        };
+        if resp.sql.trim().is_empty() {
+            return Err(SQLRiteError::new_err(format!(
+                "model declined to generate SQL: {}",
+                if resp.explanation.is_empty() {
+                    "(no explanation)"
+                } else {
+                    resp.explanation.as_str()
+                }
+            )));
+        }
+        Self::execute(slf, py, &resp.sql, None)
+    }
+}
+
+impl Connection {
+    /// Resolve the effective AskConfig for an `ask()` / `ask_run()`
+    /// call: per-call config wins, then per-connection, then env, then
+    /// defaults. See the comment block above the methods for the
+    /// rationale.
+    fn resolve_ask_config(&self, per_call: Option<&AskConfig>) -> PyResult<RustAskConfig> {
+        if let Some(cfg) = per_call {
+            return Ok(cfg.inner.clone());
+        }
+        if let Some(cfg) = &self.ask_config {
+            return Ok(cfg.clone());
+        }
+        RustAskConfig::from_env().map_err(map_err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AskConfig (Phase 7g.4)
+//
+// Mirrors the Rust AskConfig but with Python-friendly attribute
+// access. Constructed via `AskConfig(api_key=..., model=...)` or
+// `AskConfig.from_env()`. Stored on the connection via
+// `conn.set_ask_config(cfg)` or passed per-call to `conn.ask(q, cfg)`.
+
+/// LLM call configuration for `Connection.ask()` and `ask_run()`.
+///
+/// Construct from kwargs:
+///
+///     cfg = sqlrite.AskConfig(
+///         api_key="sk-ant-...",
+///         model="claude-sonnet-4-6",
+///         max_tokens=1024,
+///         cache_ttl="5m",
+///     )
+///
+/// Or from environment vars (`SQLRITE_LLM_API_KEY` etc.):
+///
+///     cfg = sqlrite.AskConfig.from_env()
+///
+/// Stored on the connection so subsequent `ask()` calls reuse it:
+///
+///     conn.set_ask_config(cfg)
+///     resp = conn.ask("How many users?")          # uses cfg
+///
+/// Or passed per-call (overrides any per-connection config):
+///
+///     resp = conn.ask("How many users?", cfg)
+#[pyclass]
+#[derive(Clone)]
+struct AskConfig {
+    inner: RustAskConfig,
+}
+
+#[pymethods]
+impl AskConfig {
+    /// Construct from kwargs. Any kwarg left unset uses the same
+    /// default the Rust side does (provider=anthropic, model=
+    /// `claude-sonnet-4-6`, max_tokens=1024, cache_ttl="5m").
+    ///
+    /// `provider`: `"anthropic"` (only currently supported).
+    /// `cache_ttl`: `"5m"` (default), `"1h"`, or `"off"`.
+    /// `base_url`: override the API base URL — production callers
+    ///   leave this None; tests point it at a localhost mock.
+    #[new]
+    #[pyo3(signature = (
+        provider="anthropic",
+        api_key=None,
+        model=None,
+        max_tokens=None,
+        cache_ttl=None,
+        base_url=None,
+    ))]
+    fn new(
+        provider: &str,
+        api_key: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        cache_ttl: Option<&str>,
+        base_url: Option<String>,
+    ) -> PyResult<Self> {
+        let mut inner = RustAskConfig::default();
+        inner.provider = match provider.to_ascii_lowercase().as_str() {
+            "anthropic" => ProviderKind::Anthropic,
+            other => {
+                return Err(SQLRiteError::new_err(format!(
+                    "unknown provider: {other} (supported: anthropic)"
+                )));
+            }
+        };
+        if let Some(k) = api_key {
+            if !k.is_empty() {
+                inner.api_key = Some(k);
+            }
+        }
+        if let Some(m) = model {
+            if !m.is_empty() {
+                inner.model = m;
+            }
+        }
+        if let Some(t) = max_tokens {
+            inner.max_tokens = t;
+        }
+        if let Some(c) = cache_ttl {
+            inner.cache_ttl = match c.to_ascii_lowercase().as_str() {
+                "5m" | "5min" | "5minutes" => CacheTtl::FiveMinutes,
+                "1h" | "1hr" | "1hour" => CacheTtl::OneHour,
+                "off" | "none" | "disabled" => CacheTtl::Off,
+                other => {
+                    return Err(SQLRiteError::new_err(format!(
+                        "unknown cache_ttl: {other} (expected 5m, 1h, or off)"
+                    )));
+                }
+            };
+        }
+        if let Some(u) = base_url {
+            if !u.is_empty() {
+                inner.base_url = Some(u);
+            }
+        }
+        Ok(AskConfig { inner })
+    }
+
+    /// Build an `AskConfig` from environment variables. Reads:
+    ///   * `SQLRITE_LLM_PROVIDER` (default: anthropic)
+    ///   * `SQLRITE_LLM_API_KEY`
+    ///   * `SQLRITE_LLM_MODEL` (default: claude-sonnet-4-6)
+    ///   * `SQLRITE_LLM_MAX_TOKENS` (default: 1024)
+    ///   * `SQLRITE_LLM_CACHE_TTL` (default: 5m)
+    ///
+    /// A missing API key is NOT an error here — `from_env()` returns
+    /// a config with `api_key=None`, and the `ask()` call later raises
+    /// the friendlier `SQLRiteError("missing API key")`.
+    #[staticmethod]
+    fn from_env() -> PyResult<Self> {
+        Ok(AskConfig {
+            inner: RustAskConfig::from_env().map_err(map_err)?,
+        })
+    }
+
+    #[getter]
+    fn api_key(&self) -> Option<&str> {
+        self.inner.api_key.as_deref()
+    }
+
+    #[getter]
+    fn model(&self) -> &str {
+        &self.inner.model
+    }
+
+    #[getter]
+    fn max_tokens(&self) -> u32 {
+        self.inner.max_tokens
+    }
+
+    #[getter]
+    fn cache_ttl(&self) -> &'static str {
+        match self.inner.cache_ttl {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+            CacheTtl::Off => "off",
+        }
+    }
+
+    #[getter]
+    fn provider(&self) -> &'static str {
+        match self.inner.provider {
+            ProviderKind::Anthropic => "anthropic",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AskConfig(provider={:?}, model={:?}, max_tokens={}, cache_ttl={:?}, api_key={})",
+            self.provider(),
+            self.model(),
+            self.max_tokens(),
+            self.cache_ttl(),
+            if self.inner.api_key.is_some() {
+                "<set>"
+            } else {
+                "None"
+            },
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AskResponse (Phase 7g.4)
+//
+// What conn.ask() returns. Carries the generated SQL, the model's
+// one-sentence rationale, and token usage. The API key is NOT in
+// here — by design.
+
+/// Result of a `conn.ask()` call.
+///
+///     resp = conn.ask("How many users?")
+///     print(resp.sql)              # generated SQL string
+///     print(resp.explanation)      # one-sentence rationale
+///     print(resp.usage.input_tokens, resp.usage.cache_read_input_tokens)
+#[pyclass]
+struct AskResponse {
+    #[pyo3(get)]
+    sql: String,
+    #[pyo3(get)]
+    explanation: String,
+    #[pyo3(get)]
+    usage: AskUsage,
+}
+
+impl AskResponse {
+    fn from_rust(resp: RustAskResponse) -> Self {
+        AskResponse {
+            sql: resp.sql,
+            explanation: resp.explanation,
+            usage: AskUsage::from_rust(resp.usage),
+        }
+    }
+}
+
+#[pymethods]
+impl AskResponse {
+    fn __repr__(&self) -> String {
+        format!(
+            "AskResponse(sql={:?}, explanation={:?})",
+            self.sql, self.explanation
+        )
+    }
+}
+
+/// Token usage breakdown from a `conn.ask()` call. Inspect to verify
+/// prompt-caching is actually working — if `cache_read_input_tokens`
+/// is zero across repeated calls with the same schema, something in
+/// the prefix is invalidating the cache.
+#[pyclass]
+#[derive(Clone)]
+struct AskUsage {
+    #[pyo3(get)]
+    input_tokens: u64,
+    #[pyo3(get)]
+    output_tokens: u64,
+    #[pyo3(get)]
+    cache_creation_input_tokens: u64,
+    #[pyo3(get)]
+    cache_read_input_tokens: u64,
+}
+
+impl AskUsage {
+    fn from_rust(u: Usage) -> Self {
+        AskUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+        }
+    }
+}
+
+#[pymethods]
+impl AskUsage {
+    fn __repr__(&self) -> String {
+        format!(
+            "AskUsage(input_tokens={}, output_tokens={}, \
+             cache_creation_input_tokens={}, cache_read_input_tokens={})",
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens
+        )
     }
 }
 
@@ -524,6 +912,10 @@ fn sqlrite_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect_read_only, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Cursor>()?;
+    // Phase 7g.4 — natural-language → SQL surface.
+    m.add_class::<AskConfig>()?;
+    m.add_class::<AskResponse>()?;
+    m.add_class::<AskUsage>()?;
     Ok(())
 }
 
