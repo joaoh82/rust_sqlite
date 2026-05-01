@@ -10,7 +10,7 @@
 # Published to crates.io as `sqlrite-ask`. Joins the lockstep release
 # wave (`sqlrite-ask-vX.Y.Z` tag) — see `docs/release-plan.md`.
 name = "sqlrite-ask"
-version = "0.1.21"
+version = "0.1.22"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
