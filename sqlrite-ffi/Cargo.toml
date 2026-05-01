@@ -33,6 +33,14 @@ path = "src/lib.rs"
 # in src/ still resolves.
 sqlrite = { package = "sqlrite-engine", path = ".." }
 
+# Phase 7g.6 — `sqlrite_ask` accepts a config JSON string (smaller,
+# more extensible C ABI than 6+ separate parameters) and returns the
+# response as a JSON string the caller's binding parses on its side.
+# `serde_json` is already a transitive dep through the engine (Phase
+# 7e — JSON column type), so this just adds the direct path.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Build-time C header generation. `cbindgen` walks this crate's extern "C"
 # declarations and emits `sqlrite.h`. We invoke it from build.rs so callers
 # that depend on the cdylib get a generated header on `cargo build`, and a

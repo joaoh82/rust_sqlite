@@ -195,6 +195,25 @@ int sqlrite_in_transaction(struct SqlriteConnection *conn);
 // -1 on error.
 int sqlrite_is_read_only(struct SqlriteConnection *conn);
 
+// Generate SQL from a natural-language question via the configured
+// LLM provider. Returns a JSON string in `*out` (caller frees with
+// `sqlrite_free_string`).
+//
+// `config_json` may be NULL or an empty string to use
+// `AskConfig::from_env()`. Otherwise it's a JSON object with any of
+// the documented keys above; unset keys fall back to env values.
+//
+// # Safety
+//
+// `conn` must be a valid open connection handle. `question` must be
+// a valid NUL-terminated UTF-8 string. `config_json` may be NULL or
+// a valid NUL-terminated UTF-8 JSON string. `out` must be a valid
+// writable pointer.
+enum SqlriteStatus sqlrite_ask(struct SqlriteConnection *conn,
+                               const char *question,
+                               const char *config_json,
+                               char **out);
+
 // Frees a string returned by `sqlrite_column_text` or `sqlrite_column_name`.
 // Safe to call with a null pointer (no-op).
 //

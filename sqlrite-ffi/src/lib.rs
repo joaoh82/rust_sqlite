@@ -626,6 +626,211 @@ pub unsafe extern "C" fn sqlrite_is_read_only(conn: *mut SqlriteConnection) -> c
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7g.6 — natural-language → SQL.
+//
+// One C function: `sqlrite_ask(conn, question, config_json, out)`.
+//
+// `config_json` is a JSON-encoded AskConfig (or NULL / empty string
+// to fall back to AskConfig::from_env). Passing the config as JSON
+// rather than 6+ separate FFI parameters keeps the surface tiny and
+// extension-friendly: adding a new field later doesn't break the
+// C ABI for existing bindings.
+//
+// Recognized JSON keys (all optional; missing → defaults):
+//   {"provider": "anthropic", "api_key": "...", "model": "...",
+//    "max_tokens": 1024, "cache_ttl": "5m", "base_url": "..."}
+//
+// On success, `*out` is set to a heap-allocated NUL-terminated UTF-8
+// JSON string the caller must free via `sqlrite_free_string`. The
+// JSON shape is:
+//
+//   {
+//     "sql": "...",
+//     "explanation": "...",
+//     "usage": {
+//       "input_tokens": 1234,
+//       "output_tokens": 56,
+//       "cache_creation_input_tokens": 1000,
+//       "cache_read_input_tokens": 0
+//     }
+//   }
+//
+// On failure, `*out` is set to NULL and the status code indicates
+// the failure mode; details are in `sqlrite_last_error`.
+
+#[derive(serde::Deserialize)]
+struct ConfigOverride {
+    provider: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    max_tokens: Option<u32>,
+    cache_ttl: Option<String>,
+    base_url: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AskFfiResponse {
+    sql: String,
+    explanation: String,
+    usage: AskFfiUsage,
+}
+
+#[derive(serde::Serialize)]
+struct AskFfiUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+}
+
+fn build_ask_config(config_json: &str) -> Result<sqlrite::ask::AskConfig, String> {
+    use sqlrite::ask::{AskConfig, CacheTtl, ProviderKind};
+
+    // Empty string == "use env defaults" — same shape every other SDK
+    // ends up at when the caller passes nothing.
+    let trimmed = config_json.trim();
+    if trimmed.is_empty() {
+        return AskConfig::from_env().map_err(|e| e.to_string());
+    }
+
+    // Start from env so any unset keys in the JSON inherit env values.
+    // Lets a Go caller pass `{"model": "claude-haiku-4-5"}` and still
+    // pick up `SQLRITE_LLM_API_KEY` from the environment.
+    let mut cfg = AskConfig::from_env().map_err(|e| e.to_string())?;
+
+    let overrides: ConfigOverride =
+        serde_json::from_str(trimmed).map_err(|e| format!("invalid config JSON: {e}"))?;
+
+    if let Some(p) = overrides.provider {
+        cfg.provider = match p.to_ascii_lowercase().as_str() {
+            "anthropic" => ProviderKind::Anthropic,
+            other => return Err(format!("unknown provider: {other} (supported: anthropic)")),
+        };
+    }
+    if let Some(k) = overrides.api_key {
+        if !k.is_empty() {
+            cfg.api_key = Some(k);
+        }
+    }
+    if let Some(m) = overrides.model {
+        if !m.is_empty() {
+            cfg.model = m;
+        }
+    }
+    if let Some(t) = overrides.max_tokens {
+        cfg.max_tokens = t;
+    }
+    if let Some(c) = overrides.cache_ttl {
+        cfg.cache_ttl = match c.to_ascii_lowercase().as_str() {
+            "5m" | "5min" | "5minutes" => CacheTtl::FiveMinutes,
+            "1h" | "1hr" | "1hour" => CacheTtl::OneHour,
+            "off" | "none" | "disabled" => CacheTtl::Off,
+            other => return Err(format!("unknown cache_ttl: {other}")),
+        };
+    }
+    if let Some(u) = overrides.base_url {
+        if !u.is_empty() {
+            cfg.base_url = Some(u);
+        }
+    }
+    Ok(cfg)
+}
+
+/// Generate SQL from a natural-language question via the configured
+/// LLM provider. Returns a JSON string in `*out` (caller frees with
+/// `sqlrite_free_string`).
+///
+/// `config_json` may be NULL or an empty string to use
+/// `AskConfig::from_env()`. Otherwise it's a JSON object with any of
+/// the documented keys above; unset keys fall back to env values.
+///
+/// # Safety
+///
+/// `conn` must be a valid open connection handle. `question` must be
+/// a valid NUL-terminated UTF-8 string. `config_json` may be NULL or
+/// a valid NUL-terminated UTF-8 JSON string. `out` must be a valid
+/// writable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlrite_ask(
+    conn: *mut SqlriteConnection,
+    question: *const c_char,
+    config_json: *const c_char,
+    out: *mut *mut c_char,
+) -> SqlriteStatus {
+    clear_last_error();
+    if out.is_null() {
+        set_last_error("output pointer is null");
+        return SqlriteStatus::InvalidArgument;
+    }
+    unsafe { *out = ptr::null_mut() };
+
+    if conn.is_null() {
+        set_last_error("connection handle is null");
+        return SqlriteStatus::InvalidArgument;
+    }
+    let Some(question_str) = (unsafe { cstr_to_str(question) }) else {
+        return SqlriteStatus::InvalidArgument;
+    };
+
+    // config_json: NULL is OK (means "use env defaults"). Non-null
+    // must be valid UTF-8.
+    let config_str = if config_json.is_null() {
+        ""
+    } else {
+        match unsafe { cstr_to_str(config_json) } {
+            Some(s) => s,
+            None => return SqlriteStatus::InvalidArgument,
+        }
+    };
+
+    let cfg = match build_ask_config(config_str) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(e);
+            return SqlriteStatus::Error;
+        }
+    };
+
+    let handle = unsafe { &*(conn as *const ConnHandle) };
+    let resp = match sqlrite::ask::ask(&handle.conn, question_str, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return SqlriteStatus::Error;
+        }
+    };
+
+    let ffi_resp = AskFfiResponse {
+        sql: resp.sql,
+        explanation: resp.explanation,
+        usage: AskFfiUsage {
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: resp.usage.cache_read_input_tokens,
+        },
+    };
+
+    let json = match serde_json::to_string(&ffi_resp) {
+        Ok(j) => j,
+        Err(e) => {
+            set_last_error(format!("failed to encode response JSON: {e}"));
+            return SqlriteStatus::Error;
+        }
+    };
+
+    let cstr = match CString::new(json) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!("response JSON contained NUL: {e}"));
+            return SqlriteStatus::Error;
+        }
+    };
+    unsafe { *out = cstr.into_raw() };
+    SqlriteStatus::Ok
+}
+
+// ---------------------------------------------------------------------------
 // Memory freeing
 
 /// Frees a string returned by `sqlrite_column_text` or `sqlrite_column_name`.
