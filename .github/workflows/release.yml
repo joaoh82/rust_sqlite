@@ -127,6 +127,7 @@ jobs:
             "sqlrite-v$V"
             "sqlrite-ffi-v$V"
             "sqlrite-ask-v$V"
+            "sqlrite-mcp-v$V"
             "sqlrite-desktop-v$V"
             "sqlrite-py-v$V"
             "sqlrite-node-v$V"
@@ -266,6 +267,164 @@ jobs:
 
             See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a'': publish the `sqlrite-mcp` crate (Phase 7h) — Model
+  # Context Protocol server adapter that exposes SQLRite as a
+  # stdio-spawned tool surface for LLM agents (Claude Code, Cursor,
+  # mcp-inspector, etc.). Same shape as `publish-ask` above; gated
+  # `needs: publish-crate, publish-ask` because sqlrite-mcp depends
+  # on both (the engine via `default-features = false` + the engine's
+  # `ask` feature for the natural-language → SQL `ask` tool).
+  #
+  # Crate name on crates.io: `sqlrite-mcp`. Binary name produced by
+  # `cargo install`: `sqlrite-mcp` (one [[bin]] target). Per-platform
+  # prebuilt binary tarballs are produced by `build-mcp-binaries`
+  # below — `cargo install` is the from-source path.
+  publish-mcp:
+    name: Publish sqlrite-mcp crate to crates.io
+    needs: [detect, tag-all, publish-crate, publish-ask]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-mcp
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # `--no-verify` mirrors `publish-crate` / `publish-ask` —
+        # Release-PR CI already validated this commit.
+        #
+        # `needs: [..., publish-crate, publish-ask]` is load-bearing:
+        # sqlrite-mcp's path-dep on sqlrite-engine + (transitive)
+        # sqlrite-ask only resolves on crates.io once both have been
+        # published at the matching version. crates.io rejects
+        # path-dep publishes whose path-dep version isn't reachable.
+        run: cargo publish -p sqlrite-mcp --no-verify
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-mcp-v${{ needs.detect.outputs.version }}
+          name: sqlrite-mcp v${{ needs.detect.outputs.version }}
+          body: |
+            Published to crates.io: https://crates.io/crates/sqlrite-mcp/${{ needs.detect.outputs.version }}
+
+            Model Context Protocol (MCP) server for SQLRite. Wraps a SQLRite database as a stdio-spawned subprocess that LLM agents (Claude Code, Cursor, `mcp-inspector`) can drive without custom integration code.
+
+            ```sh
+            cargo install sqlrite-mcp
+            ```
+
+            ```json
+            // ~/.claude.json
+            {
+              "mcpServers": {
+                "sqlrite": {
+                  "command": "sqlrite-mcp",
+                  "args": ["/path/to/your.sqlrite"],
+                  "env": { "SQLRITE_LLM_API_KEY": "sk-ant-…" }
+                }
+              }
+            }
+            ```
+
+            Seven tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`. Pass `--read-only` to hide `execute`. Pre-built binary tarballs (no Rust toolchain required) are attached to this release as well — see `sqlrite-mcp-v${{ needs.detect.outputs.version }}-{platform}.tar.gz`.
+
+            Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/docs/mcp.md
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Step 3a''': build the `sqlrite-mcp` binary for each supported
+  # platform and upload the per-platform tarballs to the
+  # `sqlrite-mcp-v<V>` GitHub Release. So users who don't want to
+  # `cargo install` (no Rust toolchain) can grab a tarball and drop
+  # the binary on their PATH.
+  #
+  # Matrix mirrors `publish-ffi` — same four platforms, same
+  # "aarch64 on macOS, x86_64 elsewhere" choice. The binary is much
+  # smaller than the FFI artifact (one [[bin]], no .so/.a files) so
+  # we just package the executable + the README.
+  build-mcp-binaries:
+    name: Build sqlrite-mcp binary (${{ matrix.platform }})
+    needs: [detect, tag-all, publish-mcp]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            bin: sqlrite-mcp
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            bin: sqlrite-mcp
+          - os: macos-latest
+            platform: macos-aarch64
+            bin: sqlrite-mcp
+          - os: windows-latest
+            platform: windows-x86_64
+            bin: sqlrite-mcp.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-mcp-${{ matrix.platform }}
+
+      - name: Build sqlrite-mcp
+        # Default features include `ask`, so the binary ships with the
+        # natural-language → SQL tool wired in. Users who want a leaner
+        # build (no LLM machinery, six pure-SQL tools) can
+        # `cargo install sqlrite-mcp --no-default-features` from source.
+        run: cargo build --release -p sqlrite-mcp
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          STAGE="sqlrite-mcp-v$V-${{ matrix.platform }}"
+          mkdir -p "$STAGE"
+          cp "target/release/${{ matrix.bin }}" "$STAGE/"
+          cat > "$STAGE/README" <<EOF
+          sqlrite-mcp v$V — ${{ matrix.platform }}
+
+          Model Context Protocol server for SQLRite.
+
+          Drop the binary on your PATH and wire it into your MCP client
+          (Claude Code, Cursor, mcp-inspector, etc.):
+
+            sqlrite-mcp /path/to/your.sqlrite              # read-write
+            sqlrite-mcp /path/to/your.sqlrite --read-only  # shared-lock RO
+            sqlrite-mcp --in-memory                        # ephemeral
+
+          Full docs: https://github.com/joaoh82/rust_sqlite/blob/main/docs/mcp.md
+          EOF
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-mcp-v${{ needs.detect.outputs.version }}
+          name: sqlrite-mcp v${{ needs.detect.outputs.version }}
+          files: ${{ env.ASSET }}
+          # The release body was already populated by `publish-mcp`
+          # above; this job only attaches assets. Don't overwrite it.
+          append_body: false
 
   # ---------------------------------------------------------------------------
   # Step 3b: build `libsqlrite_c` for each supported platform and
@@ -1291,7 +1450,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ask, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
+    needs: [detect, publish-crate, publish-ask, publish-mcp, build-mcp-binaries, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -1310,6 +1469,7 @@ jobs:
             Per-product releases in this wave:
 
             - 🦀 [Rust engine](../../releases/tag/sqlrite-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-engine/${{ needs.detect.outputs.version }})
+            - 🤖 [MCP server](../../releases/tag/sqlrite-mcp-v${{ needs.detect.outputs.version }}) → [crates.io](https://crates.io/crates/sqlrite-mcp/${{ needs.detect.outputs.version }}) — `cargo install sqlrite-mcp` or grab a prebuilt binary tarball; wires SQLRite into Claude Code / Cursor / any MCP client over stdio
             - 🔧 [C FFI](../../releases/tag/sqlrite-ffi-v${{ needs.detect.outputs.version }}) — prebuilt `libsqlrite_c` for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist

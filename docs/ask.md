@@ -1,6 +1,6 @@
 # Ask — natural-language → SQL
 
-`ask` is SQLRite's natural-language query feature: type a question in English, get back generated SQL ready to run against your database. It ships across **every product surface** — the REPL, the desktop app, all four SDKs (Python / Node.js / Go / WASM), and the embedded Rust library — with a single underlying engine and one consistent set of defaults.
+`ask` is SQLRite's natural-language query feature: type a question in English, get back generated SQL ready to run against your database. It ships across **every product surface** — the REPL, the desktop app, all four SDKs (Python / Node.js / Go / WASM), the [`sqlrite-mcp`](mcp.md) server (so any MCP client gets the `ask` tool for free), and the embedded Rust library — with a single underlying engine and one consistent set of defaults.
 
 This doc is the canonical reference. For the per-language API details, the SDK READMEs go deeper; for the design decisions, see [`docs/phase-7-plan.md`](phase-7-plan.md) §7g.
 
@@ -20,6 +20,7 @@ This doc is the canonical reference. For the per-language API details, the SDK R
   - [Node.js SDK](#nodejs-sdk)
   - [Go SDK](#go-sdk)
   - [WASM SDK](#wasm-sdk-the-different-one)
+  - [MCP server](#mcp-server-as-a-tool-for-llm-clients)
 - [The shared `AskResponse` shape](#the-shared-askresponse-shape)
 - [Errors and how they surface](#errors-and-how-they-surface)
 - [Prompt caching](#prompt-caching)
@@ -301,6 +302,33 @@ The backend proxy is ~10 lines on any modern serverless platform. **See [`docs/a
 
 A runnable end-to-end demo (browser + zero-dep Node proxy) lives at [`examples/wasm/`](../examples/wasm/) — `make build && make ask-demo`. See [`sdk/wasm/README.md`](../sdk/wasm/README.md) for the full reference.
 
+### MCP server (as a tool for LLM clients)
+
+The [`sqlrite-mcp`](mcp.md) server exposes `ask` as a tool that any [Model Context Protocol](https://modelcontextprotocol.io/) client (Claude Code, Cursor, `mcp-inspector`, etc.) can call without any glue code. The MCP server holds the API key in its own process environment — set `SQLRITE_LLM_API_KEY` in the MCP client's server-config `env` block once, and the `ask` tool works for every subsequent invocation.
+
+```sh
+# Install the MCP server:
+cargo install sqlrite-mcp
+```
+
+In the MCP client config (Claude Code's `~/.claude.json` shown):
+
+```json
+{
+  "mcpServers": {
+    "sqlrite": {
+      "command": "sqlrite-mcp",
+      "args": ["/path/to/your.sqlrite"],
+      "env": { "SQLRITE_LLM_API_KEY": "sk-ant-…" }
+    }
+  }
+}
+```
+
+Now any LLM driving that MCP client sees an `ask` tool alongside `query` / `execute` / `list_tables` / etc., and can call it with `{ "question": "...", "execute": true }` to generate-and-run in a single round trip. Per-call overrides (`model`, `max_tokens`, `cache_ttl`) are passed as additional tool arguments. See [`docs/mcp.md`](mcp.md) for the full tool reference and the other six tools the server exposes.
+
+The `ask` tool is **gated behind the `ask` cargo feature** (default-on). If you want a leaner MCP binary with no LLM machinery (six pure-SQL tools only, no `ureq` / `rustls` in the dep tree), build with `cargo install sqlrite-mcp --no-default-features`.
+
 ---
 
 ## The shared `AskResponse` shape
@@ -365,6 +393,7 @@ For long-running editor / desktop sessions where the same DB is queried sporadic
 | Rust library | Wherever you put it. Read from env, secrets manager, vault, etc. |
 | Python / Node / Go SDKs | Wherever you put it. Same flexibility — env, secrets manager, runtime config. |
 | WASM | **YOUR backend, never the browser tab.** The browser hands the prompt to your backend, the backend adds the key and forwards. See [`docs/ask-backend-examples.md`](ask-backend-examples.md). |
+| MCP server | The spawned `sqlrite-mcp` process's environment. The MCP client sets it in its server-config `env` block once at spawn time; no tool call ever echoes the key back. See [`docs/mcp.md`](mcp.md). |
 
 ### What `__repr__` / `String()` / `toString()` shows
 

@@ -274,8 +274,11 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [x] **7g.1 — `sqlrite-ask` crate** *(v0.1.18)*: foundational natural-language → SQL via the [Anthropic API](https://docs.anthropic.com/) (Sonnet 4.6 by default), prompt-cached schema dump, sync `ureq` HTTP.
 - [x] **7g.2 — REPL `.ask` + dep-direction flip** *(v0.1.19)*: `.ask <question>` meta-command with `Run? [Y/n]` confirmation. The wiring required dropping the engine dep from `sqlrite-ask` (cargo cycle) — `sqlrite-ask` is now pure over `&str` schemas; the `Connection`/`Database` integration moved to the engine's new `ask` feature. Public surface for callers: `use sqlrite::{Connection, ConnectionAskExt}`.
 - [x] **7g.3 — Desktop "Ask…" button** *(this wave)*: composer panel above the editor textarea; click → type a natural-language question → submit → generated SQL drops into the editor for review before Run. Schema introspection + LLM HTTP call run in the Tauri Rust backend, so the API key never crosses into the webview.
-- [ ] **7g.4-7g.8** — per-product `ask()` adapters: Python/Node/Go/WASM SDKs, MCP `ask` tool
-- [ ] **7h** — MCP server adapter (`sqlrite-mcp` binary)
+- [x] **7g.4 — Python SDK `conn.ask` / `ask_run` / `AskConfig`** *(v0.1.20)*: PyO3 wrappers; three-layer config precedence (per-call > per-connection > env > defaults); `__repr__` omits the API key.
+- [x] **7g.5 — Node.js SDK `db.ask` / `askRun` / `AskConfig`** *(v0.1.21)*: napi-rs wrappers with idiomatic camelCase option-object; same three-layer precedence; mock HTTP test runs in `worker_thread` to avoid event-loop deadlock.
+- [x] **7g.6 — Go SDK `sqlrite.Ask` / `AskRun` / `AskConfig`** *(v0.1.22)*: cgo wrapper plus `AskContext` / `AskRunContext`; new C FFI function takes `AskConfig` as a JSON string for ABI extensibility.
+- [x] **7g.7 — WASM SDK `db.askPrompt` / `db.askParse` (Q9 split shape)** *(v0.1.23)*: browser builds the prompt + parses the response; user's backend holds the API key. Plus `docs/ask.md` (canonical Ask reference) and `docs/ask-backend-examples.md` (Cloudflare Workers / Vercel Edge / Deno Deploy / Firebase / AWS Lambda / Express templates).
+- [x] **7h — MCP server adapter (`sqlrite-mcp` binary)** *(this wave)*: hand-rolled JSON-RPC 2.0 over stdio; seven tools — `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, plus `ask` as Phase **7g.8** behind a default-on cargo feature. Read-only mode hides `execute`. Stdout-redirect dance keeps engine prettytable noise off the protocol channel. See [`docs/mcp.md`](docs/mcp.md) for wiring into Claude Code / Cursor / `mcp-inspector`.
 - [ ] *(deferred to Phase 8)* Full-text search with BM25 + hybrid retrieval
 
 **Possible extras** *(no committed phase)*

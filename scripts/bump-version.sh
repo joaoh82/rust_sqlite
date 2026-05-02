@@ -69,6 +69,7 @@ TOML_FILES=(
     "Cargo.toml"
     "sqlrite-ffi/Cargo.toml"
     "sqlrite-ask/Cargo.toml"
+    "sqlrite-mcp/Cargo.toml"
     "sdk/python/Cargo.toml"
     "sdk/python/pyproject.toml"
     "sdk/nodejs/Cargo.toml"

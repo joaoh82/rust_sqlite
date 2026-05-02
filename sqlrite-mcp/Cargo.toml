@@ -1,0 +1,83 @@
+[package]
+# Phase 7h — Model Context Protocol (MCP) server adapter for SQLRite.
+#
+# Wraps a SQLRite database as an MCP server over stdio. LLM agents
+# (Claude Code, Cursor, Codex, the official `mcp-inspector`, etc.)
+# spawn the `sqlrite-mcp` binary as a subprocess and get a fixed set
+# of tools — `list_tables`, `describe_table`, `query`, `execute`,
+# `schema_dump`, `vector_search`, plus `ask` (Phase 7g.8) when the
+# `ask` feature is on — for driving the database without any custom
+# integration.
+#
+# **Hand-rolled JSON-RPC 2.0 over line-delimited JSON on stdio.** No
+# tokio, no async runtime. Same dep-frugal "build it ourselves"
+# theme as `sqlrite-ask`'s hand-rolled JSON over `ureq`. The MCP
+# wire format is small and stable enough that ~600 LOC is all the
+# protocol layer + dispatch + 7 tools take.
+#
+# Published to crates.io as `sqlrite-mcp`. Joins the lockstep
+# release wave (`sqlrite-mcp-vX.Y.Z` tag) — see `docs/release-plan.md`.
+name = "sqlrite-mcp"
+version = "0.1.24"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "Model Context Protocol (MCP) server for SQLRite. Exposes a SQLRite database to LLM agents over stdio."
+repository = "https://github.com/joaoh82/rust_sqlite"
+license = "MIT"
+readme = "README.md"
+keywords = ["sqlrite", "mcp", "llm", "ai", "anthropic"]
+categories = ["database", "command-line-utilities"]
+
+[[bin]]
+name = "sqlrite-mcp"
+path = "src/main.rs"
+
+[features]
+# Default is the full build with the `ask` tool wired in. The `ask`
+# tool calls into `sqlrite::ask::ask_with_database` (powered by the
+# `sqlrite-ask` crate), which needs the engine's `ask` feature on,
+# which in turn pulls `ureq` + `rustls` for the LLM HTTP transport.
+#
+# Disabling default features (`--no-default-features`) gives a lean
+# MCP binary with the six pure-SQL tools and no LLM machinery — the
+# right shape for embedded use, ultra-light Docker images, or
+# situations where the operator doesn't want any outbound HTTP from
+# the server process.
+default = ["ask"]
+ask = ["sqlrite/ask"]
+
+[dependencies]
+# The engine. We deliberately turn the engine's `default` features
+# off (which excludes the `cli` feature and its rustyline/clap pull
+# weight) and only enable `ask` when our own `ask` feature is on.
+# Keeps the MCP binary small + boot-fast.
+sqlrite = { package = "sqlrite-engine", path = "..", version = "0.1", default-features = false }
+
+# JSON-RPC + tool I/O. The MCP wire format is JSON in / JSON out;
+# tool argument schemas are JSON; tool results are JSON. serde +
+# serde_json carry their weight.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI parsing for `sqlrite-mcp [DB_PATH] [--read-only] [--in-memory]`.
+# Same crate the REPL uses, so no extra weight in the workspace's
+# resolved dep set.
+clap = { version = "4", features = ["derive"] }
+
+# `dup` / `dup2` for the stdout-redirect dance in `main.rs`. The MCP
+# wire format owns stdout exclusively; the engine's REPL-convenience
+# `print!` / `println!` calls inside `process_command` (CREATE-table
+# schema dump, INSERT row dump, SELECT result table) would otherwise
+# corrupt the JSON-RPC channel. We redirect process fd 1 to fd 2 at
+# startup so any wayward stdout write goes to stderr (visible in the
+# MCP client's server-log pane), and write JSON-RPC responses to a
+# saved-off duplicate of the original fd 1. See `src/stdio_redirect.rs`
+# for the surgical implementation. libc is already a transitive dep of
+# clap + the engine — listing it here is a free declaration of intent.
+libc = "0.2"
+
+[dev-dependencies]
+# Spawning the binary in integration tests, then piping JSON-RPC
+# requests + reading responses — pure stdlib via std::process::Command.
+# No deps needed.
