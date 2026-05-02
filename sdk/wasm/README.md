@@ -177,6 +177,8 @@ app.listen(3000);
 
 A minimal Cloudflare Worker / Vercel Edge function is essentially identical — read JSON in, forward with the key header, pass the response body through. **The API key stays on the server**; the browser never sees it.
 
+**Ready-to-deploy templates** for Cloudflare Workers, Vercel Edge Functions, Deno Deploy, Firebase Functions, AWS Lambda, and Express live in [`docs/ask-backend-examples.md`](../../docs/ask-backend-examples.md). For the broader Ask-feature reference (every SDK, env vars, defaults, prompt caching, security model), see [`docs/ask.md`](../../docs/ask.md). A runnable end-to-end demo (browser + zero-dep Node proxy) lives at [`examples/wasm/`](../../examples/wasm/) — `make build && make ask-demo`.
+
 #### `askPrompt` options
 
 ```js

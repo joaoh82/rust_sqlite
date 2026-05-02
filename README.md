@@ -185,6 +185,8 @@ println!("Why: {}",          resp.explanation);
 
 In the REPL: `.ask <question>`. From an open `Connection` (this section). Per-product wrappers — desktop "Ask" button, `conn.ask()` in the Python / Node / Go SDKs, MCP `ask` tool, WASM with a JS-callback shape so the API key never enters the browser — ship in **7g.3-7g.8** as follow-up sub-phases. See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
 
+For the canonical Ask reference covering every surface (REPL, desktop, Rust library, Python / Node / Go / WASM), env vars, defaults, prompt caching, and the security model — read [`docs/ask.md`](docs/ask.md). For copy-paste backend proxy templates the WASM SDK needs (Cloudflare Workers, Vercel Edge, Deno Deploy, Firebase, AWS Lambda, Express), see [`docs/ask-backend-examples.md`](docs/ask-backend-examples.md).
+
 ### Roadmap
 
 The project is staged in phases, each independently shippable. A finished phase is committed to `main` before the next one starts.

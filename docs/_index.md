@@ -18,6 +18,11 @@ A small, hand-written guide to the SQLRite codebase — how it's structured, how
 - [Embedding](embedding.md) — the public `Connection` / `Statement` / `Rows` API (Phase 5a) and where the non-Rust SDKs plug in (Phase 5b – 5g)
 - [`examples/`](../examples/) — runnable Rust quickstart (`cargo run --example quickstart`); language-specific subdirectories fill in as each 5x sub-phase lands
 
+## Phase 7 — AI-era extensions
+
+- [Ask — natural-language → SQL](ask.md) — the canonical reference for the `ask()` feature across every product surface (REPL, desktop, Rust library, Python / Node / Go / WASM SDKs); env vars, defaults, prompt caching, security
+- [Ask backend proxy templates](ask-backend-examples.md) — copy-paste backend examples for the WASM SDK's split design: Cloudflare Workers, Vercel Edge, Deno Deploy, Firebase Functions, AWS Lambda, Express, pure Node
+
 ## Internals
 
 These documents go into the implementation of each subsystem.
