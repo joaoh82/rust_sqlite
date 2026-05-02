@@ -368,24 +368,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlrite-ask"
+version = "0.1.23"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sqlrite-engine"
-version = "0.1.14"
+version = "0.1.23"
 dependencies = [
  "log",
  "prettytable-rs",
+ "serde_json",
  "sqlparser",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "sqlrite-wasm"
-version = "0.1.14"
+version = "0.1.23"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sqlrite-ask",
  "sqlrite-engine",
  "wasm-bindgen",
 ]

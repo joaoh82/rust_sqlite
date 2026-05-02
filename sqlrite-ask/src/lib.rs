@@ -73,9 +73,15 @@
 
 use std::env;
 
-mod prompt;
-mod provider;
+// `prompt` and parts of `provider` are wasm-safe (pure serde +
+// trait definitions); `provider::anthropic` is HTTP-only and lives
+// behind the `http` feature flag. Phase 7g.7 made these modules
+// `pub` so the WASM SDK can reuse `build_system` / `parse_response`
+// / `Usage` without duplicating them.
+pub mod prompt;
+pub mod provider;
 
+#[cfg(feature = "http")]
 pub use provider::anthropic::AnthropicProvider;
 pub use provider::{Provider, Request, Response, Usage};
 
@@ -275,6 +281,13 @@ pub enum AskError {
 ///
 /// The library does **not** execute the returned SQL — that's the
 /// caller's call. See module docs for rationale.
+///
+/// **Feature-gated under `http`** (default-on) — wraps the built-in
+/// `AnthropicProvider`, which uses ureq and isn't wasm-safe. WASM
+/// callers should use [`ask_with_schema_and_provider`] with a
+/// caller-supplied provider, or skip this crate entirely and use
+/// the WASM SDK's `db.askPrompt()` / `db.askParse()` shape (Q9).
+#[cfg(feature = "http")]
 pub fn ask_with_schema(
     schema_dump: &str,
     question: &str,
@@ -328,7 +341,12 @@ pub fn ask_with_schema_and_provider<P: Provider>(
 /// because real LLM output drifts even with strict instructions. The
 /// fence/prose tolerance matches what real callers do (better-sqlite3,
 /// rusqlite, etc.) when interfacing with model output.
-fn parse_response(raw: &str, usage: Usage) -> Result<AskResponse, AskError> {
+///
+/// **Public as of Phase 7g.7** so the WASM SDK can call this on the
+/// model-text portion of an LLM API response that JS retrieved (per
+/// Q9 the WASM module never makes the HTTP call itself; the JS
+/// caller hands the raw response back through `db.askParse()`).
+pub fn parse_response(raw: &str, usage: Usage) -> Result<AskResponse, AskError> {
     // 1. Strip markdown fences if the model wrapped its JSON.
     let trimmed = raw.trim();
     let body = strip_markdown_fence(trimmed).unwrap_or(trimmed);

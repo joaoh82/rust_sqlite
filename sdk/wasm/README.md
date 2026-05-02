@@ -89,29 +89,116 @@ const rows = db.query(`SELECT json_extract(payload, '$.user.name') AS name FROM 
 // → [{ name: 'alice' }]
 ```
 
-### Natural-language → SQL (Phase 7g.7 — *coming soon, JS-callback shape*)
+### Natural-language → SQL (Phase 7g.7)
 
-Per Phase 7 plan Q9, the WASM SDK gets a different `ask()` shape than the other SDKs: the WASM module does the schema-aware prompt construction in-page, but **does NOT** make the HTTP request itself. The caller passes a JS function (typically routed through their own backend) to do the actual fetch. That keeps the API key out of the browser and avoids the CORS dead end (Anthropic doesn't serve CORS headers on `api.anthropic.com`).
+Per Phase 7 plan Q9, the WASM SDK has a **different `ask()` shape** than the other SDKs. The WASM module does the schema-aware prompt construction in-page, but **does NOT make the HTTP request itself.** The caller's JS code does the call, typically routed through their own backend.
+
+#### Why this design
+
+Two reasons direct browser-to-LLM calls don't work:
+
+1. **CORS.** Browsers block direct cross-origin POSTs from a WASM module to `api.anthropic.com` / `api.openai.com` unless the LLM provider serves CORS headers. They don't, by design — they don't want users embedding API keys in client-side JS.
+2. **API key exposure.** Even if CORS were OK, putting the API key into a WASM-loaded page exposes it to anyone who opens devtools.
+
+Both problems disappear server-side. Node, Python, Go, Desktop (Tauri runs the call in the Rust backend, not the webview) all do the HTTP from a trusted process. WASM solves it with a split: the browser tab does the prompt building (it has the schema and the rules), then hands the request to the user's backend which holds the API key.
+
+#### Two-step API
 
 ```js
-// 7g.7 preview — not yet released. The exact callback shape may shift.
-import { Database } from '@joaoh82/sqlrite-wasm';
+import init, { Database } from '@joaoh82/sqlrite-wasm';
+await init();
 
 const db = new Database();
-const prompt = db.askPrompt('How many users are over 30?');
-// → { system: [...], messages: [...] }
+db.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)`);
 
-// Caller routes this through their own backend (which holds the key)
-const completion = await fetch('/api/llm/complete', {
+// Step 1 — build the LLM-API request body in the browser.
+const payload = db.askPrompt('How many users are over 30?');
+// payload looks like:
+// {
+//   model: 'claude-sonnet-4-6',
+//   max_tokens: 1024,
+//   system: [
+//     { type: 'text', text: '<rules block>' },
+//     { type: 'text', text: '<schema>...</schema>',
+//       cache_control: { type: 'ephemeral' } }
+//   ],
+//   messages: [{ role: 'user', content: 'How many users are over 30?' }]
+// }
+
+// Step 2 — your backend forwards this to Anthropic with your API key.
+const apiResponse = await fetch('/api/llm/complete', {
   method: 'POST',
-  body: JSON.stringify(prompt),
-}).then(r => r.json());
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(payload),
+}).then(r => r.text());     // raw response body string
 
-const resp = db.askParse(completion.text);
-// → { sql: 'SELECT COUNT(*) FROM users WHERE age > 30', explanation: '...' }
+// Step 3 — hand the raw API response back to WASM.
+const result = db.askParse(apiResponse);
+// → { sql: 'SELECT id, name FROM users WHERE age > 30',
+//     explanation: 'Counts users older than thirty.',
+//     usage: { inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens } }
+
+// Now run the SQL however you want.
+const rows = db.query(result.sql);
 ```
 
-The browser tab never sees the API key, never POSTs to a third-party LLM endpoint, and never deals with CORS. The `sdk/wasm/README.md` will get a complete worked example (browser → backend proxy → LLM provider → response back to WASM) when 7g.7 lands.
+#### Backend proxy (the bit you write)
+
+The WASM SDK is provider-agnostic at the JS boundary, but `askPrompt`'s default output shape is **Anthropic's `/v1/messages` body**, so you can forward it as-is to Anthropic. Your backend just needs to:
+1. Receive the JSON payload from the browser.
+2. Add the `x-api-key` header from your secure storage.
+3. POST to `https://api.anthropic.com/v1/messages`.
+4. Pipe the response body back to the browser.
+
+A minimal Node/Express version:
+
+```js
+import express from 'express';
+const app = express();
+app.use(express.json());
+
+app.post('/api/llm/complete', async (req, res) => {
+  const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(req.body),
+  });
+  res.status(upstream.status);
+  res.set('content-type', 'application/json');
+  res.send(await upstream.text());
+});
+
+app.listen(3000);
+```
+
+A minimal Cloudflare Worker / Vercel Edge function is essentially identical — read JSON in, forward with the key header, pass the response body through. **The API key stays on the server**; the browser never sees it.
+
+#### `askPrompt` options
+
+```js
+import { AskPromptOptions } from '@joaoh82/sqlrite-wasm';
+
+const opts = new AskPromptOptions();
+opts.model = 'claude-haiku-4-5';   // default: 'claude-sonnet-4-6'
+opts.max_tokens = 512;             // default: 1024
+opts.cache_ttl = '1h';             // default: '5m', also '1h' or 'off'
+
+const payload = db.askPrompt('How many users?', opts);
+```
+
+#### Using a non-Anthropic provider on your backend
+
+`askPrompt` produces an Anthropic-shaped body. If your backend talks to OpenAI / Ollama / etc., translate the body server-side before forwarding (the `system` blocks → `system` message, `messages` array stays the same shape). The token-usage fields in `askParse`'s output read from Anthropic's `usage` shape too — for non-Anthropic responses, your backend can normalize the response into that shape before returning it to the browser.
+
+OpenAI / Ollama / Together / ... bindings are tracked in the broader Phase 7 roadmap (`docs/phase-7-plan.md` Q4); the WASM SDK's split design means provider variety lives entirely on your backend, with no SDK changes needed.
+
+#### Verifying prompt-cache hits
+
+The `result.usage.cacheReadInputTokens` field in `askParse`'s output reports tokens served from Anthropic's prompt cache. After the first `askPrompt` call against a given schema, repeat calls within 5 minutes (1 hour with `cacheTtl: '1h'`) should show non-zero `cacheReadInputTokens`. If it stays zero, something in the prefix is invalidating the cache — most likely a timestamp / UUID / non-deterministic field bleeding into the system blocks. The WASM SDK builds the same schema dump the other SDKs do (alphabetically sorted, byte-stable), so as long as your DB schema doesn't change between calls, caching should work.
 
 ## API surface
 

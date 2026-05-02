@@ -32,7 +32,21 @@ crate-type = ["cdylib", "rlib"]
 # `file-locks` (fs2 — doesn't exist on wasm32-unknown-unknown).
 # `package = "sqlrite-engine"` — crates.io name — with an import alias
 # of `sqlrite` so src/ code can keep saying `use sqlrite::…`.
+#
+# As of Phase 7g.7 we use `sqlrite::ask::schema::dump_schema_for_database`
+# at compile time, but that submodule is now always-on (un-gated from
+# the `ask` feature) so we don't have to opt into HTTP machinery to
+# get the schema dump.
 sqlrite = { package = "sqlrite-engine", path = "../..", default-features = false }
+
+# Phase 7g.7 — pull in the wasm-safe parts of `sqlrite-ask` to reuse
+# its prompt construction (`prompt::build_system`, `SYSTEM_RULES`) and
+# response parser (`parse_response`). `default-features = false`
+# skips the `http` feature (which gates ureq + rustls — neither
+# builds for wasm32). Per Q9, the WASM SDK never makes the HTTP call
+# itself — the JS caller does that. Browser → backend → LLM provider
+# → JS hands the raw response back to `db.askParse()`.
+sqlrite-ask = { version = "0.1", path = "../../sqlrite-ask", default-features = false }
 
 # wasm-bindgen + friends. `serde-serialize` on wasm-bindgen gives
 # us `serde_wasm_bindgen` interop for structured row objects.
