@@ -1,6 +1,6 @@
 [package]
 name = "sqlrite-python"
-version = "0.1.23"
+version = "0.1.24"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
