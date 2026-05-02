@@ -15,6 +15,11 @@
       h1 {
         font-size: 1.5rem;
       }
+      h2 {
+        margin-top: 2.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e5e5ea;
+      }
       textarea {
         width: 100%;
         font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -24,6 +29,9 @@
         border-radius: 6px;
         min-height: 8rem;
       }
+      textarea.compact {
+        min-height: 3rem;
+      }
       button {
         margin: 0.5rem 0.3rem 0.5rem 0;
         padding: 0.4rem 0.9rem;
@@ -32,6 +40,10 @@
         border: 0;
         border-radius: 6px;
         cursor: pointer;
+      }
+      button:disabled {
+        background: #b0b0b8;
+        cursor: not-allowed;
       }
       button.secondary {
         background: #e5e5ea;
@@ -47,6 +59,24 @@
       .status {
         color: #515154;
         font-size: 0.85rem;
+      }
+      .ask-banner {
+        background: #fffaf0;
+        border: 1px solid #f0d8a8;
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        font-size: 0.9rem;
+        margin-bottom: 1rem;
+      }
+      .ask-banner code {
+        background: #f5e7c4;
+        padding: 0 0.2rem;
+        border-radius: 3px;
+      }
+      .meta {
+        color: #6e6e73;
+        font-size: 0.8rem;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
       }
     </style>
   </head>
@@ -74,6 +104,52 @@ SELECT id, name, age FROM users ORDER BY age DESC;</textarea
     <h3>Result</h3>
     <pre id="out">(run a query to see output)</pre>
 
+    <!-- ============================================================ -->
+    <!-- Phase 7g.7 — natural-language → SQL via askPrompt / askParse -->
+    <!-- ============================================================ -->
+
+    <h2>Ask (natural-language → SQL)</h2>
+
+    <p>
+      The WASM SDK builds the LLM-API request body in this browser tab, but
+      <strong>doesn't make the HTTP call itself</strong>. CORS + API-key
+      exposure rule that out (see <code>docs/ask.md</code> for the full
+      reasoning). Instead, the call goes through a backend proxy you control.
+      The proxy is ~10 lines — see <code>examples/wasm/server.mjs</code> for a
+      zero-dependency Node version that this demo expects on
+      <code>POST /api/llm/complete</code>.
+    </p>
+
+    <div class="ask-banner">
+      <strong>To use this section:</strong>
+      <ol>
+        <li>Set <code>ANTHROPIC_API_KEY</code> in your shell.</li>
+        <li>
+          Run <code>node server.mjs</code> from
+          <code>examples/wasm/</code> (after <code>make build</code>). It serves
+          this page on <code>http://localhost:8080</code> and proxies
+          <code>/api/llm/complete</code> to Anthropic with your key.
+        </li>
+        <li>Type a question below. The generated SQL drops into the SQL console above.</li>
+      </ol>
+      No proxy running? The Ask button will report a clean "couldn't reach
+      proxy" error and the rest of the console keeps working.
+    </div>
+
+    <textarea id="askQuestion" class="compact" placeholder="e.g. How many users are over 30?">How many users are over 30?</textarea>
+    <div>
+      <button id="ask">Ask</button>
+      <span class="status" id="askStatus"></span>
+    </div>
+
+    <h3>Generated SQL</h3>
+    <pre id="askSql">(submit a question to see generated SQL here)</pre>
+
+    <h3>Explanation</h3>
+    <pre id="askExplanation">(model rationale shows here)</pre>
+
+    <p class="meta" id="askUsage"></p>
+
     <script type="module">
       // wasm-pack's `--target web` build is imported directly as a
       // JS module. `init()` fetches the `.wasm` file and wires up
@@ -87,6 +163,10 @@ SELECT id, name, age FROM users ORDER BY age DESC;</textarea
       await init();
       let db = new Database();
       status.textContent = `sqlrite-wasm ready (in-memory)`;
+
+      // ----------------------------------------------------------------
+      // SQL console
+      // ----------------------------------------------------------------
 
       document.getElementById("run").onclick = () => {
         const input = sqlTextarea.value.trim();
@@ -128,6 +208,80 @@ SELECT id, name, age FROM users ORDER BY age DESC;</textarea
         db.free();
         db = new Database();
         out.textContent = "(reset — fresh in-memory DB)";
+      };
+
+      // ----------------------------------------------------------------
+      // Ask flow — the Q9 split: build prompt here, post to backend,
+      // parse response here.
+      // ----------------------------------------------------------------
+
+      const askButton = document.getElementById("ask");
+      const askStatus = document.getElementById("askStatus");
+      const askSqlEl = document.getElementById("askSql");
+      const askExplanationEl = document.getElementById("askExplanation");
+      const askUsageEl = document.getElementById("askUsage");
+      const askQuestionEl = document.getElementById("askQuestion");
+
+      askButton.onclick = async () => {
+        const question = askQuestionEl.value.trim();
+        if (!question) return;
+        askButton.disabled = true;
+        askStatus.textContent = "asking…";
+        askSqlEl.textContent = "(generating…)";
+        askExplanationEl.textContent = "";
+        askUsageEl.textContent = "";
+
+        try {
+          // Step 1: build the LLM-API payload in-browser. No API key
+          // needed here — it's just the prompt body.
+          const payload = db.askPrompt(question);
+
+          // Step 2: POST to the local backend proxy. The proxy adds
+          // x-api-key from its env and forwards to Anthropic.
+          // Set up: see server.mjs alongside this file.
+          const response = await fetch("/api/llm/complete", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`backend ${response.status}: ${errText}`);
+          }
+          const rawApiResponse = await response.text();
+
+          // Step 3: parse the LLM response back into structured form.
+          const result = db.askParse(rawApiResponse);
+
+          if (!result.sql || result.sql.trim().length === 0) {
+            askSqlEl.textContent = "(model declined to generate SQL)";
+            askExplanationEl.textContent = result.explanation || "(no explanation)";
+          } else {
+            askSqlEl.textContent = result.sql;
+            askExplanationEl.textContent = result.explanation || "(no explanation)";
+            // Drop the generated SQL into the SQL console for review +
+            // execution. User clicks Run to actually execute. This
+            // mirrors the REPL's confirm-and-run UX from Phase 7g.2.
+            sqlTextarea.value = result.sql + ";";
+          }
+          const u = result.usage;
+          askUsageEl.textContent =
+            `tokens: input=${u.input_tokens}, output=${u.output_tokens}, ` +
+            `cache_write=${u.cache_creation_input_tokens}, cache_hit=${u.cache_read_input_tokens}`;
+          askStatus.textContent = "done — SQL pasted into console above; click Run to execute.";
+        } catch (err) {
+          // Most common error: proxy isn't running. Give a clear hint
+          // rather than a cryptic "Failed to fetch".
+          const msg = String(err);
+          if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+            askStatus.textContent = "couldn't reach proxy — is `node server.mjs` running?";
+          } else {
+            askStatus.textContent = msg;
+          }
+          askSqlEl.textContent = `Error: ${msg}`;
+        } finally {
+          askButton.disabled = false;
+        }
       };
     </script>
   </body>
