@@ -8,9 +8,21 @@ Every SQL statement goes through [`process_command`](../src/sql/mod.rs):
 
 ```rust
 pub fn process_command(query: &str, db: &mut Database) -> Result<String>
+
+// Richer variant — returns both the status line and (for SELECT) the
+// pre-rendered prettytable. The REPL uses this so it can print the
+// table above the status; SDK / FFI / MCP callers ignore the rendered
+// field and use the typed-row API for actual row access.
+pub fn process_command_with_render(query: &str, db: &mut Database)
+    -> Result<CommandOutput>;
+
+pub struct CommandOutput {
+    pub status: String,
+    pub rendered: Option<String>,   // Some(_) only for SELECT
+}
 ```
 
-Given a raw line of SQL (e.g. `"SELECT name FROM users WHERE age > 25;"`) and the in-memory database, it returns either a human-readable status message or a typed error.
+Given a raw line of SQL (e.g. `"SELECT name FROM users WHERE age > 25;"`) and the in-memory database, both functions return either a human-readable status (and, for SELECT, a rendered prettytable) or a typed error. **Neither writes to stdout** — the REPL is the only consumer that prints anything; everyone else (Tauri desktop, SDKs, the MCP server) just reads the returned struct.
 
 The function's shape:
 
@@ -19,7 +31,7 @@ The function's shape:
 3. Classify as read-only vs. writing.
 4. Match on `Statement::*` and dispatch to the appropriate executor.
 5. If the statement writes and the DB is file-backed, auto-save.
-6. Return the status string.
+6. Return `CommandOutput { status, rendered }`. (`process_command` is a backwards-compat wrapper that just returns `.status`.)
 
 ## Parsing
 

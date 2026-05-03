@@ -8,7 +8,7 @@ use crate::repl::REPLHelper;
 use sqlrite::error::{Result, SQLRiteError};
 use sqlrite::sql::db::database::Database;
 use sqlrite::sql::pager::{open_database, save_database};
-use sqlrite::{ask::ask_with_database, process_command};
+use sqlrite::{ask::ask_with_database, process_command_with_render};
 use sqlrite_ask::AskConfig;
 
 #[derive(Debug, PartialEq)]
@@ -251,11 +251,16 @@ fn handle_ask(
     }
 
     // Run the generated SQL through the same pipeline as a typed
-    // statement. process_command handles both DDL/DML (returns a
-    // status string like "INSERT Statement executed.") and SELECT
-    // (returns a rendered table). Either is fine to return up to the
-    // outer dispatch loop, which just prints what we hand back.
-    process_command(&resp.sql, db)
+    // statement. We use the `_with_render` variant so SELECTs come back
+    // with their rendered prettytable; concatenate it above the status
+    // line so the REPL's outer dispatch (which just prints whatever
+    // string we return) shows both. DDL/DML statements return only a
+    // status — `rendered` is `None` and we skip the prepend.
+    let output = process_command_with_render(&resp.sql, db)?;
+    Ok(match output.rendered {
+        Some(rendered) => format!("{rendered}{}", output.status),
+        None => output.status,
+    })
 }
 
 #[cfg(test)]

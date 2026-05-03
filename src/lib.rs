@@ -88,7 +88,7 @@ pub use sql::pager::{
     AccessMode, MASTER_TABLE_NAME, open_database, open_database_read_only, open_database_with_mode,
     save_database,
 };
-pub use sql::process_command;
+pub use sql::{CommandOutput, process_command, process_command_with_render};
 
 // Re-export sqlparser so downstream crates (the Tauri desktop app, the
 // eventual WASM bindings) can reach into the AST without pulling a

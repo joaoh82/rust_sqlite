@@ -8,11 +8,25 @@
 //! in by accident, a banner from a third-party crate. The MCP client
 //! sees garbage where it expected JSON and disconnects.
 //!
-//! The SQLRite engine's REPL-convenience prints inside
-//! `process_command` (the `CREATE TABLE` schema dump at sql/mod.rs:150,
-//! the `INSERT` row dump at sql/mod.rs:208, the `SELECT` result table
-//! at sql/mod.rs:224) are exactly this kind of write. They're great
-//! for an interactive REPL; lethal for an MCP server.
+//! ## Engine-side fix + this defense-in-depth backstop
+//!
+//! As of the engine-stdout-pollution cleanup, the SQLRite engine's
+//! `process_command` no longer writes to stdout. The historical REPL-
+//! convenience prints (CREATE TABLE schema dump, INSERT row dump,
+//! SELECT result table) all moved out: the rendered SELECT table now
+//! comes back inside [`sqlrite::CommandOutput::rendered`] for the REPL
+//! to print itself, and the CREATE / INSERT prints were dropped
+//! entirely (the latter was a spammy bug-feature anyway). So in normal
+//! operation this redirect catches nothing.
+//!
+//! We keep the redirect anyway as **defense in depth.** Three concrete
+//! futures it protects against: (a) a future engine PR accidentally
+//! reintroducing a `println!` that the test suite doesn't catch
+//! (engine tests don't assert on stdout); (b) a transitive dep adding
+//! a startup banner; (c) a debug print left in mid-development. Any
+//! one of those would silently break the MCP server without this
+//! safety net. Cost: ~140 LOC + a libc dep that's already a
+//! transitive of clap.
 //!
 //! ## What this module does
 //!

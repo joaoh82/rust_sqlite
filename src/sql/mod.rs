@@ -41,10 +41,52 @@ impl SQLCommand {
     }
 }
 
-/// Performs initial parsing of SQL Statement using sqlparser-rs
+/// Output of running one SQL statement through the engine.
+///
+/// Two fields:
+///
+/// - `status` is the short human-readable confirmation line every caller
+///   wants ("INSERT Statement executed.", "3 rows updated.", "BEGIN", etc.).
+/// - `rendered` is the pre-formatted prettytable rendering of a SELECT's
+///   result rows. Populated only for `SELECT` statements; `None` for every
+///   other statement type. The REPL prints this above the status line so
+///   users see both the rows and the confirmation; SDK / FFI / MCP callers
+///   ignore it and reach for the typed-row APIs (`Connection::prepare` →
+///   `Statement::query` → `Rows`) when they want row data instead.
+///
+/// Splitting the two means [`process_command_with_render`] can return
+/// everything the REPL needs without writing to stdout itself —
+/// historically `process_command` would `print!()` the rendered table
+/// directly, which corrupted any non-REPL stdout channel (the MCP server's
+/// JSON-RPC wire, structured loggers piping engine output, …).
+#[derive(Debug, Clone)]
+pub struct CommandOutput {
+    pub status: String,
+    pub rendered: Option<String>,
+}
+
+/// Backwards-compatible wrapper around [`process_command_with_render`] that
+/// returns just the status string. Every existing call site (the public
+/// `Connection::execute`, the SDK FFI shims, the .ask meta-command's
+/// inline runner, the engine's own tests) keeps working unchanged.
+///
+/// Callers that want the rendered SELECT table (the REPL, future
+/// terminal-style consumers) should call [`process_command_with_render`]
+/// directly and inspect [`CommandOutput::rendered`].
 pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
+    process_command_with_render(query, db).map(|o| o.status)
+}
+
+/// Performs initial parsing of SQL Statement using sqlparser-rs.
+///
+/// Returns a [`CommandOutput`] carrying both the status string and (for
+/// SELECT statements) the pre-rendered prettytable output. **Never writes
+/// to stdout.** The REPL is responsible for printing whatever it wants
+/// from the returned struct.
+pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<CommandOutput> {
     let dialect = SQLiteDialect {};
     let message: String;
+    let mut rendered: Option<String> = None;
     let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 
     if ast.len() > 1 {
@@ -58,7 +100,10 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     // Return a benign status rather than panicking on `pop().unwrap()`. Callers
     // (REPL, Tauri app) treat this as a no-op with no disk write triggered.
     let Some(query) = ast.pop() else {
-        return Ok("No statement to execute.".to_string());
+        return Ok(CommandOutput {
+            status: "No statement to execute.".to_string(),
+            rendered: None,
+        });
     };
 
     // Transaction boundary statements are routed to Database-level
@@ -68,7 +113,10 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
     match &query {
         Statement::StartTransaction { .. } => {
             db.begin_transaction()?;
-            return Ok(String::from("BEGIN"));
+            return Ok(CommandOutput {
+                status: String::from("BEGIN"),
+                rendered: None,
+            });
         }
         Statement::Commit { .. } => {
             if !db.in_transaction() {
@@ -94,11 +142,17 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                 }
             }
             db.commit_transaction()?;
-            return Ok(String::from("COMMIT"));
+            return Ok(CommandOutput {
+                status: String::from("COMMIT"),
+                rendered: None,
+            });
         }
         Statement::Rollback { .. } => {
             db.rollback_transaction()?;
-            return Ok(String::from("ROLLBACK"));
+            return Ok(CommandOutput {
+                status: String::from("ROLLBACK"),
+                rendered: None,
+            });
         }
         _ => {}
     }
@@ -147,12 +201,14 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                         }
                         false => {
                             let table = Table::new(payload);
-                            let _ = table.print_table_schema();
+                            // Note: we used to call `table.print_table_schema()` here
+                            // for REPL convenience. Removed because it wrote
+                            // directly to stdout, which corrupted any non-REPL
+                            // protocol channel (most painfully the MCP server's
+                            // JSON-RPC wire). The status line below is enough for
+                            // the REPL; users who want to inspect the schema can
+                            // run a follow-up describe / `.tables`-style command.
                             db.tables.insert(table_name.to_string(), table);
-                            // Iterate over everything.
-                            // for (table_name, _) in &db.tables {
-                            //     println!("{}" , table_name);
-                            // }
                             message = String::from("CREATE TABLE Statement executed.");
                         }
                     }
@@ -205,7 +261,12 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
                                     ));
                                 }
                             }
-                            db_table.print_table_data();
+                            // Note: we used to call `db_table.print_table_data()`
+                            // here, which dumped the *entire* table to stdout
+                            // after every INSERT. Beyond corrupting non-REPL
+                            // stdout channels, that's actively bad UX on any
+                            // table with more than a few rows. Removed in the
+                            // engine-stdout-pollution cleanup.
                         }
                         false => {
                             return Err(SQLRiteError::Internal("Table doesn't exist".to_string()));
@@ -219,9 +280,13 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         }
         Statement::Query(_) => {
             let select_query = SelectQuery::new(&query)?;
-            let (rendered, rows) = executor::execute_select(select_query, db)?;
-            // Print the result table above the status message so the REPL shows both.
-            print!("{rendered}");
+            let (rendered_table, rows) = executor::execute_select(select_query, db)?;
+            // Stash the rendered prettytable in the output so the REPL
+            // (or any terminal-style consumer) can print it above the
+            // status line. SDK / FFI / MCP callers ignore this field.
+            // The previous implementation `print!("{rendered}")`-ed
+            // directly to stdout, which broke every non-REPL embedder.
+            rendered = Some(rendered_table);
             message = format!(
                 "SELECT Statement executed. {rows} row{s} returned.",
                 s = if rows == 1 { "" } else { "s" }
@@ -267,7 +332,10 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
         pager::save_database(db, &path)?;
     }
 
-    Ok(message)
+    Ok(CommandOutput {
+        status: message,
+        rendered,
+    })
 }
 
 #[cfg(test)]

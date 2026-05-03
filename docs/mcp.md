@@ -309,7 +309,7 @@ Stderr is reserved for diagnostics (panics, the MCP startup banner). Anything wr
 
 - **Logging hygiene:** the `query`, `execute`, and `ask` tools receive arbitrary user-supplied SQL and questions. The server emits these to stderr only on errors (so the MCP log pane is useful for debugging) — but if you wrap `sqlrite-mcp`'s stderr in your own logging stack, treat the contents as potentially sensitive.
 
-- **Stdout is owned by the protocol.** The binary redirects process fd 1 to fd 2 at startup so any errant `print!` from anywhere in the dep tree goes to stderr instead of corrupting the JSON-RPC channel. See `sqlrite-mcp/src/stdio_redirect.rs` for the dance.
+- **Stdout is owned by the protocol.** As of the engine-stdout-pollution cleanup, the SQLRite engine itself doesn't print to stdout — the REPL-convenience prints (CREATE schema, INSERT row dump, SELECT result table) all moved out: SELECT's rendered table comes back inside [`CommandOutput::rendered`](../src/sql/mod.rs) for the REPL to print itself, the others were dropped entirely. The MCP binary additionally redirects process fd 1 → fd 2 at startup as **defense in depth** — protects against future regressions if a contributor (or a transitive dep) ever reintroduces a stray `print!`. See `sqlrite-mcp/src/stdio_redirect.rs` for the dance.
 
 ---
 

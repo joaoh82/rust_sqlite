@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use meta_command::handle_meta_command;
 use repl::{CommandType, REPLHelper, get_command_type, get_config};
-use sqlrite::{Database, process_command};
+use sqlrite::{Database, process_command_with_render};
 
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
@@ -144,10 +144,21 @@ fn main() -> rustyline::Result<()> {
                 // Parsing user's input and returning and enum of repl::CommandType
                 match get_command_type(command.trim()) {
                     CommandType::SQLCommand(_cmd) => {
-                        // process_command takes care of tokenizing, parsing and executing
-                        // the SQL Statement and returning a Result<String, SQLRiteError>
-                        match process_command(&command, &mut db) {
-                            Ok(response) => println!("{response}"),
+                        // `process_command_with_render` returns a CommandOutput
+                        // carrying both the status line and (for SELECT) the
+                        // pre-rendered prettytable. Print rendered first if
+                        // present so the user sees the rows above the
+                        // confirmation. Prior to the engine-stdout-pollution
+                        // cleanup the engine printed the table itself, which
+                        // corrupted any non-REPL stdout channel — now the REPL
+                        // owns the printing.
+                        match process_command_with_render(&command, &mut db) {
+                            Ok(output) => {
+                                if let Some(rendered) = output.rendered.as_deref() {
+                                    print!("{rendered}");
+                                }
+                                println!("{}", output.status);
+                            }
                             Err(err) => eprintln!("An error occured: {err}"),
                         }
                     }
