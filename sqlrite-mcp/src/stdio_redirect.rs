@@ -28,10 +28,18 @@
 //!
 //! ## Cross-platform notes
 //!
-//! `libc::dup` / `libc::dup2` work on Unix and Windows alike (the
-//! Windows targets in the `libc` crate map them to `_dup` / `_dup2`
-//! from the MSVCRT). One implementation, two platforms — no `#[cfg]`
-//! arms required.
+//! `libc::dup` / `libc::dup2` exist on both Unix and Windows (Windows
+//! targets resolve them to `_dup` / `_dup2` in the MSVCRT). The
+//! divergence is in turning the resulting C runtime fd into a Rust
+//! `File`:
+//!
+//! - **Unix**: `std::os::fd::FromRawFd::from_raw_fd(fd) -> File`
+//!   directly. The fd IS the kernel handle.
+//! - **Windows**: C runtime fds aren't kernel handles. We need
+//!   `_get_osfhandle(fd) -> HANDLE`, then
+//!   `std::os::windows::io::FromRawHandle::from_raw_handle(handle) -> File`.
+//!
+//! Two `#[cfg]` arms below.
 
 use std::fs::File;
 use std::io;
@@ -44,6 +52,7 @@ use std::io;
 /// Returns an error if either `dup` or `dup2` fails — both extremely
 /// rare (out of file descriptors, somebody closed fd 1 already, etc.)
 /// and worth aborting on.
+#[cfg(unix)]
 pub fn redirect_stdout_to_stderr() -> io::Result<File> {
     use std::os::fd::FromRawFd;
 
@@ -60,21 +69,71 @@ pub fn redirect_stdout_to_stderr() -> io::Result<File> {
     // ultimately writes to fd 1) goes to stderr.
     if unsafe { libc::dup2(2, 1) } < 0 {
         let err = io::Error::last_os_error();
-        // Best-effort: close the saved fd before returning. If this
-        // fails too, we're well past graceful recovery.
+        // Best-effort: close the saved fd before returning.
         unsafe { libc::close(saved_stdout_fd) };
         return Err(err);
     }
 
-    // Important: drop Rust's cached `Stdout` wrapper if it has buffered
-    // anything. We haven't written anything yet (no `println!` runs
-    // before `main`), but flushing-then-rebinding keeps the contract
-    // tight. The new `File` from the saved fd is what the transport
-    // runner will use for all MCP writes.
+    // Flush Rust's cached `Stdout` buffer in case anything raced in
+    // before we got here. (In practice nothing does — `main` is the
+    // first user code to run — but flushing keeps the contract tight.)
     let _ = io::Write::flush(&mut io::stdout());
 
-    // Wrap the saved fd in a `File`. `from_raw_fd` is the safe-ish way
-    // to take ownership: when the `File` drops, it closes the fd.
+    // Wrap the saved fd in a `File`. The `File` owns the fd and will
+    // close it on drop.
     let real_stdout = unsafe { File::from_raw_fd(saved_stdout_fd) };
+    Ok(real_stdout)
+}
+
+#[cfg(windows)]
+pub fn redirect_stdout_to_stderr() -> io::Result<File> {
+    use std::os::raw::c_int;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+
+    // Bind directly to MSVCRT instead of relying on whatever surface
+    // `libc` happens to expose on Windows targets. `_dup`/`_dup2`/
+    // `_close` operate on C runtime fds (small ints, same as Unix);
+    // `_get_osfhandle` converts a C runtime fd into a Win32 HANDLE
+    // (a pointer-sized integer) so we can wrap it in a Rust `File`.
+    //
+    // The underscore-prefixed names are the canonical exports —
+    // they've been stable in MSVCRT / UCRT for decades and aren't
+    // going anywhere. Return type for `_get_osfhandle` is `intptr_t`,
+    // which we model as `isize` (pointer-width signed integer matches
+    // on both x86 and x64 Windows targets).
+    unsafe extern "C" {
+        fn _dup(fd: c_int) -> c_int;
+        fn _dup2(src: c_int, dst: c_int) -> c_int;
+        fn _close(fd: c_int) -> c_int;
+        fn _get_osfhandle(fd: c_int) -> isize;
+    }
+
+    // Save fd 1, then redirect fd 1 → fd 2.
+    let saved_stdout_fd = unsafe { _dup(1) };
+    if saved_stdout_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { _dup2(2, 1) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { _close(saved_stdout_fd) };
+        return Err(err);
+    }
+
+    let _ = io::Write::flush(&mut io::stdout());
+
+    // Convert C runtime fd → Win32 HANDLE. Returns -1 on error
+    // (INVALID_HANDLE_VALUE).
+    let handle = unsafe { _get_osfhandle(saved_stdout_fd) };
+    if handle == -1 {
+        unsafe { _close(saved_stdout_fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    // Wrap the HANDLE in a `File`. NOTE: the underlying C runtime fd
+    // (`saved_stdout_fd`) is intentionally leaked here — `File` only
+    // closes the HANDLE on drop, and closing both would double-free
+    // the kernel handle. The leaked fd is harmless: it lives for the
+    // process lifetime, and there's exactly one of them per server run.
+    let real_stdout = unsafe { File::from_raw_handle(handle as RawHandle) };
     Ok(real_stdout)
 }
