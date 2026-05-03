@@ -24,23 +24,38 @@ pub const MAGIC: &[u8; 16] = b"SQLRiteFormat\0\0\0";
 ///   the new `KIND_INDEX` format.
 /// - Version 4 (Phase 7): cell encoding gains the `KIND_VECTOR` value
 ///   tag (length-prefixed dense f32 array) for the new `VECTOR(N)`
-///   column type. Per the Phase 7 plan (`docs/phase-7-plan.md` Q8),
-///   later Phase 7 sub-phases (JSON, HNSW indexes) will add their own
-///   value/cell tags inside this same v4 envelope — no v5 mid-Phase-7.
-pub const FORMAT_VERSION: u16 = 4;
+///   column type, plus the `KIND_HNSW` cell tag for vector ANN
+///   indexes. All Phase 7 storage additions (VECTOR cells, JSON cells,
+///   HNSW index nodes) live inside the v4 envelope.
+/// - Version 5 (Phase 8c): adds the `KIND_FTS_POSTING` cell tag for
+///   persisted FTS posting lists. Bumped **on demand** — a database
+///   without any FTS index keeps writing v4. The first save with at
+///   least one FTS index attached writes v5 instead. Decoders accept
+///   both v4 and v5; v5 reading a v4-shaped DB just sees zero FTS
+///   indexes in `sqlrite_master`. See [Phase 8 plan Q10].
+pub const FORMAT_VERSION_V4: u16 = 4;
+pub const FORMAT_VERSION_V5: u16 = 5;
+/// The version a brand-new write defaults to when no FTS index forces
+/// a bump. Existing databases keep their on-disk version unchanged
+/// across reads + non-FTS writes; FTS-bearing saves switch to V5.
+pub const FORMAT_VERSION_BASELINE: u16 = FORMAT_VERSION_V4;
 
 /// Parsed header. `page_count` includes page 0 itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DbHeader {
     pub page_count: u32,
     pub schema_root_page: u32,
+    /// On-disk format version this header carries. Tracked explicitly
+    /// so save can preserve a v4 file as v4 (no FTS) or bump it to v5
+    /// (FTS present), per Phase 8c's on-demand bump strategy.
+    pub format_version: u16,
 }
 
 /// Encodes the header into a `PAGE_SIZE`-sized buffer.
 pub fn encode_header(h: &DbHeader) -> [u8; PAGE_SIZE] {
     let mut buf = [0u8; PAGE_SIZE];
     buf[0..16].copy_from_slice(MAGIC);
-    buf[16..18].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    buf[16..18].copy_from_slice(&h.format_version.to_le_bytes());
     buf[18..20].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
     buf[20..24].copy_from_slice(&h.page_count.to_le_bytes());
     buf[24..28].copy_from_slice(&h.schema_root_page.to_le_bytes());
@@ -49,6 +64,8 @@ pub fn encode_header(h: &DbHeader) -> [u8; PAGE_SIZE] {
 
 /// Decodes the header from a `PAGE_SIZE`-sized buffer. Returns an error if
 /// magic bytes, format version, or page size don't match what we wrote.
+/// Both V4 and V5 are accepted; the result's `format_version` echoes
+/// what was on disk so a no-op resave preserves it.
 pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
     if buf.len() != PAGE_SIZE {
         return Err(SQLRiteError::Internal(format!(
@@ -62,9 +79,10 @@ pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
         ));
     }
     let version = u16::from_le_bytes(buf[16..18].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION_V4 && version != FORMAT_VERSION_V5 {
         return Err(SQLRiteError::General(format!(
-            "unsupported SQLRite format version {version}; this build understands {FORMAT_VERSION}"
+            "unsupported SQLRite format version {version}; this build understands \
+             {FORMAT_VERSION_V4} and {FORMAT_VERSION_V5}"
         )));
     }
     let page_size = u16::from_le_bytes(buf[18..20].try_into().unwrap()) as usize;
@@ -78,5 +96,6 @@ pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
     Ok(DbHeader {
         page_count,
         schema_root_page,
+        format_version: version,
     })
 }

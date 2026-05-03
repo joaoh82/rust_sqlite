@@ -308,6 +308,7 @@ mod tests {
             .commit(crate::sql::pager::header::DbHeader {
                 page_count: next_free,
                 schema_root_page: 1,
+                format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
             })
             .unwrap();
 
@@ -330,6 +331,7 @@ mod tests {
             .commit(crate::sql::pager::header::DbHeader {
                 page_count: next,
                 schema_root_page: 1,
+                format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
             })
             .unwrap();
 
