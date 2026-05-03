@@ -73,6 +73,30 @@ pub const KIND_INDEX: u8 = 0x04;
 /// the first varint after the kind tag — exactly the `node_id` here.
 pub const KIND_HNSW: u8 = 0x05;
 
+/// Phase 8c: a single FTS posting-list cell. Body layout (after the
+/// shared `cell_length | kind_tag` prefix):
+///
+/// ```text
+///   cell_id    zigzag varint   sequential id assigned at save time;
+///                              acts as the B-Tree slot key so
+///                              `peek_rowid` works uniformly
+///   term_len   varint          length of the term in bytes
+///                              (0 → this cell is the doc-lengths
+///                              sidecar, value below is doc_len)
+///   term       term_len bytes  ASCII-lowercased term (per Phase 8 Q3)
+///   count      varint          number of (rowid, value) pairs
+///   for each:
+///     rowid    zigzag varint   the row this posting refers to
+///     value    varint          term frequency for this (term, row),
+///                              or doc length when term_len == 0
+/// ```
+///
+/// One sidecar cell with `term_len == 0` holds `(rowid, doc_len)`
+/// pairs so reload reproduces every indexed doc — including any with
+/// zero-token text — without re-tokenizing. All remaining cells are
+/// posting cells, one per term.
+pub const KIND_FTS_POSTING: u8 = 0x06;
+
 /// Value type tag stored in each non-NULL value block.
 pub mod tag {
     pub const INTEGER: u8 = 0;

@@ -32,6 +32,8 @@
 #[allow(dead_code)]
 pub mod cell;
 pub mod file;
+#[allow(dead_code)]
+pub mod fts_cell;
 pub mod header;
 #[allow(dead_code)]
 pub mod hnsw_cell;
@@ -166,7 +168,7 @@ pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -
         if create_index_sql_uses_hnsw(&row.sql) {
             rebuild_hnsw_index(&mut db, &pager, &row)?;
         } else if create_index_sql_uses_fts(&row.sql) {
-            rebuild_fts_index(&mut db, &row)?;
+            rebuild_fts_index(&mut db, &pager, &row)?;
         } else {
             attach_index(&mut db, &pager, row)?;
         }
@@ -291,10 +293,15 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
         });
     }
 
-    // 2c. Phase 8b — persist a sqlrite_master entry for each FTS index
-    //     so it's replayed on open. The posting list itself isn't on
-    //     disk yet (Phase 8c) — `rootpage = 0` signals replay-from-rows
-    //     to `rebuild_fts_index`. Mirrors HNSW's pre-7d.3 shape.
+    // 2c. Phase 8c — persist FTS posting lists as their own
+    //     cell-encoded page trees, with the rootpage recorded in
+    //     sqlrite_master. Reopen loads the postings back from cells
+    //     (fast, exact match) instead of re-tokenizing rows.
+    //
+    //     Dirty indexes (set by DELETE / UPDATE-on-text-col) are
+    //     rebuilt from current rows BEFORE staging by
+    //     `rebuild_dirty_fts_indexes`, so the on-disk tree reflects
+    //     the current row set.
     let mut fts_entries: Vec<(&Table, &crate::sql::db::table::FtsIndexEntry)> = Vec::new();
     for table in db.tables.values() {
         for entry in &table.fts_indexes {
@@ -303,7 +310,10 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     }
     fts_entries
         .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
+    let any_fts = !fts_entries.is_empty();
     for (table, entry) in fts_entries {
+        let (rootpage, new_next) = stage_fts_btree(&mut pager, &entry.index, next_free_page)?;
+        next_free_page = new_next;
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: entry.name.clone(),
@@ -311,7 +321,7 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
                 "CREATE INDEX {} ON {} USING fts ({})",
                 entry.name, table.tb_name, entry.column_name
             ),
-            rootpage: 0,
+            rootpage,
             last_rowid: 0,
         });
     }
@@ -335,9 +345,20 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     let (master_root, master_next) = stage_table_btree(&mut pager, &master, next_free_page)?;
     next_free_page = master_next;
 
+    // Phase 8c — on-demand v4→v5 file-format bump per Q10. If any FTS
+    // index attached to the database, write v5; otherwise preserve the
+    // pre-existing version (v4 for files born before this build, or
+    // a previously-promoted v5 file). Reads accept both.
+    let format_version = if any_fts {
+        crate::sql::pager::header::FORMAT_VERSION_V5
+    } else {
+        pager.header().format_version
+    };
+
     pager.commit(DbHeader {
         page_count: next_free_page,
         schema_root_page: master_root,
+        format_version,
     })?;
 
     if same_path {
@@ -707,12 +728,22 @@ fn create_index_sql_uses_fts(sql: &str) -> bool {
     matches!(using, Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fts"))
 }
 
-/// Phase 8b — replays a `CREATE INDEX … USING fts(...)` statement on
-/// database open to rebuild its in-memory `PostingList` from current
-/// rows. Mirrors the `rootpage == 0` arm of [`rebuild_hnsw_index`].
-/// Persistence of the posting lists themselves is Phase 8c.
-fn rebuild_fts_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
+/// Phase 8c — loads (or rebuilds) an FTS index on database open. Two
+/// paths mirror [`rebuild_hnsw_index`]:
+///
+///   - **rootpage != 0** (Phase 8c default): the posting list is
+///     persisted as cell-encoded pages. Read every cell directly via
+///     [`load_fts_postings`] and reconstruct the index — no
+///     re-tokenization, exact bit-for-bit reproduction.
+///
+///   - **rootpage == 0** (compatibility): no on-disk postings, e.g.
+///     for files saved by Phase 8b before persistence landed. Replay
+///     the CREATE INDEX SQL through `execute_create_index`, which
+///     walks the table's current rows and tokenizes them fresh.
+fn rebuild_fts_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) -> Result<()> {
+    use crate::sql::db::table::FtsIndexEntry;
     use crate::sql::executor::execute_create_index;
+    use crate::sql::fts::PostingList;
     use sqlparser::ast::Statement;
 
     let dialect = SQLiteDialect {};
@@ -723,8 +754,65 @@ fn rebuild_fts_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
             row.sql
         )));
     };
-    execute_create_index(&stmt, db)?;
+
+    if row.rootpage == 0 {
+        // Compatibility path — no persisted postings; replay rows.
+        execute_create_index(&stmt, db)?;
+        return Ok(());
+    }
+
+    let (doc_lengths, postings) = load_fts_postings(pager, row.rootpage)?;
+    let index = PostingList::from_persisted_postings(doc_lengths, postings);
+    let (tbl_name, col_name) = parse_fts_create_index_sql(&row.sql)?;
+    let table_mut = db.get_table_mut(tbl_name.clone()).map_err(|_| {
+        SQLRiteError::Internal(format!(
+            "FTS index '{}' references unknown table '{tbl_name}'",
+            row.name
+        ))
+    })?;
+    table_mut.fts_indexes.push(FtsIndexEntry {
+        name: row.name.clone(),
+        column_name: col_name,
+        index,
+        needs_rebuild: false,
+    });
     Ok(())
+}
+
+/// Pulls (table_name, column_name) out of a `CREATE INDEX … USING fts(col)`
+/// SQL string. Same shape as `parse_hnsw_create_index_sql`.
+fn parse_fts_create_index_sql(sql: &str) -> Result<(String, String)> {
+    use sqlparser::ast::{CreateIndex, Expr, Statement};
+
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
+    let Some(Statement::CreateIndex(CreateIndex {
+        table_name,
+        columns,
+        ..
+    })) = ast.pop()
+    else {
+        return Err(SQLRiteError::Internal(format!(
+            "sqlrite_master FTS row's SQL isn't a CREATE INDEX: {sql}"
+        )));
+    };
+    if columns.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "multi-column FTS indexes aren't supported yet".to_string(),
+        ));
+    }
+    let col = match &columns[0].column.expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| p.value.clone()).unwrap_or_default()
+        }
+        other => {
+            return Err(SQLRiteError::Internal(format!(
+                "FTS CREATE INDEX has unexpected column expr: {other:?}"
+            )));
+        }
+    };
+    Ok((table_name.to_string(), col))
 }
 
 /// Loads (or rebuilds) an HNSW index on database open. Two paths:
@@ -1092,6 +1180,156 @@ fn stage_hnsw_btree(
         level = next_level;
     }
     Ok((level[0].0, next_free_page))
+}
+
+/// Phase 8c — stage one FTS index as a `TableLeaf`-shaped B-Tree.
+/// Mirrors `stage_hnsw_btree` (sibling-chained leaves, optional interior
+/// levels). Returns `(root_page, next_free_page)`. Each leaf is filled
+/// with `KIND_FTS_POSTING` cells: one sidecar cell holding the
+/// doc-lengths map, then one cell per term in lexicographic order.
+fn stage_fts_btree(
+    pager: &mut Pager,
+    idx: &crate::sql::fts::PostingList,
+    start_page: u32,
+) -> Result<(u32, u32)> {
+    let (leaves, mut next_free_page) = stage_fts_leaves(pager, idx, start_page)?;
+    if leaves.len() == 1 {
+        return Ok((leaves[0].0, next_free_page));
+    }
+    let mut level: Vec<(u32, i64)> = leaves;
+    while level.len() > 1 {
+        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
+        next_free_page = new_next_free;
+        level = next_level;
+    }
+    Ok((level[0].0, next_free_page))
+}
+
+/// Packs FTS posting cells into a sibling-chained run of `TableLeaf`
+/// pages. Cell layout: a single doc-lengths sidecar at `cell_id = 1`,
+/// followed by one cell per term in lexicographic order with
+/// `cell_id = 2..=N + 1`. Sequential ids keep the slot directory's
+/// rowid ordering valid (the `cell_id` field is what `peek_rowid`
+/// returns).
+fn stage_fts_leaves(
+    pager: &mut Pager,
+    idx: &crate::sql::fts::PostingList,
+    start_page: u32,
+) -> Result<(Vec<(u32, i64)>, u32)> {
+    use crate::sql::pager::fts_cell::FtsPostingCell;
+
+    let mut leaves: Vec<(u32, i64)> = Vec::new();
+    let mut current_leaf = TablePage::empty();
+    let mut current_leaf_page = start_page;
+    let mut current_max_rowid: Option<i64> = None;
+    let mut next_free_page = start_page + 1;
+
+    // Build the cell sequence: sidecar first, then per-term cells. The
+    // sidecar always exists (even on an empty index) so reload sees a
+    // canonical "this index was persisted" marker in slot 0.
+    let mut cell_id: i64 = 1;
+    let mut cells: Vec<FtsPostingCell> = Vec::new();
+    cells.push(FtsPostingCell::doc_lengths(
+        cell_id,
+        idx.serialize_doc_lengths(),
+    ));
+    for (term, entries) in idx.serialize_postings() {
+        cell_id += 1;
+        cells.push(FtsPostingCell::posting(cell_id, term, entries));
+    }
+
+    for cell in cells {
+        let entry_bytes = cell.encode()?;
+
+        if !current_leaf.would_fit(entry_bytes.len()) {
+            let next_leaf_page_num = next_free_page;
+            emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
+            leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+            current_leaf = TablePage::empty();
+            current_leaf_page = next_leaf_page_num;
+            next_free_page += 1;
+
+            if !current_leaf.would_fit(entry_bytes.len()) {
+                // A single posting cell exceeds page capacity. Phase
+                // 8c MVP doesn't chain via overflow cells (the plan
+                // notes this as a stretch goal); surface a clear
+                // error so users know which term tripped it.
+                return Err(SQLRiteError::Internal(format!(
+                    "FTS posting cell {} of {} bytes exceeds empty-page capacity {} \
+                     (term too long or too many postings; overflow chaining is Phase 8.1)",
+                    cell.cell_id,
+                    entry_bytes.len(),
+                    current_leaf.free_space()
+                )));
+            }
+        }
+        current_leaf.insert_entry(cell.cell_id, &entry_bytes)?;
+        current_max_rowid = Some(cell.cell_id);
+    }
+
+    emit_leaf(pager, current_leaf_page, &current_leaf, 0);
+    leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
+    Ok((leaves, next_free_page))
+}
+
+/// (rowid, value) pairs as decoded from a single FTS cell — value is
+/// either term frequency (posting cell) or doc length (sidecar cell).
+type FtsEntries = Vec<(i64, u32)>;
+/// (term, posting list) pairs as decoded from non-sidecar FTS cells.
+type FtsPostings = Vec<(String, FtsEntries)>;
+
+/// Phase 8c — read every cell of an FTS index from `root_page` back
+/// into the `(doc_lengths, postings)` shape `PostingList::from_persisted_postings`
+/// expects. Mirrors `load_hnsw_nodes`: leftmost-leaf descent, walk the
+/// sibling chain, decode each slot.
+fn load_fts_postings(pager: &Pager, root_page: u32) -> Result<(FtsEntries, FtsPostings)> {
+    use crate::sql::pager::fts_cell::FtsPostingCell;
+
+    let mut doc_lengths: Vec<(i64, u32)> = Vec::new();
+    let mut postings: Vec<(String, Vec<(i64, u32)>)> = Vec::new();
+    let mut saw_sidecar = false;
+
+    let first_leaf = find_leftmost_leaf(pager, root_page)?;
+    let mut current = first_leaf;
+    while current != 0 {
+        let page_buf = pager
+            .read_page(current)
+            .ok_or_else(|| SQLRiteError::Internal(format!("missing FTS leaf page {current}")))?;
+        if page_buf[0] != PageType::TableLeaf as u8 {
+            return Err(SQLRiteError::Internal(format!(
+                "page {current} tagged {} but expected TableLeaf (FTS)",
+                page_buf[0]
+            )));
+        }
+        let next_leaf = u32::from_le_bytes(page_buf[1..5].try_into().unwrap());
+        let payload: &[u8; PAYLOAD_PER_PAGE] = (&page_buf[PAGE_HEADER_SIZE..])
+            .try_into()
+            .map_err(|_| SQLRiteError::Internal("FTS leaf payload size".to_string()))?;
+        let leaf = TablePage::from_bytes(payload);
+        for slot in 0..leaf.slot_count() {
+            let offset = leaf.slot_offset_raw(slot)?;
+            let (cell, _) = FtsPostingCell::decode(leaf.as_bytes(), offset)?;
+            if cell.is_doc_lengths() {
+                if saw_sidecar {
+                    return Err(SQLRiteError::Internal(
+                        "FTS index has more than one doc-lengths sidecar cell".to_string(),
+                    ));
+                }
+                saw_sidecar = true;
+                doc_lengths = cell.entries;
+            } else {
+                postings.push((cell.term, cell.entries));
+            }
+        }
+        current = next_leaf;
+    }
+
+    if !saw_sidecar {
+        return Err(SQLRiteError::Internal(
+            "FTS index missing doc-lengths sidecar cell — corrupt or truncated tree".to_string(),
+        ));
+    }
+    Ok((doc_lengths, postings))
 }
 
 /// Packs HNSW nodes into a sibling-chained run of `TableLeaf` pages.
@@ -1633,10 +1871,10 @@ mod tests {
 
     #[test]
     fn round_trip_rebuilds_fts_index_from_create_sql() {
-        // Phase 8b — FTS indexes don't yet persist their posting lists
-        // (Phase 8c does that). On open, sqlrite_master records the
-        // CREATE INDEX SQL and `rebuild_fts_index` replays it through
-        // `execute_create_index`, walking current rows.
+        // Phase 8c: FTS indexes now persist their posting lists as
+        // cell-encoded pages. After save+reopen the index entry
+        // reattaches with the same column + same posting count, loaded
+        // directly from disk (no re-tokenization).
         let path = tmp_path("fts_roundtrip");
 
         {
@@ -1731,6 +1969,198 @@ mod tests {
         // Pre-delete: 2 rows ('rust embedded', 'rust framework') had
         // 'rust'. Post-delete: only id=2 remains.
         assert!(resp.contains("1 row returned"), "got: {resp}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fts_roundtrip_uses_persistence_path_not_replay() {
+        // Phase 8c — assert the reload didn't go through the
+        // rootpage=0 replay shortcut. We do this by reading the
+        // sqlrite_master row for the FTS index and confirming its
+        // rootpage field is non-zero.
+        let path = tmp_path("fts_persistence_path");
+
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                "INSERT INTO docs (body) VALUES ('rust embedded database');",
+                &mut db,
+            )
+            .unwrap();
+            process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+            save_database(&mut db, &path).expect("save");
+        }
+
+        // Read raw sqlrite_master to find the FTS index row.
+        let pager = Pager::open(&path).expect("open pager");
+        let mut master = build_empty_master_table();
+        load_table_rows(&pager, &mut master, pager.header().schema_root_page).unwrap();
+        let mut found_rootpage: Option<u32> = None;
+        for rowid in master.rowids() {
+            let name = take_text(&master, "name", rowid).unwrap();
+            if name == "ix_body" {
+                let rp = take_integer(&master, "rootpage", rowid).unwrap();
+                found_rootpage = Some(rp as u32);
+            }
+        }
+        let rootpage = found_rootpage.expect("ix_body row in sqlrite_master");
+        assert!(
+            rootpage != 0,
+            "Phase 8c FTS save should set rootpage != 0; got {rootpage}"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_without_fts_keeps_format_v4() {
+        // Phase 8c on-demand bump — a database with zero FTS indexes
+        // continues writing the v4 header. Existing v4 users must not
+        // see their files silently promoted to v5 by an upgrade.
+        use crate::sql::pager::header::FORMAT_VERSION_V4;
+
+        let path = tmp_path("fts_no_bump");
+        let mut db = Database::new("test".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (n) VALUES (1);", &mut db).unwrap();
+        save_database(&mut db, &path).unwrap();
+        drop(db);
+
+        let pager = Pager::open(&path).expect("open");
+        assert_eq!(
+            pager.header().format_version,
+            FORMAT_VERSION_V4,
+            "no-FTS save should keep v4"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_with_fts_bumps_to_v5() {
+        // Phase 8c on-demand bump — first FTS-bearing save promotes
+        // the file to v5. v5 readers handle both v4 and v5; v4
+        // readers correctly refuse a v5 file.
+        use crate::sql::pager::header::FORMAT_VERSION_V5;
+
+        let path = tmp_path("fts_bump_v5");
+        let mut db = Database::new("test".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO docs (body) VALUES ('hello');", &mut db).unwrap();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        save_database(&mut db, &path).unwrap();
+        drop(db);
+
+        let pager = Pager::open(&path).expect("open");
+        assert_eq!(
+            pager.header().format_version,
+            FORMAT_VERSION_V5,
+            "FTS save should promote to v5"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fts_persistence_handles_empty_and_zero_token_docs() {
+        // Phase 8c — sidecar cell carries doc-lengths for every doc
+        // including any with zero tokens (so total_docs is honest
+        // post-reopen). Empty index also round-trips: a CREATE INDEX
+        // on an empty table emits a single empty leaf with just the
+        // (empty) sidecar.
+        let path = tmp_path("fts_edges");
+
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+                &mut db,
+            )
+            .unwrap();
+            process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+            // Mix: real text, then a row that tokenizes to zero tokens
+            // (only punctuation), then real again.
+            process_command("INSERT INTO docs (body) VALUES ('rust embedded');", &mut db).unwrap();
+            process_command("INSERT INTO docs (body) VALUES ('!!!---???');", &mut db).unwrap();
+            process_command("INSERT INTO docs (body) VALUES ('go embedded');", &mut db).unwrap();
+            save_database(&mut db, &path).unwrap();
+        }
+
+        let loaded = open_database(&path, "test".to_string()).expect("open");
+        let table = loaded.get_table("docs".to_string()).unwrap();
+        let entry = &table.fts_indexes[0];
+        // All three rows present — including the zero-token row,
+        // which is critical for total_docs honesty in BM25.
+        assert_eq!(entry.index.len(), 3);
+        // 'embedded' appears in 2 rows after reload.
+        let res = entry
+            .index
+            .query("embedded", &crate::sql::fts::Bm25Params::default());
+        assert_eq!(res.len(), 2);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fts_persistence_round_trips_large_corpus() {
+        // Phase 8c — exercise multi-leaf staging. ~500 docs with
+        // single-token bodies generates enough cells to overflow a
+        // single 4 KiB leaf (each posting cell averages ~8 bytes).
+        let path = tmp_path("fts_large_corpus");
+
+        let mut expected_terms: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+                &mut db,
+            )
+            .unwrap();
+            process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+            // 500 docs, each one a unique term — drives unique-term
+            // count up so multiple leaves are required.
+            for i in 0..500 {
+                let term = format!("term{i:04}");
+                process_command(
+                    &format!("INSERT INTO docs (body) VALUES ('{term}');"),
+                    &mut db,
+                )
+                .unwrap();
+                expected_terms.insert(term);
+            }
+            save_database(&mut db, &path).unwrap();
+        }
+
+        let loaded = open_database(&path, "test".to_string()).expect("open");
+        let table = loaded.get_table("docs".to_string()).unwrap();
+        let entry = &table.fts_indexes[0];
+        assert_eq!(entry.index.len(), 500);
+
+        // Spot-check a handful of terms come back with their original
+        // single-row posting list.
+        for &i in &[0_i64, 137, 248, 391, 499] {
+            let term = format!("term{i:04}");
+            let res = entry
+                .index
+                .query(&term, &crate::sql::fts::Bm25Params::default());
+            assert_eq!(res.len(), 1, "term {term} should match exactly 1 row");
+            // PrimaryKey rowids start at 1; doc i was inserted at
+            // rowid i+1.
+            assert_eq!(res[0].0, i + 1);
+        }
 
         cleanup(&path);
     }

@@ -76,6 +76,70 @@ impl PostingList {
         }
     }
 
+    /// Phase 8c — emit `(rowid, doc_len)` pairs for every indexed doc,
+    /// in ascending rowid order. The pager writes these into the FTS
+    /// index's doc-lengths sidecar cell; reload feeds them back to
+    /// [`Self::from_persisted_postings`].
+    pub fn serialize_doc_lengths(&self) -> Vec<(i64, u32)> {
+        self.doc_lengths
+            .iter()
+            .map(|(id, len)| (*id, *len))
+            .collect()
+    }
+
+    /// Phase 8c — emit `(term, [(rowid, term_freq)])` triples in
+    /// lexicographic term order; per-term entries are in ascending
+    /// rowid order (the underlying `BTreeMap` already guarantees this).
+    /// One element per unique indexed term; pager writes one cell per
+    /// element.
+    pub fn serialize_postings(&self) -> Vec<(String, Vec<(i64, u32)>)> {
+        self.postings
+            .iter()
+            .map(|(term, postings)| {
+                let entries = postings.iter().map(|(id, freq)| (*id, *freq)).collect();
+                (term.clone(), entries)
+            })
+            .collect()
+    }
+
+    /// Phase 8c — rebuild a `PostingList` directly from the persisted
+    /// doc-lengths sidecar + per-term postings. No tokenization runs;
+    /// the resulting index is byte-equivalent to what was saved
+    /// (assuming the input came from `serialize_*`).
+    ///
+    /// `doc_lengths` is the full `(rowid, doc_len)` map written into
+    /// the sidecar cell. `postings` is one `(term, [(rowid, tf)])`
+    /// element per term cell.
+    pub fn from_persisted_postings<I, J>(doc_lengths: I, postings: J) -> Self
+    where
+        I: IntoIterator<Item = (i64, u32)>,
+        J: IntoIterator<Item = (String, Vec<(i64, u32)>)>,
+    {
+        let mut doc_lengths_map: BTreeMap<i64, u32> = BTreeMap::new();
+        let mut total_tokens: u64 = 0;
+        for (rowid, len) in doc_lengths {
+            doc_lengths_map.insert(rowid, len);
+            total_tokens += len as u64;
+        }
+
+        let mut postings_map: BTreeMap<String, BTreeMap<i64, u32>> = BTreeMap::new();
+        for (term, entries) in postings {
+            let inner: BTreeMap<i64, u32> = entries.into_iter().collect();
+            // An empty posting list shouldn't be persisted, but if it
+            // somehow was, drop it on load — `remove()` would have
+            // pruned the same way at runtime.
+            if !inner.is_empty() {
+                postings_map.insert(term, inner);
+            }
+        }
+
+        Self {
+            postings: postings_map,
+            doc_lengths: doc_lengths_map,
+            total_tokens,
+        }
+    }
+
     /// Tokenize `text` and add its postings under `rowid`. If `rowid` is
     /// already indexed, its previous postings are removed first — i.e.
     /// `insert` is idempotent for re-indexing the same row.
@@ -411,6 +475,33 @@ mod tests {
         assert_eq!(ids, [1, 2, 3].iter().copied().collect());
         // Doc 1 has both terms → should outrank singletons.
         assert_eq!(res[0].0, 1);
+    }
+
+    #[test]
+    fn serialize_round_trips_through_from_persisted() {
+        // Phase 8c — the (de)serialize pair must reproduce the exact
+        // in-memory state that was saved. Emptiness, multi-term, and
+        // re-insert idempotence all need to round-trip.
+        let mut pl = PostingList::new();
+        pl.insert(1, "rust embedded database");
+        pl.insert(2, "rust web framework");
+        pl.insert(3, ""); // zero-token doc — exercises the sidecar
+        pl.insert(4, "rust rust rust embedded power");
+
+        let docs = pl.serialize_doc_lengths();
+        let postings = pl.serialize_postings();
+        let roundtripped = PostingList::from_persisted_postings(docs, postings);
+
+        assert_eq!(roundtripped.len(), pl.len(), "doc count");
+        assert_eq!(roundtripped.avg_doc_len(), pl.avg_doc_len(), "avg_doc_len");
+        // Every query result + score must match.
+        let q = pl.query("rust", &Bm25Params::default());
+        let q2 = roundtripped.query("rust", &Bm25Params::default());
+        assert_eq!(q, q2, "query results must match after round-trip");
+        // Zero-token doc 3 stays in the corpus stats so total_docs is
+        // honest, even though it'll never match a query.
+        assert!(roundtripped.matches(1, "rust"));
+        assert!(!roundtripped.matches(3, "rust"));
     }
 
     #[test]
