@@ -26,7 +26,7 @@ This crate is the LLM transport layer. **Most callers don't need to use it direc
 
 ```toml
 [dependencies]
-sqlrite-engine = "0.1"
+sqlrite-engine = "0.2"
 # `sqlrite-engine`'s `ask` feature is on by default, which pulls
 # `sqlrite-ask` transitively. You don't usually need to depend on
 # this crate directly.
