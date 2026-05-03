@@ -1,5 +1,6 @@
 pub mod db;
 pub mod executor;
+pub mod fts;
 pub mod hnsw;
 pub mod pager;
 pub mod parser;
