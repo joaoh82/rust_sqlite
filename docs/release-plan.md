@@ -73,16 +73,17 @@ GitHub Releases by product ("show me every Python release").
 | Rust engine     | `sqlrite-vX.Y.Z`       | crates.io + GitHub Release                       |
 | C FFI shim      | `sqlrite-ffi-vX.Y.Z`   | GitHub Release (per-platform tarballs)           |
 | `sqlrite-ask`   | `sqlrite-ask-vX.Y.Z`   | crates.io + GitHub Release                       |
+| `sqlrite-mcp`   | `sqlrite-mcp-vX.Y.Z`   | crates.io + GitHub Release (per-platform binary tarballs) |
 | Python SDK      | `sqlrite-py-vX.Y.Z`    | PyPI + GitHub Release                            |
 | Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm (`@joaoh82/sqlrite`) + GitHub Release        |
 | Go SDK          | `sdk/go/vX.Y.Z`        | Git tag (no registry) + GitHub Release assets    |
 | WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`@joaoh82/sqlrite-wasm`) + GitHub Release   |
 | Desktop app     | `sqlrite-desktop-vX.Y.Z` | GitHub Release (unsigned installers)           |
-| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other eight; acts as the "this was release 0.2.0" anchor) |
+| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other nine; acts as the "this was release 0.2.0" anchor) |
 
-All nine tags point at the same commit — the merge commit of the
+All ten tags point at the same commit — the merge commit of the
 release PR. The meta tag is the umbrella release users can link to
-in announcements; the eight per-product tags are for tooling
+in announcements; the nine per-product tags are for tooling
 (crates.io, Go module proxy, npm dist-tags, etc.) that expects a
 specific format.
 
@@ -90,8 +91,14 @@ specific format.
 > its own tag and crates.io publish but ships in lockstep with everything
 > else — same version every wave. `publish-ask` runs after `publish-crate`
 > in `release.yml` because crates.io rejects publishes whose path-deps
-> haven't yet resolved at the same version. `sqlrite-mcp` (Phase 7h) will
-> add a ninth product line on the same pattern.
+> haven't yet resolved at the same version.
+
+> **`sqlrite-mcp` joined the lockstep wave in Phase 7h (this commit).** Two
+> new release jobs: `publish-mcp` (cargo publish to crates.io, sequenced
+> after `publish-crate` + `publish-ask` because it depends on both) and
+> `build-mcp-binaries` (per-platform binary tarballs for users who want
+> to drop the executable on their PATH without installing a Rust
+> toolchain). Same Cargo.toml version-bump pattern as the other crates.
 
 ## Version bumping: exact file list
 
@@ -104,6 +111,7 @@ matching new value:
 | `Cargo.toml` (root)                      | `[package].version`                         |
 | `sqlrite-ffi/Cargo.toml`                 | `[package].version`                         |
 | `sqlrite-ask/Cargo.toml`                 | `[package].version`                         |
+| `sqlrite-mcp/Cargo.toml`                 | `[package].version`                         |
 | `sdk/python/Cargo.toml`                  | `[package].version`                         |
 | `sdk/python/pyproject.toml`              | `[project].version`                         |
 | `sdk/nodejs/Cargo.toml`                  | `[package].version`                         |

@@ -20,8 +20,9 @@ A small, hand-written guide to the SQLRite codebase — how it's structured, how
 
 ## Phase 7 — AI-era extensions
 
-- [Ask — natural-language → SQL](ask.md) — the canonical reference for the `ask()` feature across every product surface (REPL, desktop, Rust library, Python / Node / Go / WASM SDKs); env vars, defaults, prompt caching, security
+- [Ask — natural-language → SQL](ask.md) — the canonical reference for the `ask()` feature across every product surface (REPL, desktop, Rust library, Python / Node / Go / WASM SDKs, MCP server); env vars, defaults, prompt caching, security
 - [Ask backend proxy templates](ask-backend-examples.md) — copy-paste backend examples for the WASM SDK's split design: Cloudflare Workers, Vercel Edge, Deno Deploy, Firebase Functions, AWS Lambda, Express, pure Node
+- [MCP server (`sqlrite-mcp`)](mcp.md) — Phase 7h: SQLRite as a Model Context Protocol stdio server. Wiring into Claude Code / Cursor / `mcp-inspector`; the seven tools (`list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`); read-only mode; the JSON-RPC wire format
 
 ## Internals
 
