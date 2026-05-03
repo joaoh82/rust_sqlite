@@ -1,6 +1,6 @@
 # Phase 7 — AI-era extensions: proposal + plan
 
-**Status:** *approved 2026-04-26 — implementation pending.* The 10 design questions (Q1–Q10) have been resolved by the project owner; see the **Decisions** section below for the canonical answers. Each per-sub-phase section reflects the chosen design. Implementation has not yet started — sub-phase 7a is the next branch to cut.
+**Status:** *approved 2026-04-26 — implementation complete except 7f (FTS5/BM25), which deferred to Phase 8 per Q1.* All ten design questions (Q1–Q10) were resolved by the project owner; see the **Decisions** section below for the canonical answers. The per-sub-phase narratives below are now retrospectives — each marked ✅ and dated to the version that shipped it. Phase 7 closed out the v0.1.x cycle with seven new product surfaces (`sqlrite-ask` crate, `sqlrite-mcp` server binary, the `ask()` family across REPL / desktop / Rust / Python / Node / Go / WASM, the MCP tools).
 
 **Audience:** primarily the project owner deciding what Phase 7 should be; secondarily future-self / contributors trying to understand the rationale once the decisions are made and code lands.
 
@@ -514,7 +514,11 @@ For clarity:
 
 1. ~~Project owner answers Q1–Q10.~~ ✅ done 2026-04-26.
 2. ~~Update this document with the chosen answers.~~ ✅ done in the same commit that records this status.
-3. Cut a branch for sub-phase **7a** (`feat/vector-column-type`).
-4. Implementation begins.
+3. ~~Cut a branch for sub-phase **7a** (`feat/vector-column-type`).~~ ✅ shipped in v0.1.10.
+4. ~~Implementation begins.~~ ✅ Phase 7 implementation ran from v0.1.10 (7a) through v0.1.25 (7h + 7g.8). Each sub-phase shipped as its own PR + release wave.
+5. **Phase 8** — return to the FTS5/BM25 work deferred per Q1, plus hybrid retrieval (vector + BM25 score fusion).
 
-If any of the sub-phases turn out scope-misjudged in the doing — too small, too large, missing a hidden complication — re-scope in this document and link a "scope correction" note. The plan is allowed to evolve; that's why it's written down.
+The "scope correction" provision of this doc was used twice:
+
+- **7d's HNSW ANN index** broke into three follow-up sub-phases (7d.1 algorithm, 7d.2 SQL integration, 7d.3 persistence) instead of one — the persistence layer was 2× the original LOC estimate, see the 7d retrospective in `docs/roadmap.md`.
+- **7g.2's REPL `.ask`** triggered the dep-direction flip retrospective documented in `docs/roadmap.md`. `sqlrite-ask` shed its engine dep entirely; the `Connection`/`Database` integration moved into `sqlrite-engine` itself behind a new `ask` feature. Public API surface unchanged for end users; the structural cleanup unblocked 7g.7's WASM build (no HTTP transport needed there) and made 7h's MCP server simpler.

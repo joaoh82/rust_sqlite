@@ -230,6 +230,10 @@ npm run build
 npm test                # uses node --test (Node 18+'s built-in runner)
 ```
 
+## Sibling products
+
+This SDK is for when *your code* drives the database. If you want an *LLM agent* to drive a SQLRite database directly, install the [`sqlrite-mcp`](../../docs/mcp.md) Model Context Protocol server (`cargo install sqlrite-mcp`) and wire it into Claude Code / Cursor / `mcp-inspector` / any MCP-aware client. Same engine underneath.
+
 ## Status
 
 Phase 5d MVP: ✅ — CRUD, transactions, read-only mode, error handling, statement preparation, `columns()` introspection, typed columns back as JS primitives / objects. Parameter binding, prepared-plan caching, `changes`/`lastInsertRowid` tracking, and a real lazy iterator are natural follow-ups once the engine's cursor abstraction lands (5a.2).

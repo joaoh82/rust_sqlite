@@ -2,6 +2,8 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
+> **Active frontier (May 2026):** Phase 8 — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. Phases 0 – 7 are shipped (Phase 7 except for the deferred FTS slice).
+
 ## ✅ Phase 0 — Modernization
 
 *Done (commit `ce3ddd4`).*
@@ -40,7 +42,7 @@ The engine could parse SQL but only execute CREATE and INSERT. Phase 1 finished 
 
 See [File format](file-format.md).
 
-## Phase 3 — On-disk B-Tree + auto-save pager *(in progress)*
+## ✅ Phase 3 — On-disk B-Tree + auto-save pager
 
 Split into sub-phases for manageable commits.
 
@@ -101,7 +103,7 @@ Real B-Tree per table, keyed by ROWID. Leaves stay in the Phase 3c cell format; 
 
 Build / run: `cd desktop && npm install && npm run tauri dev`. See [docs/desktop.md](../docs/desktop.md) for details.
 
-## Phase 4 — Durability + concurrency *(in progress)*
+## ✅ Phase 4 — Durability + concurrency
 
 ### ✅ Phase 4a — Exclusive file lock
 
