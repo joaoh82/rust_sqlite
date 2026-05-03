@@ -1,5 +1,6 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
+use crate::sql::fts::PostingList;
 use crate::sql::hnsw::HnswIndex;
 use crate::sql::parser::create::CreateQuery;
 use std::collections::{BTreeMap, HashMap};
@@ -137,6 +138,12 @@ pub struct Table {
     /// persisted CREATE INDEX SQL. The graph itself is NOT yet persisted —
     /// see Phase 7d.3 for cell-encoded graph storage.
     pub hnsw_indexes: Vec<HnswIndexEntry>,
+    /// FTS inverted indexes on TEXT columns (Phase 8b). Maintained in
+    /// lockstep with row storage on INSERT (incremental); DELETE / UPDATE
+    /// flag `needs_rebuild` and the next save rebuilds from current rows.
+    /// The posting lists themselves are NOT yet persisted — Phase 8c
+    /// wires the cell-encoded `KIND_FTS_POSTING` storage.
+    pub fts_indexes: Vec<FtsIndexEntry>,
     /// ROWID of most recent insert.
     pub last_rowid: i64,
     /// PRIMARY KEY column name, or "-1" if the table has no PRIMARY KEY.
@@ -160,6 +167,29 @@ pub struct HnswIndexEntry {
     /// invalidated the graph since the last rebuild. INSERT maintains
     /// the graph incrementally and leaves this false. The next save
     /// rebuilds dirty indexes from current rows before serializing.
+    pub needs_rebuild: bool,
+}
+
+/// One FTS index attached to a table (Phase 8b). The inverted index
+/// itself is a [`PostingList`]; metadata (name, column, dirty flag)
+/// lives here. Mirrors [`HnswIndexEntry`] field-for-field so the
+/// rebuild-on-save and DELETE/UPDATE invalidation paths can use one
+/// pattern across both index families.
+#[derive(Debug, Clone)]
+pub struct FtsIndexEntry {
+    /// User-supplied name from `CREATE INDEX <name> … USING fts(<col>)`.
+    /// Unique across `secondary_indexes`, `hnsw_indexes`, and
+    /// `fts_indexes` on a given table.
+    pub name: String,
+    /// The TEXT column this index covers.
+    pub column_name: String,
+    /// The inverted index + per-doc length cache.
+    pub index: PostingList,
+    /// True iff a DELETE or UPDATE-on-text-col has invalidated the
+    /// posting lists since the last rebuild. INSERT maintains the
+    /// index incrementally and leaves this false. The next save
+    /// rebuilds dirty indexes from current rows before serializing
+    /// (mirrors HNSW's Q7 strategy).
     pub needs_rebuild: bool,
 }
 
@@ -244,6 +274,9 @@ impl Table {
             // time, because there's no UNIQUE-style constraint that
             // implies a vector index.
             hnsw_indexes: Vec::new(),
+            // Same story for FTS indexes — explicit `CREATE INDEX … USING
+            // fts(<col>)` only (Phase 8b).
+            fts_indexes: Vec::new(),
             last_rowid: 0,
             primary_key,
         }
@@ -271,6 +304,8 @@ impl Table {
             // graph copy. Phase 4f's snapshot-rollback semantics require
             // the snapshot to be fully decoupled from live state.
             hnsw_indexes: self.hnsw_indexes.clone(),
+            // Same fully-decoupled clone for FTS indexes (Phase 8b).
+            fts_indexes: self.fts_indexes.clone(),
             last_rowid: self.last_rowid,
             primary_key: self.primary_key.clone(),
         }
@@ -908,8 +943,16 @@ impl Table {
             // wiring up neighbor edges, so build a get_vec closure that
             // pulls from the table's row storage (which we *just* updated
             // with the new value).
-            if let Some(Value::Vector(new_vec)) = typed_value {
-                self.maintain_hnsw_on_insert(key, next_rowid, &new_vec);
+            if let Some(Value::Vector(new_vec)) = &typed_value {
+                self.maintain_hnsw_on_insert(key, next_rowid, new_vec);
+            }
+
+            // Step 4 (Phase 8b): maintain any FTS indexes on this column.
+            // Cheap incremental update — PostingList::insert tokenizes
+            // the value and adds postings under the new rowid. DELETE
+            // and UPDATE take the rebuild-on-save path instead (Q7).
+            if let Some(Value::Text(text)) = &typed_value {
+                self.maintain_fts_on_insert(key, next_rowid, text);
             }
         }
         self.last_rowid = next_rowid;
@@ -944,6 +987,20 @@ impl Table {
                 entry.index.insert(rowid, new_vec, |id| {
                     vec_snapshot.get(&id).cloned().unwrap_or_default()
                 });
+            }
+        }
+    }
+
+    /// After a row insert, push the new (rowid, text) into every FTS
+    /// index whose column matches `column`. Phase 8b.
+    ///
+    /// Mirrors [`Self::maintain_hnsw_on_insert`] but the FTS index is
+    /// self-contained — `PostingList::insert` only needs the new doc's
+    /// text, not the rest of the corpus, so there's no snapshot dance.
+    fn maintain_fts_on_insert(&mut self, column: &str, rowid: i64, text: &str) {
+        for entry in &mut self.fts_indexes {
+            if entry.column_name == column {
+                entry.index.insert(rowid, text);
             }
         }
     }

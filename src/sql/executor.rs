@@ -7,13 +7,16 @@ use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, FunctionArg,
     FunctionArgExpr, FunctionArguments, IndexType, ObjectNamePart, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Update,
+    TableWithJoins, UnaryOperator, Update, Value as AstValue,
 };
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
-use crate::sql::db::table::{DataType, HnswIndexEntry, Table, Value, parse_vector_literal};
+use crate::sql::db::table::{
+    DataType, FtsIndexEntry, HnswIndexEntry, Table, Value, parse_vector_literal,
+};
+use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
 
@@ -99,12 +102,18 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     //
     // We branch in cases:
     //   1. ORDER BY + LIMIT k matches the HNSW probe pattern  → graph probe.
-    //   2. ORDER BY + LIMIT k where k < |matching|            → bounded heap (7c).
-    //   3. ORDER BY without LIMIT, or LIMIT >= |matching|     → full sort.
-    //   4. LIMIT without ORDER BY                              → just truncate.
+    //   2. ORDER BY + LIMIT k matches the FTS probe pattern   → posting probe.
+    //   3. ORDER BY + LIMIT k where k < |matching|            → bounded heap (7c).
+    //   4. ORDER BY without LIMIT, or LIMIT >= |matching|     → full sort.
+    //   5. LIMIT without ORDER BY                              → just truncate.
     match (&query.order_by, query.limit) {
         (Some(order), Some(k)) if try_hnsw_probe(table, &order.expr, k).is_some() => {
             matching = try_hnsw_probe(table, &order.expr, k).unwrap();
+        }
+        (Some(order), Some(k))
+            if try_fts_probe(table, &order.expr, order.ascending, k).is_some() =>
+        {
+            matching = try_fts_probe(table, &order.expr, order.ascending, k).unwrap();
         }
         (Some(order), Some(k)) if k < matching.len() => {
             matching = select_topk(&matching, table, order, k)?;
@@ -208,8 +217,15 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
     // table (the deleted node could still appear in other nodes'
     // neighbor lists, breaking subsequent searches). Mark dirty so
     // the next save rebuilds from current rows before serializing.
+    //
+    // Phase 8b — same posture for FTS indexes (Q7 — rebuild-on-save
+    // mirrors HNSW). The deleted rowid still appears in posting
+    // lists; leaving it would surface zombie hits in future queries.
     if !matching.is_empty() {
         for entry in &mut table.hnsw_indexes {
+            entry.needs_rebuild = true;
+        }
+        for entry in &mut table.fts_indexes {
             entry.needs_rebuild = true;
         }
     }
@@ -314,12 +330,19 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     // non-vector columns also mark dirty, which is over-conservative
     // but harmless — the rebuild walks rows anyway, and the cost is
     // only paid on save.)
+    //
+    // Phase 8b — same shape for FTS indexes covering updated TEXT cols.
     if !work.is_empty() {
         let updated_columns: std::collections::HashSet<&str> = work
             .iter()
             .flat_map(|(_, values)| values.iter().map(|(c, _)| c.as_str()))
             .collect();
         for entry in &mut tbl.hnsw_indexes {
+            if updated_columns.contains(entry.column_name.as_str()) {
+                entry.needs_rebuild = true;
+            }
+        }
+        for entry in &mut tbl.fts_indexes {
             if updated_columns.contains(entry.column_name.as_str()) {
                 entry.needs_rebuild = true;
             }
@@ -384,12 +407,16 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw") => {
             IndexMethod::Hnsw
         }
+        Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fts") => {
+            IndexMethod::Fts
+        }
         Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("btree") => {
             IndexMethod::Btree
         }
         Some(other) => {
             return Err(SQLRiteError::NotImplemented(format!(
-                "CREATE INDEX … USING {other:?} is not supported (try `hnsw` or no USING clause)"
+                "CREATE INDEX … USING {other:?} is not supported \
+                 (try `hnsw`, `fts`, or no USING clause)"
             )));
         }
         None => IndexMethod::Btree,
@@ -430,10 +457,11 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
             .find(|c| c.column_name == column_name)
             .expect("we just verified the column exists");
 
-        // Name uniqueness check spans BOTH index kinds — a btree and an
-        // hnsw can't share a name.
+        // Name uniqueness check spans ALL index kinds — btree, hnsw, and
+        // fts share one namespace per table.
         if table.index_by_name(&index_name).is_some()
             || table.hnsw_indexes.iter().any(|i| i.name == index_name)
+            || table.fts_indexes.iter().any(|i| i.name == index_name)
         {
             if *if_not_exists {
                 return Ok(index_name);
@@ -472,6 +500,15 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
             *unique,
             &existing_rowids_and_values,
         ),
+        IndexMethod::Fts => create_fts_index(
+            db,
+            &table_name_str,
+            &index_name,
+            &column_name,
+            &datatype,
+            *unique,
+            &existing_rowids_and_values,
+        ),
     }
 }
 
@@ -482,6 +519,8 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
 enum IndexMethod {
     Btree,
     Hnsw,
+    /// Phase 8b — full-text inverted index over a TEXT column.
+    Fts,
 }
 
 /// Builds a Phase 3e B-Tree secondary index and attaches it to the table.
@@ -598,6 +637,57 @@ fn create_hnsw_index(
         column_name: column_name.to_string(),
         index: idx,
         // Freshly built — no DELETE/UPDATE has invalidated it yet.
+        needs_rebuild: false,
+    });
+    Ok(index_name.to_string())
+}
+
+/// Builds a Phase 8b FTS inverted index and attaches it to the table.
+/// Mirrors [`create_hnsw_index`] in shape: validate column type,
+/// tokenize each existing row's text into the in-memory posting list,
+/// push an `FtsIndexEntry`.
+fn create_fts_index(
+    db: &mut Database,
+    table_name: &str,
+    index_name: &str,
+    column_name: &str,
+    datatype: &DataType,
+    unique: bool,
+    existing: &[(i64, Value)],
+) -> Result<String> {
+    // FTS is a TEXT-only feature for the MVP. JSON columns share the
+    // Row::Text storage but their content is structured — full-text
+    // indexing JSON keys + values would need a different design (and
+    // is out of scope per the Phase 8 plan's "Out of scope" section).
+    match datatype {
+        DataType::Text => {}
+        other => {
+            return Err(SQLRiteError::General(format!(
+                "USING fts requires a TEXT column; '{column_name}' is {other}"
+            )));
+        }
+    }
+
+    if unique {
+        return Err(SQLRiteError::General(
+            "UNIQUE has no meaning for FTS indexes".to_string(),
+        ));
+    }
+
+    let mut idx = PostingList::new();
+    for (rowid, v) in existing {
+        if let Value::Text(text) = v {
+            idx.insert(*rowid, text);
+        }
+        // Non-text values (Null, type coercion bugs) get skipped — same
+        // posture as create_hnsw_index for non-vector values.
+    }
+
+    let table_mut = db.get_table_mut(table_name.to_string())?;
+    table_mut.fts_indexes.push(FtsIndexEntry {
+        name: index_name.to_string(),
+        column_name: column_name.to_string(),
+        index: idx,
         needs_rebuild: false,
     });
     Ok(index_name.to_string())
@@ -837,6 +927,89 @@ fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>
         }
     });
     Some(result)
+}
+
+/// Phase 8b — FTS optimizer hook.
+///
+/// Recognizes `ORDER BY bm25_score(<col>, '<query>') DESC LIMIT <k>`
+/// and serves it from the FTS index instead of full-scanning. Returns
+/// `Some(rowids)` already sorted by descending BM25 (with rowid
+/// ascending as tie-break), or `None` to fall through to scalar eval.
+///
+/// **Known limitation (mirrors `try_hnsw_probe`).** This shortcut
+/// ignores any `WHERE` clause. The canonical FTS query has a
+/// `WHERE fts_match(<col>, '<q>')` predicate, which is implicitly
+/// satisfied by the probe results — so dropping it is harmless.
+/// Anything *else* in the WHERE (`AND status = 'published'`) gets
+/// silently skipped on the optimizer path. Per Phase 8 plan Q6 we
+/// match HNSW's posture here; a correctness-preserving multi-index
+/// composer is deferred.
+fn try_fts_probe(table: &Table, order_expr: &Expr, ascending: bool, k: usize) -> Option<Vec<i64>> {
+    if k == 0 || ascending {
+        // BM25 is "higher = better"; ASC ranking is almost certainly a
+        // user mistake. Fall through so the caller gets either an
+        // explicit error from scalar eval or the slow correct path.
+        return None;
+    }
+
+    let func = match order_expr {
+        Expr::Function(f) => f,
+        _ => return None,
+    };
+    let fname = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.to_lowercase(),
+        _ => return None,
+    };
+    if fname != "bm25_score" {
+        return None;
+    }
+
+    let arg_list = match &func.args {
+        FunctionArguments::List(l) => &l.args,
+        _ => return None,
+    };
+    if arg_list.len() != 2 {
+        return None;
+    }
+    let exprs: Vec<&Expr> = arg_list
+        .iter()
+        .filter_map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect();
+    if exprs.len() != 2 {
+        return None;
+    }
+
+    // Arg 0 must be a bare column identifier.
+    let col_name = match exprs[0] {
+        Expr::Identifier(ident) if ident.quote_style.is_none() => ident.value.clone(),
+        _ => return None,
+    };
+
+    // Arg 1 must be a single-quoted string literal. Anything else
+    // (column reference, function call) requires per-row evaluation —
+    // we'd lose the whole point of the probe.
+    let query = match exprs[1] {
+        Expr::Value(v) => match &v.value {
+            AstValue::SingleQuotedString(s) => s.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let entry = table
+        .fts_indexes
+        .iter()
+        .find(|e| e.column_name == col_name)?;
+
+    let scored = entry.index.query(&query, &Bm25Params::default());
+    let mut out: Vec<i64> = scored.into_iter().map(|(id, _)| id).collect();
+    if out.len() > k {
+        out.truncate(k);
+    }
+    Some(out)
 }
 
 /// Helper for `try_hnsw_probe`: given two function args, identify which
@@ -1210,10 +1383,105 @@ fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> 
         "json_type" => json_fn_type(&name, &func.args, table, rowid),
         "json_array_length" => json_fn_array_length(&name, &func.args, table, rowid),
         "json_object_keys" => json_fn_object_keys(&name, &func.args, table, rowid),
+        // Phase 8b — FTS scalars. Both consult an FTS index attached to
+        // the named column; both error if no index exists (the index is
+        // a hard prerequisite, mirroring SQLite FTS5's MATCH).
+        "fts_match" => {
+            let (entry, query) = resolve_fts_args(&name, &func.args, table, rowid)?;
+            Ok(Value::Bool(entry.index.matches(rowid, &query)))
+        }
+        "bm25_score" => {
+            let (entry, query) = resolve_fts_args(&name, &func.args, table, rowid)?;
+            let s = entry.index.score(rowid, &query, &Bm25Params::default());
+            Ok(Value::Real(s))
+        }
         other => Err(SQLRiteError::NotImplemented(format!(
             "unknown function: {other}(...)"
         ))),
     }
+}
+
+/// Helper for `fts_match` / `bm25_score`: pull the column reference out
+/// of arg 0 (a bare identifier — we need the *name*, not the per-row
+/// value), evaluate arg 1 as a Text query string, and look up the FTS
+/// index attached to that column. Errors if any step fails.
+fn resolve_fts_args<'t>(
+    fn_name: &str,
+    args: &FunctionArguments,
+    table: &'t Table,
+    rowid: i64,
+) -> Result<(&'t FtsIndexEntry, String)> {
+    let arg_list = match args {
+        FunctionArguments::List(l) => &l.args,
+        _ => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() expects exactly two arguments: (column, query_text)"
+            )));
+        }
+    };
+    if arg_list.len() != 2 {
+        return Err(SQLRiteError::General(format!(
+            "{fn_name}() expects exactly 2 arguments, got {}",
+            arg_list.len()
+        )));
+    }
+
+    // Arg 0: bare column identifier. Must resolve syntactically to a
+    // column name (we can't accept arbitrary expressions because we
+    // need the column to look up the index, not the column's value).
+    let col_expr = match &arg_list[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        other => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "{fn_name}() argument 0 must be a column name, got {other:?}"
+            )));
+        }
+    };
+    let col_name = match col_expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?,
+        other => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() argument 0 must be a column reference, got {other:?}"
+            )));
+        }
+    };
+
+    // Arg 1: query string. Evaluated through the normal expression
+    // pipeline so callers can pass a literal `'rust db'` or an
+    // expression that yields TEXT.
+    let q_expr = match &arg_list[1] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        other => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "{fn_name}() argument 1 must be a text expression, got {other:?}"
+            )));
+        }
+    };
+    let query = match eval_expr(q_expr, table, rowid)? {
+        Value::Text(s) => s,
+        other => {
+            return Err(SQLRiteError::General(format!(
+                "{fn_name}() argument 1 must be TEXT, got {}",
+                other.to_display_string()
+            )));
+        }
+    };
+
+    let entry = table
+        .fts_indexes
+        .iter()
+        .find(|e| e.column_name == col_name)
+        .ok_or_else(|| {
+            SQLRiteError::General(format!(
+                "{fn_name}({col_name}, ...): no FTS index on column '{col_name}' \
+                 (run CREATE INDEX <name> ON <table> USING fts({col_name}) first)"
+            ))
+        })?;
+    Ok((entry, query))
 }
 
 // -----------------------------------------------------------------
