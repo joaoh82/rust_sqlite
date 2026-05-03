@@ -184,11 +184,14 @@ impl CreateQuery {
                         is_unique,
                     });
                 }
-                // TODO: Handle constraints,
-                // Default value and others.
-                for constraint in constraints {
-                    println!("{constraint:?}");
-                }
+                // TODO: handle constraints + default values + check
+                // constraints + ON DELETE / ON UPDATE referential actions
+                // properly. They're currently parsed by `sqlparser` and
+                // dropped on the floor here. (Previously we `println!`-ed
+                // them to stdout as a debug aid — removed in the
+                // engine-stdout-pollution cleanup; flip to a `tracing`
+                // span if we ever want them visible in dev builds.)
+                let _ = constraints;
                 Ok(CreateQuery {
                     table_name: table_name.to_string(),
                     columns: parsed_columns,

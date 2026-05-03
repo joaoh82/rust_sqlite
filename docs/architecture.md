@@ -89,13 +89,13 @@ The engine never depends on the SDK crates; the SDK crates each depend on the en
 | Module | What it owns |
 |---|---|
 | [`src/main.rs`](../src/main.rs) | Binary entry: init env_logger, build rustyline editor, run the REPL loop, route input to either the meta or SQL dispatcher |
-| [`src/lib.rs`](../src/lib.rs) | Library entry: re-exports `Connection`, `Statement`, `Rows`, `Value`, `Database`, `process_command`, the `ask` module (when feature on), etc. — the stable public surface every SDK binds against |
+| [`src/lib.rs`](../src/lib.rs) | Library entry: re-exports `Connection`, `Statement`, `Rows`, `Value`, `Database`, `process_command` / `process_command_with_render` / `CommandOutput`, the `ask` module (when feature on), etc. — the stable public surface every SDK binds against |
 | [`src/connection.rs`](../src/connection.rs) | `Connection` / `Statement` / `Rows` / `Row` / `OwnedRow` / `FromValue` — the Phase 5a public API |
 | [`src/ask/`](../src/ask/) | Engine integration with `sqlrite-ask`: `ConnectionAskExt`, `ask_with_database`, the `schema::dump_schema_for_database` helper. The `schema` submodule is always available; the rest is gated behind the `ask` feature. Phase 7g.2. |
 | [`src/repl/`](../src/repl/) | `REPLHelper` (implements rustyline's `Helper` trait: completer, hinter, highlighter, validator). Also `get_config` and `get_command_type` |
 | [`src/meta_command/`](../src/meta_command/) | `MetaCommand` enum, parsing (`.open FOO.db` → `Open(PathBuf)`, `.ask <Q>` → `Ask(String)`), and dispatch to persistence + ask helpers |
 | [`src/error.rs`](../src/error.rs) | `SQLRiteError` (thiserror-derived), `Result<T>` alias, hand-rolled `PartialEq` that handles `io::Error` |
-| [`src/sql/mod.rs`](../src/sql/mod.rs) | `SQLCommand` classifier, `process_command` — the top-level entry that parses a SQL string and routes to the right executor. Also triggers auto-save. |
+| [`src/sql/mod.rs`](../src/sql/mod.rs) | `SQLCommand` classifier, `process_command` / `process_command_with_render` — the top-level entries that parse a SQL string and route to the right executor. Also triggers auto-save. **Never writes to stdout** — for SELECT statements, the rendered prettytable comes back inside `CommandOutput.rendered` so the REPL can print it (the engine itself doesn't); the SDK / FFI / MCP callers ignore it. |
 | [`src/sql/parser/`](../src/sql/parser/) | Takes a `sqlparser::ast::Statement` and produces internal query structs (`CreateQuery`, `InsertQuery`, `SelectQuery`) with only the fields we actually use |
 | [`src/sql/executor.rs`](../src/sql/executor.rs) | `execute_select`, `execute_delete`, `execute_update`, plus the shared expression evaluator `eval_expr` / `eval_predicate`. Also the bounded-heap top-k optimization (Phase 7c) and the HNSW probe shortcut (Phase 7d.2). |
 | [`src/sql/db/database.rs`](../src/sql/db/database.rs) | `Database`: table map + optional `source_path` + optional long-lived `Pager` + transaction-snapshot state |
