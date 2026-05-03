@@ -136,6 +136,28 @@ SELECT email FROM users WHERE dept = 'eng';
 
 Expect `CREATE INDEX 'users_dept_idx' executed.` followed by the two `eng` rows (alice and bob). This exercises the executor's index-probe fast path.
 
+### 1.9b CREATE INDEX … USING fts + BM25 top-k (Phase 8)
+
+```sql
+CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO docs (body) VALUES ('rust embedded database');
+INSERT INTO docs (body) VALUES ('rust web framework');
+INSERT INTO docs (body) VALUES ('go embedded systems');
+INSERT INTO docs (body) VALUES ('rust rust rust embedded power');
+
+CREATE INDEX docs_fts ON docs USING fts (body);
+
+-- Lexical filter — three rows contain 'rust'.
+SELECT id FROM docs WHERE fts_match(body, 'rust');
+
+-- Top-1 by BM25 — id=4 wins (tf=3 in a 5-token doc).
+SELECT id FROM docs
+ WHERE fts_match(body, 'rust')
+ ORDER BY bm25_score(body, 'rust') DESC LIMIT 1;
+```
+
+Expect 3 rows for the first SELECT, then `id = 4` from the second. This exercises the FTS posting list, the `fts_match` predicate, and the `try_fts_probe` optimizer hook end-to-end. For the runnable hybrid (BM25 + vector) walkthrough, see `cargo run --example hybrid-retrieval`.
+
 ### 1.10 Error cases don't crash the REPL
 
 These should each print a clean `An error occured: …` message and leave the REPL live:

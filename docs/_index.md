@@ -22,7 +22,11 @@ A small, hand-written guide to the SQLRite codebase — how it's structured, how
 
 - [Ask — natural-language → SQL](ask.md) — the canonical reference for the `ask()` feature across every product surface (REPL, desktop, Rust library, Python / Node / Go / WASM SDKs, MCP server); env vars, defaults, prompt caching, security
 - [Ask backend proxy templates](ask-backend-examples.md) — copy-paste backend examples for the WASM SDK's split design: Cloudflare Workers, Vercel Edge, Deno Deploy, Firebase Functions, AWS Lambda, Express, pure Node
-- [MCP server (`sqlrite-mcp`)](mcp.md) — Phase 7h: SQLRite as a Model Context Protocol stdio server. Wiring into Claude Code / Cursor / `mcp-inspector`; the seven tools (`list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`); read-only mode; the JSON-RPC wire format
+- [MCP server (`sqlrite-mcp`)](mcp.md) — Phase 7h + 8e: SQLRite as a Model Context Protocol stdio server. Wiring into Claude Code / Cursor / `mcp-inspector`; the eight tools (`list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `bm25_search`, `ask`); read-only mode; the JSON-RPC wire format
+
+## Phase 8 — Full-text search + hybrid retrieval
+
+- [FTS — full-text search + hybrid retrieval](fts.md) — the canonical reference for `CREATE INDEX … USING fts`, the `fts_match` / `bm25_score` scalar functions, the `try_fts_probe` optimizer hook, hybrid retrieval via raw arithmetic with `vec_distance_cosine`, persistence + the on-demand v4 → v5 file-format bump, and the `bm25_search` MCP tool
 
 ## Internals
 
@@ -42,10 +46,9 @@ As of May 2026, SQLRite has:
 - WAL-backed persistence with crash-safe checkpointing, shared/exclusive lock modes, and real `BEGIN` / `COMMIT` / `ROLLBACK` transactions (Phase 4 complete)
 - A stable public Rust embedding API plus C FFI shim and SDKs for Python, Node.js, Go, and WASM (Phase 5 complete except the optional 5f crate-polish task)
 - A Tauri 2.0 + Svelte desktop app (Phase 2.5 complete)
-- AI-era extensions across the product surface (Phase 7 complete except FTS): VECTOR columns + HNSW indexes (7a-7d), JSON columns (7e), the `ask()` natural-language → SQL family across the REPL / desktop / Rust / Python / Node / Go / WASM (7g.1-7g.7), and the [`sqlrite-mcp`](mcp.md) Model Context Protocol server with seven tools including `ask` (7h + 7g.8)
+- AI-era extensions across the product surface (Phase 7 complete): VECTOR columns + HNSW indexes (7a-7d), JSON columns (7e), the `ask()` natural-language → SQL family across the REPL / desktop / Rust / Python / Node / Go / WASM (7g.1-7g.7), and the [`sqlrite-mcp`](mcp.md) Model Context Protocol server (7h + 7g.8)
+- Full-text search + hybrid retrieval (Phase 8 complete): FTS5-style inverted index with BM25 ranking + `fts_match` / `bm25_score` scalar functions + `try_fts_probe` optimizer hook + on-disk persistence with on-demand v4 → v5 file-format bump (8a-8c), a worked hybrid-retrieval example combining BM25 with vector cosine via raw arithmetic (8d), and a `bm25_search` MCP tool symmetric with `vector_search` (8e). See [`docs/fts.md`](fts.md).
 - A fully-automated release pipeline that ships every product to its registry on every release with one human action — Rust engine + `sqlrite-ask` + `sqlrite-mcp` to crates.io, Python wheels to PyPI (`sqlrite`), Node.js + WASM to npm (`@joaoh82/sqlrite` + `@joaoh82/sqlrite-wasm`), Go module via `sdk/go/v*` git tag, plus C FFI tarballs, MCP binary tarballs, and unsigned desktop installers as GitHub Release assets (Phase 6 complete)
-
-The active frontier is **Phase 8 — Full-text search + hybrid retrieval** (the deferred 7f scope).
 
 See the [Roadmap](roadmap.md) for the full phase plan.
 
@@ -58,7 +61,7 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 ## Future work
 
 - [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `ask()` API across REPL/library/SDKs/desktop/MCP, MCP server). **Implementation complete except 7f, which deferred to Phase 8.**
-- [Phase 8 plan](phase-8-plan.md) — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. **Draft 2026-05-03 — awaiting Q1–Q10 sign-off before implementation starts at sub-phase 8a.**
+- [Phase 8 plan](phase-8-plan.md) — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. **All six sub-phases (8a–8f) shipped.** Canonical reference: [`docs/fts.md`](fts.md).
 
 ## Conventions
 

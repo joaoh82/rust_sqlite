@@ -116,6 +116,29 @@ Arithmetic follows a simple rule:
 
 Both return `SQLRiteError::General("division by zero")` rather than panicking or returning NaN/Infinity. The check happens *after* NULL propagation, so `5 / NULL` is still `NULL` (not an error).
 
+### Optimizer hooks: `try_hnsw_probe` + `try_fts_probe`
+
+Two specialized shortcuts in [`src/sql/executor.rs`](../src/sql/executor.rs) recognize specific top-k query shapes and serve them directly from an attached index instead of full-scanning. Both fire only on the exact patterns below; anything else falls through to the generic `select_topk` (Phase 7c bounded heap) or `sort_rowids` (full sort) paths.
+
+`try_hnsw_probe` (Phase 7d.2) — vector KNN:
+
+```text
+ORDER BY vec_distance_l2(<col>, <bracket-array literal>) ASC LIMIT k
+```
+
+Returns top-k from the HNSW graph in `O(log N)` per probe. Mirrored shapes for `vec_distance_cosine` and `vec_distance_dot`.
+
+`try_fts_probe` (Phase 8b) — BM25 keyword:
+
+```text
+WHERE  fts_match(<col>, '<q>')
+ORDER BY bm25_score(<col>, '<q>') DESC LIMIT k
+```
+
+Returns top-k from the inverted index in `O(query-term-count × k log k)`. The probe matches only when ORDER BY direction is `DESC` (BM25 is "higher = better"; ASC almost certainly means user error and falls through). The query string in `WHERE fts_match` and `ORDER BY bm25_score` must literally match. If WHERE has additional conditions beyond the canonical `fts_match` predicate, those conditions are silently dropped on the optimizer fast path — same posture as `try_hnsw_probe` per [Phase 8 plan Q6](phase-8-plan.md#q6-filtered-fts).
+
+The full canonical FTS reference is in [`docs/fts.md`](fts.md).
+
 ## Two-pass pattern for UPDATE and DELETE
 
 Both `execute_update` and `execute_delete` use the same pattern to satisfy Rust's aliasing rules:
