@@ -94,6 +94,23 @@ Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor 
 - Persisted as a `KIND_HNSW` cell tree alongside the regular page hierarchy — open path loads the graph bit-for-bit, no algorithm runs.
 - Without an HNSW index, the same `ORDER BY vec_distance_… LIMIT k` query still works — it just brute-force-scans every row (Phase 7c's bounded-heap top-k optimization keeps the memory footprint to O(k)).
 
+### FTS indexes (Phase 8)
+
+```sql
+CREATE INDEX <name> ON <table> USING fts (<text_column>);
+```
+
+Builds an FTS5-style inverted index with BM25 ranking over a `TEXT` column. Pairs with the [`fts_match`](#fts_match) and [`bm25_score`](#bm25_score) functions for keyword retrieval, and composes with `vec_distance_*` for hybrid retrieval (see [`docs/fts.md`](fts.md)).
+
+- **TEXT columns only.** `INTEGER`, `REAL`, `BOOLEAN`, `VECTOR`, `JSON` columns are rejected at CREATE-INDEX time.
+- **Single-column only.** Multi-column FTS is deferred to Phase 8.1.
+- **`UNIQUE` is rejected** — UNIQUE has no meaning for an inverted index.
+- The index is built incrementally on `INSERT`. `DELETE` / `UPDATE` mark the index `needs_rebuild`; the next save rebuilds from current rows.
+- Persisted as a `KIND_FTS_POSTING` cell tree alongside the regular page hierarchy — open path loads posting lists bit-for-bit, no re-tokenization.
+- The first save of a database with at least one FTS index promotes the file format from v4 to v5 (on-demand bump per Phase 8 plan Q10).
+- Tokenizer is ASCII MVP per Q3: `[^A-Za-z0-9]+` split, lowercased, no stemming, no stop list.
+- BM25 parameters are fixed at SQLite FTS5's defaults (`k1 = 1.5`, `b = 0.75`).
+
 ---
 
 ## `INSERT INTO`
@@ -221,6 +238,8 @@ Same set accepted by `INSERT` (see [Value literals accepted](#value-literals-acc
 | `json_type(json[, path])` | Text | One of `'object'`, `'array'`, `'string'`, `'integer'`, `'real'`, `'true'`, `'false'`, `'null'`. Path defaults to `$`. *(Phase 7e)* |
 | `json_array_length(json[, path])` | Integer | Number of elements in the JSON array at `path`. Errors if the resolved node is not an array. Path defaults to `$`. *(Phase 7e)* |
 | `json_object_keys(json[, path])` | Text (JSON-array string) | Returns the object's keys as a JSON-array text in insertion order — e.g. `'["a","b","c"]'`. Path defaults to `$`. **Diverges from SQLite**, which exposes keys as a *table-valued* function (one row per key). SQLRite has no set-returning functions yet, so we return the keys as a JSON array and let callers parse if needed. *(Phase 7e)* |
+| `fts_match(col, 'q')` | Bool | True iff the row contains at least one tokenized query term in `col`. Requires an FTS index on `col`; errors otherwise. Tokenization rules: ASCII split + lowercase, no stemming, no stop-list. Multi-token queries use any-term (OR) semantics. *(Phase 8b)* |
+| `bm25_score(col, 'q')` | Real (f64) | Per-row BM25 relevance score for the given query. Higher is more relevant. Requires an FTS index on `col`. Pairs with `fts_match` in the canonical `WHERE … ORDER BY bm25_score(...) DESC LIMIT k` shape, which the optimizer probes via the inverted index instead of scanning rows. *(Phase 8b)* |
 
 All three vector-distance functions take exactly two arguments, both of which must be vectors of the same dimension. Either argument can be a column reference (`embedding`), a bracket-array literal (`[0.1, 0.2, 0.3]`), or any sub-expression that evaluates to a vector. Mismatched dimensions error with `vector dimensions don't match (lhs=N, rhs=M)`.
 
@@ -261,6 +280,27 @@ SELECT id,
   FROM events
  WHERE json_extract(payload, '$.user.name') = 'alice';
 ```
+
+#### FTS query patterns
+
+```sql
+CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+INSERT INTO docs (body) VALUES ('rust embedded database');
+INSERT INTO docs (body) VALUES ('postgres relational database server');
+CREATE INDEX docs_fts ON docs USING fts (body);
+
+-- Lexical filter (Boolean predicate).
+SELECT id FROM docs WHERE fts_match(body, 'database');
+
+-- Top-k by BM25 relevance — the optimizer probes the inverted index
+-- when WHERE / ORDER BY share the same query string and direction.
+SELECT id FROM docs
+ WHERE fts_match(body, 'embedded database')
+ ORDER BY bm25_score(body, 'embedded database') DESC
+ LIMIT 5;
+```
+
+See [`docs/fts.md`](fts.md) for the canonical FTS reference (tokenizer rules, BM25 parameters, persistence, hybrid retrieval with `vec_distance_*`).
 
 ### Type coercion in arithmetic
 

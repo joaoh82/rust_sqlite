@@ -97,10 +97,11 @@ The engine never depends on the SDK crates; the SDK crates each depend on the en
 | [`src/error.rs`](../src/error.rs) | `SQLRiteError` (thiserror-derived), `Result<T>` alias, hand-rolled `PartialEq` that handles `io::Error` |
 | [`src/sql/mod.rs`](../src/sql/mod.rs) | `SQLCommand` classifier, `process_command` / `process_command_with_render` — the top-level entries that parse a SQL string and route to the right executor. Also triggers auto-save. **Never writes to stdout** — for SELECT statements, the rendered prettytable comes back inside `CommandOutput.rendered` so the REPL can print it (the engine itself doesn't); the SDK / FFI / MCP callers ignore it. |
 | [`src/sql/parser/`](../src/sql/parser/) | Takes a `sqlparser::ast::Statement` and produces internal query structs (`CreateQuery`, `InsertQuery`, `SelectQuery`) with only the fields we actually use |
-| [`src/sql/executor.rs`](../src/sql/executor.rs) | `execute_select`, `execute_delete`, `execute_update`, plus the shared expression evaluator `eval_expr` / `eval_predicate`. Also the bounded-heap top-k optimization (Phase 7c) and the HNSW probe shortcut (Phase 7d.2). |
+| [`src/sql/executor.rs`](../src/sql/executor.rs) | `execute_select`, `execute_delete`, `execute_update`, plus the shared expression evaluator `eval_expr` / `eval_predicate`. Also the bounded-heap top-k optimization (Phase 7c), the HNSW probe shortcut (Phase 7d.2), and the FTS probe shortcut (Phase 8b). |
 | [`src/sql/db/database.rs`](../src/sql/db/database.rs) | `Database`: table map + optional `source_path` + optional long-lived `Pager` + transaction-snapshot state |
 | [`src/sql/db/table.rs`](../src/sql/db/table.rs) | `Table`, `Column`, `Row`, `Value` (in-memory storage incl. VECTOR + JSON columns); helpers for row iteration (`rowids`, `get_value`, `set_value`, `delete_row`, `insert_row`) |
 | [`src/sql/hnsw.rs`](../src/sql/hnsw.rs) | Standalone HNSW algorithm — insert / search / layer assignment / beam search. Phase 7d.1. |
+| [`src/sql/fts/`](../src/sql/fts/) | Full-text search — standalone tokenizer, BM25 scorer, and in-memory `PostingList` inverted index. Wired into the executor via the `fts_match` / `bm25_score` scalar functions and the `try_fts_probe` optimizer hook. Phase 8a-8b; persistence in 8c. See [`docs/fts.md`](fts.md). |
 | [`src/sql/json.rs`](../src/sql/json.rs) | JSON column type + path-extraction functions (`json_extract`, `json_type`, `json_array_length`, `json_object_keys`). Phase 7e. |
 | [`src/sql/pager/`](../src/sql/pager/) | On-disk file format and I/O — see [file-format.md](file-format.md) and [pager.md](pager.md) for details. WAL + checkpointer + shared/exclusive lock modes (Phase 4a-4e) live here. |
 
@@ -127,7 +128,7 @@ Steps 1–7 are purely in-memory; step 8 is the only disk contact, and after the
 - **Planning**: intentionally not a thing yet. Execution is direct — a query plan is implicit in the executor code path.
 - **Execution**: `src/sql/executor.rs` walks the internal structs, drives reads against `Table`, and writes via `Table::set_value` / `insert_row` / `delete_row`.
 - **Storage (in memory)**: `src/sql/db/table.rs` — column-oriented `BTreeMap<rowid, value>` per column; indexes as separate `BTreeMap`s on UNIQUE/PK columns.
-- **Storage (on disk)**: `src/sql/pager/` — 4 KiB pages, real B-Tree per table (Phase 3d), secondary indexes (3e), HNSW indexes as their own page tree (7d.3), WAL + crash-safe checkpointer (4c-4d), shared/exclusive lock modes (4e).
+- **Storage (on disk)**: `src/sql/pager/` — 4 KiB pages, real B-Tree per table (Phase 3d), secondary indexes (3e), HNSW indexes as their own page tree (7d.3), FTS posting lists as their own page tree (8c, on-demand v5 file format), WAL + crash-safe checkpointer (4c-4d), shared/exclusive lock modes (4e).
 - **Persistence policy**: `src/sql/mod.rs::process_command` for when to auto-save; `src/sql/pager/mod.rs::save_database` for how. Inside a `BEGIN`/`COMMIT` block, auto-save is suppressed and changes accumulate against an in-memory snapshot — `COMMIT` flushes the whole batch in one WAL frame; `ROLLBACK` restores the snapshot.
 - **Error handling**: `src/error.rs` defines a single `SQLRiteError` enum used throughout, with `#[from]` conversions from `ParserError` and `io::Error`.
 

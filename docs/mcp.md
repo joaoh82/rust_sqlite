@@ -4,7 +4,7 @@
 
 This is **Phase 7h** in the project's roadmap. The natural-language → SQL `ask` tool is **Phase 7g.8**, shipped in the same crate behind a default-on cargo feature.
 
-This page is the canonical reference. For the design rationale (hand-rolled JSON-RPC vs. crate, why stdio-only, the seven-tool decision tree), see [`docs/phase-7-plan.md`](phase-7-plan.md) §7h.
+This page is the canonical reference. For the design rationale (hand-rolled JSON-RPC vs. crate, why stdio-only, the original seven-tool decision tree), see [`docs/phase-7-plan.md`](phase-7-plan.md) §7h. The eighth tool (`bm25_search`) was added in Phase 8e — see [`docs/phase-8-plan.md`](phase-8-plan.md) Q9.
 
 ---
 
@@ -16,7 +16,7 @@ This page is the canonical reference. For the design rationale (hand-rolled JSON
   - [Claude Code](#claude-code)
   - [Cursor](#cursor)
   - [`mcp-inspector` (debugging)](#mcp-inspector-debugging)
-- [The seven tools](#the-seven-tools)
+- [The eight tools](#the-eight-tools)
 - [Read-only mode](#read-only-mode)
 - [Environment variables](#environment-variables)
 - [Wire format](#wire-format)
@@ -32,7 +32,7 @@ Given an MCP client (the LLM or its harness), `sqlrite-mcp`:
 
 1. Reads a SQLRite database file (or runs in-memory) from the path it's spawned with.
 2. Speaks JSON-RPC 2.0 over stdio: line-delimited JSON in on stdin, line-delimited JSON out on stdout.
-3. Exposes seven tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask` (the last one gated behind the `ask` cargo feature, default-on).
+3. Exposes eight tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `bm25_search`, `ask` (the last one gated behind the `ask` cargo feature, default-on).
 4. Stays purely synchronous — one tool call at a time, in arrival order. Mirrors the engine's own thread-safety model; clients pipelining requests get serialized completion.
 
 The whole binary is ~1100 LOC of hand-rolled protocol + dispatch + tool handlers. No tokio, no async runtime, no MCP framework — same dep-frugal approach as the rest of the project.
@@ -117,11 +117,11 @@ The official [MCP Inspector](https://github.com/modelcontextprotocol/inspector) 
 npx @modelcontextprotocol/inspector sqlrite-mcp /path/to/your.sqlrite
 ```
 
-Open the URL it prints. You'll see the seven tools, can call them with hand-typed JSON arguments, and watch the JSON-RPC traffic in both directions. **First thing to check after deploying — confirms the wire-up before pointing a real LLM at it.**
+Open the URL it prints. You'll see the eight tools, can call them with hand-typed JSON arguments, and watch the JSON-RPC traffic in both directions. **First thing to check after deploying — confirms the wire-up before pointing a real LLM at it.**
 
 ---
 
-## The seven tools
+## The eight tools
 
 | Tool | Purpose | Required input |
 |---|---|---|
@@ -131,6 +131,7 @@ Open the URL it prints. You'll see the seven tools, can call them with hand-type
 | [`execute`](#execute) | Run DDL / DML / transactions | `sql` |
 | [`schema_dump`](#schema_dump) | Full `CREATE TABLE` script | — |
 | [`vector_search`](#vector_search) | k-NN over a VECTOR column | `table`, `column`, `embedding` |
+| [`bm25_search`](#bm25_search) *(8e)* | Top-k by BM25 over an FTS column | `table`, `column`, `query` |
 | [`ask`](#ask) *(7g.8)* | Natural-language → SQL | `question` |
 
 ### `list_tables`
@@ -212,6 +213,28 @@ k-NN lookup against a VECTOR column. Picks up an HNSW index automatically if one
 ```
 
 Supported metrics: `l2` (default, Euclidean), `cosine`, `dot`. `embedding` must match the column's declared dimension. Returns the matching rows in ascending distance order (the numeric distance value is not included — the engine doesn't yet support function calls in SELECT projections; if you need the value, recompute it client-side from the returned vector).
+
+### `bm25_search`
+
+*Phase 8e — symmetric with `vector_search` for keyword retrieval.*
+
+Top-k lookup against an FTS-indexed TEXT column, ranked by BM25. Wraps the canonical `WHERE fts_match(col, 'q') ORDER BY bm25_score(col, 'q') DESC LIMIT k` SQL so the LLM doesn't have to remember the WHERE pre-filter, the DESC direction, or string quoting. Picks up the engine's FTS optimizer hook automatically.
+
+```jsonc
+{
+  "name": "bm25_search",
+  "arguments": {
+    "table": "documents",
+    "column": "body",
+    "query": "rust embedded database",
+    "k": 5
+  }
+}
+```
+
+Requires a `CREATE INDEX … USING fts (column)` on the column; errors clearly otherwise (the message names the missing CREATE INDEX so the LLM can recover). The query is tokenized with the same rules used to build the index (ASCII split + lowercase, no stemming or stop list — see [`docs/fts.md`](fts.md)). Returns matching rows in descending BM25-relevance order.
+
+For hybrid retrieval (BM25 + vector) the LLM can either call both `bm25_search` and `vector_search` and fuse client-side, or compose them in a single SQL via the `query` tool — see the worked example in [`examples/hybrid-retrieval/`](../examples/hybrid-retrieval/).
 
 ### `ask`
 

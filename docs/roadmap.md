@@ -2,7 +2,7 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
-> **Active frontier (May 2026):** Phase 8 — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. Phases 0 – 7 are shipped (Phase 7 except for the deferred FTS slice).
+> **Active frontier (May 2026):** Phase 8 shipped end-to-end (8a–8f). All six sub-phases — standalone algorithms, SQL surface, cell-encoded persistence with on-demand v4→v5 file-format bump, hybrid-retrieval worked example, `bm25_search` MCP tool, and the docs sweep — landed across PRs #78–#83. The next milestone is the **v0.2.0 release** (file-format change + new SQL surface). After v0.2.0 the roadmap loops back to "possible extras" and the 5a.2 cursor refactor.
 
 ## ✅ Phase 0 — Modernization
 
@@ -487,13 +487,35 @@ Total scope budget: ~3-4 kLOC of new Rust across the wave. Each sub-phase ships 
 
 > **v0.1.19 dep-direction flip retrospective** *(2026-04-30)* — Phase 7g.2 wired the REPL's `.ask` meta-command, which required the engine binary to call into `sqlrite-ask`. That created a cargo cycle: `sqlrite-engine[bin] → sqlrite-ask → sqlrite-engine[lib]` (because `sqlrite-ask` 0.1.18 imported `sqlrite::Connection` for `ConnectionAskExt`). Cargo's static cycle detection counts every edge in the graph regardless of features, so `optional = true` didn't help — the cycle is rejected even when nobody actually exercises both directions at once. The fix flipped the dep direction structurally: `sqlrite-ask` 0.1.19 dropped `sqlrite-engine` entirely and became pure over `&str` schemas (canonical API: `ask_with_schema(schema_dump, question, &cfg)`). The engine integration (`schema::dump_schema_for_database`, `ConnectionAskExt`, `ask`, `ask_with_database`) moved into a new `sqlrite::ask` module gated by a fresh `ask` feature on `sqlrite-engine`. Default-on for the CLI binary; off for the WASM SDK and any `default-features = false` lib embedding. **Breaking change for `sqlrite-ask` 0.1.18 callers:** `use sqlrite_ask::ConnectionAskExt` becomes `use sqlrite::ConnectionAskExt` (after enabling the engine's `ask` feature). API method signature unchanged. The 0.1.18 crate had been live ~30 minutes with no known adopters at the time of the flip. Lesson: when a "thin per-product wrapper" sub-phase introduces a new edge in the dep graph, sketch out the full graph BEFORE writing code — would have caught the cycle in design rather than mid-implementation.
 
-## Phase 8 — Full-text search + hybrid retrieval *(active frontier — see [`phase-8-plan.md`](phase-8-plan.md))*
+## ✅ Phase 8 — Full-text search + hybrid retrieval *(complete — see [`phase-8-plan.md`](phase-8-plan.md), [`fts.md`](fts.md))*
 
-Adds the FTS5-style inverted-index machinery that Phase 7 deliberately skipped, plus hybrid retrieval (BM25 + vector score fusion via raw arithmetic — no new typed function needed). Why deferred from Phase 7: ~700-900 LOC of engine code, orthogonal to the AI-era theme, and Phase 7 was already large. Why we'll come back to it: hybrid search (lexical + semantic) is the modern standard for RAG retrieval — vector-only retrieval misses keyword-grounded queries.
+Adds the FTS5-style inverted-index machinery that Phase 7 deliberately skipped, plus hybrid retrieval (BM25 + vector score fusion via raw arithmetic — no new typed function needed). Hybrid search (lexical + semantic) is the modern standard for RAG retrieval — vector-only retrieval misses keyword-grounded queries.
 
-**Plan: [`phase-8-plan.md`](phase-8-plan.md).** Six sub-phases (8a algorithms · 8b SQL surface · 8c persistence · 8d hybrid example · 8e MCP `bm25_search` tool · 8f docs sweep), mirroring the integration shape Phase 7d (HNSW) laid down: new `IndexMethod::Fts` arm, `try_fts_probe` optimizer hook, dedicated `KIND_FTS_POSTING` cell tag, on-demand v4→v5 file-format bump. Likely closes out v0.2.0 (the 0.1.x → 0.2.x bump marks the file-format change + new SQL surface).
+Mirrored the integration shape Phase 7d (HNSW) laid down: new `IndexMethod::Fts` arm, `try_fts_probe` optimizer hook, dedicated `KIND_FTS_POSTING` cell tag, on-demand v4→v5 file-format bump. Closes out the 0.1.x cycle and lines up the **v0.2.0** release (the 0.1.x → 0.2.x bump marks the file-format change + new SQL surface).
 
-**Status:** draft awaiting Q1–Q10 sign-off; implementation kicks off at sub-phase 8a once approved.
+### ✅ Phase 8a — Standalone algorithms
+
+`src/sql/fts/` ships three standalone modules: `tokenizer.rs` (ASCII split + lowercase), `bm25.rs` (BM25+ scoring with `k1=1.5`, `b=0.75` fixed at SQLite FTS5 defaults), and `posting_list.rs` (in-memory inverted index keyed on `i64` rowid, with `insert` / `remove` / `query` / `matches` / `score`). Pure algorithm — no SQL coupling, infallible API, only `std` deps. Inline `#[cfg(test)] mod tests` per file (22 tests covering empty cases, TF monotonicity, length normalization, IDF behavior, hand-computed BM25 reference, deterministic 1k-doc corpus). PR #78.
+
+### ✅ Phase 8b — SQL surface
+
+Wires the standalone algorithms into the executor end-to-end. `IndexMethod::Fts` arm + `create_fts_index` (TEXT-only validation + seed from existing rows + push `FtsIndexEntry`). `fts_match(col, 'q')` / `bm25_score(col, 'q')` scalar functions with pre-flight FTS-index check. `try_fts_probe` optimizer hook recognizes `WHERE fts_match(col, 'q') ORDER BY bm25_score(col, 'q') DESC LIMIT k`. INSERT incremental update via `maintain_fts_on_insert`; DELETE / UPDATE flag `needs_rebuild = true`; `rebuild_dirty_fts_indexes` runs at save start. 14 new tests (12 integration + 2 persistence round-trip via the rootpage=0 replay path). PR #79.
+
+### ✅ Phase 8c — Persistence
+
+Cell-encoded storage so the in-memory `PostingList` survives save/reopen byte-equivalently. `KIND_FTS_POSTING = 0x06` cell tag; new `src/sql/pager/fts_cell.rs` with `FtsPostingCell` (per-term cells + an empty-term sidecar carrying the doc-lengths map for round-trip honesty on zero-token rows). `stage_fts_btree` / `load_fts_postings` mirror the HNSW save/load shape; `rebuild_fts_index` gains the cell-load fast path. **On-demand v4→v5 file-format bump** ([Q10](phase-8-plan.md#q10-file-format-version-bump-strategy)): existing v4 databases without FTS keep writing v4; the first FTS-bearing save promotes to v5. Decoders accept both. 16 new tests (10 cell-codec, 1 PostingList round-trip, 5 pager-level: persistence path, v4 preservation, v5 bump, empty / zero-token edge cases, 500-doc multi-leaf). PR #80.
+
+### ✅ Phase 8d — Hybrid retrieval worked example
+
+`examples/hybrid-retrieval/` ships a self-contained Rust example showing how to compose `bm25_score` (8b) with `vec_distance_cosine` (Phase 7d) via raw arithmetic ([Q8](phase-8-plan.md#q8-hybrid-retrieval)) — no new engine code. 6-doc tech-blurb corpus with hand-baked 4-dim embeddings (no embedding-model dependency); runs three rankings on the same query: pure BM25, pure vector cosine, and 50/50 hybrid via `0.5 * bm25_score + 0.5 * (1.0 - vec_distance_cosine)`. README walks through when each shape wins, the cosine-distance-vs-similarity inversion gotcha, weight-tuning sketches, and a production checklist. PR #81.
+
+### ✅ Phase 8e — MCP `bm25_search` tool
+
+Adds the `bm25_search` MCP tool, symmetric with `vector_search` (Phase 7h). Wraps the canonical `WHERE fts_match(col, 'q') ORDER BY bm25_score(col, 'q') DESC LIMIT k` SQL so the LLM doesn't have to remember the WHERE pre-filter, the DESC direction, or string quoting. Pre-flight checks (table exists, column is TEXT, FTS index attached) surface clean errors before any SQL runs. SQL string-literal escaper handles embedded apostrophes per SQL standard. 3 new protocol tests. The MCP server now exposes 8 tools (was 7). PR #82.
+
+### ✅ Phase 8f — Docs sweep
+
+Final docs pass — canonical [`fts.md`](fts.md) reference (mirrors `ask.md`'s shape); FTS sections added to [`supported-sql.md`](supported-sql.md), [`architecture.md`](architecture.md) (module map + storage section), [`file-format.md`](file-format.md) (`KIND_FTS_POSTING` layout, v4→v5 bump in version history), [`sql-engine.md`](sql-engine.md) (`try_fts_probe` optimizer hook), [`mcp.md`](mcp.md) (`bm25_search` tool entry + count bump 7→8); FTS step added to [`smoke-test.md`](smoke-test.md); [`_index.md`](_index.md) re-organized to give Phase 8 its own top-level section.
 
 ## "Possible extras" not pinned to a phase
 

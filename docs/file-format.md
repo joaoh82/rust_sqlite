@@ -4,7 +4,7 @@ A SQLRite database is a single file, by convention named `*.sqlrite`. The file i
 
 All multi-byte integers in this format are **little-endian**.
 
-The current on-disk format is **version 3** (Phase 3e). Files produced by earlier versions are rejected on open.
+The current on-disk format is **version 4** (Phase 7) by default, with **version 5** written on demand whenever an FTS index is attached to the database (Phase 8c). Decoders accept both v4 and v5; writers preserve the existing version on no-op resaves so a v4 database without FTS stays v4. Files produced by versions 1 – 3 are rejected on open.
 
 ## Page 0 — the database header
 
@@ -15,7 +15,7 @@ The first 4096 bytes of every file are the header page. Only the first 28 bytes 
 │ offset │ length │ content                                         │
 ├────────┼────────┼─────────────────────────────────────────────────┤
 │     0  │   16   │ magic:  "SQLRiteFormat\0\0\0"                   │
-│    16  │    2   │ format version (u16 LE) = 3                     │
+│    16  │    2   │ format version (u16 LE) = 4 or 5                │
 │    18  │    2   │ page size      (u16 LE) = 4096                  │
 │    20  │    4   │ total page count (u32 LE), includes page 0      │
 │    24  │    4   │ root page of sqlrite_master (u32 LE)            │
@@ -25,7 +25,7 @@ The first 4096 bytes of every file are the header page. Only the first 28 bytes 
 
 The magic string is 14 ASCII bytes (`SQLRiteFormat`) padded with two NUL bytes to fill 16 bytes. It's deliberately different from SQLite's `"SQLite format 3\0"` so the two formats can't be confused on inspection.
 
-`decode_header` in [`src/sql/pager/header.rs`](../src/sql/pager/header.rs) validates all three of (magic, format version, page size) on open. A wrong magic produces `not a SQLRite database`; a wrong version or page size produces `unsupported ...` errors.
+`decode_header` in [`src/sql/pager/header.rs`](../src/sql/pager/header.rs) validates all three of (magic, format version, page size) on open. A wrong magic produces `not a SQLRite database`; a wrong version or page size produces `unsupported ...` errors. The decoder accepts both v4 and v5 (anything else is rejected); the parsed `format_version` is propagated through the in-memory `DbHeader` so the writer can preserve it on resave when no version-bumping feature has been added.
 
 ## Pages 1..page_count — payload pages
 
@@ -126,14 +126,16 @@ A cell is length-prefixed; its body starts with a `kind_tag` byte:
 
 ```
 cell_length    varint          excludes itself; total bytes of kind_tag + body
-kind_tag       u8              0x01 = Local    (full row on a leaf)
-                               0x02 = Overflow (pointer to spilled body)
-                               0x03 = Interior (divider on an interior node)
-                               0x04 = Index    (one entry in an index leaf)
+kind_tag       u8              0x01 = Local         (full row on a leaf)
+                               0x02 = Overflow      (pointer to spilled body)
+                               0x03 = Interior      (divider on an interior node)
+                               0x04 = Index         (entry in a secondary-index leaf)
+                               0x05 = HNSW          (Phase 7d.3 — one HNSW node)
+                               0x06 = FTS Posting   (Phase 8c — one FTS posting list)
 body           variable        depends on kind_tag
 ```
 
-The shared prefix means `Cell::peek_rowid` works uniformly across all three kinds — useful for binary search over a page's slot directory without decoding full bodies.
+The shared prefix means `Cell::peek_rowid` works uniformly across all kinds — useful for binary search over a page's slot directory without decoding full bodies.
 
 ### Local cell body
 
@@ -204,6 +206,25 @@ value_body      variable          encoded per the Local cell's value-block rules
 ```
 
 NULL values are never indexed — `SecondaryIndex::insert` skips them — so there's no null bitmap here; a non-null value is always present.
+
+### FTS posting cell body — `KIND_FTS_POSTING` (0x06, Phase 8c)
+
+Used on the leaves of an FTS index B-Tree. Each cell carries either a posting list for one term (`term`-bytes non-empty), or — in a single sidecar cell — the per-doc length map (`term`-bytes empty). The B-Tree key is `cell_id`, a sequential integer assigned at save time; it has no meaning beyond ordering cells within their tree (so `Cell::peek_rowid`'s slot-directory ordering still works without FTS-specific page plumbing).
+
+```
+cell_id         zigzag varint     sequential B-Tree slot key (1, 2, 3, ...)
+term_len        varint            byte length of `term` (0 → sidecar cell)
+term            term_len bytes    ASCII-lowercased term per Phase 8 Q3
+count           varint            number of (rowid, value) pairs
+for each:
+  rowid         zigzag varint     the row this entry refers to
+  value         varint            term frequency for this (term, row),
+                                  or doc length when term_len == 0
+```
+
+One sidecar cell with `term_len == 0` exists per index, holding `(rowid, doc_len)` pairs for every indexed doc — including any with zero-token text — so `total_docs` and `avg_doc_len` round-trip in BM25 even on degenerate corner cases. Posting cells follow, one per unique term in lexicographic order.
+
+A single posting cell that exceeds page capacity (~4 KiB) errors at save time; overflow chaining is a Phase 8.1 stretch goal. In practice — even `'the'` in a million-row English corpus stays under the limit with the varint encoding above.
 
 ## The schema catalog: `sqlrite_master`
 
@@ -284,7 +305,8 @@ These are not all enforced on open — we validate the header strictly and rely 
 - **v1** (Phases 2 / 3a / 3b) — schema catalog and table data were opaque `bincode` blobs chained across typed payload pages.
 - **v2** (Phases 3c / 3d) — cell-based storage and `sqlrite_master`. Phase 3d added interior pages without a version bump.
 - **v3** (Phase 3e) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
-- **v4** (Phase 7a, current) — value block dispatch gains the `0x04 Vector` tag for the new `VECTOR(N)` column type. Per the [Phase 7 plan's Q8](phase-7-plan.md#q8-file-format-version-bump), later Phase 7 sub-phases (JSON storage, HNSW indexes) will add their own value/cell tags inside this same v4 envelope — no v5 mid-Phase-7. The `CREATE TABLE` SQL stored in `sqlrite_master` carries vector columns as `VECTOR(N)` in the type position; on open, the engine re-parses that SQL and reconstructs `DataType::Vector(N)` from the `Custom` AST node sqlparser produces.
+- **v4** (Phase 7a) — value block dispatch gains the `0x04 Vector` tag for the new `VECTOR(N)` column type. Per the [Phase 7 plan's Q8](phase-7-plan.md#q8-file-format-version-bump), later Phase 7 sub-phases (JSON storage, HNSW indexes) added their own value/cell tags inside this same v4 envelope. The `CREATE TABLE` SQL stored in `sqlrite_master` carries vector columns as `VECTOR(N)` in the type position; on open, the engine re-parses that SQL and reconstructs `DataType::Vector(N)` from the `Custom` AST node sqlparser produces.
+- **v5** (Phase 8c, current for FTS-bearing files) — adds the `KIND_FTS_POSTING` cell tag for persisted FTS posting lists. Bumped **on demand** per the [Phase 8 plan's Q10](phase-8-plan.md#q10-file-format-version-bump-strategy): existing v4 databases without FTS keep writing v4 across non-FTS saves; the first save with at least one FTS index attached promotes the file to v5. Decoders accept both v4 and v5; opening a v4 file with a build that supports v5 is a no-op until the user creates an FTS index.
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL introduces a sibling file (`.sqlrite-wal`) rather than changing the main file format.
 
