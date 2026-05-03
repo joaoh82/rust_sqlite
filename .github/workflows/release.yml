@@ -152,7 +152,14 @@ jobs:
   # click Approve before this job actually runs).
   publish-crate:
     name: Publish sqlrite crate to crates.io
-    needs: [detect, tag-all]
+    # Engine depends on sqlrite-ask (post-v0.1.19 dep-direction flip), so
+    # publish-ask must complete first — otherwise crates.io rejects the
+    # engine publish with "failed to select a version for the requirement
+    # `sqlrite-ask = "^X.Y"`". This was masked through 0.1.x because old
+    # sqlrite-ask versions were already on crates.io and the engine's
+    # version requirement (`^0.1`) matched them; the v0.2.0 cut surfaced
+    # the latent bug.
+    needs: [detect, tag-all, publish-ask]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -203,9 +210,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Step 3a': publish the `sqlrite-ask` crate (Phase 7g.1) — natural-
-  # language → SQL adapter built on top of the engine. Same shape as
-  # `publish-crate` above; separate job so a registry hiccup on one
-  # doesn't block the other and re-runs are surgical.
+  # language → SQL adapter. Since the v0.1.19 dep-direction flip,
+  # sqlrite-ask is dep-free of sqlrite-engine — it's a pure-string-in /
+  # string-out adapter. The engine depends on IT, not the other way
+  # around. So this job runs FIRST in the publish chain; publish-crate
+  # waits on it.
   #
   # Crate name on crates.io: `sqlrite-ask`. Library name (the `use`
   # path): `sqlrite_ask`. No alias-renaming this time — the short
@@ -213,7 +222,7 @@ jobs:
   # for why the engine had to rename).
   publish-ask:
     name: Publish sqlrite-ask crate to crates.io
-    needs: [detect, tag-all, publish-crate]
+    needs: [detect, tag-all]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -230,13 +239,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         # `--no-verify` mirrors `publish-crate` — Release-PR CI
-        # already validated this commit.
-        #
-        # `needs: [..., publish-crate]` is load-bearing: sqlrite-ask
-        # depends on sqlrite-engine, and crates.io rejects publishes
-        # whose path-deps haven't yet resolved to a published version
-        # at the same number. Sequencing makes the dep visible by the
-        # time we publish.
+        # already validated this commit. sqlrite-ask has no
+        # SQLRite-internal path-deps after the v0.1.19 dep-direction
+        # flip, so this job is unblocked the moment `tag-all` lands.
         run: cargo publish -p sqlrite-ask --no-verify
 
       - name: GitHub Release
