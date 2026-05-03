@@ -1510,6 +1510,237 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Phase 8b — CREATE INDEX … USING fts end-to-end
+    // -----------------------------------------------------------------
+
+    /// 5-row docs(id INTEGER PK, body TEXT) populated with overlapping
+    /// vocabulary so BM25 ranking has interesting structure.
+    fn seed_fts_table() -> Database {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        for body in &[
+            "rust embedded database",        // id=1 — both 'rust' and 'embedded'
+            "rust web framework",            // id=2 — 'rust' only
+            "go embedded systems",           // id=3 — 'embedded' only
+            "python web framework",          // id=4 — neither
+            "rust rust rust embedded power", // id=5 — heavy on 'rust'
+        ] {
+            process_command(
+                &format!("INSERT INTO docs (body) VALUES ('{body}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn create_index_using_fts_succeeds_and_indexes_existing_rows() {
+        let mut db = seed_fts_table();
+        let resp =
+            process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        assert!(resp.to_lowercase().contains("create index"), "got {resp}");
+        let table = db.get_table("docs".to_string()).unwrap();
+        assert_eq!(table.fts_indexes.len(), 1);
+        assert_eq!(table.fts_indexes[0].name, "ix_body");
+        assert_eq!(table.fts_indexes[0].column_name, "body");
+        // All five rows should be in the in-memory PostingList.
+        assert_eq!(table.fts_indexes[0].index.len(), 5);
+    }
+
+    #[test]
+    fn create_index_using_fts_rejects_non_text_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let err = process_command("CREATE INDEX ix_n ON t USING fts (n);", &mut db).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("text"),
+            "expected error mentioning TEXT; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_match_returns_expected_rows() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        // Rows that contain 'rust': ids 1, 2, 5.
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust');",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn fts_match_without_index_errors_clearly() {
+        let mut db = seed_fts_table();
+        // No CREATE INDEX — fts_match must surface a useful error.
+        let err = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust');",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no FTS index"),
+            "expected no-index error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bm25_score_orders_descending_by_relevance() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        // ORDER BY bm25_score DESC LIMIT 1: id=5 has 'rust' three times in
+        // a 5-token doc — highest tf, modest length penalty → top score.
+        let out = process_command_with_render(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust') \
+             ORDER BY bm25_score(body, 'rust') DESC LIMIT 1;",
+            &mut db,
+        )
+        .unwrap();
+        assert!(out.status.contains("1 row returned"), "got: {}", out.status);
+        let rendered = out.rendered.expect("SELECT should produce rendered output");
+        // The rendered prettytable contains the integer 5 in a cell.
+        assert!(
+            rendered.contains(" 5 "),
+            "expected id=5 to be top-ranked; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn bm25_score_without_index_errors_clearly() {
+        let mut db = seed_fts_table();
+        let err = process_command(
+            "SELECT id FROM docs ORDER BY bm25_score(body, 'rust') DESC LIMIT 1;",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no FTS index"),
+            "expected no-index error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_post_create_inserts_are_indexed_incrementally() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        process_command(
+            "INSERT INTO docs (body) VALUES ('rust embedded analytics');",
+            &mut db,
+        )
+        .unwrap();
+        let table = db.get_table("docs".to_string()).unwrap();
+        // PostingList::len() reports doc count; should be 6 now.
+        assert_eq!(table.fts_indexes[0].index.len(), 6);
+        // 'analytics' appears only in the new row → query returns 1 hit.
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'analytics');",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("1 row returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn delete_on_fts_indexed_table_marks_dirty() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let resp = process_command("DELETE FROM docs WHERE id = 1;", &mut db).unwrap();
+        assert!(resp.contains("1 row"), "got: {resp}");
+        let docs = db.get_table("docs".to_string()).unwrap();
+        let entry = docs
+            .fts_indexes
+            .iter()
+            .find(|e| e.name == "ix_body")
+            .unwrap();
+        assert!(
+            entry.needs_rebuild,
+            "DELETE should have flagged the FTS index dirty"
+        );
+    }
+
+    #[test]
+    fn update_on_fts_indexed_text_col_marks_dirty() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let resp = process_command(
+            "UPDATE docs SET body = 'java spring framework' WHERE id = 1;",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("1 row"), "got: {resp}");
+        let docs = db.get_table("docs".to_string()).unwrap();
+        let entry = docs
+            .fts_indexes
+            .iter()
+            .find(|e| e.name == "ix_body")
+            .unwrap();
+        assert!(
+            entry.needs_rebuild,
+            "UPDATE on the indexed TEXT column should have flagged dirty"
+        );
+    }
+
+    #[test]
+    fn fts_index_name_collides_with_btree_and_hnsw_namespaces() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let err = process_command("CREATE INDEX ix_body ON docs (body);", &mut db).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("already exists"),
+            "expected duplicate-index error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_index_rejects_unique() {
+        let mut db = seed_fts_table();
+        let err = process_command(
+            "CREATE UNIQUE INDEX ix_body ON docs USING fts (body);",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("unique"),
+            "expected UNIQUE-rejection error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_fts_probe_falls_through_on_ascending() {
+        // BM25 is "higher = better"; ASC is rejected so the slow path
+        // applies. We verify by running the query and checking the
+        // result is still correct (the slow path goes through scalar
+        // bm25_score on every row).
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        // Same query as bm25_score_orders_descending but ASC → should
+        // still succeed (slow path), and id=5 should now be LAST.
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust') \
+             ORDER BY bm25_score(body, 'rust') ASC LIMIT 3;",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+    }
+
+    // -----------------------------------------------------------------
     // Phase 7b — vector distance functions through process_command
     // -----------------------------------------------------------------
 

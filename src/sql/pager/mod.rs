@@ -158,9 +158,15 @@ pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -
     // form is just the CREATE INDEX SQL — the graph itself isn't
     // persisted yet (Phase 7d.3). Detect HNSW via the SQL's USING clause
     // and route to a graph-rebuild instead of the B-Tree-cell load.
+    //
+    // Phase 8b — same shape for FTS indexes. The posting lists aren't
+    // persisted yet (Phase 8c), so we replay the CREATE INDEX SQL on
+    // open and let `execute_create_index` walk current rows.
     for row in index_rows {
         if create_index_sql_uses_hnsw(&row.sql) {
             rebuild_hnsw_index(&mut db, &pager, &row)?;
+        } else if create_index_sql_uses_fts(&row.sql) {
+            rebuild_fts_index(&mut db, &row)?;
         } else {
             attach_index(&mut db, &pager, row)?;
         }
@@ -187,6 +193,8 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     // already hold, before the immutable iteration loops below need
     // their own borrow.
     rebuild_dirty_hnsw_indexes(db);
+    // Phase 8b — same drill for FTS indexes flagged by DELETE / UPDATE.
+    rebuild_dirty_fts_indexes(db);
 
     let same_path = db.source_path.as_deref() == Some(path);
     let mut pager = if same_path {
@@ -279,6 +287,31 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
                 entry.name, table.tb_name, entry.column_name
             ),
             rootpage,
+            last_rowid: 0,
+        });
+    }
+
+    // 2c. Phase 8b — persist a sqlrite_master entry for each FTS index
+    //     so it's replayed on open. The posting list itself isn't on
+    //     disk yet (Phase 8c) — `rootpage = 0` signals replay-from-rows
+    //     to `rebuild_fts_index`. Mirrors HNSW's pre-7d.3 shape.
+    let mut fts_entries: Vec<(&Table, &crate::sql::db::table::FtsIndexEntry)> = Vec::new();
+    for table in db.tables.values() {
+        for entry in &table.fts_indexes {
+            fts_entries.push((table, entry));
+        }
+    }
+    fts_entries
+        .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
+    for (table, entry) in fts_entries {
+        master_rows.push(CatalogEntry {
+            kind: "index".into(),
+            name: entry.name.clone(),
+            sql: format!(
+                "CREATE INDEX {} ON {} USING fts ({})",
+                entry.name, table.tb_name, entry.column_name
+            ),
+            rootpage: 0,
             last_rowid: 0,
         });
     }
@@ -478,6 +511,11 @@ fn build_empty_table(name: &str, columns: Vec<Column>, last_rowid: i64) -> Table
         // graph from current row data. Persistence of the graph itself
         // (avoiding the on-open rebuild cost) is Phase 7d.3.
         hnsw_indexes: Vec::new(),
+        // FTS indexes (Phase 8b) follow the same pattern — the
+        // CREATE INDEX … USING fts SQL is the source of truth on open
+        // and the in-memory posting list gets rebuilt from current
+        // rows. Cell-encoded persistence of the postings is Phase 8c.
+        fts_indexes: Vec::new(),
         last_rowid,
         primary_key,
     }
@@ -652,6 +690,41 @@ fn create_index_sql_uses_hnsw(sql: &str) -> bool {
         return false;
     };
     matches!(using, Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw"))
+}
+
+/// Phase 8b — peeks at a CREATE INDEX SQL to detect `USING fts(...)`.
+/// Mirrors [`create_index_sql_uses_hnsw`].
+fn create_index_sql_uses_fts(sql: &str) -> bool {
+    use sqlparser::ast::{CreateIndex, IndexType, Statement};
+
+    let dialect = SQLiteDialect {};
+    let Ok(mut ast) = Parser::parse_sql(&dialect, sql) else {
+        return false;
+    };
+    let Some(Statement::CreateIndex(CreateIndex { using, .. })) = ast.pop() else {
+        return false;
+    };
+    matches!(using, Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fts"))
+}
+
+/// Phase 8b — replays a `CREATE INDEX … USING fts(...)` statement on
+/// database open to rebuild its in-memory `PostingList` from current
+/// rows. Mirrors the `rootpage == 0` arm of [`rebuild_hnsw_index`].
+/// Persistence of the posting lists themselves is Phase 8c.
+fn rebuild_fts_index(db: &mut Database, row: &IndexCatalogRow) -> Result<()> {
+    use crate::sql::executor::execute_create_index;
+    use sqlparser::ast::Statement;
+
+    let dialect = SQLiteDialect {};
+    let mut ast = Parser::parse_sql(&dialect, &row.sql).map_err(SQLRiteError::from)?;
+    let Some(stmt @ Statement::CreateIndex(_)) = ast.pop() else {
+        return Err(SQLRiteError::Internal(format!(
+            "sqlrite_master FTS row's SQL isn't a CREATE INDEX: {}",
+            row.sql
+        )));
+    };
+    execute_create_index(&stmt, db)?;
+    Ok(())
 }
 
 /// Loads (or rebuilds) an HNSW index on database open. Two paths:
@@ -837,6 +910,62 @@ fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
 
             // Replace the entry's index + clear the dirty flag.
             if let Some(entry) = table.hnsw_indexes.iter_mut().find(|e| e.name == idx_name) {
+                entry.index = new_idx;
+                entry.needs_rebuild = false;
+            }
+        }
+    }
+}
+
+/// Phase 8b — rebuild every FTS index a DELETE / UPDATE-on-text-col
+/// marked dirty. Mirrors [`rebuild_dirty_hnsw_indexes`]; runs at save
+/// time under `&mut Database`. Cheap on a clean DB (the `dirty` snapshot
+/// is empty so the per-table loop short-circuits).
+fn rebuild_dirty_fts_indexes(db: &mut Database) {
+    use crate::sql::fts::PostingList;
+
+    for table in db.tables.values_mut() {
+        let dirty: Vec<(String, String)> = table
+            .fts_indexes
+            .iter()
+            .filter(|e| e.needs_rebuild)
+            .map(|e| (e.name.clone(), e.column_name.clone()))
+            .collect();
+        if dirty.is_empty() {
+            continue;
+        }
+
+        for (idx_name, col_name) in dirty {
+            // Snapshot every (rowid, text) pair for this column under
+            // the row mutex, then drop the lock before re-tokenizing.
+            let mut docs: Vec<(i64, String)> = Vec::new();
+            {
+                let row_data = table.rows.lock().expect("rows mutex poisoned");
+                if let Some(Row::Text(map)) = row_data.get(&col_name) {
+                    for (id, v) in map.iter() {
+                        // "Null" sentinel is the parser's
+                        // null-marker for TEXT cells; skip those —
+                        // they'd round-trip as the literal string
+                        // "Null" otherwise. Aligns with insert_row's
+                        // typed_value gate.
+                        if v != "Null" {
+                            docs.push((*id, v.clone()));
+                        }
+                    }
+                }
+            }
+
+            let mut new_idx = PostingList::new();
+            // Sort by id so the rebuild is deterministic across runs
+            // (the BTreeMap inside PostingList is order-stable, but
+            // doc-length aggregation order doesn't matter — sorting
+            // here is purely for reproducibility on inspection).
+            docs.sort_by_key(|(id, _)| *id);
+            for (id, text) in &docs {
+                new_idx.insert(*id, text);
+            }
+
+            if let Some(entry) = table.fts_indexes.iter_mut().find(|e| e.name == idx_name) {
                 entry.index = new_idx;
                 entry.needs_rebuild = false;
             }
@@ -1498,6 +1627,110 @@ mod tests {
         )
         .unwrap();
         assert!(resp.contains("3 rows returned"), "got: {resp}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn round_trip_rebuilds_fts_index_from_create_sql() {
+        // Phase 8b — FTS indexes don't yet persist their posting lists
+        // (Phase 8c does that). On open, sqlrite_master records the
+        // CREATE INDEX SQL and `rebuild_fts_index` replays it through
+        // `execute_create_index`, walking current rows.
+        let path = tmp_path("fts_roundtrip");
+
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+                &mut db,
+            )
+            .unwrap();
+            for body in &[
+                "rust embedded database",
+                "rust web framework",
+                "go embedded systems",
+                "python web framework",
+                "rust rust embedded power",
+            ] {
+                process_command(
+                    &format!("INSERT INTO docs (body) VALUES ('{body}');"),
+                    &mut db,
+                )
+                .unwrap();
+            }
+            process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+            save_database(&mut db, &path).expect("save");
+        } // db drops → exclusive lock releases.
+
+        let mut loaded = open_database(&path, "test".to_string()).expect("open");
+        {
+            let table = loaded.get_table("docs".to_string()).expect("docs");
+            assert_eq!(table.fts_indexes.len(), 1, "FTS index should reattach");
+            let entry = &table.fts_indexes[0];
+            assert_eq!(entry.name, "ix_body");
+            assert_eq!(entry.column_name, "body");
+            assert_eq!(
+                entry.index.len(),
+                5,
+                "rebuilt posting list should hold all 5 rows"
+            );
+            assert!(!entry.needs_rebuild);
+        }
+
+        // Functional smoke: an FTS query through the reloaded index
+        // returns the expected hit count.
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust');",
+            &mut loaded,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_then_save_then_reopen_excludes_deleted_node_from_fts() {
+        // Phase 8b — DELETE marks the FTS index dirty; save rebuilds it
+        // from current rows; reopen replays the CREATE INDEX SQL against
+        // the post-delete row set. The deleted rowid must not surface
+        // in `fts_match` results post-reopen.
+        let path = tmp_path("fts_delete_rebuild");
+        let mut db = Database::new("test".to_string());
+        process_command(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        for body in &[
+            "rust embedded",
+            "rust framework",
+            "go embedded",
+            "python web",
+        ] {
+            process_command(
+                &format!("INSERT INTO docs (body) VALUES ('{body}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+
+        // Delete row 1 ('rust embedded'); save (rebuild fires); reopen.
+        process_command("DELETE FROM docs WHERE id = 1;", &mut db).unwrap();
+        save_database(&mut db, &path).expect("save");
+        drop(db);
+
+        let mut loaded = open_database(&path, "test".to_string()).expect("open");
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(body, 'rust');",
+            &mut loaded,
+        )
+        .unwrap();
+        // Pre-delete: 2 rows ('rust embedded', 'rust framework') had
+        // 'rust'. Post-delete: only id=2 remains.
+        assert!(resp.contains("1 row returned"), "got: {resp}");
 
         cleanup(&path);
     }
