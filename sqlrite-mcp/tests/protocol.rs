@@ -169,6 +169,7 @@ fn tools_list_returns_expected_set_in_default_mode() {
         "execute",
         "schema_dump",
         "vector_search",
+        "bm25_search",
     ];
     if cfg!(feature = "ask") {
         expected.push("ask");
@@ -484,6 +485,128 @@ fn vector_search_returns_nearest_rows() {
     assert_eq!(rows.len(), 2);
     // Closest should be id=1 ([1.0, 0.0] — distance 0).
     assert_eq!(rows[0]["id"], 1);
+}
+
+#[test]
+fn bm25_search_returns_top_ranked_rows() {
+    let mut srv = Server::spawn(&["--in-memory"]);
+    srv.handshake();
+    let _ = call_tool(
+        &mut srv,
+        1,
+        "execute",
+        json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)"}),
+    );
+    for (i, body) in [
+        "rust embedded database",   // id=1: 'rust' once
+        "rust web framework",       // id=2: 'rust' once
+        "go embedded systems",      // id=3: no 'rust'
+        "rust rust embedded power", // id=4: 'rust' twice — should win
+    ]
+    .iter()
+    .enumerate()
+    {
+        let _ = call_tool(
+            &mut srv,
+            (10 + i) as u64,
+            "execute",
+            json!({
+                "sql": format!("INSERT INTO docs (body) VALUES ('{body}')")
+            }),
+        );
+    }
+    let _ = call_tool(
+        &mut srv,
+        20,
+        "execute",
+        json!({"sql": "CREATE INDEX docs_fts ON docs USING fts (body)"}),
+    );
+
+    let r = call_tool(
+        &mut srv,
+        21,
+        "bm25_search",
+        json!({
+            "table": "docs",
+            "column": "body",
+            "query": "rust",
+            "k": 3,
+        }),
+    );
+    assert_tool_success(&r);
+    let parsed: Value = serde_json::from_str(&tool_text(&r)).unwrap();
+    let rows = parsed["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "three docs contain 'rust'");
+    // Top-ranked must be id=4 (tf=2 in a 5-token doc → highest BM25).
+    assert_eq!(rows[0]["id"], 4);
+    // id=3 (no 'rust') must NOT appear.
+    for row in rows {
+        assert_ne!(row["id"], 3, "doc without 'rust' must not be in results");
+    }
+}
+
+#[test]
+fn bm25_search_without_index_errors_clearly() {
+    let mut srv = Server::spawn(&["--in-memory"]);
+    srv.handshake();
+    let _ = call_tool(
+        &mut srv,
+        1,
+        "execute",
+        json!({"sql": "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)"}),
+    );
+    let _ = call_tool(
+        &mut srv,
+        2,
+        "execute",
+        json!({"sql": "INSERT INTO docs (body) VALUES ('hello')"}),
+    );
+    // No CREATE INDEX … USING fts — bm25_search must surface a
+    // clear, actionable error pointing the LLM at the missing step.
+    let r = call_tool(
+        &mut srv,
+        3,
+        "bm25_search",
+        json!({
+            "table": "docs",
+            "column": "body",
+            "query": "hello",
+        }),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    let text = tool_text(&r);
+    assert!(
+        text.contains("no FTS index"),
+        "expected no-FTS-index error: {text}"
+    );
+}
+
+#[test]
+fn bm25_search_rejects_non_text_column() {
+    let mut srv = Server::spawn(&["--in-memory"]);
+    srv.handshake();
+    let _ = call_tool(
+        &mut srv,
+        1,
+        "execute",
+        json!({"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"}),
+    );
+    let r = call_tool(
+        &mut srv,
+        2,
+        "bm25_search",
+        json!({
+            "table": "t",
+            "column": "n",
+            "query": "anything",
+        }),
+    );
+    assert_eq!(r["result"]["isError"], true);
+    let text = tool_text(&r);
+    assert!(
+        text.to_lowercase().contains("text"),
+        "expected non-TEXT-column error: {text}"
+    );
 }
 
 // ----------------------------------------------------------------------

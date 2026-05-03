@@ -27,6 +27,7 @@ use crate::protocol::ServerState;
 
 #[cfg(feature = "ask")]
 mod ask;
+mod bm25_search;
 mod describe_table;
 mod execute;
 mod list_tables;
@@ -37,9 +38,9 @@ mod vector_search;
 /// MCP `tools/list` result. Returns the metadata for each tool —
 /// name, description, JSON Schema for input. The order matters
 /// only for human readability in the client UI; we go DB-discovery
-/// → SELECT → DML → vector → ask.
+/// → SELECT → DML → retrieval (vector + bm25) → ask.
 pub fn list(read_only: bool) -> Vec<Value> {
-    let mut tools = Vec::with_capacity(7);
+    let mut tools = Vec::with_capacity(8);
 
     tools.push(list_tables::metadata());
     tools.push(describe_table::metadata());
@@ -55,6 +56,7 @@ pub fn list(read_only: bool) -> Vec<Value> {
 
     tools.push(schema_dump::metadata());
     tools.push(vector_search::metadata());
+    tools.push(bm25_search::metadata());
 
     #[cfg(feature = "ask")]
     tools.push(ask::metadata());
@@ -76,6 +78,7 @@ pub fn dispatch(name: &str, args: Value, state: &mut ServerState) -> Result<Stri
         "execute" => execute::handle(args, state),
         "schema_dump" => schema_dump::handle(args, state),
         "vector_search" => vector_search::handle(args, state),
+        "bm25_search" => bm25_search::handle(args, state),
         #[cfg(feature = "ask")]
         "ask" => ask::handle(args, state),
         // Unknown tool: this is a tool-error not a protocol-error,
