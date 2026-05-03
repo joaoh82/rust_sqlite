@@ -58,7 +58,7 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 ## Future work
 
 - [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `ask()` API across REPL/library/SDKs/desktop/MCP, MCP server). **Implementation complete except 7f, which deferred to Phase 8.**
-- Phase 8 — Full-text search (FTS5-style BM25) + hybrid retrieval, deferred from Phase 7 per the plan-doc's Q1. **Active frontier as of May 2026.**
+- [Phase 8 plan](phase-8-plan.md) — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. **Draft 2026-05-03 — awaiting Q1–Q10 sign-off before implementation starts at sub-phase 8a.**
 
 ## Conventions
 
