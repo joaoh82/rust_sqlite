@@ -65,6 +65,14 @@ required-features = ["cli", "ask"]
 name = "quickstart"
 path = "examples/rust/quickstart.rs"
 
+# Phase 8d — hybrid retrieval (BM25 + vector cosine via raw arithmetic).
+# Run with `cargo run --example hybrid-retrieval`. Pre-baked vectors
+# (no embedding model dependency) over a 6-doc tech-blurb corpus,
+# showing where pure-BM25, pure-vector, and 50/50 hybrid each win.
+[[example]]
+name = "hybrid-retrieval"
+path = "examples/hybrid-retrieval/hybrid_retrieval.rs"
+
 [features]
 # Default build includes everything: the REPL binary (cli) and
 # POSIX/Windows advisory file locks on the Pager (file-locks).

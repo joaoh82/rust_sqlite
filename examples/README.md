@@ -24,6 +24,14 @@ cargo run --example quickstart
 
 Walks through opening an in-memory `Connection`, creating a table, inserting rows, preparing a SELECT, iterating typed `Row` values, and running a `BEGIN` / `ROLLBACK` block. About 50 lines with comments — read [`rust/quickstart.rs`](rust/quickstart.rs) first.
 
+## Running the hybrid-retrieval example (Phase 8d)
+
+```bash
+cargo run --example hybrid-retrieval
+```
+
+Combines BM25 lexical scoring (Phase 8b) with vector cosine distance (Phase 7d) in a single `ORDER BY`, showing where each ranking shape wins on the same corpus. Pre-baked vectors keep the example self-contained — no embedding-model dependency. Read [`hybrid-retrieval/README.md`](hybrid-retrieval/README.md) for the narrative.
+
 ## Running the C sample
 
 ```bash
