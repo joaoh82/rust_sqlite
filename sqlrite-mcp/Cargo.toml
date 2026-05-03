@@ -18,7 +18,7 @@
 # Published to crates.io as `sqlrite-mcp`. Joins the lockstep
 # release wave (`sqlrite-mcp-vX.Y.Z` tag) — see `docs/release-plan.md`.
 name = "sqlrite-mcp"
-version = "0.1.24"
+version = "0.1.25"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
