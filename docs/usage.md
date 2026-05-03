@@ -69,4 +69,4 @@ while let Some(row) = rows.next()? {
 }
 ```
 
-See [Embedding the SQLRite engine](embedding.md) for the full API reference, and [`examples/`](../examples/) for runnable samples (`cargo run --example quickstart` walks through the basics end-to-end). Language SDKs for Python, Node.js, Go, and WASM land in Phases 5b – 5g.
+See [Embedding the SQLRite engine](embedding.md) for the full API reference, and [`examples/`](../examples/) for runnable samples (`cargo run --example quickstart` walks through the basics end-to-end). Language SDKs shipped across Phases 5b – 5g — Python (PyPI: `sqlrite`), Node.js (npm: `@joaoh82/sqlrite`), Go (`github.com/joaoh82/rust_sqlite/sdk/go`), WASM (npm: `@joaoh82/sqlrite-wasm`). For LLM-agent-driven access, the [`sqlrite-mcp`](mcp.md) MCP server (Phase 7h) wraps the same engine over stdio.

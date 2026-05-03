@@ -12,6 +12,7 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 | Node.js  | ✅ Phase 5d       | npm as `@joaoh82/sqlrite` (Phase 6g) | [`nodejs/`](nodejs/) |
 | Go       | ✅ Phase 5e       | Go modules (Phase 6i) | [`go/`](go/)         |
 | WASM     | ✅ Phase 5g       | npm as `@joaoh82/sqlrite-wasm` (Phase 6h) | [`wasm/`](wasm/)     |
+| MCP      | ✅ Phase 7h       | crates.io as `sqlrite-mcp` + per-platform binary tarballs | *(no `examples/` subdir — see [`docs/mcp.md`](../docs/mcp.md) for the full quickstart with Claude Code / Cursor / `mcp-inspector` wiring snippets)* |
 
 See [docs/roadmap.md](../docs/roadmap.md) for what each sub-phase delivers.
 

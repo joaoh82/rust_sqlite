@@ -13,7 +13,7 @@ Before starting:
   cargo build --workspace
   cargo test --workspace
   ```
-  Current expected: 123 tests pass across lib + bin + doctests.
+  All tests should pass. (The exact count grows each phase — don't pin to a number.)
 
 - For the desktop section: Node 18+, a functional webview (macOS has it built in; Linux needs `webkit2gtk-4.1`; Windows needs Edge WebView2), and the Tauri prerequisites per [docs/desktop.md](desktop.md).
 
@@ -34,13 +34,15 @@ cargo run --quiet --bin sqlrite
 You should see:
 
 ```
-sqlrite - 0.1.0
+sqlrite
 Enter .exit to quit.
 Enter .help for usage hints.
 Connected to a transient in-memory database.
 Use '.open FILENAME' to reopen on a persistent database.
 sqlrite>
 ```
+
+(The version line in the banner tracks the current build — `cargo run` always shows the live value, so don't be surprised if it's later than what's printed here.)
 
 Also verify the help text is detailed:
 
@@ -557,7 +559,8 @@ In the terminal running `tauri dev`, press Ctrl+C.
 When you want a fast before/after comparison for a change, run this condensed checklist instead of the full walkthrough:
 
 - [ ] `cargo build --workspace` → clean, zero warnings
-- [ ] `cargo test --workspace` → 123 tests pass (123 was the count as of Phase 2.5; update when new tests land)
+- [ ] `cargo test --workspace` → all tests pass (don't pin to a specific count — it grows each phase)
+- [ ] `cargo run --bin sqlrite-mcp -- --help` prints the MCP server CLI without crashing — quick check that the stdio_redirect dance still works
 - [ ] `cargo run -- --help` prints the full description + meta-command table + SQL surface (not just `-h` / `-V`)
 - [ ] `cargo run -- somefile.sqlrite` on a non-existent path creates the file and enters the REPL with auto-save on
 - [ ] REPL launches, `.help` shows 5 commands
@@ -594,7 +597,7 @@ Mark the ones you haven't covered for the current change; revisit if any fail.
 
 **`.open` fails with `not a SQLRite database (bad magic bytes)`** on a file you just wrote. Likely cause: the file was written by an older format version (pre-Phase-3e). Delete and recreate.
 
-**`.open` fails with `unsupported SQLRite format version N`**. The current code expects format version `3` (Phase 3e). Older / newer files produce this error. If you hit it on a file from *this* build, the format constant and the file's bytes have desynced — rerun `cargo build` and `.open` again.
+**`.open` fails with `unsupported SQLRite format version N`**. The current code expects format version `4` (bumped in Phase 7a for VECTOR support). Older / newer files produce this error. If you hit it on a file from *this* build, the format constant and the file's bytes have desynced — rerun `cargo build` and `.open` again.
 
 **`cargo run --bin sqlrite` fails to find the binary.** Since Phase 2.5.1 the binary name is `sqlrite`, not `SQLRite`. Passing `--bin sqlrite` is only necessary in the workspace context; `cargo run` alone also defaults to the REPL.
 

@@ -80,6 +80,32 @@ A cross-platform Tauri 2.0 + Svelte 5 desktop GUI ships alongside the REPL (see 
 
 **From source** — `cd desktop && npm install && npm run tauri dev`. The header's New… / Open… / Save As… buttons cover the file lifecycle; the query editor has a live line-number gutter, `⌘/` (Ctrl+/) SQL comment toggle, and selection-aware Run (highlight a statement to run just that one).
 
+### MCP server (drive SQLRite from an LLM agent)
+
+`sqlrite-mcp` exposes a SQLRite database as a [Model Context Protocol](https://modelcontextprotocol.io/) stdio server. Spawn it from any MCP client (Claude Code, Cursor, `mcp-inspector`, …) and the agent gets seven tools — `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, plus `ask` for natural-language → SQL — without any custom integration code.
+
+```sh
+cargo install sqlrite-mcp
+```
+
+Or grab a per-platform pre-built binary from the [latest release](https://github.com/joaoh82/rust_sqlite/releases/latest) (Linux x86_64/aarch64, macOS aarch64, Windows x86_64).
+
+Wire it into Claude Code (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "sqlrite": {
+      "command": "sqlrite-mcp",
+      "args": ["/absolute/path/to/your.sqlrite"],
+      "env": { "SQLRITE_LLM_API_KEY": "sk-ant-…" }
+    }
+  }
+}
+```
+
+`--read-only` opens the DB with a shared lock and hides the `execute` tool. Full docs + the other six tools' references in [`docs/mcp.md`](docs/mcp.md).
+
 ### Developer guide
 
 In-depth documentation lives under [`docs/`](docs/). Start at [`docs/_index.md`](docs/_index.md) — it navigates to:
@@ -100,10 +126,10 @@ Build and launch the REPL:
 cargo run
 ```
 
-You'll drop into a REPL connected to a transient in-memory database. On-disk persistence (`.open`, `.save`) is coming in Phase 2.
+You'll drop into a REPL connected to a transient in-memory database. Use `.open <path>` to switch to a file-backed database (auto-saves on every statement; see Meta commands).
 
 ```
-SQLRite - 0.1.0
+SQLRite
 Enter .exit to quit.
 Enter .help for usage hints.
 Connected to a transient in-memory database.
@@ -183,7 +209,7 @@ println!("Why: {}",          resp.explanation);
 
 **Defaults:** `claude-sonnet-4-6`, `max_tokens: 1024`, schema dump cached for 5 minutes via Anthropic prompt caching (configurable to 1h or off via `AskConfig::cache_ttl`). Bring your own API key — set `SQLRITE_LLM_API_KEY` or pass it on `AskConfig`.
 
-In the REPL: `.ask <question>`. From an open `Connection` (this section). Per-product wrappers — desktop "Ask" button, `conn.ask()` in the Python / Node / Go SDKs, MCP `ask` tool, WASM with a JS-callback shape so the API key never enters the browser — ship in **7g.3-7g.8** as follow-up sub-phases. See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
+In the REPL: `.ask <question>`. From an open `Connection` (this section). Per-product wrappers shipped across **7g.3 – 7g.8**: the desktop "Ask…" composer, `conn.ask()` / `db.ask()` in the Python / Node / Go SDKs, the WASM SDK's split `db.askPrompt()` / `db.askParse()` shape (so the API key never enters the browser), and the MCP `ask` tool exposed by [`sqlrite-mcp`](docs/mcp.md) (so any LLM agent over MCP can call `ask` against your database directly). See [`docs/phase-7-plan.md`](docs/phase-7-plan.md) §7g for the full surface plan.
 
 For the canonical Ask reference covering every surface (REPL, desktop, Rust library, Python / Node / Go / WASM), env vars, defaults, prompt caching, and the security model — read [`docs/ask.md`](docs/ask.md). For copy-paste backend proxy templates the WASM SDK needs (Cloudflare Workers, Vercel Edge, Deno Deploy, Firebase, AWS Lambda, Express), see [`docs/ask-backend-examples.md`](docs/ask-backend-examples.md).
 
@@ -230,7 +256,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **Tauri 2.0 backend**: four commands (`open_database`, `list_tables`, `table_rows`, `execute_sql`) wrap the engine; results are tagged enums shipped to the UI via the JSON IPC bridge.
 - [x] **Svelte 5 frontend**: dark-themed three-pane layout — header with "Open…" file picker, sidebar with table list + schema, query editor with Cmd/Ctrl+Enter to run, result grid with sticky header.
 
-**Phase 4 — Durability and concurrency** *(in progress)*
+**Phase 4 — Durability and concurrency** *(done)*
 - [x] **4a — Exclusive file lock**: `Pager::open` / `::create` takes an OS advisory lock (`fs2::try_lock_exclusive`); a second process on the same file gets a clean "already in use" error. Lock releases automatically when the Pager drops.
 - [x] **4b — Write-Ahead Log (`<db>.sqlrite-wal`) file format + frame codec**: 32-byte WAL header (magic / version / page size / salt / checkpoint seq), 4112-byte frames carrying `(page_num, commit_page_count, salt, checksum, body)`. Rolling-sum checksum. Torn-write recovery: corrupt or partial trailing frames are silently truncated at the boundary. Standalone module; not wired yet.
 - [x] **4c — WAL-aware Pager**: `Pager::open` / `::create` now own both the main file and its `-wal` sidecar. Reads resolve `staged → wal_cache → on_disk` with a page-count bounds check; commits append a WAL frame per dirty page plus a final commit frame carrying the new page 0 (encoded header). The main file stays frozen between checkpoints — reopening replays the WAL and the decoded page-0 frame overrides the (stale) main-file header.
@@ -246,7 +272,7 @@ The project is staged in phases, each independently shippable. A finished phase 
 - [x] **5e — Go SDK**: new `sdk/go/` module at `github.com/joaoh82/rust_sqlite/sdk/go`; cgo-wired against `libsqlrite_c` from Phase 5b. Implements the full `database/sql/driver` surface so users get the standard-library experience (`sql.Open("sqlrite", path)`, `db.Query/Exec/Begin`, `rows.Scan(&id, &name)`). 9-test `go test` integration suite. `examples/go/hello.go` runs after `cargo build --release -p sqlrite-ffi`. Module publish landed in Phase 6i — `go get github.com/joaoh82/rust_sqlite/sdk/go@vX.Y.Z` resolves directly via VCS tag.
 - [ ] **5f — Rust crate polish** *(deferred — Phase 6c companion)*: crate metadata, docs.rs config, prep for `cargo publish`. Deferred to land alongside the actual publish workflow.
 - [x] **5g — WASM** build: new `sdk/wasm/` crate via `wasm-bindgen`; engine runs entirely in a browser tab. Feature-gated root crate (`cli` + `file-locks` optional, both default-on) so WASM disables fs2 / rustyline / clap / env_logger cleanly. `Database` class with `exec/query/columns/inTransaction`; rows as plain JS objects in projection order. ~1.8 MB wasm / ~500 KB gzipped. Three `wasm-pack` targets (web/bundler/nodejs). `examples/wasm/` ships a self-contained HTML SQL console.
-- [ ] Code examples for every language under `examples/{rust,python,nodejs,go,wasm}/`
+- [x] Code examples for every language under `examples/{rust,python,nodejs,go,wasm,c}/`
 
 **Phase 6 — Release engineering + CI/CD**
 Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. Two-workflow design: `release-pr.yml` opens a Release PR with the version bumps (human reviews + merges), then `release.yml` fires on merge to tag + publish everything. Trusted-publishing via OIDC for PyPI + npm (no long-lived tokens). Full plan: [`docs/release-plan.md`](docs/release-plan.md).
@@ -265,7 +291,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [ ] macOS Apple Developer ID cert → `codesign` + `notarytool` in `tauri-action`
 - [ ] Windows code-signing cert → `signtool` in `tauri-action`
 
-**Phase 7 — AI-era extensions** *(in progress — full plan in [`docs/phase-7-plan.md`](docs/phase-7-plan.md))*
+**Phase 7 — AI-era extensions** *(7a–7h shipped; FTS deferred to Phase 8 — full plan in [`docs/phase-7-plan.md`](docs/phase-7-plan.md))*
 - [x] **7a — `VECTOR(N)` column type** *(v0.1.10)*: dense f32 vectors with bracket-array literal syntax (`[0.1, 0.2, ...]`); file format bumped to v4
 - [x] **7b — Distance functions** *(v0.1.11)*: `vec_distance_l2/cosine/dot` + `ORDER BY <expr> LIMIT k` so KNN queries work end-to-end
 - [x] **7c — Bounded-heap top-k optimization** *(v0.1.12)*

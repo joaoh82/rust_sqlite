@@ -218,6 +218,10 @@ python -m pytest tests/
 - maturin as the build backend, emitting standard `.whl` files that pip can install directly.
 - Phase 6f's CI publishes abi3-py38 wheels to PyPI for manylinux x86_64/aarch64, macOS aarch64, and Windows x86_64 (plus an sdist) on every release. OIDC trusted publishing — no long-lived PyPI token in the repo.
 
+## Sibling products
+
+This SDK is for when *your code* drives the database. If you want an *LLM agent* to drive a SQLRite database directly, install the [`sqlrite-mcp`](../../docs/mcp.md) Model Context Protocol server (`cargo install sqlrite-mcp`) and wire it into Claude Code / Cursor / `mcp-inspector` / any MCP-aware client. Same engine underneath.
+
 ## Status
 
 Phase 5c MVP: ✅ — basic CRUD, transactions, context managers, read-only mode, iteration. Parameter binding, CursorRow namedtuples, and type converters (datetime, Decimal) are natural follow-ups.

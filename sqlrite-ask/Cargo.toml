@@ -17,6 +17,9 @@ rust-version = "1.85"
 description = "Natural-language → SQL adapter for sqlrite-engine. Anthropic-first; OpenAI / Ollama follow-ups."
 repository = "https://github.com/joaoh82/rust_sqlite"
 license = "MIT"
+readme = "README.md"
+keywords = ["sqlrite", "llm", "anthropic", "ai", "sql"]
+categories = ["database", "api-bindings"]
 
 [lib]
 name = "sqlrite_ask"

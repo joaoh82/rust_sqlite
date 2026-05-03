@@ -81,6 +81,19 @@ sqlrite_autoindex_<table>_<column>
 
 These are full-citizen indexes — they're visible via `.tables`-adjacent catalog queries (once those land), persist across saves, and accelerate equality probes. You don't need to `CREATE INDEX` them yourself.
 
+### HNSW indexes (Phase 7d)
+
+```sql
+CREATE INDEX <name> ON <table> USING hnsw (<vector_column>);
+```
+
+Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor index over a `VECTOR(N)` column. The query optimizer recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` (or the cosine / dot variants) on an HNSW-indexed column and probes the graph instead of full-scanning.
+
+- Recall@10 ≥ 0.95 at default parameters (`M=16`, `ef_construction=200`, `ef_search=50`). Parameters aren't tunable from SQL yet — see Q2 of [`docs/phase-7-plan.md`](phase-7-plan.md).
+- The index is built incrementally on `INSERT`. `DELETE` / `UPDATE` mark the index `needs_rebuild`; the next save rebuilds from current rows.
+- Persisted as a `KIND_HNSW` cell tree alongside the regular page hierarchy — open path loads the graph bit-for-bit, no algorithm runs.
+- Without an HNSW index, the same `ORDER BY vec_distance_… LIMIT k` query still works — it just brute-force-scans every row (Phase 7c's bounded-heap top-k optimization keeps the memory footprint to O(k)).
+
 ---
 
 ## `INSERT INTO`

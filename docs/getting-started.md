@@ -34,7 +34,7 @@ cargo run
 You'll land in an in-memory REPL:
 
 ```
-SQLRite - 0.1.0
+SQLRite
 Enter .exit to quit.
 Enter .help for usage hints.
 Connected to a transient in-memory database.
@@ -89,22 +89,35 @@ rust_sqlite/
 ├── rust-toolchain.toml     Pinned stable Rust + rustfmt + clippy
 ├── README.md               Project overview (what/why/how)
 ├── docs/                   Developer guide (you are here)
-├── src/
+├── src/                    Engine library + REPL binary
 │   ├── lib.rs              Library root — the public engine API
 │   ├── main.rs             Binary entry point, REPL loop
+│   ├── connection.rs       Phase 5a public API (Connection, Statement, Rows)
+│   ├── ask/                Engine integration with sqlrite-ask (Phase 7g.2)
 │   ├── error.rs            SQLRiteError enum
 │   ├── repl/               rustyline integration, input validation
-│   ├── meta_command/       Parsing + execution of .exit, .open, .save, .tables
+│   ├── meta_command/       Parsing + execution of .exit, .open, .save, .tables, .ask
 │   └── sql/
 │       ├── mod.rs          Top-level process_command dispatcher
 │       ├── parser/         sqlparser → internal SelectQuery / CreateQuery / InsertQuery
 │       ├── executor.rs     SELECT / UPDATE / DELETE / CREATE INDEX execution
-│       ├── db/             In-memory data model (Database, Table, Column, Row,
-│       │                   SecondaryIndex)
-│       └── pager/          On-disk paged file format + Pager cache
+│       ├── hnsw.rs         HNSW ANN algorithm (Phase 7d.1)
+│       ├── json.rs         JSON column type + path functions (Phase 7e)
+│       ├── db/             In-memory data model (Database, Table, Column, Row, Value)
+│       └── pager/          On-disk paged file format + Pager cache + WAL + checkpointer
+├── sqlrite-ffi/            C FFI shim — libsqlrite_c.{so,dylib,dll} + sqlrite.h
+├── sqlrite-ask/            Pure-Rust LLM transport adapter (Phase 7g.1)
+├── sqlrite-mcp/            Model Context Protocol server binary (Phase 7h)
+├── sdk/
+│   ├── python/             PyO3 bindings → `sqlrite` on PyPI
+│   ├── nodejs/             napi-rs bindings → `@joaoh82/sqlrite` on npm
+│   ├── go/                 cgo wrapper over sqlrite-ffi
+│   └── wasm/               wasm-bindgen build → `@joaoh82/sqlrite-wasm` on npm
 ├── desktop/                Tauri 2.0 desktop app (see docs/desktop.md)
 │   ├── src/                Svelte 5 UI
 │   └── src-tauri/          Tauri backend; pulls in the engine by path
+├── examples/               Runnable examples for every SDK + the WASM browser demo
+├── scripts/                Release tooling (start with bump-version.sh)
 └── samples/                Example SQL and reference ASTs
 ```
 

@@ -240,6 +240,10 @@ The wasm gzips to ~500 KB; browsers serve it compressed.
 - Release profile uses `opt-level = "z"` + LTO + `codegen-units = 1` + symbol stripping — wasm binary size is the main cost center on the wire.
 - Rows are marshalled to JS via `serde_wasm_bindgen` with `serialize_maps_as_objects(true)` (so each row is a plain JS `Object`, not a `Map`) and `serde_json`'s `preserve_order` feature (so column keys come across in projection order, not alphabetical).
 
+## Sibling products
+
+The WASM SDK is browser-only. For LLM-agent-driven *server-side* access to SQLRite, install the [`sqlrite-mcp`](../../docs/mcp.md) Model Context Protocol server (`cargo install sqlrite-mcp`) and wire it into Claude Code / Cursor / `mcp-inspector` / any MCP-aware client. Same engine underneath.
+
 ## Status
 
 Phase 5g MVP: ✅ — in-memory CRUD, transactions, columns(), panic hook, serialization behavior matches the Node.js SDK. OPFS-backed persistence, prepared-statement objects, and parameter binding are natural follow-ups.

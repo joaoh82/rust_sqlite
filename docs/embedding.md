@@ -1,11 +1,14 @@
 # Embedding the SQLRite engine
 
-SQLRite ships as a library that other programs can embed — the REPL and desktop app are just thin UIs over the same core. Phase 5 builds out the embedding surface:
+SQLRite ships as a library that other programs can embed — the REPL and desktop app are just thin UIs over the same core. Phase 5 built out the embedding surface across every reasonable runtime; Phase 7g/7h layered the natural-language `ask()` family + an MCP server on top.
 
-- **Phase 5a** — a stable public Rust API (`Connection` / `Statement` / `Rows` / `Row` / `Value`) plus structured row return. ✅ **Landed.**
-- **Phase 5b** — a C FFI shim (`libsqlrite.{so,dylib,dll}` + generated `sqlrite.h`) that every non-Rust SDK binds against.
-- **Phase 5c – 5f** — Python, Node.js, Go, Rust SDKs published to their respective registries.
-- **Phase 5g** — WASM build so the engine runs entirely in a browser tab.
+- ✅ **Phase 5a** — stable public Rust API (`Connection` / `Statement` / `Rows` / `Row` / `Value`) plus structured row return. Parameter binding + a streaming cursor abstraction are deferred to **5a.2**.
+- ✅ **Phase 5b** — C FFI shim (`libsqlrite_c.{so,dylib,dll}` + cbindgen-generated `sqlrite.h`) that every non-Rust SDK binds against.
+- ✅ **Phase 5c – 5e** — Python (PyO3 → PyPI), Node.js (napi-rs → npm), Go (cgo against the FFI shim → git tag) SDKs published to their respective registries.
+- ⏳ **Phase 5f** — Rust crate polish (deferred — Phase 6c shipped the actual crates.io publish; 5f's polish work folded into ongoing maintenance).
+- ✅ **Phase 5g** — WASM build (`@joaoh82/sqlrite-wasm` on npm) so the engine runs entirely in a browser tab.
+- ✅ **Phase 7g** — `ask()` natural-language → SQL family across every embedding surface — see [`ask.md`](ask.md).
+- ✅ **Phase 7h** — [`sqlrite-mcp`](mcp.md), a Model Context Protocol stdio server that wraps a database for LLM agents (Claude Code, Cursor, `mcp-inspector`, …) without any custom integration code on the LLM side. Sibling product to the SDKs, not a replacement — use the SDKs when *your* code drives the database, use the MCP server when an *LLM agent* drives it.
 
 See [roadmap.md](roadmap.md) for the detailed Phase 5 breakdown.
 
@@ -120,7 +123,7 @@ let _ = conn.execute(&resp.sql)?;
 
 **REPL surface** *(7g.2)*: type `.ask <question>` at the prompt. Prints generated SQL + rationale, asks `Run? [Y/n]`, executes through the same `process_command` pipeline as a typed statement on confirm. Requires `SQLRITE_LLM_API_KEY`.
 
-**Per-product wrappers ship in 7g.3-7g.8** — desktop "Ask" button, Python/Node/Go SDKs `conn.ask()`, WASM SDK with a JS-callback shape (so the API key stays out of the browser tab), and the MCP `ask` tool.
+**Per-product wrappers shipped across 7g.3 – 7g.8** — desktop "Ask…" composer, Python/Node/Go SDKs' `conn.ask()` / `db.ask()`, WASM SDK with the split JS-callback shape (so the API key stays out of the browser tab; see [`ask-backend-examples.md`](ask-backend-examples.md) for backend templates), and the MCP `ask` tool exposed by [`sqlrite-mcp`](mcp.md). [`ask.md`](ask.md) is the canonical reference covering all of them.
 
 ## The C FFI (Phase 5b)
 

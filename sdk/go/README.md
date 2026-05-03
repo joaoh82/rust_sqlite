@@ -239,6 +239,10 @@ cargo build --release -p sqlrite-ffi   # one-time
 cd sdk/go && go test -v ./...
 ```
 
+## Sibling products
+
+This SDK is for when *your code* drives the database. If you want an *LLM agent* to drive a SQLRite database directly, install the [`sqlrite-mcp`](../../docs/mcp.md) Model Context Protocol server (`cargo install sqlrite-mcp`) and wire it into Claude Code / Cursor / `mcp-inspector` / any MCP-aware client. Same engine underneath.
+
 ## Status
 
 Phase 5e MVP: ✅ — CRUD, transactions, file-backed + read-only, `QueryRow`/`Scan` round-trip, `database/sql`'s context-aware interfaces, error surfacing through the driver layer. Parameter binding, prepared-plan caching, and `LastInsertId`/`RowsAffected` tracking land with the engine-level 5a.2 cursor work.

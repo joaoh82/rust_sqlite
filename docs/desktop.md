@@ -186,7 +186,7 @@ No external store — just `$state` runes inside the component. For a single-win
 - **App icon** — a placeholder PNG; replace before bundling for distribution
 - **Error recovery after panic** — the Tauri app is a thin shell, so if the engine panics the whole window dies. The engine isn't supposed to panic on user input (Phase 1 made that a requirement), but a panic in the Tauri layer itself would take the app down.
 
-Most of the above are straightforward frontend additions. The bigger shift is the cursor API — see [Roadmap](roadmap.md) Phase 5.
+Most of the above are straightforward frontend additions. The bigger shift is the cursor API — see [Roadmap](roadmap.md) Phase 5a.2 (deferred — currently `Rows` materializes eagerly into a `Vec`).
 
 ## Multi-process behavior
 
