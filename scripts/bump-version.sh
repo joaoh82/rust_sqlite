@@ -6,8 +6,8 @@
 #     scripts/bump-version.sh 0.2.0
 #
 # Rewrites the version field in every manifest that carries one
-# (eight Cargo.toml / pyproject.toml files, plus three JSON manifests
-# — eleven files total). Then you run `cargo build` yourself to
+# (nine Cargo.toml / pyproject.toml files, plus three JSON manifests
+# — twelve files total). Then you run `cargo build` yourself to
 # refresh Cargo.lock. Idempotent: running twice with the same version
 # is a no-op; running twice with different versions lands on the
 # second.
@@ -192,5 +192,5 @@ fi
 echo
 echo "Done. Next steps:"
 echo "  cargo build    # refresh Cargo.lock with the new versions"
-echo "  git diff       # inspect the ten-file bump"
+echo "  git diff       # inspect the twelve-file bump"
 echo "  git checkout . # or back out if it looks wrong"
