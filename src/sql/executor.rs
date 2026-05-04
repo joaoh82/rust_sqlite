@@ -717,6 +717,60 @@ pub fn execute_alter_table(alter: AlterTable, db: &mut Database) -> Result<Strin
     }
 }
 
+/// Executes `VACUUM;` (SQLR-6). Compacts the database file: rewrites
+/// every live table, index, and the catalog contiguously from page 1,
+/// drops the freelist, and truncates the tail at the next checkpoint.
+///
+/// Refuses to run inside a transaction (would publish in-flight writes
+/// out of band); refuses on read-only databases (handled upstream by
+/// the read-only mutation gate); and is a no-op on in-memory databases
+/// (no file to compact). Bare `VACUUM;` only — non-default options
+/// (`FULL`, `REINDEX`, table targets, etc.) are rejected.
+pub fn execute_vacuum(db: &mut Database) -> Result<String> {
+    if db.in_transaction() {
+        return Err(SQLRiteError::General(
+            "VACUUM cannot run inside a transaction".to_string(),
+        ));
+    }
+    let path = match db.source_path.clone() {
+        Some(p) => p,
+        None => {
+            return Ok("VACUUM is a no-op for in-memory databases".to_string());
+        }
+    };
+    // Checkpoint before AND after VACUUM so the main-file size we report
+    // reflects only what VACUUM actually reclaimed — without the leading
+    // checkpoint, `size_before` would be the stale main-file snapshot
+    // (typically 2 pages) while WAL holds the live bytes, making the
+    // bytes-reclaimed delta meaningless.
+    if let Some(pager) = db.pager.as_mut() {
+        let _ = pager.checkpoint();
+    }
+    let size_before = std::fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
+    let pages_before = db
+        .pager
+        .as_ref()
+        .map(|p| p.header().page_count)
+        .unwrap_or(0);
+    crate::sql::pager::vacuum_database(db, &path)?;
+    // Second checkpoint so the main file shrinks now — VACUUM's whole
+    // purpose is to reclaim bytes, so paying the I/O up front is fair.
+    if let Some(pager) = db.pager.as_mut() {
+        let _ = pager.checkpoint();
+    }
+    let size_after = std::fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
+    let pages_after = db
+        .pager
+        .as_ref()
+        .map(|p| p.header().page_count)
+        .unwrap_or(0);
+    let pages_reclaimed = pages_before.saturating_sub(pages_after);
+    let bytes_reclaimed = size_before.saturating_sub(size_after);
+    Ok(format!(
+        "VACUUM completed. {pages_reclaimed} pages reclaimed ({bytes_reclaimed} bytes)."
+    ))
+}
+
 /// Renames a table in `db.tables`. Updates `tb_name`, every secondary
 /// index's `table_name` field, and any auto-index whose name embedded
 /// the old table name. HNSW / FTS index entries don't carry a

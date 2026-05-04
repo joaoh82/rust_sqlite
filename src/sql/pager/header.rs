@@ -33,11 +33,18 @@ pub const MAGIC: &[u8; 16] = b"SQLRiteFormat\0\0\0";
 ///   least one FTS index attached writes v5 instead. Decoders accept
 ///   both v4 and v5; v5 reading a v4-shaped DB just sees zero FTS
 ///   indexes in `sqlrite_master`. See [Phase 8 plan Q10].
+/// - Version 6 (SQLR-6): adds a persisted free-page list at header
+///   bytes [28..32] (`freelist_head`) plus the `PAGE_TYPE_FREELIST_TRUNK`
+///   page tag. Bumped **on demand** — a save that produces no freed
+///   pages keeps writing the file's existing version. The first save
+///   that yields a non-empty freelist promotes the file to v6.
 pub const FORMAT_VERSION_V4: u16 = 4;
 pub const FORMAT_VERSION_V5: u16 = 5;
+pub const FORMAT_VERSION_V6: u16 = 6;
 /// The version a brand-new write defaults to when no FTS index forces
 /// a bump. Existing databases keep their on-disk version unchanged
-/// across reads + non-FTS writes; FTS-bearing saves switch to V5.
+/// across reads + non-FTS writes; FTS-bearing saves switch to V5,
+/// freelist-bearing saves switch to V6.
 pub const FORMAT_VERSION_BASELINE: u16 = FORMAT_VERSION_V4;
 
 /// Parsed header. `page_count` includes page 0 itself.
@@ -46,9 +53,15 @@ pub struct DbHeader {
     pub page_count: u32,
     pub schema_root_page: u32,
     /// On-disk format version this header carries. Tracked explicitly
-    /// so save can preserve a v4 file as v4 (no FTS) or bump it to v5
-    /// (FTS present), per Phase 8c's on-demand bump strategy.
+    /// so save can preserve a v4 file as v4 (no FTS, no freelist),
+    /// bump it to v5 (FTS), or bump it to v6 (freelist), per the
+    /// on-demand promotion rules.
     pub format_version: u16,
+    /// First page of the persisted free-page list, or `0` if the list
+    /// is empty. The freelist is a chain of trunk pages; each trunk
+    /// records up to ~1018 free leaf-page numbers. v4/v5 files don't
+    /// carry a freelist on disk — `decode_header` returns `0` for them.
+    pub freelist_head: u32,
 }
 
 /// Encodes the header into a `PAGE_SIZE`-sized buffer.
@@ -59,13 +72,16 @@ pub fn encode_header(h: &DbHeader) -> [u8; PAGE_SIZE] {
     buf[18..20].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
     buf[20..24].copy_from_slice(&h.page_count.to_le_bytes());
     buf[24..28].copy_from_slice(&h.schema_root_page.to_le_bytes());
+    buf[28..32].copy_from_slice(&h.freelist_head.to_le_bytes());
     buf
 }
 
 /// Decodes the header from a `PAGE_SIZE`-sized buffer. Returns an error if
 /// magic bytes, format version, or page size don't match what we wrote.
-/// Both V4 and V5 are accepted; the result's `format_version` echoes
-/// what was on disk so a no-op resave preserves it.
+/// V4, V5, and V6 are accepted; the result's `format_version` echoes
+/// what was on disk so a no-op resave preserves it. `freelist_head` is
+/// read from bytes [28..32] for V6 files; V4/V5 files have a zero
+/// reserved region there, so the field decodes as `0` either way.
 pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
     if buf.len() != PAGE_SIZE {
         return Err(SQLRiteError::Internal(format!(
@@ -79,10 +95,11 @@ pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
         ));
     }
     let version = u16::from_le_bytes(buf[16..18].try_into().unwrap());
-    if version != FORMAT_VERSION_V4 && version != FORMAT_VERSION_V5 {
+    if version != FORMAT_VERSION_V4 && version != FORMAT_VERSION_V5 && version != FORMAT_VERSION_V6
+    {
         return Err(SQLRiteError::General(format!(
             "unsupported SQLRite format version {version}; this build understands \
-             {FORMAT_VERSION_V4} and {FORMAT_VERSION_V5}"
+             {FORMAT_VERSION_V4}, {FORMAT_VERSION_V5}, and {FORMAT_VERSION_V6}"
         )));
     }
     let page_size = u16::from_le_bytes(buf[18..20].try_into().unwrap()) as usize;
@@ -93,9 +110,11 @@ pub fn decode_header(buf: &[u8]) -> Result<DbHeader> {
     }
     let page_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
     let schema_root_page = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+    let freelist_head = u32::from_le_bytes(buf[28..32].try_into().unwrap());
     Ok(DbHeader {
         page_count,
         schema_root_page,
         format_version: version,
+        freelist_head,
     })
 }

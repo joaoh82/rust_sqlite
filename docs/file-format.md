@@ -4,7 +4,7 @@ A SQLRite database is a single file, by convention named `*.sqlrite`. The file i
 
 All multi-byte integers in this format are **little-endian**.
 
-The current on-disk format is **version 4** (Phase 7) by default, with **version 5** written on demand whenever an FTS index is attached to the database (Phase 8c). Decoders accept both v4 and v5; writers preserve the existing version on no-op resaves so a v4 database without FTS stays v4. Files produced by versions 1 – 3 are rejected on open.
+The current on-disk format is **version 4** (Phase 7) by default, with **version 5** written on demand whenever an FTS index is attached to the database (Phase 8c) and **version 6** written on demand whenever a save produces a non-empty freelist (SQLR-6). Decoders accept v4, v5, and v6; writers preserve the existing version on no-op resaves so a v4 database without FTS or freelist stays v4. Files produced by versions 1 – 3 are rejected on open.
 
 ## Page 0 — the database header
 
@@ -15,17 +15,18 @@ The first 4096 bytes of every file are the header page. Only the first 28 bytes 
 │ offset │ length │ content                                         │
 ├────────┼────────┼─────────────────────────────────────────────────┤
 │     0  │   16   │ magic:  "SQLRiteFormat\0\0\0"                   │
-│    16  │    2   │ format version (u16 LE) = 4 or 5                │
+│    16  │    2   │ format version (u16 LE) = 4, 5, or 6            │
 │    18  │    2   │ page size      (u16 LE) = 4096                  │
 │    20  │    4   │ total page count (u32 LE), includes page 0      │
 │    24  │    4   │ root page of sqlrite_master (u32 LE)            │
-│    28  │ 4068   │ reserved / zero                                 │
+│    28  │    4   │ freelist head    (u32 LE; 0 = empty) — v6 only  │
+│    32  │ 4064   │ reserved / zero                                 │
 └────────┴────────┴─────────────────────────────────────────────────┘
 ```
 
 The magic string is 14 ASCII bytes (`SQLRiteFormat`) padded with two NUL bytes to fill 16 bytes. It's deliberately different from SQLite's `"SQLite format 3\0"` so the two formats can't be confused on inspection.
 
-`decode_header` in [`src/sql/pager/header.rs`](../src/sql/pager/header.rs) validates all three of (magic, format version, page size) on open. A wrong magic produces `not a SQLRite database`; a wrong version or page size produces `unsupported ...` errors. The decoder accepts both v4 and v5 (anything else is rejected); the parsed `format_version` is propagated through the in-memory `DbHeader` so the writer can preserve it on resave when no version-bumping feature has been added.
+`decode_header` in [`src/sql/pager/header.rs`](../src/sql/pager/header.rs) validates all three of (magic, format version, page size) on open. A wrong magic produces `not a SQLRite database`; a wrong version or page size produces `unsupported ...` errors. The decoder accepts v4, v5, and v6 (anything else is rejected); the parsed `format_version` is propagated through the in-memory `DbHeader` so the writer can preserve it on resave when no version-bumping feature has been added. `freelist_head` is read from bytes [28..32]: v4/v5 files leave that region zero so it always decodes as `0` (an empty freelist), and v6 files store the page number of the first freelist trunk there.
 
 ## Pages 1..page_count — payload pages
 
@@ -53,6 +54,7 @@ Every non-header page starts with a 7-byte header:
 | `2` | `TableLeaf` | Holds a slot directory and a set of cells representing rows of a table. Leaves for one table are linked by sibling `next_page` pointers. |
 | `3` | `Overflow` | Continuation page carrying the spilled body of a single oversized cell. |
 | `4` | `InteriorNode` | Interior B-Tree node. Holds a slot directory of divider cells routing to child pages plus a rightmost-child pointer in the payload header. |
+| `5` | `FreelistTrunk` | One link of the persisted free-page list (SQLR-6). Payload carries `count: u16` followed by `count × u32` free leaf-page numbers; `next_page` chains to the next trunk (0 = end). |
 
 Tag `1` is reserved (it was `SchemaRoot` in format v1; unused in v2). Any other tag on open is a corruption error.
 
@@ -307,6 +309,7 @@ These are not all enforced on open — we validate the header strictly and rely 
 - **v3** (Phase 3e) — `sqlrite_master` gains a `type` column; secondary indexes persist as their own cell-based B-Trees whose leaves carry `KIND_INDEX` cells.
 - **v4** (Phase 7a) — value block dispatch gains the `0x04 Vector` tag for the new `VECTOR(N)` column type. Per the [Phase 7 plan's Q8](phase-7-plan.md#q8-file-format-version-bump), later Phase 7 sub-phases (JSON storage, HNSW indexes) added their own value/cell tags inside this same v4 envelope. The `CREATE TABLE` SQL stored in `sqlrite_master` carries vector columns as `VECTOR(N)` in the type position; on open, the engine re-parses that SQL and reconstructs `DataType::Vector(N)` from the `Custom` AST node sqlparser produces.
 - **v5** (Phase 8c, current for FTS-bearing files) — adds the `KIND_FTS_POSTING` cell tag for persisted FTS posting lists. Bumped **on demand** per the [Phase 8 plan's Q10](phase-8-plan.md#q10-file-format-version-bump-strategy): existing v4 databases without FTS keep writing v4 across non-FTS saves; the first save with at least one FTS index attached promotes the file to v5. Decoders accept both v4 and v5; opening a v4 file with a build that supports v5 is a no-op until the user creates an FTS index.
+- **v6** (SQLR-6, current for files with persisted free-page lists) — adds the `freelist_head` field at header bytes [28..32] and the `FreelistTrunk` page tag (`5`). Bumped **on demand**: a save that ends with an empty freelist preserves the existing version; the first save that produces a non-empty freelist promotes the file to v6. Decoders accept v4, v5, and v6; v6 is a strict superset, so opening a v4/v5 file with a v6-aware build is a no-op until the user creates a freelist (e.g., by dropping a table or index). VACUUM clears the freelist but doesn't downgrade.
 
 The page header (7 bytes) and chaining mechanism are stable across future phases. Phase 4's WAL introduces a sibling file (`.sqlrite-wal`) rather than changing the main file format.
 

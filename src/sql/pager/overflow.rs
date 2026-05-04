@@ -156,26 +156,33 @@ impl PagedEntry {
     }
 }
 
-/// Writes `bytes` into a chain of Overflow-typed pages starting at
-/// `start_page`, using consecutive page numbers. Returns the first page
-/// number *after* the chain (i.e., the next free page to hand out).
-pub fn write_overflow_chain(pager: &mut Pager, bytes: &[u8], start_page: u32) -> Result<u32> {
+/// Writes `bytes` into a chain of Overflow-typed pages, drawing each
+/// page number from the supplied [`PageAllocator`]. Returns the page
+/// number of the first link in the chain (the value to record in the
+/// `OverflowRef` cell on the owning leaf).
+///
+/// Pages no longer have to be consecutive — the chain is followed by
+/// `next_page` pointers, and the allocator may hand out pages from a
+/// freelist or preferred pool that aren't sequential.
+pub fn write_overflow_chain(
+    pager: &mut Pager,
+    bytes: &[u8],
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<u32> {
     if bytes.is_empty() {
         return Err(SQLRiteError::Internal(
             "refusing to write an empty overflow chain — caller should inline instead".to_string(),
         ));
     }
-    let mut current_page = start_page;
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        let chunk_len = remaining.len().min(PAYLOAD_PER_PAGE);
-        let (chunk, rest) = remaining.split_at(chunk_len);
-        let next = if rest.is_empty() { 0 } else { current_page + 1 };
-        pager.stage_page(current_page, encode_overflow_page(next, chunk)?);
-        current_page += 1;
-        remaining = rest;
+    // Allocate every page in the chain up front so each stage_page call
+    // already knows the successor's page number.
+    let chunks: Vec<&[u8]> = bytes.chunks(PAYLOAD_PER_PAGE).collect();
+    let pages: Vec<u32> = (0..chunks.len()).map(|_| alloc.allocate()).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let next = if i + 1 < pages.len() { pages[i + 1] } else { 0 };
+        pager.stage_page(pages[i], encode_overflow_page(next, chunk)?);
     }
-    Ok(current_page)
+    Ok(pages[0])
 }
 
 /// Walks an overflow chain starting at `first_page` and concatenates its
@@ -300,15 +307,19 @@ mod tests {
         // A blob that definitely spans multiple pages.
         let blob: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
         let pages_needed = blob.len().div_ceil(PAYLOAD_PER_PAGE) as u32;
-        let start = 10u32;
-        let next_free = write_overflow_chain(&mut pager, &blob, start).unwrap();
-        assert_eq!(next_free, start + pages_needed);
+        let mut alloc =
+            crate::sql::pager::allocator::PageAllocator::new(std::collections::VecDeque::new(), 10);
+        let start = write_overflow_chain(&mut pager, &blob, &mut alloc).unwrap();
+        assert_eq!(start, 10);
+        // Linear allocation from page 10 → high water = 10 + pages_needed.
+        assert_eq!(alloc.high_water(), 10 + pages_needed);
 
         pager
             .commit(crate::sql::pager::header::DbHeader {
-                page_count: next_free,
+                page_count: alloc.high_water(),
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
 
@@ -326,17 +337,21 @@ mod tests {
         let path = tmp_path("mismatch");
         let mut pager = Pager::create(&path).unwrap();
         let blob = vec![1u8; 500];
-        let next = write_overflow_chain(&mut pager, &blob, 10).unwrap();
+        let mut alloc =
+            crate::sql::pager::allocator::PageAllocator::new(std::collections::VecDeque::new(), 10);
+        let start = write_overflow_chain(&mut pager, &blob, &mut alloc).unwrap();
+        assert_eq!(start, 10);
         pager
             .commit(crate::sql::pager::header::DbHeader {
-                page_count: next,
+                page_count: alloc.high_water(),
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
 
         // Claim more bytes than the chain actually carries.
-        let err = read_overflow_chain(&pager, 10, 999).unwrap_err();
+        let err = read_overflow_chain(&pager, start, 999).unwrap_err();
         assert!(format!("{err}").contains("overflow chain produced"));
 
         let _ = std::fs::remove_file(&path);
@@ -346,7 +361,9 @@ mod tests {
     fn empty_chain_is_rejected() {
         let path = tmp_path("empty");
         let mut pager = Pager::create(&path).unwrap();
-        let err = write_overflow_chain(&mut pager, &[], 10).unwrap_err();
+        let mut alloc =
+            crate::sql::pager::allocator::PageAllocator::new(std::collections::VecDeque::new(), 10);
+        let err = write_overflow_chain(&mut pager, &[], &mut alloc).unwrap_err();
         assert!(format!("{err}").contains("empty overflow chain"));
         let _ = std::fs::remove_file(&path);
     }
