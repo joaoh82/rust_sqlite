@@ -2190,6 +2190,30 @@ mod tests {
     }
 
     #[test]
+    fn default_for_json_column_must_be_valid_json() {
+        // ADD COLUMN ... JSON DEFAULT 'not-json' would otherwise backfill
+        // every existing row with invalid JSON (insert_row's validation
+        // is bypassed for the backfill path).
+        let mut db = Database::new("t".to_string());
+        let err = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSON DEFAULT 'not-json{');",
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("json"),
+            "got: {err}"
+        );
+
+        // Valid JSON DEFAULT works.
+        process_command(
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, doc JSON DEFAULT '{\"k\":1}');",
+            &mut db,
+        )
+        .expect("valid JSON DEFAULT should be accepted");
+    }
+
+    #[test]
     fn default_with_non_literal_expression_errors_at_create_time() {
         let mut db = Database::new("t".to_string());
         // Function-call DEFAULT (e.g. CURRENT_TIMESTAMP) → rejected; we only
@@ -2685,6 +2709,23 @@ mod tests {
         let response = process_command("ALTER TABLE IF EXISTS missing RENAME TO other;", &mut db)
             .expect("IF EXISTS makes missing-table ALTER a no-op");
         assert!(response.contains("no-op"));
+    }
+
+    #[test]
+    fn drop_table_inside_transaction_rolls_back() {
+        // Exercises Database::deep_clone snapshot path with DROP TABLE.
+        // A wholesale tables-HashMap restore on ROLLBACK should resurrect
+        // the dropped table — including its data and dependent indexes.
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("DROP TABLE users;", &mut db).unwrap();
+        assert!(!db.contains_table("users".to_string()));
+        process_command("ROLLBACK;", &mut db).unwrap();
+        assert!(db.contains_table("users".to_string()));
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 3);
+        assert!(users.index_by_name("users_age_idx").is_some());
     }
 
     #[test]

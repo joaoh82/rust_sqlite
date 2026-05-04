@@ -229,7 +229,19 @@ fn eval_literal_default(expr: &Expr, datatype: &str, col_name: &str) -> Result<V
             }
         }
         AstValue::SingleQuotedString(s) => {
-            if datatype == "Text" || datatype == "Json" {
+            if datatype == "Text" {
+                Ok(Value::Text(s.clone()))
+            } else if datatype == "Json" {
+                // JSON columns accept text literals only if they parse as
+                // JSON — otherwise an ALTER TABLE ADD COLUMN ... JSON
+                // DEFAULT '<garbage>' would silently backfill every row
+                // with invalid JSON (insert_row's per-row JSON validation
+                // is bypassed during the backfill path).
+                serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
+                    SQLRiteError::General(format!(
+                        "DEFAULT type mismatch for column '{col_name}': '{s}' is not valid JSON: {e}"
+                    ))
+                })?;
                 Ok(Value::Text(s.clone()))
             } else {
                 Err(SQLRiteError::General(format!(
