@@ -160,6 +160,9 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
 
     // Statements that mutate state — trigger auto-save on success. Read-only
     // SELECTs skip the save entirely to avoid pointless file writes.
+    // VACUUM is a write statement (rewrites the entire file) but it does
+    // its own save internally, so it's also explicitly excluded from the
+    // post-dispatch auto-save block at the bottom.
     let is_write_statement = matches!(
         &query,
         Statement::CreateTable(_)
@@ -169,7 +172,9 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             | Statement::Delete(_)
             | Statement::Drop { .. }
             | Statement::AlterTable(_)
+            | Statement::Vacuum(_)
     );
+    let is_vacuum = matches!(&query, Statement::Vacuum(_));
 
     // Early-reject mutations on a read-only database before they touch
     // in-memory state. Phase 4e: without this, a user running INSERT
@@ -338,6 +343,27 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
         Statement::AlterTable(alter) => {
             message = executor::execute_alter_table(alter, db)?;
         }
+        Statement::Vacuum(vac) => {
+            // SQLR-6 — only bare `VACUUM;` is supported. The crate-level
+            // `VacuumStatement` carries Redshift-style modifiers we don't
+            // implement; reject any non-default flag rather than silently
+            // ignoring it.
+            if vac.full
+                || vac.sort_only
+                || vac.delete_only
+                || vac.reindex
+                || vac.recluster
+                || vac.boost
+                || vac.table_name.is_some()
+                || vac.threshold.is_some()
+            {
+                return Err(SQLRiteError::NotImplemented(
+                    "VACUUM modifiers (FULL, REINDEX, table targets, etc.) are not supported; use bare VACUUM;"
+                        .to_string(),
+                ));
+            }
+            message = executor::execute_vacuum(db)?;
+        }
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "SQL Statement not supported yet.".to_string(),
@@ -355,7 +381,10 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
     // mutated, so the caller should know disk is out of sync. The
     // Pager held on `db` diffs against its last-committed snapshot,
     // so only pages whose bytes actually changed are written.
-    if is_write_statement && db.source_path.is_some() && !db.in_transaction() {
+    //
+    // VACUUM is a write-shaped statement but already wrote the file
+    // internally — skip the second save to avoid undoing the compact.
+    if is_write_statement && !is_vacuum && db.source_path.is_some() && !db.in_transaction() {
         let path = db.source_path.clone().unwrap();
         pager::save_database(db, &path)?;
     }

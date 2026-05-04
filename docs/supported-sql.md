@@ -17,6 +17,7 @@ If you're looking for _how_ to use SQLRite (REPL flow, meta-commands, history, e
 | [`ALTER TABLE`](#alter-table) | `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN` (one operation per statement) |
 | [`DROP TABLE`](#drop-table) / [`DROP INDEX`](#drop-index) | `IF EXISTS`; single target; auto-indexes refused for `DROP INDEX` |
 | [`BEGIN`](#transactions) / [`COMMIT`](#transactions) / [`ROLLBACK`](#transactions) | Snapshot-based; single-level; WAL-backed commit; auto-rollback on COMMIT disk failure |
+| [`VACUUM`](#vacuum) | Compacts the file: rewrites every live B-Tree contiguously from page 1 and clears the freelist. Bare `VACUUM;` only — no modifiers. |
 
 Statements the parser accepts (because sqlparser understands them in the SQLite dialect) but SQLRite doesn't execute yet return `SQL Statement not supported yet`. The [Not yet supported](#not-yet-supported) section below enumerates the common ones.
 
@@ -259,7 +260,7 @@ DROP TABLE [IF EXISTS] <table>;
 - Reserved-name rejection: `DROP TABLE sqlrite_master` errors with the same message `CREATE TABLE` uses.
 - All indexes attached to the table (auto, explicit, HNSW, FTS) disappear with the table — they live inside the `Table` struct and ride along.
 - Without `IF EXISTS`, dropping a table that doesn't exist errors. With it, that's a benign 0-tables-dropped no-op.
-- **Disk pages are orphaned, not freed.** SQLRite has no free-list yet — the file size doesn't shrink until a future `VACUUM`. The behavior is safe (orphan pages are unreachable from `sqlrite_master` after reopen) but means a write-heavy schema churn won't reclaim space until VACUUM lands.
+- **Disk pages move onto the freelist.** Pages the dropped table occupied are pushed onto a persisted free-page list (SQLR-6) so subsequent `CREATE TABLE` or inserts can reuse them. The file doesn't shrink until [`VACUUM;`](#vacuum) compacts it.
 
 ---
 
@@ -425,6 +426,24 @@ ROLLBACK;  -- nothing was actually deleted
 - **`COMMIT`'s disk write failing DOES auto-rollback.** If the save at COMMIT time errors (disk full, permission denied, checksum mismatch), SQLRite restores the pre-BEGIN snapshot and surfaces `COMMIT failed — transaction rolled back: <underlying error>`. Leaving in-flight mutations live after a failed COMMIT would be unsafe — any subsequent non-transactional statement's auto-save would silently publish partial work.
 - **Cost**: `BEGIN` is `O(N)` in the total size of the in-memory database because of the snapshot clone. On a huge database, opening a transaction just to run a single read-only query is wasteful — use a plain `SELECT` instead.
 - **Visibility to other processes**: with POSIX file locks (Phase 4a–4e), a writer excludes all concurrent readers anyway, so "uncommitted transaction state leaking to a concurrent reader" isn't a concern — no concurrent reader exists during an open transaction.
+
+---
+
+## `VACUUM`
+
+```sql
+VACUUM;
+```
+
+Compacts the database file: rewrites every live table, index, HNSW graph, FTS posting tree, and `sqlrite_master` itself contiguously from page 1, drops the freelist, and lets the next checkpoint truncate the tail.
+
+- **Bare `VACUUM;` only.** Modifiers — `VACUUM FULL`, `VACUUM REINDEX`, table targets, `TO ... PERCENT`, `BOOST` — are parsed (sqlparser supports them) but rejected at execution with `VACUUM modifiers (FULL, REINDEX, table targets, etc.) are not supported`.
+- **Refused inside a transaction.** `BEGIN; VACUUM;` errors with `VACUUM cannot run inside a transaction`. Use `COMMIT;` first, then `VACUUM;`.
+- **No-op on in-memory databases.** Returns a `VACUUM is a no-op for in-memory databases` status string and does nothing — there's no file to compact.
+- **Status string** carries pages and bytes reclaimed: `VACUUM completed. <N> pages reclaimed (<B> bytes).`
+- **Format-version side effect.** A v4/v5 file that has been promoted to v6 by an earlier drop stays at v6 after VACUUM (v6 is a strict superset; we don't downgrade). A file that's already at v4/v5 because no drop ever happened on it doesn't get bumped by VACUUM.
+
+When to run it: any time after a string of `DROP TABLE` / `DROP INDEX` / `ALTER TABLE DROP COLUMN` operations if you care about file size. SQLRite reuses freelist pages on subsequent inserts, so a write-heavy workload may not need VACUUM at all — its main use is reclaiming space when you don't expect to grow back.
 
 ---
 

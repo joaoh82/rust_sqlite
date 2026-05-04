@@ -187,10 +187,23 @@ Without the diff, step 3's "re-serialize every table" would trigger a full file 
 
 This only works because `save_database` iterates tables in sorted order — if the order were random, a table that didn't change might land at a different page number, appearing dirty. See [Design decisions §7](design-decisions.md#7-deterministic-page-number-ordering-when-saving).
 
+## Free-page list and VACUUM (SQLR-6)
+
+Save now uses a [`PageAllocator`](../src/sql/pager/allocator.rs) instead of a bare `next_free_page` counter. The allocator pulls pages from three sources, in preference order:
+
+1. **Per-table preferred pool** — every table/index/master is given the page numbers it occupied last save (collected by walking from its old `rootpage`). An unchanged table re-stages byte-identical pages at the same numbers, so the diff pager skips every write for it.
+2. **Global freelist** — pages from dropped tables/indexes that are recorded in the persisted freelist (rooted at `header.freelist_head`).
+3. **Extend** — `next_extend++`, monotonic past the high-water mark.
+
+After staging, pages that were live before this save but didn't get restaged this round (e.g., the leaves of a dropped table) move onto the new freelist. The freelist itself is encoded into a chain of `FreelistTrunk` pages — each trunk holds up to 1021 free leaf-page numbers plus a `next_page` pointer to the following trunk. Trunks consume some of the free pages they describe (a trunk page IS a free page borrowed for metadata), so a freelist of N pages takes `ceil(N / 1022)` trunks and persists `N − T` leaf entries.
+
+`VACUUM;` (a SQL statement) calls [`vacuum_database`](../src/sql/pager/mod.rs), which is `save_database` with empty per-table preferred pools and an empty initial freelist. Allocation falls through to extend on every page → contiguous layout from page 1, no freelist trunks, file truncates to the new high-water mark on the next checkpoint.
+
+Format-version side effect: a save that produces a non-empty freelist promotes the file from v4/v5 to v6 (mirrors Phase 8c's v4→v5 FTS rule). VACUUM clears the freelist but doesn't downgrade — v6 is a strict superset.
+
 ## What it doesn't do (yet)
 
 - **No LRU eviction.** `on_disk` + `wal_cache` together grow with the page count. For a 1 GiB database, that's ~1 GiB of page cache. Bounded cache is future work.
-- **No free-page management.** When a table shrinks, the main file's tail pages are truncated at checkpoint, but there's no free-list to reuse pages inside a grown file.
 - **No per-statement granularity.** The whole database is re-serialized on every commit; the diff keeps the *written* set small but the CPU cost of reserialization is unchanged.
 - **No concurrent reader-and-writer.** Phase 4e graduated to shared/exclusive lock modes (multi-reader *or* single-writer), but POSIX flock can't give us both at once. True concurrent access would need a shared-memory coordination file with read marks — not on the roadmap.
 - **Savepoints / nested transactions.** Phase 4f added top-level `BEGIN` / `COMMIT` / `ROLLBACK` (snapshot-based rollback, auto-save suppressed inside a transaction), but nested `BEGIN` is rejected — real savepoints aren't on the roadmap.

@@ -30,8 +30,12 @@
 // Module-level #[allow(dead_code)] keeps the build quiet without dotting
 // the modules with per-item attributes.
 #[allow(dead_code)]
+pub mod allocator;
+#[allow(dead_code)]
 pub mod cell;
 pub mod file;
+#[allow(dead_code)]
+pub mod freelist;
 #[allow(dead_code)]
 pub mod fts_cell;
 pub mod header;
@@ -187,9 +191,38 @@ struct IndexCatalogRow {
     rootpage: u32,
 }
 
-/// Persists `db` to disk. Same diff-commit behavior as before: only pages
-/// whose bytes actually changed get written.
+/// Persists `db` to disk. Diff-pager skips writing pages whose bytes
+/// haven't changed; the [`PageAllocator`] preserves per-table page
+/// numbers across saves so unchanged tables produce zero dirty frames.
+///
+/// Pages that were live before this save but aren't restaged this round
+/// (e.g., the leaves of a dropped table) move onto a persisted free
+/// list rooted at `header.freelist_head`; subsequent saves draw from
+/// the freelist before extending the file. `VACUUM` (see
+/// [`vacuum_database`]) compacts the file by ignoring the freelist and
+/// allocating linearly from page 1.
+///
+/// [`PageAllocator`]: crate::sql::pager::allocator::PageAllocator
 pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
+    save_database_with_mode(db, path, /*compact=*/ false)
+}
+
+/// Reclaims space by rewriting every live B-Tree contiguously from
+/// page 1, with no freelist. Equivalent to `save_database` but ignores
+/// the existing freelist and per-table preferred pools — every page is
+/// allocated by extending the high-water mark — so the resulting file
+/// is tightly packed and the freelist is empty.
+///
+/// Used by the SQL-level `VACUUM;` statement.
+pub fn vacuum_database(db: &mut Database, path: &Path) -> Result<()> {
+    save_database_with_mode(db, path, /*compact=*/ true)
+}
+
+/// Shared save core. `compact = false` is the normal save path (uses
+/// the existing freelist + per-table preferred pools). `compact = true`
+/// is the VACUUM path (empty freelist, empty preferred pools, linear
+/// allocation from page 1).
+fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Result<()> {
     // Phase 7d.3 — rebuild any HNSW index that DELETE / UPDATE-on-vector
     // marked dirty. Done up front under the &mut Database borrow we
     // already hold, before the immutable iteration loops below need
@@ -211,10 +244,40 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
         Pager::create(path)?
     };
 
+    // Snapshot what was live BEFORE we reset staged. Used to compute the
+    // newly-freed set after staging completes. Page 0 (the header) is
+    // never on the freelist — it's always live.
+    let old_header = pager.header();
+    let old_live: std::collections::HashSet<u32> = (1..old_header.page_count).collect();
+
+    // Read the previously-persisted freelist so its leaf pages can be
+    // reused as preferred allocations and its trunk pages don't leak.
+    let (old_free_leaves, old_free_trunks) = if compact || old_header.freelist_head == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        crate::sql::pager::freelist::read_freelist(&pager, old_header.freelist_head)?
+    };
+
+    // Snapshot the previous rootpages of each table/index so we can
+    // seed per-table preferred pools (the unchanged-table case stages
+    // byte-identical pages → diff pager skips every write for it).
+    let old_rootpages = if compact {
+        HashMap::new()
+    } else {
+        read_old_rootpages(&pager, old_header.schema_root_page)?
+    };
+
     pager.clear_staged();
 
-    // Page 0 is the header; payload pages start at 1.
-    let mut next_free_page: u32 = 1;
+    // Allocator: in normal mode, seed with the old freelist; in compact
+    // mode, start empty so allocation extends linearly from page 1.
+    use std::collections::VecDeque;
+    let initial_freelist: VecDeque<u32> = if compact {
+        VecDeque::new()
+    } else {
+        crate::sql::pager::freelist::freelist_to_deque(old_free_leaves.clone())
+    };
+    let mut alloc = crate::sql::pager::allocator::PageAllocator::new(initial_freelist, 1);
 
     // 1. Stage each user table's B-Tree, collecting master-row info.
     //    `kind` is "table" or "index" — master has one row per each.
@@ -228,9 +291,16 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
                 "user table cannot be named '{MASTER_TABLE_NAME}' (reserved)"
             )));
         }
+        if !compact {
+            if let Some(&prev_root) = old_rootpages.get(&("table".to_string(), name.to_string())) {
+                let prev =
+                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ true)?;
+                alloc.set_preferred(prev);
+            }
+        }
         let table = &db.tables[name];
-        let (rootpage, new_next) = stage_table_btree(&mut pager, table, next_free_page)?;
-        next_free_page = new_next;
+        let rootpage = stage_table_btree(&mut pager, table, &mut alloc)?;
+        alloc.finish_preferred();
         master_rows.push(CatalogEntry {
             kind: "table".into(),
             name: name.clone(),
@@ -251,8 +321,17 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     index_entries
         .sort_by(|(ta, ia), (tb, ib)| ta.tb_name.cmp(&tb.tb_name).then(ia.name.cmp(&ib.name)));
     for (_table, idx) in index_entries {
-        let (rootpage, new_next) = stage_index_btree(&mut pager, idx, next_free_page)?;
-        next_free_page = new_next;
+        if !compact {
+            if let Some(&prev_root) =
+                old_rootpages.get(&("index".to_string(), idx.name.to_string()))
+            {
+                let prev =
+                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
+                alloc.set_preferred(prev);
+            }
+        }
+        let rootpage = stage_index_btree(&mut pager, idx, &mut alloc)?;
+        alloc.finish_preferred();
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: idx.name.clone(),
@@ -279,8 +358,17 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     hnsw_entries
         .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
     for (table, entry) in hnsw_entries {
-        let (rootpage, new_next) = stage_hnsw_btree(&mut pager, &entry.index, next_free_page)?;
-        next_free_page = new_next;
+        if !compact {
+            if let Some(&prev_root) =
+                old_rootpages.get(&("index".to_string(), entry.name.to_string()))
+            {
+                let prev =
+                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
+                alloc.set_preferred(prev);
+            }
+        }
+        let rootpage = stage_hnsw_btree(&mut pager, &entry.index, &mut alloc)?;
+        alloc.finish_preferred();
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: entry.name.clone(),
@@ -312,8 +400,17 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
         .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
     let any_fts = !fts_entries.is_empty();
     for (table, entry) in fts_entries {
-        let (rootpage, new_next) = stage_fts_btree(&mut pager, &entry.index, next_free_page)?;
-        next_free_page = new_next;
+        if !compact {
+            if let Some(&prev_root) =
+                old_rootpages.get(&("index".to_string(), entry.name.to_string()))
+            {
+                let prev =
+                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
+                alloc.set_preferred(prev);
+            }
+        }
+        let rootpage = stage_fts_btree(&mut pager, &entry.index, &mut alloc)?;
+        alloc.finish_preferred();
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: entry.name.clone(),
@@ -327,7 +424,10 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
     }
 
     // 3. Build an in-memory sqlrite_master with one row per table or index,
-    //    then stage it via the same tree-build path.
+    //    then stage it via the same tree-build path. Seed master's
+    //    preferred pool with the previous master tree's pages so the
+    //    catalog page numbers stay stable across saves whenever the
+    //    catalog content didn't change.
     let mut master = build_empty_master_table();
     for (i, entry) in master_rows.into_iter().enumerate() {
         let rowid = (i as i64) + 1;
@@ -342,23 +442,67 @@ pub fn save_database(db: &mut Database, path: &Path) -> Result<()> {
             ],
         )?;
     }
-    let (master_root, master_next) = stage_table_btree(&mut pager, &master, next_free_page)?;
-    next_free_page = master_next;
+    if !compact && old_header.schema_root_page != 0 {
+        let prev = collect_pages_for_btree(
+            &pager,
+            old_header.schema_root_page,
+            /*follow_overflow=*/ true,
+        )?;
+        alloc.set_preferred(prev);
+    }
+    let master_root = stage_table_btree(&mut pager, &master, &mut alloc)?;
+    alloc.finish_preferred();
 
-    // Phase 8c — on-demand v4→v5 file-format bump per Q10. If any FTS
-    // index attached to the database, write v5; otherwise preserve the
-    // pre-existing version (v4 for files born before this build, or
-    // a previously-promoted v5 file). Reads accept both.
-    let format_version = if any_fts {
-        crate::sql::pager::header::FORMAT_VERSION_V5
+    // 4. Compute newly-freed pages: the previously-live set minus what
+    //    we just restaged. The previous freelist's trunk pages get
+    //    re-encoded too — they're in `old_live`, weren't restaged, so
+    //    the filter naturally moves them to the new freelist.
+    //
+    // In `compact` mode (VACUUM), we *discard* newly_freed instead of
+    // routing it onto the new freelist. The whole point of VACUUM is
+    // to let the file truncate to the new high-water mark, so any page
+    // past it gets dropped at the next checkpoint.
+    if !compact {
+        let used = alloc.used().clone();
+        let mut newly_freed: Vec<u32> = old_live
+            .iter()
+            .copied()
+            .filter(|p| !used.contains(p))
+            .collect();
+        let _ = &old_free_trunks; // silenced — handled by the old_live filter
+        alloc.add_to_freelist(newly_freed.drain(..));
+    }
+
+    // 5. Encode the new freelist into trunk pages. `stage_freelist`
+    //    consumes some of the free pages AS the trunk pages themselves —
+    //    a trunk is just a free page borrowed for metadata. Pages that
+    //    were on the freelist but become trunks no longer need to be
+    //    "extension" pages; the high-water mark from the staging loop
+    //    above is already correct.
+    let new_free_pages = alloc.drain_freelist();
+    let new_freelist_head =
+        crate::sql::pager::freelist::stage_freelist(&mut pager, new_free_pages)?;
+
+    // 6. Pick the format version. v6 is on demand: only bumps when the
+    //    new freelist is non-empty. FTS-bearing files keep their v5
+    //    promotion; v6 is a strict superset (v6 readers handle v4/v5/v6).
+    use crate::sql::pager::header::{FORMAT_VERSION_V5, FORMAT_VERSION_V6};
+    let format_version = if new_freelist_head != 0 {
+        FORMAT_VERSION_V6
+    } else if any_fts {
+        // Preserve a v6 file at v6 (don't downgrade) but otherwise
+        // bump v4 → v5 for FTS like Phase 8c does.
+        std::cmp::max(FORMAT_VERSION_V5, old_header.format_version)
     } else {
-        pager.header().format_version
+        // Preserve whatever the file already was.
+        old_header.format_version
     };
 
     pager.commit(DbHeader {
-        page_count: next_free_page,
+        page_count: alloc.high_water(),
         schema_root_page: master_root,
         format_version,
+        freelist_head: new_freelist_head,
     })?;
 
     if same_path {
@@ -1121,20 +1265,18 @@ fn clone_datatype(dt: &DataType) -> DataType {
 fn stage_index_btree(
     pager: &mut Pager,
     idx: &SecondaryIndex,
-    start_page: u32,
-) -> Result<(u32, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<u32> {
     // Build the leaves.
-    let (leaves, mut next_free_page) = stage_index_leaves(pager, idx, start_page)?;
+    let leaves = stage_index_leaves(pager, idx, alloc)?;
     if leaves.len() == 1 {
-        return Ok((leaves[0].0, next_free_page));
+        return Ok(leaves[0].0);
     }
     let mut level: Vec<(u32, i64)> = leaves;
     while level.len() > 1 {
-        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
-        next_free_page = new_next_free;
-        level = next_level;
+        level = stage_interior_level(pager, &level, alloc)?;
     }
-    Ok((level[0].0, next_free_page))
+    Ok(level[0].0)
 }
 
 /// Packs the index's (value, rowid) entries into a sibling-chained run
@@ -1146,13 +1288,12 @@ fn stage_index_btree(
 fn stage_index_leaves(
     pager: &mut Pager,
     idx: &SecondaryIndex,
-    start_page: u32,
-) -> Result<(Vec<(u32, i64)>, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<Vec<(u32, i64)>> {
     let mut leaves: Vec<(u32, i64)> = Vec::new();
     let mut current_leaf = TablePage::empty();
-    let mut current_leaf_page = start_page;
+    let mut current_leaf_page = alloc.allocate();
     let mut current_max_rowid: Option<i64> = None;
-    let mut next_free_page = start_page + 1;
 
     // Sort the entries by original rowid so the in-page slot directory,
     // which binary-searches by rowid, stays valid. (iter_entries orders by
@@ -1165,12 +1306,11 @@ fn stage_index_leaves(
         let entry_bytes = cell.encode()?;
 
         if !current_leaf.would_fit(entry_bytes.len()) {
-            let next_leaf_page_num = next_free_page;
+            let next_leaf_page_num = alloc.allocate();
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
             leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
-            next_free_page += 1;
 
             if !current_leaf.would_fit(entry_bytes.len()) {
                 return Err(SQLRiteError::Internal(format!(
@@ -1186,7 +1326,7 @@ fn stage_index_leaves(
 
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
     leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
-    Ok((leaves, next_free_page))
+    Ok(leaves)
 }
 
 /// Phase 7d.3 — stages an HNSW index's page tree at `start_page`.
@@ -1202,19 +1342,17 @@ fn stage_index_leaves(
 fn stage_hnsw_btree(
     pager: &mut Pager,
     idx: &crate::sql::hnsw::HnswIndex,
-    start_page: u32,
-) -> Result<(u32, u32)> {
-    let (leaves, mut next_free_page) = stage_hnsw_leaves(pager, idx, start_page)?;
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<u32> {
+    let leaves = stage_hnsw_leaves(pager, idx, alloc)?;
     if leaves.len() == 1 {
-        return Ok((leaves[0].0, next_free_page));
+        return Ok(leaves[0].0);
     }
     let mut level: Vec<(u32, i64)> = leaves;
     while level.len() > 1 {
-        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
-        next_free_page = new_next_free;
-        level = next_level;
+        level = stage_interior_level(pager, &level, alloc)?;
     }
-    Ok((level[0].0, next_free_page))
+    Ok(level[0].0)
 }
 
 /// Phase 8c — stage one FTS index as a `TableLeaf`-shaped B-Tree.
@@ -1225,19 +1363,17 @@ fn stage_hnsw_btree(
 fn stage_fts_btree(
     pager: &mut Pager,
     idx: &crate::sql::fts::PostingList,
-    start_page: u32,
-) -> Result<(u32, u32)> {
-    let (leaves, mut next_free_page) = stage_fts_leaves(pager, idx, start_page)?;
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<u32> {
+    let leaves = stage_fts_leaves(pager, idx, alloc)?;
     if leaves.len() == 1 {
-        return Ok((leaves[0].0, next_free_page));
+        return Ok(leaves[0].0);
     }
     let mut level: Vec<(u32, i64)> = leaves;
     while level.len() > 1 {
-        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
-        next_free_page = new_next_free;
-        level = next_level;
+        level = stage_interior_level(pager, &level, alloc)?;
     }
-    Ok((level[0].0, next_free_page))
+    Ok(level[0].0)
 }
 
 /// Packs FTS posting cells into a sibling-chained run of `TableLeaf`
@@ -1249,15 +1385,14 @@ fn stage_fts_btree(
 fn stage_fts_leaves(
     pager: &mut Pager,
     idx: &crate::sql::fts::PostingList,
-    start_page: u32,
-) -> Result<(Vec<(u32, i64)>, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<Vec<(u32, i64)>> {
     use crate::sql::pager::fts_cell::FtsPostingCell;
 
     let mut leaves: Vec<(u32, i64)> = Vec::new();
     let mut current_leaf = TablePage::empty();
-    let mut current_leaf_page = start_page;
+    let mut current_leaf_page = alloc.allocate();
     let mut current_max_rowid: Option<i64> = None;
-    let mut next_free_page = start_page + 1;
 
     // Build the cell sequence: sidecar first, then per-term cells. The
     // sidecar always exists (even on an empty index) so reload sees a
@@ -1277,12 +1412,11 @@ fn stage_fts_leaves(
         let entry_bytes = cell.encode()?;
 
         if !current_leaf.would_fit(entry_bytes.len()) {
-            let next_leaf_page_num = next_free_page;
+            let next_leaf_page_num = alloc.allocate();
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
             leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
-            next_free_page += 1;
 
             if !current_leaf.would_fit(entry_bytes.len()) {
                 // A single posting cell exceeds page capacity. Phase
@@ -1304,7 +1438,7 @@ fn stage_fts_leaves(
 
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
     leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
-    Ok((leaves, next_free_page))
+    Ok(leaves)
 }
 
 /// (rowid, value) pairs as decoded from a single FTS cell — value is
@@ -1373,15 +1507,14 @@ fn load_fts_postings(pager: &Pager, root_page: u32) -> Result<(FtsEntries, FtsPo
 fn stage_hnsw_leaves(
     pager: &mut Pager,
     idx: &crate::sql::hnsw::HnswIndex,
-    start_page: u32,
-) -> Result<(Vec<(u32, i64)>, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<Vec<(u32, i64)>> {
     use crate::sql::pager::hnsw_cell::HnswNodeCell;
 
     let mut leaves: Vec<(u32, i64)> = Vec::new();
     let mut current_leaf = TablePage::empty();
-    let mut current_leaf_page = start_page;
+    let mut current_leaf_page = alloc.allocate();
     let mut current_max_rowid: Option<i64> = None;
-    let mut next_free_page = start_page + 1;
 
     let serialized = idx.serialize_nodes();
 
@@ -1394,12 +1527,11 @@ fn stage_hnsw_leaves(
         let entry_bytes = cell.encode()?;
 
         if !current_leaf.would_fit(entry_bytes.len()) {
-            let next_leaf_page_num = next_free_page;
+            let next_leaf_page_num = alloc.allocate();
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
             leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
-            next_free_page += 1;
 
             if !current_leaf.would_fit(entry_bytes.len()) {
                 return Err(SQLRiteError::Internal(format!(
@@ -1415,7 +1547,7 @@ fn stage_hnsw_leaves(
 
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
     leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
-    Ok((leaves, next_free_page))
+    Ok(leaves)
 }
 
 fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<()> {
@@ -1455,6 +1587,115 @@ fn load_table_rows(pager: &Pager, table: &mut Table, root_page: u32) -> Result<(
     Ok(())
 }
 
+/// Walks every page reachable from `root_page` and returns their page
+/// numbers. Includes `root_page`, every interior page, every leaf, and
+/// — when `follow_overflow` is true — every overflow page chained off
+/// table-leaf cells. Used by `save_database` to seed each table's
+/// per-table preferred pool and to compute the newly-freed set.
+///
+/// `follow_overflow = true` for table B-Trees (cells may carry
+/// `OverflowRef`s pointing at chained overflow pages); `false` for
+/// secondary-index, HNSW, and FTS B-Trees, which never overflow in the
+/// current encoding.
+fn collect_pages_for_btree(
+    pager: &Pager,
+    root_page: u32,
+    follow_overflow: bool,
+) -> Result<Vec<u32>> {
+    if root_page == 0 {
+        return Ok(Vec::new());
+    }
+    let mut pages: Vec<u32> = Vec::new();
+    let mut stack: Vec<u32> = vec![root_page];
+
+    while let Some(p) = stack.pop() {
+        let buf = pager.read_page(p).ok_or_else(|| {
+            SQLRiteError::Internal(format!(
+                "collect_pages: missing page {p} (rooted at {root_page})"
+            ))
+        })?;
+        pages.push(p);
+        match buf[0] {
+            t if t == PageType::InteriorNode as u8 => {
+                let payload: &[u8; PAYLOAD_PER_PAGE] =
+                    (&buf[PAGE_HEADER_SIZE..]).try_into().map_err(|_| {
+                        SQLRiteError::Internal("interior payload slice size".to_string())
+                    })?;
+                let interior = InteriorPage::from_bytes(payload);
+                // Push every divider's child + the rightmost child.
+                for slot in 0..interior.slot_count() {
+                    let cell = interior.cell_at(slot)?;
+                    stack.push(cell.child_page);
+                }
+                stack.push(interior.rightmost_child());
+            }
+            t if t == PageType::TableLeaf as u8 => {
+                if follow_overflow {
+                    let payload: &[u8; PAYLOAD_PER_PAGE] =
+                        (&buf[PAGE_HEADER_SIZE..]).try_into().map_err(|_| {
+                            SQLRiteError::Internal("leaf payload slice size".to_string())
+                        })?;
+                    let leaf = TablePage::from_bytes(payload);
+                    for slot in 0..leaf.slot_count() {
+                        match leaf.entry_at(slot)? {
+                            PagedEntry::Local(_) => {}
+                            PagedEntry::Overflow(r) => {
+                                let mut cur = r.first_overflow_page;
+                                while cur != 0 {
+                                    pages.push(cur);
+                                    let ob = pager.read_page(cur).ok_or_else(|| {
+                                        SQLRiteError::Internal(format!(
+                                            "collect_pages: missing overflow page {cur}"
+                                        ))
+                                    })?;
+                                    if ob[0] != PageType::Overflow as u8 {
+                                        return Err(SQLRiteError::Internal(format!(
+                                            "collect_pages: page {cur} expected Overflow, got tag {}",
+                                            ob[0]
+                                        )));
+                                    }
+                                    cur = u32::from_le_bytes(ob[1..5].try_into().unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(SQLRiteError::Internal(format!(
+                    "collect_pages: unexpected page type {other} at page {p}"
+                )));
+            }
+        }
+    }
+    Ok(pages)
+}
+
+/// Reads the previously-persisted `sqlrite_master` and returns a map from
+/// `(kind, name)` to that object's rootpage. Used by `save_database` to
+/// seed each table/index's per-table preferred pool with the pages it
+/// occupied last time round.
+///
+/// `kind` is `"table"` or `"index"` (the catalog already disambiguates
+/// the three index families via the SQL string, but for page-collection
+/// purposes a "table" tree must follow overflow refs while an "index"
+/// tree never does — that's the only distinction we need here).
+fn read_old_rootpages(pager: &Pager, schema_root: u32) -> Result<HashMap<(String, String), u32>> {
+    let mut out: HashMap<(String, String), u32> = HashMap::new();
+    if schema_root == 0 {
+        return Ok(out);
+    }
+    let mut master = build_empty_master_table();
+    load_table_rows(pager, &mut master, schema_root)?;
+    for rowid in master.rowids() {
+        let kind = take_text(&master, "type", rowid)?;
+        let name = take_text(&master, "name", rowid)?;
+        let rootpage = take_integer(&master, "rootpage", rowid)? as u32;
+        out.insert((kind, name), rootpage);
+    }
+    Ok(out)
+}
+
 /// Descends from `root_page` through `InteriorNode` pages, always taking
 /// the leftmost child, until a `TableLeaf` is reached. Returns that leaf's
 /// page number. A root that's already a leaf is returned as-is.
@@ -1483,60 +1724,57 @@ fn find_leftmost_leaf(pager: &Pager, root_page: u32) -> Result<u32> {
     }
 }
 
-/// Stages a table's B-Tree starting at `start_page`. Returns
-/// `(root_page, next_free_page)`. Builds bottom-up:
+/// Stages a table's B-Tree, drawing every page number from `alloc`.
+/// Returns the root page (the topmost interior page, or the single leaf
+/// when the table fits in one page).
 ///
-/// 1. Pack all row cells into `TableLeaf` pages, chaining them via each
-///    leaf's `next_page` sibling pointer (for fast sequential scans).
-/// 2. If the table fits in a single leaf, that leaf is the root.
-/// 3. Otherwise, group leaves into `InteriorNode` pages; recurse up the
-///    tree until one root remains.
+/// Builds bottom-up: pack rows into `TableLeaf` pages chained via
+/// `next_page`, then if more than one leaf, recursively wrap them in
+/// `InteriorNode` levels until one root remains.
 ///
-/// Deterministic: same in-memory rows → same pages at same offsets, so
-/// the Pager's diff commit still skips unchanged tables.
-fn stage_table_btree(pager: &mut Pager, table: &Table, start_page: u32) -> Result<(u32, u32)> {
-    let (leaves, mut next_free_page) = stage_leaves(pager, table, start_page)?;
+/// Deterministic: same rows + same allocator handouts → byte-identical
+/// pages at the same numbers, so the diff pager skips unchanged tables.
+fn stage_table_btree(
+    pager: &mut Pager,
+    table: &Table,
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<u32> {
+    let leaves = stage_leaves(pager, table, alloc)?;
     if leaves.len() == 1 {
-        return Ok((leaves[0].0, next_free_page));
+        return Ok(leaves[0].0);
     }
     let mut level: Vec<(u32, i64)> = leaves;
     while level.len() > 1 {
-        let (next_level, new_next_free) = stage_interior_level(pager, &level, next_free_page)?;
-        next_free_page = new_next_free;
-        level = next_level;
+        level = stage_interior_level(pager, &level, alloc)?;
     }
-    Ok((level[0].0, next_free_page))
+    Ok(level[0].0)
 }
 
 /// Packs the table's rows into a sibling-linked chain of `TableLeaf` pages.
-/// Returns each leaf's `(page_number, max_rowid)` (used by the next level
-/// up to build divider cells) and the first free page after the chain
-/// including any overflow pages allocated for oversized cells.
+/// Returns each leaf's `(page_number, max_rowid)` for use by the next
+/// interior level. Allocates leaf and overflow pages from `alloc`.
 fn stage_leaves(
     pager: &mut Pager,
     table: &Table,
-    start_page: u32,
-) -> Result<(Vec<(u32, i64)>, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<Vec<(u32, i64)>> {
     let mut leaves: Vec<(u32, i64)> = Vec::new();
     let mut current_leaf = TablePage::empty();
-    let mut current_leaf_page = start_page;
+    let mut current_leaf_page = alloc.allocate();
     let mut current_max_rowid: Option<i64> = None;
-    let mut next_free_page = start_page + 1;
 
     for rowid in table.rowids() {
-        let entry_bytes = build_row_entry(pager, table, rowid, &mut next_free_page)?;
+        let entry_bytes = build_row_entry(pager, table, rowid, alloc)?;
 
         if !current_leaf.would_fit(entry_bytes.len()) {
-            // Commit the current leaf. Its sibling next_page is the page
-            // number where the new leaf will go — which is next_free_page
-            // right now (no overflow pages have been allocated between
-            // this decision and the new leaf's allocation below).
-            let next_leaf_page_num = next_free_page;
+            // The new leaf goes at whatever the allocator hands out
+            // next. Commit the current leaf with that as its sibling
+            // pointer.
+            let next_leaf_page_num = alloc.allocate();
             emit_leaf(pager, current_leaf_page, &current_leaf, next_leaf_page_num);
             leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
             current_leaf = TablePage::empty();
             current_leaf_page = next_leaf_page_num;
-            next_free_page += 1;
             // current_max_rowid is reassigned by the insert below; no need
             // to zero it out here.
 
@@ -1555,25 +1793,24 @@ fn stage_leaves(
     // Final leaf: sibling next_page = 0 (end of chain).
     emit_leaf(pager, current_leaf_page, &current_leaf, 0);
     leaves.push((current_leaf_page, current_max_rowid.unwrap_or(i64::MIN)));
-    Ok((leaves, next_free_page))
+    Ok(leaves)
 }
 
 /// Encodes a single row's on-leaf entry — either the local cell bytes, or
 /// an `OverflowRef` pointing at a freshly-allocated overflow chain if the
-/// encoded cell exceeded the inline threshold. Advances `next_free_page`
-/// past any overflow pages used.
+/// encoded cell exceeded the inline threshold. Allocates any overflow
+/// pages from `alloc`.
 fn build_row_entry(
     pager: &mut Pager,
     table: &Table,
     rowid: i64,
-    next_free_page: &mut u32,
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
 ) -> Result<Vec<u8>> {
     let values = table.extract_row(rowid);
     let local_cell = Cell::new(rowid, values);
     let local_bytes = local_cell.encode()?;
     if local_bytes.len() > OVERFLOW_THRESHOLD {
-        let overflow_start = *next_free_page;
-        *next_free_page = write_overflow_chain(pager, &local_bytes, overflow_start)?;
+        let overflow_start = write_overflow_chain(pager, &local_bytes, alloc)?;
         Ok(OverflowRef {
             rowid,
             total_body_len: local_bytes.len() as u64,
@@ -1588,20 +1825,17 @@ fn build_row_entry(
 /// Builds one level of `InteriorNode` pages above the given children.
 /// Each interior packs as many dividers as will fit; the last child
 /// assigned to an interior becomes its `rightmost_child`. Returns the
-/// emitted interior pages as `(page_number, max_rowid_in_subtree)` so the
-/// next level can build on top of them.
+/// emitted interior pages as `(page_number, max_rowid_in_subtree)`.
 fn stage_interior_level(
     pager: &mut Pager,
     children: &[(u32, i64)],
-    start_page: u32,
-) -> Result<(Vec<(u32, i64)>, u32)> {
+    alloc: &mut crate::sql::pager::allocator::PageAllocator,
+) -> Result<Vec<(u32, i64)>> {
     let mut next_level: Vec<(u32, i64)> = Vec::new();
-    let mut next_free_page = start_page;
     let mut idx = 0usize;
 
     while idx < children.len() {
-        let interior_page_num = next_free_page;
-        next_free_page += 1;
+        let interior_page_num = alloc.allocate();
 
         // Seed the interior with the first unassigned child as its
         // rightmost. As we add more children, the previous rightmost
@@ -1632,7 +1866,7 @@ fn stage_interior_level(
         next_level.push((interior_page_num, rightmost_child_max));
     }
 
-    Ok((next_level, next_free_page))
+    Ok(next_level)
 }
 
 /// Wraps a `TablePage` in the 7-byte page header and hands it to the pager.
@@ -2771,6 +3005,324 @@ mod tests {
         );
         assert_eq!(users.get_value("score", 1), Some(Value::Integer(0)));
 
+        cleanup(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-6 — free-list + VACUUM tests
+    // ---------------------------------------------------------------------
+
+    /// Drop a table; subsequent CREATE TABLE should reuse the freed pages
+    /// rather than extending the file. The page_count after drop+create
+    /// should be at most what it was after the original two tables —
+    /// proving the new table landed on freelist pages.
+    #[test]
+    fn drop_table_freelist_persists_pages_for_reuse() {
+        let path = tmp_path("freelist_reuse");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+        let pages_two_tables = db.pager.as_ref().unwrap().header().page_count;
+
+        // Drop one table; its pages go on the freelist.
+        process_command("DROP TABLE users;", &mut db).expect("drop users");
+        let pages_after_drop = db.pager.as_ref().unwrap().header().page_count;
+        assert_eq!(
+            pages_after_drop, pages_two_tables,
+            "page_count should not shrink on drop — the freed pages persist on the freelist"
+        );
+        let head_after_drop = db.pager.as_ref().unwrap().header().freelist_head;
+        assert!(
+            head_after_drop != 0,
+            "freelist_head must be non-zero after drop"
+        );
+
+        // Re-create a similar-shaped table; should reuse freelist pages.
+        process_command(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, label TEXT NOT NULL UNIQUE);",
+            &mut db,
+        )
+        .expect("create accounts");
+        process_command("INSERT INTO accounts (label) VALUES ('a');", &mut db).unwrap();
+        process_command("INSERT INTO accounts (label) VALUES ('b');", &mut db).unwrap();
+        let pages_after_create = db.pager.as_ref().unwrap().header().page_count;
+        assert!(
+            pages_after_create <= pages_two_tables + 2,
+            "creating a similar-sized table after a drop should mostly draw from the \
+             freelist, not extend the file (got {pages_after_create} > {pages_two_tables} + 2)"
+        );
+
+        cleanup(&path);
+    }
+
+    /// `VACUUM;` after a drop must shrink the file and clear the freelist.
+    #[test]
+    fn drop_then_vacuum_shrinks_file() {
+        let path = tmp_path("vacuum_shrinks");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        // Add a few more rows to make the dropped table bigger.
+        for i in 0..20 {
+            process_command(
+                &format!("INSERT INTO users (name, age) VALUES ('user{i}', {i});"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        save_database(&mut db, &path).expect("save");
+
+        process_command("DROP TABLE users;", &mut db).expect("drop");
+        let size_before_vacuum = std::fs::metadata(&path).unwrap().len();
+        let pages_before_vacuum = db.pager.as_ref().unwrap().header().page_count;
+        let head_before = db.pager.as_ref().unwrap().header().freelist_head;
+        assert!(head_before != 0, "drop should populate the freelist");
+
+        // VACUUM (via process_command) checkpoints internally so the
+        // file actually shrinks on disk before we observe its size.
+        process_command("VACUUM;", &mut db).expect("vacuum");
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        let head_after = db.pager.as_ref().unwrap().header().freelist_head;
+        assert!(
+            pages_after < pages_before_vacuum,
+            "VACUUM must reduce page_count: was {pages_before_vacuum}, now {pages_after}"
+        );
+        assert_eq!(head_after, 0, "VACUUM must clear the freelist");
+        assert!(
+            size_after < size_before_vacuum,
+            "VACUUM must shrink the file on disk: was {size_before_vacuum} bytes, now {size_after}"
+        );
+
+        cleanup(&path);
+    }
+
+    /// VACUUM on a non-empty multi-table DB must not lose any rows.
+    #[test]
+    fn vacuum_round_trips_data() {
+        let path = tmp_path("vacuum_round_trip");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+        process_command("VACUUM;", &mut db).expect("vacuum");
+
+        // Re-open from disk to make sure the on-disk catalog round-trips.
+        drop(db);
+        let loaded = open_database(&path, "t".to_string()).expect("reopen after vacuum");
+        assert!(loaded.contains_table("users".to_string()));
+        assert!(loaded.contains_table("notes".to_string()));
+        let users = loaded.get_table("users".to_string()).unwrap();
+        // seed_db inserts two users.
+        assert_eq!(users.rowids().len(), 2);
+
+        cleanup(&path);
+    }
+
+    /// Format version is bumped to v6 only after a save that creates a
+    /// non-empty freelist. VACUUM clears the freelist but doesn't
+    /// downgrade — v6 is a strict superset, so once at v6 we stay.
+    #[test]
+    fn freelist_format_version_promotion() {
+        use crate::sql::pager::header::{FORMAT_VERSION_BASELINE, FORMAT_VERSION_V6};
+        let path = tmp_path("v6_promotion");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+        let v_after_save = db.pager.as_ref().unwrap().header().format_version;
+        assert_eq!(
+            v_after_save, FORMAT_VERSION_BASELINE,
+            "fresh DB without drops should stay at the baseline version"
+        );
+
+        process_command("DROP TABLE users;", &mut db).expect("drop");
+        let v_after_drop = db.pager.as_ref().unwrap().header().format_version;
+        assert_eq!(
+            v_after_drop, FORMAT_VERSION_V6,
+            "first save with a non-empty freelist must promote to V6"
+        );
+
+        process_command("VACUUM;", &mut db).expect("vacuum");
+        let v_after_vacuum = db.pager.as_ref().unwrap().header().format_version;
+        assert_eq!(
+            v_after_vacuum, FORMAT_VERSION_V6,
+            "VACUUM must not downgrade — V6 is a strict superset"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Freelist persists across reopen: drop, save, close, reopen,
+    /// confirm the next CREATE TABLE re-uses pages from the persisted
+    /// freelist (rather than extending the file).
+    #[test]
+    fn freelist_round_trip_through_reopen() {
+        let path = tmp_path("freelist_reopen");
+        let pages_two_tables;
+        {
+            let mut db = seed_db();
+            db.source_path = Some(path.clone());
+            save_database(&mut db, &path).expect("save");
+            pages_two_tables = db.pager.as_ref().unwrap().header().page_count;
+            process_command("DROP TABLE users;", &mut db).expect("drop");
+            let head = db.pager.as_ref().unwrap().header().freelist_head;
+            assert!(head != 0, "drop must populate the freelist");
+        }
+
+        // Reopen from disk — the freelist must come back.
+        let mut db = open_database(&path, "t".to_string()).expect("reopen");
+        assert!(
+            db.pager.as_ref().unwrap().header().freelist_head != 0,
+            "freelist_head must survive close/reopen"
+        );
+
+        process_command(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, label TEXT NOT NULL UNIQUE);",
+            &mut db,
+        )
+        .expect("create accounts");
+        process_command("INSERT INTO accounts (label) VALUES ('reopened');", &mut db).unwrap();
+        let pages_after_create = db.pager.as_ref().unwrap().header().page_count;
+        assert!(
+            pages_after_create <= pages_two_tables + 2,
+            "post-reopen create should reuse freelist (got {pages_after_create} > \
+             {pages_two_tables} + 2 — file extended instead of reusing)"
+        );
+
+        cleanup(&path);
+    }
+
+    /// VACUUM inside an explicit transaction must error before touching the
+    /// disk. `BEGIN; VACUUM;` is the documented rejection path.
+    #[test]
+    fn vacuum_inside_transaction_is_rejected() {
+        let path = tmp_path("vacuum_txn");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+
+        process_command("BEGIN;", &mut db).expect("begin");
+        let err = process_command("VACUUM;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").contains("VACUUM cannot run inside a transaction"),
+            "expected in-transaction rejection, got: {err}"
+        );
+        // Roll back to leave the DB in a clean state.
+        process_command("ROLLBACK;", &mut db).unwrap();
+        cleanup(&path);
+    }
+
+    /// VACUUM on an in-memory database is a documented no-op.
+    #[test]
+    fn vacuum_on_in_memory_database_is_noop() {
+        let mut db = Database::new("mem".to_string());
+        process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        let out = process_command("VACUUM;", &mut db).expect("vacuum no-op");
+        assert!(
+            out.to_lowercase().contains("no-op") || out.to_lowercase().contains("in-memory"),
+            "expected no-op message for in-memory VACUUM, got: {out}"
+        );
+    }
+
+    /// Untouched tables shouldn't write any pages on the save that
+    /// follows a DROP of an unrelated table. Confirms the per-table
+    /// preferred pool keeps page numbers stable so the diff pager skips
+    /// every byte-identical leaf.
+    #[test]
+    fn unchanged_table_pages_skip_diff_after_unrelated_drop() {
+        // Need three tables so dropping one in the middle still leaves
+        // an "unrelated" alphabetical neighbour. Layout pre-drop (sorted):
+        //   accounts, notes, users
+        // Drop `notes`. `accounts` and `users` should keep their pages.
+        let path = tmp_path("diff_after_drop");
+        let mut db = Database::new("t".to_string());
+        db.source_path = Some(path.clone());
+        process_command(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, label TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        for i in 0..5 {
+            process_command(
+                &format!("INSERT INTO accounts (label) VALUES ('a{i}');"),
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                &format!("INSERT INTO notes (body) VALUES ('n{i}');"),
+                &mut db,
+            )
+            .unwrap();
+            process_command(
+                &format!("INSERT INTO users (name) VALUES ('u{i}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        save_database(&mut db, &path).expect("baseline save");
+
+        // Capture page bytes for `accounts` and `users` so we can
+        // verify they don't change.
+        let pager = db.pager.as_ref().unwrap();
+        let acc_root = read_old_rootpages(pager, pager.header().schema_root_page)
+            .unwrap()
+            .get(&("table".to_string(), "accounts".to_string()))
+            .copied()
+            .unwrap();
+        let users_root = read_old_rootpages(pager, pager.header().schema_root_page)
+            .unwrap()
+            .get(&("table".to_string(), "users".to_string()))
+            .copied()
+            .unwrap();
+        let acc_bytes_before: Vec<u8> = pager.read_page(acc_root).unwrap().to_vec();
+        let users_bytes_before: Vec<u8> = pager.read_page(users_root).unwrap().to_vec();
+
+        // Drop the middle table.
+        process_command("DROP TABLE notes;", &mut db).expect("drop notes");
+
+        let pager = db.pager.as_ref().unwrap();
+        // `accounts` and `users` should still live at the same pages
+        // with byte-identical content.
+        let acc_after = pager.read_page(acc_root).unwrap();
+        let users_after = pager.read_page(users_root).unwrap();
+        assert_eq!(
+            &acc_after[..],
+            &acc_bytes_before[..],
+            "accounts root page must not be rewritten when an unrelated table is dropped"
+        );
+        assert_eq!(
+            &users_after[..],
+            &users_bytes_before[..],
+            "users root page must not be rewritten when an unrelated table is dropped"
+        );
+
+        cleanup(&path);
+    }
+
+    /// VACUUM modifiers (FULL, REINDEX, table targets, …) are rejected
+    /// with NotImplemented — only bare `VACUUM;` is supported.
+    #[test]
+    fn vacuum_modifiers_are_rejected() {
+        let path = tmp_path("vacuum_modifiers");
+        let mut db = seed_db();
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+        for stmt in ["VACUUM FULL;", "VACUUM users;"] {
+            let err = process_command(stmt, &mut db).unwrap_err();
+            assert!(
+                format!("{err}").contains("VACUUM modifiers"),
+                "expected modifier rejection for `{stmt}`, got: {err}"
+            );
+        }
         cleanup(&path);
     }
 }

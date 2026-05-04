@@ -306,6 +306,7 @@ impl Pager {
             page_count: 2,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         };
 
         // Write the file synchronously so the initial create is durable and
@@ -664,6 +665,7 @@ mod tests {
                 page_count: 5,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         // 3 dirty data pages (pages 2, 3, 4). The page-0 commit frame is
@@ -679,6 +681,7 @@ mod tests {
                 page_count: 5,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         assert_eq!(writes, 1, "only the changed page should have been written");
@@ -739,6 +742,7 @@ mod tests {
             page_count: 5,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
 
@@ -760,6 +764,7 @@ mod tests {
             page_count: 3,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
 
@@ -792,6 +797,7 @@ mod tests {
                 page_count: 4,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -817,6 +823,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -853,6 +860,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         assert_eq!(first, 1);
@@ -864,6 +872,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         assert_eq!(second, 0, "no data frames should be re-appended");
@@ -887,6 +896,7 @@ mod tests {
             page_count: 4,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
 
@@ -928,6 +938,7 @@ mod tests {
             page_count: 3,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
 
@@ -953,6 +964,7 @@ mod tests {
             page_count: 5,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
         p.checkpoint().unwrap();
@@ -966,6 +978,7 @@ mod tests {
             page_count: 3,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
         p.checkpoint().unwrap();
@@ -1000,6 +1013,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -1034,6 +1048,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -1091,6 +1106,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -1101,6 +1117,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap_err();
         assert!(
@@ -1133,6 +1150,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
             // Force the WAL into the main file before we nuke it.
@@ -1166,6 +1184,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
             // Manually write the committed page 2 into the main file at
@@ -1210,6 +1229,7 @@ mod tests {
                 page_count: 3,
                 schema_root_page: 1,
                 format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+                freelist_head: 0,
             })
             .unwrap();
         }
@@ -1226,6 +1246,7 @@ mod tests {
             page_count: 3,
             schema_root_page: 1,
             format_version: crate::sql::pager::header::FORMAT_VERSION_BASELINE,
+            freelist_head: 0,
         })
         .unwrap();
         let post = std::fs::metadata(wal_path_for(&path)).unwrap().len();
