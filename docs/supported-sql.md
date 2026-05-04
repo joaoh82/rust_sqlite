@@ -8,12 +8,14 @@ If you're looking for _how_ to use SQLRite (REPL flow, meta-commands, history, e
 
 | Statement | Supported today |
 |---|---|
-| [`CREATE TABLE`](#create-table) | Columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL`; typed columns; auto-indexes on constrained columns |
+| [`CREATE TABLE`](#create-table) | Columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT <literal>`; typed columns; auto-indexes on constrained columns |
 | [`CREATE [UNIQUE] INDEX`](#create-index) | Single-column named indexes, `IF NOT EXISTS`, persisted as cell-based B-Trees |
-| [`INSERT INTO`](#insert-into) | Auto-ROWID, UNIQUE/PK enforcement, clean type errors, NULL padding |
+| [`INSERT INTO`](#insert-into) | Auto-ROWID, UNIQUE/PK enforcement, clean type errors, NULL/DEFAULT padding |
 | [`SELECT`](#select) | `*` or column list, `WHERE`, single-column `ORDER BY`, `LIMIT`; index probing on `col = literal` |
 | [`UPDATE`](#update) | Multi-column `SET`, `WHERE`, arithmetic RHS, type + UNIQUE enforcement |
 | [`DELETE`](#delete) | `WHERE` predicate or whole-table |
+| [`ALTER TABLE`](#alter-table) | `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN` (one operation per statement) |
+| [`DROP TABLE`](#drop-table) / [`DROP INDEX`](#drop-index) | `IF EXISTS`; single target; auto-indexes refused for `DROP INDEX` |
 | [`BEGIN`](#transactions) / [`COMMIT`](#transactions) / [`ROLLBACK`](#transactions) | Snapshot-based; single-level; WAL-backed commit; auto-rollback on COMMIT disk failure |
 
 Statements the parser accepts (because sqlparser understands them in the SQLite dialect) but SQLRite doesn't execute yet return `SQL Statement not supported yet`. The [Not yet supported](#not-yet-supported) section below enumerates the common ones.
@@ -41,12 +43,12 @@ CREATE TABLE <name> (<col> <type> [column_constraint]* [, ...]);
 
 - `PRIMARY KEY` — one column per table; the column **must** be `INTEGER` and gets auto-ROWID behavior (omitted on INSERT → auto-assigned). Auto-creates an index named `sqlrite_autoindex_<table>_<column>`.
 - `UNIQUE` — enforced at INSERT/UPDATE time. Auto-creates an index with the same naming scheme.
-- `NOT NULL` — rejects NULL at INSERT/UPDATE. Omitted columns on INSERT are NULL by default, so a `NOT NULL` without an INSERT-time value is an error.
+- `NOT NULL` — rejects NULL at INSERT/UPDATE. Omitted columns on INSERT are NULL by default (or pick up the column's `DEFAULT`, if any), so a `NOT NULL` without an INSERT-time value or DEFAULT is an error.
+- `DEFAULT <literal>` — value substituted when the column is omitted from an INSERT. Accepts integer / real / text / boolean / NULL literals (and unary `+` / `-` on numerics). Function-call defaults like `CURRENT_TIMESTAMP` and other non-literal expressions are rejected at CREATE TABLE time. Explicit `INSERT ... VALUES (..., NULL, ...)` is preserved as NULL — the default only fires for omitted columns (matches SQLite).
 
 ### What's **not** enforced at CREATE TABLE time
 
 - **Table-level constraints** (`PRIMARY KEY (col1, col2)`, `FOREIGN KEY`, `CHECK`, `UNIQUE (col1, col2)`) are parsed but ignored.
-- **`DEFAULT` values** are parsed but ignored.
 - **Multi-column `PRIMARY KEY`** — only single-column PKs work; a composite PK is accepted by the parser but treated as no PK.
 
 ### Errors returned
@@ -205,6 +207,72 @@ DELETE FROM <table> [WHERE <expr>];
 - **No `WHERE`** deletes every row (tables and indexes are preserved; only row data is removed).
 - **`WHERE`** uses the same [expression](#expressions) evaluator as `SELECT`.
 - Secondary indexes are updated alongside the row deletes so a subsequent `WHERE col = ...` doesn't return stale hits.
+
+---
+
+## `ALTER TABLE`
+
+```sql
+ALTER TABLE [IF EXISTS] <table> RENAME TO <new_table>;
+ALTER TABLE [IF EXISTS] <table> RENAME COLUMN <old_col> TO <new_col>;
+ALTER TABLE [IF EXISTS] <table> ADD COLUMN <col_def>;
+ALTER TABLE [IF EXISTS] <table> DROP COLUMN <col>;
+```
+
+One operation per statement (SQLite-style). `ALTER TABLE foo RENAME TO bar, ADD COLUMN x ...` is rejected — issue separate statements instead.
+
+### `RENAME TO`
+
+- Reserved-name rejection: cannot rename to `sqlrite_master`.
+- Errors if the target name is already a table.
+- Auto-indexes whose names embed the old table name (`sqlrite_autoindex_<old>_<col>`) are renamed in lockstep so the schema catalog stays consistent. Explicit indexes carry their user-given name unchanged.
+
+### `RENAME COLUMN`
+
+- Errors if the old column doesn't exist or the new name already exists in the table.
+- Re-keys the row storage and updates every dependent index (auto + explicit, secondary / HNSW / FTS) — including auto-index name regeneration.
+- Renaming the PRIMARY KEY column is allowed; the table's `primary_key` pointer follows the new name.
+
+### `ADD COLUMN`
+
+- The column definition reuses the same parser that handles CREATE TABLE columns: same types, same `NOT NULL` / `DEFAULT` semantics.
+- **Rejected:** `PRIMARY KEY` and `UNIQUE` constraints on the added column. Both would require backfilling the column under uniqueness constraints against existing rows; that path will land alongside multi-column UNIQUE.
+- **`NOT NULL` on a non-empty table requires `DEFAULT`.** Without one there's no value to backfill existing rowids with. Same rule SQLite applies.
+- With a `DEFAULT`, every existing rowid is backfilled with the default value at ADD COLUMN time. Without a `DEFAULT`, existing rowids read as NULL for the new column.
+
+### `DROP COLUMN`
+
+- **Rejected:** dropping the PRIMARY KEY column.
+- **Rejected:** dropping the only remaining column (degenerate table).
+- Cascades to every dependent index (auto + explicit, secondary / HNSW / FTS) on the dropped column.
+- `CASCADE` / `RESTRICT` modifiers are accepted by the parser and ignored — SQLite has no real distinction here either.
+
+---
+
+## `DROP TABLE`
+
+```sql
+DROP TABLE [IF EXISTS] <table>;
+```
+
+- Single target per statement. `DROP TABLE a, b, c;` is parsed but rejected with a NotImplemented error.
+- Reserved-name rejection: `DROP TABLE sqlrite_master` errors with the same message `CREATE TABLE` uses.
+- All indexes attached to the table (auto, explicit, HNSW, FTS) disappear with the table — they live inside the `Table` struct and ride along.
+- Without `IF EXISTS`, dropping a table that doesn't exist errors. With it, that's a benign 0-tables-dropped no-op.
+- **Disk pages are orphaned, not freed.** SQLRite has no free-list yet — the file size doesn't shrink until a future `VACUUM`. The behavior is safe (orphan pages are unreachable from `sqlrite_master` after reopen) but means a write-heavy schema churn won't reclaim space until VACUUM lands.
+
+---
+
+## `DROP INDEX`
+
+```sql
+DROP INDEX [IF EXISTS] <index_name>;
+```
+
+- Single target per statement.
+- Walks every table searching for an index with the given name across the secondary B-Tree, HNSW, and FTS index families.
+- **Refuses to drop auto-indexes.** `sqlrite_autoindex_*` names are constraint-bound to the column they index — the only way to remove them is to drop the underlying column or table. Same rule SQLite enforces for its `sqlite_autoindex_*` indexes.
+- `IF EXISTS` makes a missing index a benign no-op.
 
 ---
 
@@ -405,11 +473,12 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 - Built-in functions (`LENGTH`, `UPPER`, `LOWER`, `COALESCE`, `IFNULL`, date/time, `printf`, …)
 
 ### DDL
-- `ALTER TABLE` (add column, rename column, rename table)
-- `DROP TABLE`, `DROP INDEX`
+- `ALTER TABLE` extras: multi-operation (`ALTER TABLE foo RENAME TO bar, ADD COLUMN x ...`), `ALTER COLUMN ... SET / DROP DEFAULT`, `ALTER COLUMN ... TYPE`
+- `ADD COLUMN` constraint extras: `PRIMARY KEY` and `UNIQUE` on the added column (would need backfill + uniqueness against existing rows)
+- `DROP TABLE` / `DROP INDEX` extras: multi-target (`DROP TABLE a, b, c;`)
 - `CREATE VIEW`, `CREATE TRIGGER`
 - Table-level constraints (composite PK, composite UNIQUE, `FOREIGN KEY`, `CHECK`)
-- Column defaults (`DEFAULT <value>`)
+- Non-literal `DEFAULT` expressions (`CURRENT_TIMESTAMP`, function calls, column references)
 - Composite / multi-column indexes
 
 ### Transactions

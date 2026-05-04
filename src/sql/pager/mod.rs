@@ -443,9 +443,35 @@ fn table_to_create_sql(table: &Table) -> String {
                 piece.push_str(" NOT NULL");
             }
         }
+        if let Some(default) = &c.default {
+            piece.push_str(" DEFAULT ");
+            piece.push_str(&render_default_literal(default));
+        }
         parts.push(piece);
     }
     format!("CREATE TABLE {} ({});", table.tb_name, parts.join(", "))
+}
+
+/// Renders a DEFAULT value back to SQL-literal form so the synthesized
+/// CREATE TABLE round-trips through `parse_create_sql`. Text values get
+/// single-quoted with single-quote doubling for escaping. Vector defaults
+/// are not currently expressible at CREATE TABLE time, so we render them
+/// as their bracket-array form (matches the INSERT literal grammar).
+fn render_default_literal(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Null => "NULL".to_string(),
+        Value::Vector(_) => value.to_display_string(),
+    }
 }
 
 /// Reverses `table_to_create_sql`: feeds the SQL back through `sqlparser`
@@ -460,7 +486,16 @@ fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
     let columns = create
         .columns
         .into_iter()
-        .map(|pc| Column::new(pc.name, pc.datatype, pc.is_pk, pc.not_null, pc.is_unique))
+        .map(|pc| {
+            Column::with_default(
+                pc.name,
+                pc.datatype,
+                pc.is_pk,
+                pc.not_null,
+                pc.is_unique,
+                pc.default,
+            )
+        })
         .collect();
     Ok((create.table_name, columns))
 }
@@ -2517,6 +2552,224 @@ mod tests {
             PageType::InteriorNode as u8,
             "expected 3-level tree: root's leftmost child should also be InteriorNode",
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_rename_table_survives_save_and_reopen() {
+        let path = tmp_path("alter_rename_table_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("ALTER TABLE users RENAME TO members;", &mut db).expect("rename");
+        save_database(&mut db, &path).expect("save after rename");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        assert!(!loaded.contains_table("users".to_string()));
+        assert!(loaded.contains_table("members".to_string()));
+        let members = loaded.get_table("members".to_string()).unwrap();
+        assert_eq!(members.rowids().len(), 2, "rows should survive");
+        // Auto-indexes followed the rename.
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_id")
+                .is_some()
+        );
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_name")
+                .is_some()
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_rename_column_survives_save_and_reopen() {
+        let path = tmp_path("alter_rename_col_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command(
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+            &mut db,
+        )
+        .expect("rename column");
+        save_database(&mut db, &path).expect("save after rename");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("full_name".to_string()));
+        assert!(!users.contains_column("name".to_string()));
+        // Verify a row's value survived the rename round-trip.
+        let alice_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("full_name", *r) == Some(Value::Text("alice".to_string())))
+            .expect("alice row should be findable under renamed column");
+        assert_eq!(
+            users.get_value("full_name", alice_rowid),
+            Some(Value::Text("alice".to_string()))
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_add_column_with_default_survives_save_and_reopen() {
+        let path = tmp_path("alter_add_default_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command(
+            "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';",
+            &mut db,
+        )
+        .expect("add column");
+        save_database(&mut db, &path).expect("save after add");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("status".to_string()));
+        for rowid in users.rowids() {
+            assert_eq!(
+                users.get_value("status", rowid),
+                Some(Value::Text("active".to_string())),
+                "backfilled default should round-trip for rowid {rowid}"
+            );
+        }
+        // The DEFAULT clause itself should still be on the column metadata
+        // so a subsequent INSERT picks it up.
+        let status_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "status")
+            .unwrap();
+        assert_eq!(status_col.default, Some(Value::Text("active".to_string())));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_drop_column_survives_save_and_reopen() {
+        let path = tmp_path("alter_drop_col_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("ALTER TABLE users DROP COLUMN age;", &mut db).expect("drop column");
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(!users.contains_column("age".to_string()));
+        assert!(users.contains_column("name".to_string()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_table_survives_save_and_reopen() {
+        let path = tmp_path("drop_table_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        // Verify both tables landed.
+        {
+            let loaded = open_database(&path, "t".to_string()).expect("open");
+            assert!(loaded.contains_table("users".to_string()));
+            assert!(loaded.contains_table("notes".to_string()));
+        }
+
+        process_command("DROP TABLE users;", &mut db).expect("drop users");
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        assert!(
+            !loaded.contains_table("users".to_string()),
+            "dropped table should not resurface on reopen"
+        );
+        assert!(
+            loaded.contains_table("notes".to_string()),
+            "untouched table should survive"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_survives_save_and_reopen() {
+        let path = tmp_path("drop_index_roundtrip");
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE INDEX notes_body_idx ON notes (body);", &mut db).unwrap();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("DROP INDEX notes_body_idx;", &mut db).unwrap();
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let notes = loaded.get_table("notes".to_string()).unwrap();
+        assert!(
+            notes.index_by_name("notes_body_idx").is_none(),
+            "dropped index should not resurface on reopen"
+        );
+        // The auto-index for the PK should still be there.
+        assert!(notes.index_by_name("sqlrite_autoindex_notes_id").is_some());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn default_clause_survives_save_and_reopen() {
+        let path = tmp_path("default_roundtrip");
+        let mut db = Database::new("t".to_string());
+
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', score INTEGER DEFAULT 0);",
+            &mut db,
+        )
+        .unwrap();
+        save_database(&mut db, &path).expect("save");
+
+        let mut loaded = open_database(&path, "t".to_string()).expect("open");
+
+        // The reloaded column metadata should still carry the DEFAULT.
+        let users = loaded.get_table("users".to_string()).expect("users table");
+        let status_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "status")
+            .expect("status column");
+        assert_eq!(
+            status_col.default,
+            Some(Value::Text("active".to_string())),
+            "DEFAULT 'active' should round-trip"
+        );
+        let score_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "score")
+            .expect("score column");
+        assert_eq!(
+            score_col.default,
+            Some(Value::Integer(0)),
+            "DEFAULT 0 should round-trip"
+        );
+
+        // Now exercise the runtime path: an INSERT that omits both DEFAULT
+        // columns should pick them up from the reloaded schema.
+        process_command("INSERT INTO users (id) VALUES (1);", &mut loaded).unwrap();
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert_eq!(
+            users.get_value("status", 1),
+            Some(Value::Text("active".to_string()))
+        );
+        assert_eq!(users.get_value("score", 1), Some(Value::Integer(0)));
 
         cleanup(&path);
     }

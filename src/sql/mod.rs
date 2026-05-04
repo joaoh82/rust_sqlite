@@ -10,7 +10,7 @@ use parser::create::CreateQuery;
 use parser::insert::InsertQuery;
 use parser::select::SelectQuery;
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectType, Statement};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
@@ -167,6 +167,8 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
+            | Statement::Drop { .. }
+            | Statement::AlterTable(_)
     );
 
     // Early-reject mutations on a read-only database before they touch
@@ -310,6 +312,31 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
         Statement::CreateIndex(_) => {
             let name = executor::execute_create_index(&query, db)?;
             message = format!("CREATE INDEX '{name}' executed.");
+        }
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => match object_type {
+            ObjectType::Table => {
+                let count = executor::execute_drop_table(&names, if_exists, db)?;
+                let plural = if count == 1 { "table" } else { "tables" };
+                message = format!("DROP TABLE Statement executed. {count} {plural} dropped.");
+            }
+            ObjectType::Index => {
+                let count = executor::execute_drop_index(&names, if_exists, db)?;
+                let plural = if count == 1 { "index" } else { "indexes" };
+                message = format!("DROP INDEX Statement executed. {count} {plural} dropped.");
+            }
+            other => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "DROP {other:?} is not supported (only TABLE and INDEX)"
+                )));
+            }
+        },
+        Statement::AlterTable(alter) => {
+            message = executor::execute_alter_table(alter, db)?;
         }
         _ => {
             return Err(SQLRiteError::NotImplemented(
@@ -601,8 +628,10 @@ mod tests {
     #[test]
     fn process_command_unsupported_statement_test() {
         let mut db = Database::new("tempdb".to_string());
-        // Nothing in Phase 1 handles DROP.
-        let result = process_command("DROP TABLE users;", &mut db);
+        // CREATE VIEW is firmly in the "Not yet supported" list — used as
+        // the canary for the dispatcher's NotImplemented arm. (DROP TABLE
+        // moved out of unsupported in this branch.)
+        let result = process_command("CREATE VIEW v AS SELECT * FROM users;", &mut db);
         assert!(result.is_err());
     }
 
@@ -2096,5 +2125,673 @@ mod tests {
             msg.contains("json") && msg.contains("payload"),
             "got: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // DEFAULT clause on CREATE TABLE columns
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn default_literal_int_applies_when_column_omitted() {
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 42);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        assert_eq!(table.get_value("n", 1), Some(Value::Integer(42)));
+    }
+
+    #[test]
+    fn default_literal_text_applies_when_column_omitted() {
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active');",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("users".to_string()).unwrap();
+        assert_eq!(
+            table.get_value("status", 1),
+            Some(Value::Text("active".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_literal_real_negative_applies_when_column_omitted() {
+        // `DEFAULT -1.5` arrives as a UnaryOp(Minus, Number) — exercise that path.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, score REAL DEFAULT -1.5);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        assert_eq!(table.get_value("score", 1), Some(Value::Real(-1.5)));
+    }
+
+    #[test]
+    fn default_with_type_mismatch_errors_at_create_time() {
+        let mut db = Database::new("t".to_string());
+        let result = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 'oops');",
+            &mut db,
+        );
+        let err = result.expect_err("text default on INTEGER column should be rejected");
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("default"), "got: {msg}");
+    }
+
+    #[test]
+    fn default_for_json_column_must_be_valid_json() {
+        // ADD COLUMN ... JSON DEFAULT 'not-json' would otherwise backfill
+        // every existing row with invalid JSON (insert_row's validation
+        // is bypassed for the backfill path).
+        let mut db = Database::new("t".to_string());
+        let err = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSON DEFAULT 'not-json{');",
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("json"),
+            "got: {err}"
+        );
+
+        // Valid JSON DEFAULT works.
+        process_command(
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, doc JSON DEFAULT '{\"k\":1}');",
+            &mut db,
+        )
+        .expect("valid JSON DEFAULT should be accepted");
+    }
+
+    #[test]
+    fn default_with_non_literal_expression_errors_at_create_time() {
+        let mut db = Database::new("t".to_string());
+        // Function-call DEFAULT (e.g. CURRENT_TIMESTAMP) → rejected; we only
+        // accept literal expressions for now.
+        let result = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP);",
+            &mut db,
+        );
+        let err = result.expect_err("non-literal DEFAULT should be rejected");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("default") && msg.contains("literal"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_null_is_accepted_at_create_time() {
+        // `DEFAULT NULL` is a no-op equivalent to no DEFAULT clause; the
+        // important thing is that CREATE TABLE accepts it without error
+        // (some DDL exporters emit `DEFAULT NULL` redundantly).
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT DEFAULT NULL);",
+            &mut db,
+        )
+        .expect("CREATE TABLE with DEFAULT NULL should be accepted");
+        let table = db.get_table("t".to_string()).unwrap();
+        let note = table
+            .columns
+            .iter()
+            .find(|c| c.column_name == "note")
+            .unwrap();
+        assert_eq!(note.default, Some(Value::Null));
+    }
+
+    // -------------------------------------------------------------------
+    // DROP TABLE / DROP INDEX
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn drop_table_basic() {
+        let mut db = seed_users_table();
+        let response = process_command("DROP TABLE users;", &mut db).expect("drop table");
+        assert!(response.contains("1 table dropped"));
+        assert!(!db.contains_table("users".to_string()));
+    }
+
+    #[test]
+    fn drop_table_if_exists_noop_on_missing() {
+        let mut db = Database::new("t".to_string());
+        let response =
+            process_command("DROP TABLE IF EXISTS missing;", &mut db).expect("drop if exists");
+        assert!(response.contains("0 tables dropped"));
+    }
+
+    #[test]
+    fn drop_table_missing_errors_without_if_exists() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP TABLE missing;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_reserved_name_errors() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP TABLE sqlrite_master;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_multi_target_rejected() {
+        let mut db = seed_users_table();
+        process_command("CREATE TABLE other (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        // sqlparser accepts `DROP TABLE a, b` as one statement; we reject
+        // to keep error semantics simple (no partial-failure rollback).
+        let err = process_command("DROP TABLE users, other;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("single table"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_cascades_indexes_in_memory() {
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        // PK auto-index + UNIQUE-on-name auto-index + the explicit one.
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(
+            users
+                .secondary_indexes
+                .iter()
+                .any(|i| i.name == "users_age_idx")
+        );
+
+        process_command("DROP TABLE users;", &mut db).unwrap();
+
+        // After DROP TABLE, no other table should claim the dropped indexes.
+        for table in db.tables.values() {
+            assert!(
+                !table
+                    .secondary_indexes
+                    .iter()
+                    .any(|i| i.name.contains("users")),
+                "dropped table's indexes should not survive on any other table"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_index_explicit_basic() {
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        let response = process_command("DROP INDEX users_age_idx;", &mut db).expect("drop index");
+        assert!(response.contains("1 index dropped"));
+
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(users.index_by_name("users_age_idx").is_none());
+    }
+
+    #[test]
+    fn drop_index_refuses_auto_index() {
+        let mut db = seed_users_table();
+        // `users` was created with `id INTEGER PRIMARY KEY` → auto-index
+        // named `sqlrite_autoindex_users_id`.
+        let err = process_command("DROP INDEX sqlrite_autoindex_users_id;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("auto-created"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_index_if_exists_noop_on_missing() {
+        let mut db = Database::new("t".to_string());
+        let response =
+            process_command("DROP INDEX IF EXISTS nope;", &mut db).expect("drop index if exists");
+        assert!(response.contains("0 indexes dropped"));
+    }
+
+    #[test]
+    fn drop_index_missing_errors_without_if_exists() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP INDEX nope;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_statements_rejected_on_readonly_db() {
+        use crate::sql::pager::{open_database_read_only, save_database};
+
+        let mut seed = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut seed,
+        )
+        .unwrap();
+        process_command("CREATE INDEX notes_body ON notes (body);", &mut seed).unwrap();
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-drop-ro-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        save_database(&mut seed, &path).unwrap();
+        drop(seed);
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        for stmt in ["DROP TABLE notes;", "DROP INDEX notes_body;"] {
+            let err = process_command(stmt, &mut ro).unwrap_err();
+            assert!(
+                format!("{err}").contains("read-only"),
+                "{stmt:?} should surface read-only error, got: {err}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    // -------------------------------------------------------------------
+    // ALTER TABLE — RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn alter_rename_table_basic() {
+        let mut db = seed_users_table();
+        process_command("ALTER TABLE users RENAME TO members;", &mut db).expect("rename table");
+        assert!(!db.contains_table("users".to_string()));
+        assert!(db.contains_table("members".to_string()));
+        // Data still queryable under the new name.
+        let response = process_command("SELECT * FROM members;", &mut db).expect("select");
+        assert!(response.contains("3 rows returned"));
+    }
+
+    #[test]
+    fn alter_rename_table_renames_auto_indexes() {
+        // Use a fresh table with both PK and a UNIQUE column so we
+        // exercise both auto-index renames in one shot.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        {
+            let accounts = db.get_table("accounts".to_string()).unwrap();
+            assert!(
+                accounts
+                    .index_by_name("sqlrite_autoindex_accounts_id")
+                    .is_some()
+            );
+            assert!(
+                accounts
+                    .index_by_name("sqlrite_autoindex_accounts_email")
+                    .is_some()
+            );
+        }
+        process_command("ALTER TABLE accounts RENAME TO members;", &mut db).expect("rename");
+        let members = db.get_table("members".to_string()).unwrap();
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_id")
+                .is_some(),
+            "PK auto-index should be renamed to match new table"
+        );
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_email")
+                .is_some()
+        );
+        // The old-named auto-indexes should be gone.
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_accounts_id")
+                .is_none()
+        );
+        // table_name field on each index should also reflect the rename.
+        for idx in &members.secondary_indexes {
+            assert_eq!(idx.table_name, "members");
+        }
+    }
+
+    #[test]
+    fn alter_rename_table_to_existing_errors() {
+        let mut db = seed_users_table();
+        process_command("CREATE TABLE other (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        let err = process_command("ALTER TABLE users RENAME TO other;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "got: {err}");
+        // Both tables still present.
+        assert!(db.contains_table("users".to_string()));
+        assert!(db.contains_table("other".to_string()));
+    }
+
+    #[test]
+    fn alter_rename_table_to_reserved_name_errors() {
+        let mut db = seed_users_table();
+        let err =
+            process_command("ALTER TABLE users RENAME TO sqlrite_master;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn alter_rename_column_basic() {
+        let mut db = seed_users_table();
+        process_command(
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+            &mut db,
+        )
+        .expect("rename column");
+
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("full_name".to_string()));
+        assert!(!users.contains_column("name".to_string()));
+
+        // Existing data is queryable under the new column name and value
+        // is preserved at the same rowid.
+        let bob_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("full_name", *r) == Some(Value::Text("bob".to_string())))
+            .expect("bob row should be findable under the new column name");
+        assert_eq!(
+            users.get_value("full_name", bob_rowid),
+            Some(Value::Text("bob".to_string()))
+        );
+    }
+
+    #[test]
+    fn alter_rename_column_collision_errors() {
+        let mut db = seed_users_table();
+        let err =
+            process_command("ALTER TABLE users RENAME COLUMN name TO age;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn alter_rename_column_updates_indexes() {
+        // `accounts.email` is UNIQUE → has a renameable auto-index.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "ALTER TABLE accounts RENAME COLUMN email TO contact;",
+            &mut db,
+        )
+        .unwrap();
+        let accounts = db.get_table("accounts".to_string()).unwrap();
+        assert!(
+            accounts
+                .index_by_name("sqlrite_autoindex_accounts_contact")
+                .is_some()
+        );
+        assert!(
+            accounts
+                .index_by_name("sqlrite_autoindex_accounts_email")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn alter_add_column_basic() {
+        let mut db = seed_users_table();
+        process_command("ALTER TABLE users ADD COLUMN nickname TEXT;", &mut db)
+            .expect("add column");
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("nickname".to_string()));
+        // Existing rows read NULL for the new column (no default given).
+        let any_rowid = *users.rowids().first().expect("seed has rows");
+        assert_eq!(users.get_value("nickname", any_rowid), None);
+
+        // A new INSERT supplying the new column works.
+        process_command(
+            "INSERT INTO users (name, age, nickname) VALUES ('dan', 22, 'd');",
+            &mut db,
+        )
+        .expect("insert with new col");
+        let users = db.get_table("users".to_string()).unwrap();
+        let dan_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("name", *r) == Some(Value::Text("dan".to_string())))
+            .unwrap();
+        assert_eq!(
+            users.get_value("nickname", dan_rowid),
+            Some(Value::Text("d".to_string()))
+        );
+    }
+
+    #[test]
+    fn alter_add_column_with_default_backfills_existing_rows() {
+        let mut db = seed_users_table();
+        process_command(
+            "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';",
+            &mut db,
+        )
+        .expect("add column with default");
+        let users = db.get_table("users".to_string()).unwrap();
+        for rowid in users.rowids() {
+            assert_eq!(
+                users.get_value("status", rowid),
+                Some(Value::Text("active".to_string())),
+                "rowid {rowid} should have been backfilled with the default"
+            );
+        }
+    }
+
+    #[test]
+    fn alter_add_column_not_null_with_default_works_on_nonempty_table() {
+        let mut db = seed_users_table();
+        process_command(
+            "ALTER TABLE users ADD COLUMN score INTEGER NOT NULL DEFAULT 0;",
+            &mut db,
+        )
+        .expect("NOT NULL ADD with DEFAULT should succeed even with existing rows");
+        let users = db.get_table("users".to_string()).unwrap();
+        for rowid in users.rowids() {
+            assert_eq!(users.get_value("score", rowid), Some(Value::Integer(0)));
+        }
+    }
+
+    #[test]
+    fn alter_add_column_not_null_without_default_errors_on_nonempty_table() {
+        let mut db = seed_users_table();
+        let err = process_command(
+            "ALTER TABLE users ADD COLUMN score INTEGER NOT NULL;",
+            &mut db,
+        )
+        .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("not null") && msg.contains("default"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn alter_add_column_pk_rejected() {
+        let mut db = seed_users_table();
+        let err = process_command(
+            "ALTER TABLE users ADD COLUMN extra INTEGER PRIMARY KEY;",
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("primary key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alter_add_column_unique_rejected() {
+        let mut db = seed_users_table();
+        let err = process_command(
+            "ALTER TABLE users ADD COLUMN extra INTEGER UNIQUE;",
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("unique"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alter_add_column_existing_name_errors() {
+        let mut db = seed_users_table();
+        let err =
+            process_command("ALTER TABLE users ADD COLUMN age INTEGER;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "got: {err}");
+    }
+
+    // Note: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` is not in the
+    // SQLite dialect (PG/MSSQL extension); the AST `if_not_exists` flag is
+    // still honoured by the executor if some other dialect ever produces
+    // it, but there's no way to feed it via SQL in our default dialect.
+
+    #[test]
+    fn alter_drop_column_basic() {
+        let mut db = seed_users_table();
+        process_command("ALTER TABLE users DROP COLUMN age;", &mut db).expect("drop column");
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(!users.contains_column("age".to_string()));
+        // Other columns and rowids still intact.
+        assert!(users.contains_column("name".to_string()));
+        assert_eq!(users.rowids().len(), 3);
+    }
+
+    #[test]
+    fn alter_drop_column_drops_dependent_indexes() {
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        process_command("ALTER TABLE users DROP COLUMN age;", &mut db).unwrap();
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(users.index_by_name("users_age_idx").is_none());
+    }
+
+    #[test]
+    fn alter_drop_column_pk_errors() {
+        let mut db = seed_users_table();
+        let err = process_command("ALTER TABLE users DROP COLUMN id;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("primary key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alter_drop_column_only_column_errors() {
+        let mut db = Database::new("t".to_string());
+        process_command("CREATE TABLE solo (only_col TEXT);", &mut db).unwrap();
+        let err = process_command("ALTER TABLE solo DROP COLUMN only_col;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("only column"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alter_unknown_table_errors_without_if_exists() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("ALTER TABLE missing RENAME TO other;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn alter_unknown_table_if_exists_noop() {
+        let mut db = Database::new("t".to_string());
+        let response = process_command("ALTER TABLE IF EXISTS missing RENAME TO other;", &mut db)
+            .expect("IF EXISTS makes missing-table ALTER a no-op");
+        assert!(response.contains("no-op"));
+    }
+
+    #[test]
+    fn drop_table_inside_transaction_rolls_back() {
+        // Exercises Database::deep_clone snapshot path with DROP TABLE.
+        // A wholesale tables-HashMap restore on ROLLBACK should resurrect
+        // the dropped table — including its data and dependent indexes.
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command("DROP TABLE users;", &mut db).unwrap();
+        assert!(!db.contains_table("users".to_string()));
+        process_command("ROLLBACK;", &mut db).unwrap();
+        assert!(db.contains_table("users".to_string()));
+        let users = db.get_table("users".to_string()).unwrap();
+        assert_eq!(users.rowids().len(), 3);
+        assert!(users.index_by_name("users_age_idx").is_some());
+    }
+
+    #[test]
+    fn alter_inside_transaction_rolls_back() {
+        let mut db = seed_users_table();
+        process_command("BEGIN;", &mut db).unwrap();
+        process_command(
+            "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';",
+            &mut db,
+        )
+        .unwrap();
+        // Confirm in-flight visibility.
+        assert!(
+            db.get_table("users".to_string())
+                .unwrap()
+                .contains_column("status".to_string())
+        );
+        process_command("ROLLBACK;", &mut db).unwrap();
+        // Snapshot restore should erase the ALTER.
+        assert!(
+            !db.get_table("users".to_string())
+                .unwrap()
+                .contains_column("status".to_string())
+        );
+    }
+
+    #[test]
+    fn alter_rejected_on_readonly_db() {
+        use crate::sql::pager::{open_database_read_only, save_database};
+
+        let mut seed = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut seed,
+        )
+        .unwrap();
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-alter-ro-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        save_database(&mut seed, &path).unwrap();
+        drop(seed);
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        for stmt in [
+            "ALTER TABLE notes RENAME TO n2;",
+            "ALTER TABLE notes RENAME COLUMN body TO b;",
+            "ALTER TABLE notes ADD COLUMN extra TEXT;",
+            "ALTER TABLE notes DROP COLUMN body;",
+        ] {
+            let err = process_command(stmt, &mut ro).unwrap_err();
+            assert!(
+                format!("{err}").contains("read-only"),
+                "{stmt:?} should surface read-only error, got: {err}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
     }
 }
