@@ -207,12 +207,13 @@ impl Table {
             if col.is_pk {
                 primary_key = col_name.to_string();
             }
-            table_cols.push(Column::new(
+            table_cols.push(Column::with_default(
                 col_name.to_string(),
                 col.datatype.to_string(),
                 col.is_pk,
                 col.not_null,
                 col.is_unique,
+                col.default.clone(),
             ));
 
             let dt = DataType::new(col.datatype.to_string());
@@ -822,10 +823,12 @@ impl Table {
         for i in 0..column_names.len() {
             let mut val = String::from("Null");
             let key = &column_names[i];
+            let mut column_supplied = false;
 
             if let Some(supplied_key) = cols.get(j) {
                 if supplied_key == &column_names[i] {
                     val = values[j].to_string();
+                    column_supplied = true;
                     j += 1;
                 } else if self.primary_key == column_names[i] {
                     // PK already stored in the auto-assign branch above.
@@ -833,6 +836,17 @@ impl Table {
                 }
             } else if self.primary_key == column_names[i] {
                 continue;
+            }
+
+            // Column was omitted from the INSERT column list. Substitute its
+            // DEFAULT literal if one was declared at CREATE TABLE time;
+            // otherwise it stays as the "Null" sentinel set above. SQLite
+            // semantics: an *explicit* NULL is preserved as NULL — the
+            // default only fires for omitted columns.
+            if !column_supplied {
+                if let Some(default) = &self.columns[i].default {
+                    val = default.to_default_insert_string();
+                }
             }
 
             // Step 1: write into row storage and compute the typed Value
@@ -1129,15 +1143,36 @@ pub struct Column {
     pub is_pk: bool,
     pub not_null: bool,
     pub is_unique: bool,
+    /// Literal value to substitute when this column is omitted from an
+    /// INSERT. Restricted to literal expressions at CREATE TABLE time.
+    /// `None` means "no DEFAULT declared"; an INSERT that omits the column
+    /// gets `Value::Null` instead.
+    pub default: Option<Value>,
 }
 
 impl Column {
+    /// Builds a `Column` without a `DEFAULT` clause. Existing call sites
+    /// (catalog-table setup, test fixtures) keep working unchanged.
     pub fn new(
         name: String,
         datatype: String,
         is_pk: bool,
         not_null: bool,
         is_unique: bool,
+    ) -> Self {
+        Self::with_default(name, datatype, is_pk, not_null, is_unique, None)
+    }
+
+    /// Builds a `Column` with an optional `DEFAULT` literal. Used by the
+    /// CREATE TABLE / `parse_create_sql` paths that propagate user-supplied
+    /// defaults from `ParsedColumn`.
+    pub fn with_default(
+        name: String,
+        datatype: String,
+        is_pk: bool,
+        not_null: bool,
+        is_unique: bool,
+        default: Option<Value>,
     ) -> Self {
         let dt = DataType::new(datatype);
         Column {
@@ -1146,6 +1181,7 @@ impl Column {
             is_pk,
             not_null,
             is_unique,
+            default,
         }
     }
 }
@@ -1273,6 +1309,25 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Vector(v) => format_vector_for_display(v),
             Value::Null => String::from("NULL"),
+        }
+    }
+
+    /// Renders this value in the same stringly format that
+    /// [`crate::sql::parser::insert::InsertQuery::new`] produces for INSERT
+    /// values, so a DEFAULT can be substituted into the existing
+    /// `insert_row` parse pipeline without a parallel typed path.
+    ///
+    /// The differences from [`Self::to_display_string`] that matter:
+    ///   - `NULL` renders as the `"Null"` sentinel that `insert_row` matches.
+    ///   - Text stays unquoted (the insert pipeline strips quotes upstream).
+    pub fn to_default_insert_string(&self) -> String {
+        match self {
+            Value::Integer(v) => v.to_string(),
+            Value::Text(s) => s.clone(),
+            Value::Real(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Vector(v) => format_vector_for_display(v),
+            Value::Null => String::from("Null"),
         }
     }
 }

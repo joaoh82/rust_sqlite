@@ -2097,4 +2097,103 @@ mod tests {
             "got: {msg}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // DEFAULT clause on CREATE TABLE columns
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn default_literal_int_applies_when_column_omitted() {
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 42);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        assert_eq!(table.get_value("n", 1), Some(Value::Integer(42)));
+    }
+
+    #[test]
+    fn default_literal_text_applies_when_column_omitted() {
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active');",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO users (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("users".to_string()).unwrap();
+        assert_eq!(
+            table.get_value("status", 1),
+            Some(Value::Text("active".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_literal_real_negative_applies_when_column_omitted() {
+        // `DEFAULT -1.5` arrives as a UnaryOp(Minus, Number) — exercise that path.
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, score REAL DEFAULT -1.5);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id) VALUES (1);", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        assert_eq!(table.get_value("score", 1), Some(Value::Real(-1.5)));
+    }
+
+    #[test]
+    fn default_with_type_mismatch_errors_at_create_time() {
+        let mut db = Database::new("t".to_string());
+        let result = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 'oops');",
+            &mut db,
+        );
+        let err = result.expect_err("text default on INTEGER column should be rejected");
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("default"), "got: {msg}");
+    }
+
+    #[test]
+    fn default_with_non_literal_expression_errors_at_create_time() {
+        let mut db = Database::new("t".to_string());
+        // Function-call DEFAULT (e.g. CURRENT_TIMESTAMP) → rejected; we only
+        // accept literal expressions for now.
+        let result = process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP);",
+            &mut db,
+        );
+        let err = result.expect_err("non-literal DEFAULT should be rejected");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("default") && msg.contains("literal"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_null_is_accepted_at_create_time() {
+        // `DEFAULT NULL` is a no-op equivalent to no DEFAULT clause; the
+        // important thing is that CREATE TABLE accepts it without error
+        // (some DDL exporters emit `DEFAULT NULL` redundantly).
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT DEFAULT NULL);",
+            &mut db,
+        )
+        .expect("CREATE TABLE with DEFAULT NULL should be accepted");
+        let table = db.get_table("t".to_string()).unwrap();
+        let note = table
+            .columns
+            .iter()
+            .find(|c| c.column_name == "note")
+            .unwrap();
+        assert_eq!(note.default, Some(Value::Null));
+    }
 }

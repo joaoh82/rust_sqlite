@@ -443,9 +443,35 @@ fn table_to_create_sql(table: &Table) -> String {
                 piece.push_str(" NOT NULL");
             }
         }
+        if let Some(default) = &c.default {
+            piece.push_str(" DEFAULT ");
+            piece.push_str(&render_default_literal(default));
+        }
         parts.push(piece);
     }
     format!("CREATE TABLE {} ({});", table.tb_name, parts.join(", "))
+}
+
+/// Renders a DEFAULT value back to SQL-literal form so the synthesized
+/// CREATE TABLE round-trips through `parse_create_sql`. Text values get
+/// single-quoted with single-quote doubling for escaping. Vector defaults
+/// are not currently expressible at CREATE TABLE time, so we render them
+/// as their bracket-array form (matches the INSERT literal grammar).
+fn render_default_literal(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => f.to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Null => "NULL".to_string(),
+        Value::Vector(_) => value.to_display_string(),
+    }
 }
 
 /// Reverses `table_to_create_sql`: feeds the SQL back through `sqlparser`
@@ -460,7 +486,16 @@ fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
     let columns = create
         .columns
         .into_iter()
-        .map(|pc| Column::new(pc.name, pc.datatype, pc.is_pk, pc.not_null, pc.is_unique))
+        .map(|pc| {
+            Column::with_default(
+                pc.name,
+                pc.datatype,
+                pc.is_pk,
+                pc.not_null,
+                pc.is_unique,
+                pc.default,
+            )
+        })
         .collect();
     Ok((create.table_name, columns))
 }
@@ -2517,6 +2552,56 @@ mod tests {
             PageType::InteriorNode as u8,
             "expected 3-level tree: root's leftmost child should also be InteriorNode",
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn default_clause_survives_save_and_reopen() {
+        let path = tmp_path("default_roundtrip");
+        let mut db = Database::new("t".to_string());
+
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', score INTEGER DEFAULT 0);",
+            &mut db,
+        )
+        .unwrap();
+        save_database(&mut db, &path).expect("save");
+
+        let mut loaded = open_database(&path, "t".to_string()).expect("open");
+
+        // The reloaded column metadata should still carry the DEFAULT.
+        let users = loaded.get_table("users".to_string()).expect("users table");
+        let status_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "status")
+            .expect("status column");
+        assert_eq!(
+            status_col.default,
+            Some(Value::Text("active".to_string())),
+            "DEFAULT 'active' should round-trip"
+        );
+        let score_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "score")
+            .expect("score column");
+        assert_eq!(
+            score_col.default,
+            Some(Value::Integer(0)),
+            "DEFAULT 0 should round-trip"
+        );
+
+        // Now exercise the runtime path: an INSERT that omits both DEFAULT
+        // columns should pick them up from the reloaded schema.
+        process_command("INSERT INTO users (id) VALUES (1);", &mut loaded).unwrap();
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert_eq!(
+            users.get_value("status", 1),
+            Some(Value::Text("active".to_string()))
+        );
+        assert_eq!(users.get_value("score", 1), Some(Value::Integer(0)));
 
         cleanup(&path);
     }
