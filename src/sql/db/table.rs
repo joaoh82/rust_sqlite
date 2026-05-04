@@ -2,7 +2,7 @@ use crate::error::{Result, SQLRiteError};
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::fts::PostingList;
 use crate::sql::hnsw::HnswIndex;
-use crate::sql::parser::create::CreateQuery;
+use crate::sql::parser::create::{CreateQuery, ParsedColumn};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -327,11 +327,233 @@ impl Table {
     }
 
     /// Finds a secondary index by its own name (e.g., `sqlrite_autoindex_users_email`
-    /// or a user-provided CREATE INDEX name). Used by Phase 3e.2 to look up
-    /// explicit indexes when DROP INDEX lands.
-    #[allow(dead_code)]
+    /// or a user-provided CREATE INDEX name). Used by DROP INDEX and the
+    /// rename helpers below.
     pub fn index_by_name(&self, name: &str) -> Option<&SecondaryIndex> {
         self.secondary_indexes.iter().find(|i| i.name == name)
+    }
+
+    /// Renames a column in place. Updates row storage, the `Column`
+    /// metadata, every secondary / HNSW / FTS index whose `column_name`
+    /// matches, the `primary_key` pointer if the renamed column is the
+    /// PK, and any auto-index name that embedded the old column name.
+    ///
+    /// Caller-side validation (table existence, source-column existence
+    /// at the surface level, IF EXISTS) lives in the executor; this
+    /// method enforces the column-level invariants that have to be
+    /// checked under the `Table` borrow anyway.
+    pub fn rename_column(&mut self, old: &str, new: &str) -> Result<()> {
+        if !self.columns.iter().any(|c| c.column_name == old) {
+            return Err(SQLRiteError::General(format!(
+                "column '{old}' does not exist in table '{}'",
+                self.tb_name
+            )));
+        }
+        if old != new && self.columns.iter().any(|c| c.column_name == new) {
+            return Err(SQLRiteError::General(format!(
+                "column '{new}' already exists in table '{}'",
+                self.tb_name
+            )));
+        }
+        if old == new {
+            return Ok(());
+        }
+
+        for col in self.columns.iter_mut() {
+            if col.column_name == old {
+                col.column_name = new.to_string();
+            }
+        }
+
+        // Re-key the per-column row map.
+        {
+            let mut rows = self.rows.lock().expect("rows mutex poisoned");
+            if let Some(storage) = rows.remove(old) {
+                rows.insert(new.to_string(), storage);
+            }
+        }
+
+        if self.primary_key == old {
+            self.primary_key = new.to_string();
+        }
+
+        let table_name = self.tb_name.clone();
+        for idx in self.secondary_indexes.iter_mut() {
+            if idx.column_name == old {
+                idx.column_name = new.to_string();
+                if idx.origin == IndexOrigin::Auto
+                    && idx.name == SecondaryIndex::auto_name(&table_name, old)
+                {
+                    idx.name = SecondaryIndex::auto_name(&table_name, new);
+                }
+            }
+        }
+        for entry in self.hnsw_indexes.iter_mut() {
+            if entry.column_name == old {
+                entry.column_name = new.to_string();
+            }
+        }
+        for entry in self.fts_indexes.iter_mut() {
+            if entry.column_name == old {
+                entry.column_name = new.to_string();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Appends a new column to this table from a parsed column spec.
+    /// The new column's row storage is allocated empty; existing rowids
+    /// read NULL for the new column unless `parsed.default` is set, in
+    /// which case those rowids are backfilled with the default value.
+    ///
+    /// Rejects PK / UNIQUE on the added column (would require
+    /// backfill-with-uniqueness-check against existing rows). Rejects
+    /// NOT NULL without DEFAULT on a non-empty table — same rule SQLite
+    /// applies, and necessary because we have no other backfill source.
+    pub fn add_column(&mut self, parsed: ParsedColumn) -> Result<()> {
+        if self.contains_column(parsed.name.clone()) {
+            return Err(SQLRiteError::General(format!(
+                "column '{}' already exists in table '{}'",
+                parsed.name, self.tb_name
+            )));
+        }
+        if parsed.is_pk {
+            return Err(SQLRiteError::General(
+                "cannot ADD COLUMN with PRIMARY KEY constraint on existing table".to_string(),
+            ));
+        }
+        if parsed.is_unique {
+            return Err(SQLRiteError::General(
+                "cannot ADD COLUMN with UNIQUE constraint on existing table".to_string(),
+            ));
+        }
+        let table_has_rows = self
+            .columns
+            .first()
+            .map(|c| {
+                self.rows
+                    .lock()
+                    .expect("rows mutex poisoned")
+                    .get(&c.column_name)
+                    .map(|r| r.rowids().len())
+                    .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or(false);
+        if parsed.not_null && parsed.default.is_none() && table_has_rows {
+            return Err(SQLRiteError::General(format!(
+                "cannot ADD COLUMN '{}' NOT NULL without DEFAULT to a non-empty table",
+                parsed.name
+            )));
+        }
+
+        let new_column = Column::with_default(
+            parsed.name.clone(),
+            parsed.datatype.clone(),
+            parsed.is_pk,
+            parsed.not_null,
+            parsed.is_unique,
+            parsed.default.clone(),
+        );
+
+        // Allocate empty row storage for the new column. Mirrors the
+        // dispatch in `Table::new` so the new column behaves identically
+        // to one declared at CREATE TABLE time.
+        let row_storage = match &new_column.datatype {
+            DataType::Integer => Row::Integer(BTreeMap::new()),
+            DataType::Real => Row::Real(BTreeMap::new()),
+            DataType::Text => Row::Text(BTreeMap::new()),
+            DataType::Bool => Row::Bool(BTreeMap::new()),
+            DataType::Vector(_dim) => Row::Vector(BTreeMap::new()),
+            DataType::Json => Row::Text(BTreeMap::new()),
+            DataType::Invalid | DataType::None => Row::None,
+        };
+        {
+            let mut rows = self.rows.lock().expect("rows mutex poisoned");
+            rows.insert(parsed.name.clone(), row_storage);
+        }
+
+        // Backfill existing rowids with the default value, if any.
+        // NULL defaults are a no-op — a missing key in the BTreeMap reads
+        // as NULL anyway. Type mismatches were caught at `parse_one_column`
+        // time when the DEFAULT was evaluated against the declared
+        // datatype; reaching the `_` arm here would indicate a bug.
+        if let Some(default) = &parsed.default {
+            let existing_rowids = self.rowids();
+            let mut rows = self.rows.lock().expect("rows mutex poisoned");
+            let storage = rows.get_mut(&parsed.name).expect("just inserted");
+            match (storage, default) {
+                (Row::Integer(tree), Value::Integer(v)) => {
+                    let v32 = *v as i32;
+                    for rowid in existing_rowids {
+                        tree.insert(rowid, v32);
+                    }
+                }
+                (Row::Real(tree), Value::Real(v)) => {
+                    let v32 = *v as f32;
+                    for rowid in existing_rowids {
+                        tree.insert(rowid, v32);
+                    }
+                }
+                (Row::Text(tree), Value::Text(v)) => {
+                    for rowid in existing_rowids {
+                        tree.insert(rowid, v.clone());
+                    }
+                }
+                (Row::Bool(tree), Value::Bool(v)) => {
+                    for rowid in existing_rowids {
+                        tree.insert(rowid, *v);
+                    }
+                }
+                (_, Value::Null) => {} // no-op
+                (storage_ref, _) => {
+                    return Err(SQLRiteError::Internal(format!(
+                        "DEFAULT type does not match column storage for '{}': storage variant {:?}, default {:?}",
+                        parsed.name,
+                        std::mem::discriminant(storage_ref),
+                        default
+                    )));
+                }
+            }
+        }
+
+        self.columns.push(new_column);
+        Ok(())
+    }
+
+    /// Removes a column from this table. Refuses to drop the PRIMARY KEY
+    /// column or the only remaining column. Cascades to every index
+    /// (auto, explicit, HNSW, FTS) that referenced the column.
+    pub fn drop_column(&mut self, name: &str) -> Result<()> {
+        if !self.contains_column(name.to_string()) {
+            return Err(SQLRiteError::General(format!(
+                "column '{name}' does not exist in table '{}'",
+                self.tb_name
+            )));
+        }
+        if self.primary_key == name {
+            return Err(SQLRiteError::General(format!(
+                "cannot drop primary key column '{name}'"
+            )));
+        }
+        if self.columns.len() == 1 {
+            return Err(SQLRiteError::General(format!(
+                "cannot drop the only column of table '{}'",
+                self.tb_name
+            )));
+        }
+
+        self.columns.retain(|c| c.column_name != name);
+        {
+            let mut rows = self.rows.lock().expect("rows mutex poisoned");
+            rows.remove(name);
+        }
+        self.secondary_indexes.retain(|i| i.column_name != name);
+        self.hnsw_indexes.retain(|i| i.column_name != name);
+        self.fts_indexes.retain(|i| i.column_name != name);
+
+        Ok(())
     }
 
     /// Returns a `bool` informing if a `Column` with a specific name exists or not

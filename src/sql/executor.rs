@@ -5,9 +5,10 @@ use std::cmp::Ordering;
 
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, IndexType, ObjectName, ObjectNamePart, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Update, Value as AstValue,
+    AlterTable, AlterTableOperation, AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, IndexType, ObjectName,
+    ObjectNamePart, RenameTableNameKind, Statement, TableFactor, TableWithJoins, UnaryOperator,
+    Update, Value as AstValue,
 };
 
 use crate::error::{Result, SQLRiteError};
@@ -602,6 +603,156 @@ pub fn execute_drop_index(
             "Index '{name}' does not exist"
         )))
     }
+}
+
+/// Executes `ALTER TABLE [IF EXISTS] <name> <op>;` for one operation per
+/// statement. Supports four sub-operations matching SQLite:
+///
+///   - `RENAME TO <new>`
+///   - `RENAME COLUMN <old> TO <new>`
+///   - `ADD COLUMN <coldef>` (NOT NULL requires DEFAULT on a non-empty table;
+///     PK / UNIQUE constraints rejected — would need backfill + uniqueness)
+///   - `DROP COLUMN <name>` (refuses PK column and only-column)
+///
+/// Multi-operation ALTER (`ALTER TABLE foo RENAME TO bar, ADD COLUMN x ...`)
+/// is rejected; SQLite forbids it too.
+pub fn execute_alter_table(alter: AlterTable, db: &mut Database) -> Result<String> {
+    let table_name = alter.name.to_string();
+
+    if table_name == crate::sql::pager::MASTER_TABLE_NAME {
+        return Err(SQLRiteError::General(format!(
+            "'{}' is a reserved name used by the internal schema catalog",
+            crate::sql::pager::MASTER_TABLE_NAME
+        )));
+    }
+
+    if !db.contains_table(table_name.clone()) {
+        return if alter.if_exists {
+            Ok("ALTER TABLE: no-op (table does not exist)".to_string())
+        } else {
+            Err(SQLRiteError::General(format!(
+                "Table '{table_name}' does not exist"
+            )))
+        };
+    }
+
+    if alter.operations.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "ALTER TABLE supports one operation per statement".to_string(),
+        ));
+    }
+
+    match &alter.operations[0] {
+        AlterTableOperation::RenameTable { table_name: kind } => {
+            let new_name = match kind {
+                RenameTableNameKind::To(name) => name.to_string(),
+                RenameTableNameKind::As(_) => {
+                    return Err(SQLRiteError::NotImplemented(
+                        "ALTER TABLE ... RENAME AS (MySQL-only) is not supported; use RENAME TO"
+                            .to_string(),
+                    ));
+                }
+            };
+            alter_rename_table(db, &table_name, &new_name)?;
+            Ok(format!(
+                "ALTER TABLE '{table_name}' RENAME TO '{new_name}' executed."
+            ))
+        }
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => {
+            let old = old_column_name.value.clone();
+            let new = new_column_name.value.clone();
+            db.get_table_mut(table_name.clone())?
+                .rename_column(&old, &new)?;
+            Ok(format!(
+                "ALTER TABLE '{table_name}' RENAME COLUMN '{old}' TO '{new}' executed."
+            ))
+        }
+        AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            ..
+        } => {
+            let parsed = crate::sql::parser::create::parse_one_column(column_def)?;
+            let table = db.get_table_mut(table_name.clone())?;
+            if *if_not_exists && table.contains_column(parsed.name.clone()) {
+                return Ok(format!(
+                    "ALTER TABLE '{table_name}' ADD COLUMN: no-op (column '{}' already exists)",
+                    parsed.name
+                ));
+            }
+            let col_name = parsed.name.clone();
+            table.add_column(parsed)?;
+            Ok(format!(
+                "ALTER TABLE '{table_name}' ADD COLUMN '{col_name}' executed."
+            ))
+        }
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
+            if column_names.len() != 1 {
+                return Err(SQLRiteError::NotImplemented(
+                    "ALTER TABLE DROP COLUMN supports a single column per statement".to_string(),
+                ));
+            }
+            let col_name = column_names[0].value.clone();
+            let table = db.get_table_mut(table_name.clone())?;
+            if *if_exists && !table.contains_column(col_name.clone()) {
+                return Ok(format!(
+                    "ALTER TABLE '{table_name}' DROP COLUMN: no-op (column '{col_name}' does not exist)"
+                ));
+            }
+            table.drop_column(&col_name)?;
+            Ok(format!(
+                "ALTER TABLE '{table_name}' DROP COLUMN '{col_name}' executed."
+            ))
+        }
+        other => Err(SQLRiteError::NotImplemented(format!(
+            "ALTER TABLE operation {other:?} is not supported"
+        ))),
+    }
+}
+
+/// Renames a table in `db.tables`. Updates `tb_name`, every secondary
+/// index's `table_name` field, and any auto-index whose name embedded
+/// the old table name. HNSW / FTS index entries don't carry a
+/// `table_name` field — they're addressed implicitly via the `Table`
+/// they live inside, so they move with the rename for free.
+fn alter_rename_table(db: &mut Database, old: &str, new: &str) -> Result<()> {
+    if new == crate::sql::pager::MASTER_TABLE_NAME {
+        return Err(SQLRiteError::General(format!(
+            "'{}' is a reserved name used by the internal schema catalog",
+            crate::sql::pager::MASTER_TABLE_NAME
+        )));
+    }
+    if old == new {
+        return Ok(());
+    }
+    if db.contains_table(new.to_string()) {
+        return Err(SQLRiteError::General(format!(
+            "target table '{new}' already exists"
+        )));
+    }
+
+    let mut table = db
+        .tables
+        .remove(old)
+        .ok_or_else(|| SQLRiteError::General(format!("Table '{old}' does not exist")))?;
+    table.tb_name = new.to_string();
+    for idx in table.secondary_indexes.iter_mut() {
+        idx.table_name = new.to_string();
+        if idx.origin == IndexOrigin::Auto
+            && idx.name == SecondaryIndex::auto_name(old, &idx.column_name)
+        {
+            idx.name = SecondaryIndex::auto_name(new, &idx.column_name);
+        }
+    }
+    db.tables.insert(new.to_string(), table);
+    Ok(())
 }
 
 /// `USING <method>` choices recognized by `execute_create_index`. A

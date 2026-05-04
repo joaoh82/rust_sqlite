@@ -2557,6 +2557,118 @@ mod tests {
     }
 
     #[test]
+    fn alter_rename_table_survives_save_and_reopen() {
+        let path = tmp_path("alter_rename_table_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("ALTER TABLE users RENAME TO members;", &mut db).expect("rename");
+        save_database(&mut db, &path).expect("save after rename");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        assert!(!loaded.contains_table("users".to_string()));
+        assert!(loaded.contains_table("members".to_string()));
+        let members = loaded.get_table("members".to_string()).unwrap();
+        assert_eq!(members.rowids().len(), 2, "rows should survive");
+        // Auto-indexes followed the rename.
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_id")
+                .is_some()
+        );
+        assert!(
+            members
+                .index_by_name("sqlrite_autoindex_members_name")
+                .is_some()
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_rename_column_survives_save_and_reopen() {
+        let path = tmp_path("alter_rename_col_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command(
+            "ALTER TABLE users RENAME COLUMN name TO full_name;",
+            &mut db,
+        )
+        .expect("rename column");
+        save_database(&mut db, &path).expect("save after rename");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("full_name".to_string()));
+        assert!(!users.contains_column("name".to_string()));
+        // Verify a row's value survived the rename round-trip.
+        let alice_rowid = users
+            .rowids()
+            .into_iter()
+            .find(|r| users.get_value("full_name", *r) == Some(Value::Text("alice".to_string())))
+            .expect("alice row should be findable under renamed column");
+        assert_eq!(
+            users.get_value("full_name", alice_rowid),
+            Some(Value::Text("alice".to_string()))
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_add_column_with_default_survives_save_and_reopen() {
+        let path = tmp_path("alter_add_default_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command(
+            "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';",
+            &mut db,
+        )
+        .expect("add column");
+        save_database(&mut db, &path).expect("save after add");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(users.contains_column("status".to_string()));
+        for rowid in users.rowids() {
+            assert_eq!(
+                users.get_value("status", rowid),
+                Some(Value::Text("active".to_string())),
+                "backfilled default should round-trip for rowid {rowid}"
+            );
+        }
+        // The DEFAULT clause itself should still be on the column metadata
+        // so a subsequent INSERT picks it up.
+        let status_col = users
+            .columns
+            .iter()
+            .find(|c| c.column_name == "status")
+            .unwrap();
+        assert_eq!(status_col.default, Some(Value::Text("active".to_string())));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn alter_drop_column_survives_save_and_reopen() {
+        let path = tmp_path("alter_drop_col_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("ALTER TABLE users DROP COLUMN age;", &mut db).expect("drop column");
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let users = loaded.get_table("users".to_string()).unwrap();
+        assert!(!users.contains_column("age".to_string()));
+        assert!(users.contains_column("name".to_string()));
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn drop_table_survives_save_and_reopen() {
         let path = tmp_path("drop_table_roundtrip");
         let mut db = seed_db();
