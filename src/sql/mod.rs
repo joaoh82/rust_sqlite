@@ -10,7 +10,7 @@ use parser::create::CreateQuery;
 use parser::insert::InsertQuery;
 use parser::select::SelectQuery;
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectType, Statement};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
@@ -167,6 +167,8 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
+            | Statement::Drop { .. }
+            | Statement::AlterTable(_)
     );
 
     // Early-reject mutations on a read-only database before they touch
@@ -311,6 +313,28 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             let name = executor::execute_create_index(&query, db)?;
             message = format!("CREATE INDEX '{name}' executed.");
         }
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => match object_type {
+            ObjectType::Table => {
+                let count = executor::execute_drop_table(&names, if_exists, db)?;
+                let plural = if count == 1 { "table" } else { "tables" };
+                message = format!("DROP TABLE Statement executed. {count} {plural} dropped.");
+            }
+            ObjectType::Index => {
+                let count = executor::execute_drop_index(&names, if_exists, db)?;
+                let plural = if count == 1 { "index" } else { "indexes" };
+                message = format!("DROP INDEX Statement executed. {count} {plural} dropped.");
+            }
+            other => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "DROP {other:?} is not supported (only TABLE and INDEX)"
+                )));
+            }
+        },
         _ => {
             return Err(SQLRiteError::NotImplemented(
                 "SQL Statement not supported yet.".to_string(),
@@ -601,8 +625,10 @@ mod tests {
     #[test]
     fn process_command_unsupported_statement_test() {
         let mut db = Database::new("tempdb".to_string());
-        // Nothing in Phase 1 handles DROP.
-        let result = process_command("DROP TABLE users;", &mut db);
+        // CREATE VIEW is firmly in the "Not yet supported" list — used as
+        // the canary for the dispatcher's NotImplemented arm. (DROP TABLE
+        // moved out of unsupported in this branch.)
+        let result = process_command("CREATE VIEW v AS SELECT * FROM users;", &mut db);
         assert!(result.is_err());
     }
 
@@ -2195,5 +2221,150 @@ mod tests {
             .find(|c| c.column_name == "note")
             .unwrap();
         assert_eq!(note.default, Some(Value::Null));
+    }
+
+    // -------------------------------------------------------------------
+    // DROP TABLE / DROP INDEX
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn drop_table_basic() {
+        let mut db = seed_users_table();
+        let response = process_command("DROP TABLE users;", &mut db).expect("drop table");
+        assert!(response.contains("1 table dropped"));
+        assert!(!db.contains_table("users".to_string()));
+    }
+
+    #[test]
+    fn drop_table_if_exists_noop_on_missing() {
+        let mut db = Database::new("t".to_string());
+        let response =
+            process_command("DROP TABLE IF EXISTS missing;", &mut db).expect("drop if exists");
+        assert!(response.contains("0 tables dropped"));
+    }
+
+    #[test]
+    fn drop_table_missing_errors_without_if_exists() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP TABLE missing;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_reserved_name_errors() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP TABLE sqlrite_master;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_multi_target_rejected() {
+        let mut db = seed_users_table();
+        process_command("CREATE TABLE other (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        // sqlparser accepts `DROP TABLE a, b` as one statement; we reject
+        // to keep error semantics simple (no partial-failure rollback).
+        let err = process_command("DROP TABLE users, other;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("single table"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_table_cascades_indexes_in_memory() {
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        // PK auto-index + UNIQUE-on-name auto-index + the explicit one.
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(
+            users
+                .secondary_indexes
+                .iter()
+                .any(|i| i.name == "users_age_idx")
+        );
+
+        process_command("DROP TABLE users;", &mut db).unwrap();
+
+        // After DROP TABLE, no other table should claim the dropped indexes.
+        for table in db.tables.values() {
+            assert!(
+                !table
+                    .secondary_indexes
+                    .iter()
+                    .any(|i| i.name.contains("users")),
+                "dropped table's indexes should not survive on any other table"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_index_explicit_basic() {
+        let mut db = seed_users_table();
+        process_command("CREATE INDEX users_age_idx ON users (age);", &mut db).unwrap();
+        let response = process_command("DROP INDEX users_age_idx;", &mut db).expect("drop index");
+        assert!(response.contains("1 index dropped"));
+
+        let users = db.get_table("users".to_string()).unwrap();
+        assert!(users.index_by_name("users_age_idx").is_none());
+    }
+
+    #[test]
+    fn drop_index_refuses_auto_index() {
+        let mut db = seed_users_table();
+        // `users` was created with `id INTEGER PRIMARY KEY` → auto-index
+        // named `sqlrite_autoindex_users_id`.
+        let err = process_command("DROP INDEX sqlrite_autoindex_users_id;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("auto-created"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_index_if_exists_noop_on_missing() {
+        let mut db = Database::new("t".to_string());
+        let response =
+            process_command("DROP INDEX IF EXISTS nope;", &mut db).expect("drop index if exists");
+        assert!(response.contains("0 indexes dropped"));
+    }
+
+    #[test]
+    fn drop_index_missing_errors_without_if_exists() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("DROP INDEX nope;", &mut db).unwrap_err();
+        assert!(format!("{err}").contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn drop_statements_rejected_on_readonly_db() {
+        use crate::sql::pager::{open_database_read_only, save_database};
+
+        let mut seed = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut seed,
+        )
+        .unwrap();
+        process_command("CREATE INDEX notes_body ON notes (body);", &mut seed).unwrap();
+        let path = {
+            let mut p = std::env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("sqlrite-drop-ro-{pid}-{nanos}.sqlrite"));
+            p
+        };
+        save_database(&mut seed, &path).unwrap();
+        drop(seed);
+
+        let mut ro = open_database_read_only(&path, "t".to_string()).unwrap();
+        for stmt in ["DROP TABLE notes;", "DROP INDEX notes_body;"] {
+            let err = process_command(stmt, &mut ro).unwrap_err();
+            assert!(
+                format!("{err}").contains("read-only"),
+                "{stmt:?} should surface read-only error, got: {err}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
     }
 }

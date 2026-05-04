@@ -6,8 +6,8 @@ use std::cmp::Ordering;
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, IndexType, ObjectNamePart, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Update, Value as AstValue,
+    FunctionArgExpr, FunctionArguments, IndexType, ObjectName, ObjectNamePart, Statement,
+    TableFactor, TableWithJoins, UnaryOperator, Update, Value as AstValue,
 };
 
 use crate::error::{Result, SQLRiteError};
@@ -509,6 +509,98 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
             *unique,
             &existing_rowids_and_values,
         ),
+    }
+}
+
+/// Executes `DROP TABLE [IF EXISTS] <name>;`. Mirrors SQLite's single-target
+/// shape: sqlparser parses `DROP TABLE a, b` as one statement with
+/// `names: vec![a, b]`, but we reject the multi-target form to keep error
+/// semantics simple (no partial-failure rollback).
+///
+/// On success the table — and every index attached to it — disappears from
+/// the in-memory `Database`. The next auto-save rebuilds `sqlrite_master`
+/// from scratch and simply doesn't write a row for the dropped table or
+/// its indexes; pages previously occupied by them become orphans on disk
+/// (no free-list yet — file size doesn't shrink until a future VACUUM).
+pub fn execute_drop_table(
+    names: &[ObjectName],
+    if_exists: bool,
+    db: &mut Database,
+) -> Result<usize> {
+    if names.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "DROP TABLE supports a single table per statement".to_string(),
+        ));
+    }
+    let name = names[0].to_string();
+
+    if name == crate::sql::pager::MASTER_TABLE_NAME {
+        return Err(SQLRiteError::General(format!(
+            "'{}' is a reserved name used by the internal schema catalog",
+            crate::sql::pager::MASTER_TABLE_NAME
+        )));
+    }
+
+    if !db.contains_table(name.clone()) {
+        return if if_exists {
+            Ok(0)
+        } else {
+            Err(SQLRiteError::General(format!(
+                "Table '{name}' does not exist"
+            )))
+        };
+    }
+
+    db.tables.remove(&name);
+    Ok(1)
+}
+
+/// Executes `DROP INDEX [IF EXISTS] <name>;`. The statement does not name a
+/// table, so we walk every table looking for the index across all three
+/// index families (B-Tree secondary, HNSW, FTS).
+///
+/// Refuses to drop auto-indexes (`origin == IndexOrigin::Auto`) — those are
+/// invariants of the table's PRIMARY KEY / UNIQUE constraints and should
+/// only disappear when the column or table they depend on is dropped.
+/// SQLite has the same rule for its `sqlite_autoindex_*` indexes.
+pub fn execute_drop_index(
+    names: &[ObjectName],
+    if_exists: bool,
+    db: &mut Database,
+) -> Result<usize> {
+    if names.len() != 1 {
+        return Err(SQLRiteError::NotImplemented(
+            "DROP INDEX supports a single index per statement".to_string(),
+        ));
+    }
+    let name = names[0].to_string();
+
+    for table in db.tables.values_mut() {
+        if let Some(secondary) = table.secondary_indexes.iter().find(|i| i.name == name) {
+            if secondary.origin == IndexOrigin::Auto {
+                return Err(SQLRiteError::General(format!(
+                    "cannot drop auto-created index '{name}' (drop the column or table instead)"
+                )));
+            }
+            table.secondary_indexes.retain(|i| i.name != name);
+            return Ok(1);
+        }
+        if table.hnsw_indexes.iter().any(|i| i.name == name) {
+            table.hnsw_indexes.retain(|i| i.name != name);
+            return Ok(1);
+        }
+        if table.fts_indexes.iter().any(|i| i.name == name) {
+            table.fts_indexes.retain(|i| i.name != name);
+            return Ok(1);
+        }
+    }
+
+    if if_exists {
+        Ok(0)
+    } else {
+        Err(SQLRiteError::General(format!(
+            "Index '{name}' does not exist"
+        )))
     }
 }
 

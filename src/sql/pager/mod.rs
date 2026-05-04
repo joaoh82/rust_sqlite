@@ -2557,6 +2557,62 @@ mod tests {
     }
 
     #[test]
+    fn drop_table_survives_save_and_reopen() {
+        let path = tmp_path("drop_table_roundtrip");
+        let mut db = seed_db();
+        save_database(&mut db, &path).expect("save");
+
+        // Verify both tables landed.
+        {
+            let loaded = open_database(&path, "t".to_string()).expect("open");
+            assert!(loaded.contains_table("users".to_string()));
+            assert!(loaded.contains_table("notes".to_string()));
+        }
+
+        process_command("DROP TABLE users;", &mut db).expect("drop users");
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        assert!(
+            !loaded.contains_table("users".to_string()),
+            "dropped table should not resurface on reopen"
+        );
+        assert!(
+            loaded.contains_table("notes".to_string()),
+            "untouched table should survive"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_survives_save_and_reopen() {
+        let path = tmp_path("drop_index_roundtrip");
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE INDEX notes_body_idx ON notes (body);", &mut db).unwrap();
+        save_database(&mut db, &path).expect("save");
+
+        process_command("DROP INDEX notes_body_idx;", &mut db).unwrap();
+        save_database(&mut db, &path).expect("save after drop");
+
+        let loaded = open_database(&path, "t".to_string()).expect("reopen");
+        let notes = loaded.get_table("notes".to_string()).unwrap();
+        assert!(
+            notes.index_by_name("notes_body_idx").is_none(),
+            "dropped index should not resurface on reopen"
+        );
+        // The auto-index for the PK should still be there.
+        assert!(notes.index_by_name("sqlrite_autoindex_notes_id").is_some());
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn default_clause_survives_save_and_reopen() {
         let path = tmp_path("default_roundtrip");
         let mut db = Database::new("t".to_string());
