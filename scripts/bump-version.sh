@@ -84,6 +84,25 @@ for file in "${TOML_FILES[@]}"; do
     fi
     sed "s/^version = \"[^\"]*\"/version = \"${VERSION}\"/" "$file" > "$file.tmp"
     mv "$file.tmp" "$file"
+
+    # Inter-workspace dep pins — lines like:
+    #   sqlrite-ask = { version = "0.3", path = "sqlrite-ask", ... }
+    #   sqlrite     = { package = "sqlrite-engine", path = "..", version = "0.3", ... }
+    #
+    # These carry BOTH version and path because crates.io publishing
+    # rejects path-only deps (see PR #58 retrospective). The version
+    # field has to track the workspace bump or `cargo build` fails to
+    # resolve a candidate (SQLR-9; failed run for v0.3.0 hit exactly
+    # this — `failed to select a version for the requirement
+    # sqlrite-ask = "^0.2"`).
+    #
+    # Detection: any line containing both `version = "..."` and
+    # `path = "..."`. The package-level `^version = "..."` line at
+    # the top of each manifest has no `path` on it and can't match.
+    # Both inline-table orderings (version-first and path-first) work
+    # because sed acts per-line, not per-token-order.
+    sed -E '/path *= *"[^"]*"/ s/version *= *"[^"]*"/version = "'"${VERSION}"'"/' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
 done
 
 # ---------------------------------------------------------------------------
@@ -143,6 +162,22 @@ for file in "${JSON_FILES[@]}"; do
     else
         actual="$(grep -E '^  "version": ' "$file" | head -1)"
         echo "  ✗ $file — expected version \"${VERSION}\", got: $actual" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
+# Inter-workspace pin sweep — any surviving `version = "X"` on a TOML
+# line that also has `path = "..."` and isn't already at $VERSION is a
+# pin we missed. Catches future refactors that change pin shape (e.g.
+# someone splits a long dep line across multiple TOML lines, where the
+# single-line address would no longer match).
+for file in "${TOML_FILES[@]}"; do
+    bad="$(grep -nE 'path *= *"[^"]*"' "$file" \
+           | grep -E 'version *= *"[^"]*"' \
+           | grep -vE "version *= *\"${VERSION}\"" || true)"
+    if [[ -n "$bad" ]]; then
+        echo "  ✗ $file — inter-workspace pin not at ${VERSION}:" >&2
+        echo "$bad" | sed 's/^/      /' >&2
         FAILURES=$((FAILURES + 1))
     fi
 done
