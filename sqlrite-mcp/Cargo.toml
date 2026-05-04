@@ -18,7 +18,7 @@
 # Published to crates.io as `sqlrite-mcp`. Joins the lockstep
 # release wave (`sqlrite-mcp-vX.Y.Z` tag) — see `docs/release-plan.md`.
 name = "sqlrite-mcp"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
@@ -52,7 +52,7 @@ ask = ["sqlrite/ask"]
 # off (which excludes the `cli` feature and its rustyline/clap pull
 # weight) and only enable `ask` when our own `ask` feature is on.
 # Keeps the MCP binary small + boot-fast.
-sqlrite = { package = "sqlrite-engine", path = "..", version = "0.2", default-features = false }
+sqlrite = { package = "sqlrite-engine", path = "..", version = "0.3", default-features = false }
 
 # JSON-RPC + tool I/O. The MCP wire format is JSON in / JSON out;
 # tool argument schemas are JSON; tool results are JSON. serde +

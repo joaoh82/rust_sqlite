@@ -27,7 +27,7 @@ resolver = "3"
 # `package =` key so the import name stays `sqlrite` internally:
 #     sqlrite = { package = "sqlrite-engine", path = "…" }
 name = "sqlrite-engine"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
@@ -138,4 +138,4 @@ fs2 = { version = "0.4", optional = true }
 # crate publishes to crates.io, and a path-only dep without a
 # version field fails the manifest verification step. See PR #58
 # retrospective in docs/roadmap.md.
-sqlrite-ask = { version = "0.2", path = "sqlrite-ask", optional = true }
+sqlrite-ask = { version = "0.3", path = "sqlrite-ask", optional = true }
