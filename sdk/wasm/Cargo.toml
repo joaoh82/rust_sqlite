@@ -7,7 +7,7 @@
 
 [package]
 name = "sqlrite-wasm"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
@@ -46,7 +46,7 @@ sqlrite = { package = "sqlrite-engine", path = "../..", default-features = false
 # builds for wasm32). Per Q9, the WASM SDK never makes the HTTP call
 # itself — the JS caller does that. Browser → backend → LLM provider
 # → JS hands the raw response back to `db.askParse()`.
-sqlrite-ask = { version = "0.5.0", path = "../../sqlrite-ask", default-features = false }
+sqlrite-ask = { version = "0.5.1", path = "../../sqlrite-ask", default-features = false }
 
 # wasm-bindgen + friends. `serde-serialize` on wasm-bindgen gives
 # us `serde_wasm_bindgen` interop for structured row objects.
