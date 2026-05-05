@@ -267,6 +267,43 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
         read_old_rootpages(&pager, old_header.schema_root_page)?
     };
 
+    // SQLR-1 — snapshot every prior B-Tree's page set NOW, before any
+    // staging starts. `Pager::read_page` shadows on-disk bytes with the
+    // current `staged` buffer, so if we deferred these walks until each
+    // object's turn in the staging loop, a *new* index added in this
+    // save would extend past the old high-water and overwrite the
+    // pages of any later-staged object whose old root sits in that
+    // range — including `sqlrite_master`, which is always staged last.
+    // The follow-up walk would then read the wrong B-Tree's bytes and
+    // either hand the allocator a bogus preferred pool or panic
+    // dispatching cells (a table-cell decoder vs. an index leaf, the
+    // shape of the original SQLR-1 panic). Walking up front pins each
+    // map to the committed bytes that were on disk before this save
+    // touched anything.
+    let old_preferred_pages: HashMap<(String, String), Vec<u32>> = if compact {
+        HashMap::new()
+    } else {
+        let mut map: HashMap<(String, String), Vec<u32>> = HashMap::new();
+        for ((kind, name), &root) in &old_rootpages {
+            // Tables can carry overflow chains; index/HNSW/FTS leaves
+            // never overflow in the current encoding, so the cheaper
+            // walk suffices for them.
+            let follow = kind == "table";
+            let pages = collect_pages_for_btree(&pager, root, follow)?;
+            map.insert((kind.clone(), name.clone()), pages);
+        }
+        map
+    };
+    let old_master_pages: Vec<u32> = if compact || old_header.schema_root_page == 0 {
+        Vec::new()
+    } else {
+        collect_pages_for_btree(
+            &pager,
+            old_header.schema_root_page,
+            /*follow_overflow=*/ true,
+        )?
+    };
+
     pager.clear_staged();
 
     // Allocator: in normal mode, seed with the old freelist; in compact
@@ -292,10 +329,8 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
             )));
         }
         if !compact {
-            if let Some(&prev_root) = old_rootpages.get(&("table".to_string(), name.to_string())) {
-                let prev =
-                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ true)?;
-                alloc.set_preferred(prev);
+            if let Some(prev) = old_preferred_pages.get(&("table".to_string(), name.to_string())) {
+                alloc.set_preferred(prev.clone());
             }
         }
         let table = &db.tables[name];
@@ -322,12 +357,10 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
         .sort_by(|(ta, ia), (tb, ib)| ta.tb_name.cmp(&tb.tb_name).then(ia.name.cmp(&ib.name)));
     for (_table, idx) in index_entries {
         if !compact {
-            if let Some(&prev_root) =
-                old_rootpages.get(&("index".to_string(), idx.name.to_string()))
+            if let Some(prev) =
+                old_preferred_pages.get(&("index".to_string(), idx.name.to_string()))
             {
-                let prev =
-                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
-                alloc.set_preferred(prev);
+                alloc.set_preferred(prev.clone());
             }
         }
         let rootpage = stage_index_btree(&mut pager, idx, &mut alloc)?;
@@ -359,12 +392,10 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
         .sort_by(|(ta, ea), (tb, eb)| ta.tb_name.cmp(&tb.tb_name).then(ea.name.cmp(&eb.name)));
     for (table, entry) in hnsw_entries {
         if !compact {
-            if let Some(&prev_root) =
-                old_rootpages.get(&("index".to_string(), entry.name.to_string()))
+            if let Some(prev) =
+                old_preferred_pages.get(&("index".to_string(), entry.name.to_string()))
             {
-                let prev =
-                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
-                alloc.set_preferred(prev);
+                alloc.set_preferred(prev.clone());
             }
         }
         let rootpage = stage_hnsw_btree(&mut pager, &entry.index, &mut alloc)?;
@@ -401,12 +432,10 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
     let any_fts = !fts_entries.is_empty();
     for (table, entry) in fts_entries {
         if !compact {
-            if let Some(&prev_root) =
-                old_rootpages.get(&("index".to_string(), entry.name.to_string()))
+            if let Some(prev) =
+                old_preferred_pages.get(&("index".to_string(), entry.name.to_string()))
             {
-                let prev =
-                    collect_pages_for_btree(&pager, prev_root, /*follow_overflow=*/ false)?;
-                alloc.set_preferred(prev);
+                alloc.set_preferred(prev.clone());
             }
         }
         let rootpage = stage_fts_btree(&mut pager, &entry.index, &mut alloc)?;
@@ -442,13 +471,11 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
             ],
         )?;
     }
-    if !compact && old_header.schema_root_page != 0 {
-        let prev = collect_pages_for_btree(
-            &pager,
-            old_header.schema_root_page,
-            /*follow_overflow=*/ true,
-        )?;
-        alloc.set_preferred(prev);
+    if !compact && !old_master_pages.is_empty() {
+        // Use the page list snapshotted before any staging touched
+        // disk; re-walking here would read whatever a new index
+        // already restaged on top of master's old root (SQLR-1).
+        alloc.set_preferred(old_master_pages.clone());
     }
     let master_root = stage_table_btree(&mut pager, &master, &mut alloc)?;
     alloc.finish_preferred();
@@ -2719,6 +2746,148 @@ mod tests {
         assert!(idx.is_unique);
         assert_eq!(idx.lookup(&Value::Text("a@x".into())).len(), 1);
         assert_eq!(idx.lookup(&Value::Text("b@x".into())).len(), 1);
+
+        cleanup(&path);
+    }
+
+    /// SQLR-1 — `CREATE INDEX` on a wide table must round-trip when the
+    /// index B-tree grows past one leaf and needs an interior level.
+    /// Before the fix, the post-DDL auto-save panicked with
+    /// `Internal("unknown paged-entry kind tag 0x4 …")` because a
+    /// table-cell decoder was being run against an index leaf
+    /// (`KIND_INDEX = 0x04`).
+    ///
+    /// 5 000 rows mirror the original repro from the issue and exceed
+    /// every leaf-fanout cliff for the small `(rowid, value)` cells in
+    /// a TEXT-keyed secondary index.
+    #[test]
+    fn secondary_index_with_interior_level_round_trips() {
+        let path = tmp_path("sqlr1_wide_index");
+        let mut db = Database::new("idx".to_string());
+        db.source_path = Some(path.clone());
+
+        process_command(
+            "CREATE TABLE bloat (id INTEGER PRIMARY KEY, payload TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        // BEGIN/COMMIT collapses 5 000 inserts into one save (matches
+        // `auto_vacuum_setup` and the issue's repro shape).
+        process_command("BEGIN;", &mut db).unwrap();
+        for i in 0..5000 {
+            process_command(
+                &format!("INSERT INTO bloat (payload) VALUES ('p-{i:08}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        process_command("COMMIT;", &mut db).unwrap();
+
+        // The DDL that used to panic.
+        process_command("CREATE INDEX idx_p ON bloat (payload);", &mut db).unwrap();
+
+        // Reopen and verify lookups, plus that the index tree actually
+        // grew an interior layer (otherwise this test wouldn't cover the
+        // regression).
+        drop(db);
+        let loaded = open_database(&path, "idx".to_string()).unwrap();
+        let bloat = loaded.get_table("bloat".to_string()).unwrap();
+        let idx = bloat
+            .index_by_name("idx_p")
+            .expect("idx_p should survive close/reopen");
+        assert!(!idx.is_unique);
+
+        // Spot-check the keyspace: first, middle, last value each map
+        // back to exactly the row that carried them.
+        for &(probe_i, expected_rowid) in &[(0i64, 1i64), (2500, 2501), (4999, 5000)] {
+            let value = Value::Text(format!("p-{probe_i:08}"));
+            let hits = idx.lookup(&value);
+            assert_eq!(
+                hits,
+                vec![expected_rowid],
+                "lookup({value:?}) should yield rowid {expected_rowid}",
+            );
+        }
+
+        // Confirm the index tree is multi-level (the regression's
+        // necessary condition) — root must be an `InteriorNode` and
+        // `find_leftmost_leaf` must reach a `TableLeaf` through it.
+        let pager = loaded.pager.as_ref().unwrap();
+        let mut master = build_empty_master_table();
+        load_table_rows(pager, &mut master, pager.header().schema_root_page).unwrap();
+        let idx_root = master
+            .rowids()
+            .into_iter()
+            .find_map(
+                |r| match (master.get_value("name", r), master.get_value("type", r)) {
+                    (Some(Value::Text(name)), Some(Value::Text(kind)))
+                        if name == "idx_p" && kind == "index" =>
+                    {
+                        match master.get_value("rootpage", r) {
+                            Some(Value::Integer(p)) => Some(p as u32),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+            )
+            .expect("idx_p should appear in sqlrite_master");
+        let root_buf = pager.read_page(idx_root).unwrap();
+        assert_eq!(
+            root_buf[0],
+            PageType::InteriorNode as u8,
+            "5 000-entry index must have an interior root — without one this test wouldn't cover SQLR-1",
+        );
+        let leaf = find_leftmost_leaf(pager, idx_root).unwrap();
+        let leaf_buf = pager.read_page(leaf).unwrap();
+        assert_eq!(leaf_buf[0], PageType::TableLeaf as u8);
+
+        cleanup(&path);
+    }
+
+    /// SQLR-1 follow-on — the page-recycling path between two large
+    /// versions of the same index name must not corrupt cell decoding.
+    /// `DROP INDEX` returns its pages to the freelist; the next
+    /// `CREATE INDEX` is free to reuse them. If the allocator hands an
+    /// old index leaf to a *table* without zeroing it, an upstream
+    /// table walk would see KIND_INDEX cells and panic.
+    #[test]
+    fn drop_then_recreate_wide_index_does_not_panic() {
+        let path = tmp_path("sqlr1_drop_recreate");
+        let mut db = Database::new("idx".to_string());
+        db.source_path = Some(path.clone());
+
+        process_command(
+            "CREATE TABLE bloat (id INTEGER PRIMARY KEY, payload TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("BEGIN;", &mut db).unwrap();
+        for i in 0..5000 {
+            process_command(
+                &format!("INSERT INTO bloat (payload) VALUES ('p-{i:08}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        process_command("COMMIT;", &mut db).unwrap();
+
+        process_command("CREATE INDEX idx_p ON bloat (payload);", &mut db).unwrap();
+        process_command("DROP INDEX idx_p;", &mut db).unwrap();
+        // Recreate from scratch — exercises the recycle path.
+        process_command("CREATE INDEX idx_p ON bloat (payload);", &mut db).unwrap();
+
+        drop(db);
+        let loaded = open_database(&path, "idx".to_string()).unwrap();
+        let bloat = loaded.get_table("bloat".to_string()).unwrap();
+        let idx = bloat
+            .index_by_name("idx_p")
+            .expect("idx_p should survive drop+recreate+reopen");
+        assert_eq!(
+            idx.lookup(&Value::Text("p-00002500".into())),
+            vec![2501],
+            "post-recycle lookup must still resolve correctly",
+        );
 
         cleanup(&path);
     }
