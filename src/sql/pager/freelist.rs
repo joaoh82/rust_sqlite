@@ -202,6 +202,39 @@ pub fn freelist_to_deque(leaves: Vec<u32>) -> VecDeque<u32> {
     VecDeque::from(sorted)
 }
 
+/// Auto-VACUUM (SQLR-10) does not fire on databases below this many
+/// pages. The 4 KiB page size makes 16 pages = 64 KiB — small enough
+/// that the cost of a full-file rewrite is negligible if the user
+/// genuinely wants it (manual `VACUUM;` still works), but large enough
+/// that single-table churn doesn't blow past the threshold and trigger
+/// a noisy compact every few statements.
+pub const MIN_PAGES_FOR_AUTO_VACUUM: u32 = 16;
+
+/// Returns `true` if the on-disk freelist (counting both leaf and
+/// trunk pages — they're all reclaimable bytes) exceeds `threshold`
+/// of `header.page_count`, i.e. the file is bloated enough to be
+/// worth compacting. Returns `false` for tiny databases (under
+/// [`MIN_PAGES_FOR_AUTO_VACUUM`]) and for empty freelists, both as
+/// fast paths to keep the auto-VACUUM hook cheap on the common case.
+///
+/// This is a read-only inspection of the pager's current header and
+/// freelist chain — it does not mutate any state. The caller is
+/// responsible for actually invoking
+/// [`crate::sql::pager::vacuum_database`] when this returns `true`.
+pub fn should_auto_vacuum(pager: &Pager, threshold: f32) -> Result<bool> {
+    let header = pager.header();
+    if header.page_count < MIN_PAGES_FOR_AUTO_VACUUM {
+        return Ok(false);
+    }
+    if header.freelist_head == 0 {
+        return Ok(false);
+    }
+    let (leaves, trunks) = read_freelist(pager, header.freelist_head)?;
+    let free_pages = leaves.len() + trunks.len();
+    let ratio = free_pages as f32 / header.page_count as f32;
+    Ok(ratio > threshold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

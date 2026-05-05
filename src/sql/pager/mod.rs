@@ -1896,6 +1896,7 @@ fn emit_interior(pager: &mut Pager, page_num: u32, interior: &InteriorPage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::pager::freelist::MIN_PAGES_FOR_AUTO_VACUUM;
     use crate::sql::process_command;
 
     fn seed_db() -> Database {
@@ -3306,6 +3307,306 @@ mod tests {
         );
 
         cleanup(&path);
+    }
+
+    // ---- SQLR-10: auto-VACUUM trigger after page-releasing DDL ----
+
+    /// Builds a file-backed DB with one small "keep" table and one
+    /// large "bloat" table, sized so the post-drop freelist will
+    /// comfortably cross the default 25% threshold and the
+    /// `MIN_PAGES_FOR_AUTO_VACUUM` floor (16 pages). Used by the
+    /// auto-VACUUM happy-path tests.
+    fn auto_vacuum_setup(path: &std::path::Path) -> Database {
+        let mut db = Database::new("av".to_string());
+        db.source_path = Some(path.to_path_buf());
+        process_command(
+            "CREATE TABLE keep (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO keep (n) VALUES (1);", &mut db).unwrap();
+        process_command(
+            "CREATE TABLE bloat (id INTEGER PRIMARY KEY, payload TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        // Wrap the bulk insert in a transaction so we pay one save at
+        // COMMIT instead of 5000 round-trips through auto-save.
+        process_command("BEGIN;", &mut db).unwrap();
+        for i in 0..5000 {
+            process_command(
+                &format!("INSERT INTO bloat (payload) VALUES ('p-{i:08}');"),
+                &mut db,
+            )
+            .unwrap();
+        }
+        process_command("COMMIT;", &mut db).unwrap();
+        db
+    }
+
+    /// Default threshold (0.25) is engaged for fresh `Database`s and
+    /// fires when a `DROP TABLE` orphans enough pages — file shrinks
+    /// without anyone calling `VACUUM;`.
+    #[test]
+    fn auto_vacuum_default_threshold_triggers_on_drop_table() {
+        let path = tmp_path("av_default_drop_table");
+        let mut db = auto_vacuum_setup(&path);
+        // Sanity: setup respects the shipped default.
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+
+        // Checkpoint before measuring `size_before` so the bloat actually
+        // lives in the main file and not just the WAL — otherwise
+        // `size_before` is the bare 2-page header and any post-vacuum
+        // checkpoint will look like the file *grew*.
+        if let Some(p) = db.pager.as_mut() {
+            let _ = p.checkpoint();
+        }
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            pages_before >= MIN_PAGES_FOR_AUTO_VACUUM,
+            "setup should produce >= MIN_PAGES_FOR_AUTO_VACUUM ({MIN_PAGES_FOR_AUTO_VACUUM}) \
+             pages so the floor doesn't suppress the trigger; got {pages_before}"
+        );
+
+        // Drop the bloat table — freelist should pass 25% of page_count
+        // and the auto-VACUUM hook should compact in place. Note: no
+        // explicit `VACUUM;` statement is issued.
+        process_command("DROP TABLE bloat;", &mut db).expect("drop");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        let head_after = db.pager.as_ref().unwrap().header().freelist_head;
+        // Second checkpoint so the post-vacuum file shrinks on disk
+        // (auto-VACUUM stages the compact through WAL just like manual
+        // VACUUM does).
+        if let Some(p) = db.pager.as_mut() {
+            let _ = p.checkpoint();
+        }
+        let size_after = std::fs::metadata(&path).unwrap().len();
+
+        assert!(
+            pages_after < pages_before,
+            "auto-VACUUM must reduce page_count: was {pages_before}, now {pages_after}"
+        );
+        assert_eq!(head_after, 0, "auto-VACUUM must clear the freelist");
+        assert!(
+            size_after < size_before,
+            "auto-VACUUM must shrink the file on disk: was {size_before}, now {size_after}"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Setting the threshold to `None` disables the trigger entirely:
+    /// the same workload that shrinks under the default leaves the file
+    /// at its high-water mark.
+    #[test]
+    fn auto_vacuum_disabled_keeps_file_at_hwm() {
+        let path = tmp_path("av_disabled");
+        let mut db = auto_vacuum_setup(&path);
+        db.set_auto_vacuum_threshold(None).expect("disable");
+        assert_eq!(db.auto_vacuum_threshold(), None);
+
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+
+        process_command("DROP TABLE bloat;", &mut db).expect("drop");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        let head_after = db.pager.as_ref().unwrap().header().freelist_head;
+        assert_eq!(
+            pages_after, pages_before,
+            "with auto-VACUUM disabled, drop must keep page_count at the HWM"
+        );
+        assert!(
+            head_after != 0,
+            "drop must still populate the freelist (manual VACUUM would be needed to reclaim)"
+        );
+
+        cleanup(&path);
+    }
+
+    /// `DROP INDEX` is the second of three page-releasing DDL paths
+    /// covered by SQLR-10. We bloat the freelist via a separate
+    /// `DROP TABLE` first (with auto-VACUUM disabled so it doesn't
+    /// compact early), then re-arm the trigger and drop a small index
+    /// — the cumulative freelist crosses 25% on the index drop and
+    /// auto-VACUUM fires.
+    ///
+    /// The detour around bloat is necessary because building a
+    /// secondary index on a 5000-row column would need multi-level
+    /// interior nodes, and the cell-decoder's interior-page support
+    /// is a separate work item from SQLR-10.
+    #[test]
+    fn auto_vacuum_triggers_on_drop_index() {
+        let path = tmp_path("av_drop_index");
+        let mut db = auto_vacuum_setup(&path);
+
+        // Phase 1: drop the bloat table with auto-VACUUM disabled so
+        // its pages land on the freelist without being reclaimed.
+        db.set_auto_vacuum_threshold(None).expect("disable");
+        process_command("DROP TABLE bloat;", &mut db).expect("drop bloat");
+        let pages_after_bloat_drop = db.pager.as_ref().unwrap().header().page_count;
+        let head_after_bloat_drop = db.pager.as_ref().unwrap().header().freelist_head;
+        assert!(
+            head_after_bloat_drop != 0,
+            "bloat drop must populate the freelist (else later index drop won't trip the threshold)"
+        );
+
+        // Phase 2: a small index on the surviving `keep` table. The
+        // index reuses one page from the freelist (which is fine —
+        // freelist still holds plenty more).
+        process_command("CREATE INDEX idx_keep_n ON keep (n);", &mut db).expect("create idx");
+
+        // Phase 3: re-arm the trigger and drop the index. The freelist
+        // is already heavily populated from phase 1; this drop just
+        // adds the index page on top, keeping the ratio well above
+        // 25%, so auto-VACUUM should fire.
+        db.set_auto_vacuum_threshold(Some(0.25)).expect("re-arm");
+        process_command("DROP INDEX idx_keep_n;", &mut db).expect("drop index");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        let head_after = db.pager.as_ref().unwrap().header().freelist_head;
+        assert!(
+            pages_after < pages_after_bloat_drop,
+            "DROP INDEX should fire auto-VACUUM and reduce page_count: \
+             was {pages_after_bloat_drop}, now {pages_after}"
+        );
+        assert_eq!(
+            head_after, 0,
+            "auto-VACUUM after DROP INDEX must clear the freelist"
+        );
+
+        cleanup(&path);
+    }
+
+    /// `ALTER TABLE … DROP COLUMN` releases pages too — the third path
+    /// the SQLR-10 trigger covers.
+    #[test]
+    fn auto_vacuum_triggers_on_alter_drop_column() {
+        let path = tmp_path("av_alter_drop_col");
+        let mut db = auto_vacuum_setup(&path);
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+
+        // Drop the wide `payload` column — this rewrites every row in
+        // `bloat` without the column, so the old leaf pages get freed.
+        process_command("ALTER TABLE bloat DROP COLUMN payload;", &mut db).expect("alter drop");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        assert!(
+            pages_after < pages_before,
+            "ALTER TABLE DROP COLUMN should fire auto-VACUUM and reduce page_count: \
+             was {pages_before}, now {pages_after}"
+        );
+        assert_eq!(db.pager.as_ref().unwrap().header().freelist_head, 0);
+
+        cleanup(&path);
+    }
+
+    /// A high threshold (0.99) suppresses the trigger when the freelist
+    /// ratio is well below it — the file stays at HWM.
+    #[test]
+    fn auto_vacuum_skips_below_threshold() {
+        let path = tmp_path("av_below_threshold");
+        let mut db = auto_vacuum_setup(&path);
+        db.set_auto_vacuum_threshold(Some(0.99)).expect("set");
+
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+
+        process_command("DROP TABLE bloat;", &mut db).expect("drop");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        assert_eq!(
+            pages_after, pages_before,
+            "freelist ratio after a single drop is far below 0.99 — \
+             page_count must stay at the HWM"
+        );
+        assert!(
+            db.pager.as_ref().unwrap().header().freelist_head != 0,
+            "drop must still populate the freelist"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Inside an explicit transaction, the page-releasing DDL doesn't
+    /// flush to disk yet — the freelist isn't accurate, so the trigger
+    /// must skip. The compact would also publish in-flight work out of
+    /// band, which is exactly what the manual `VACUUM;` rejection
+    /// inside a txn already prevents.
+    #[test]
+    fn auto_vacuum_skips_inside_transaction() {
+        let path = tmp_path("av_in_txn");
+        let mut db = auto_vacuum_setup(&path);
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+
+        process_command("BEGIN;", &mut db).expect("begin");
+        process_command("DROP TABLE bloat;", &mut db).expect("drop in txn");
+        // Mid-transaction: no save has occurred, so the on-disk
+        // freelist_head must be unchanged and page_count must not have
+        // shifted from a sneaky compact.
+        let pages_mid = db.pager.as_ref().unwrap().header().page_count;
+        assert_eq!(
+            pages_mid, pages_before,
+            "auto-VACUUM must not fire mid-transaction"
+        );
+
+        process_command("ROLLBACK;", &mut db).expect("rollback");
+        cleanup(&path);
+    }
+
+    /// Tiny databases (under `MIN_PAGES_FOR_AUTO_VACUUM`) skip the
+    /// trigger even if the ratio would otherwise qualify — the cost of
+    /// rewriting a 64 KiB file isn't worth the few bytes reclaimed.
+    #[test]
+    fn auto_vacuum_skips_under_min_pages_floor() {
+        let path = tmp_path("av_under_floor");
+        let mut db = seed_db(); // small: just users + notes, ~5 pages
+        db.source_path = Some(path.clone());
+        save_database(&mut db, &path).expect("save");
+        // Confirm we're below the floor so the test is meaningful.
+        let pages_before = db.pager.as_ref().unwrap().header().page_count;
+        assert!(
+            pages_before < MIN_PAGES_FOR_AUTO_VACUUM,
+            "test setup is too large: floor would not apply (got {pages_before} pages, \
+             floor is {MIN_PAGES_FOR_AUTO_VACUUM})"
+        );
+
+        process_command("DROP TABLE users;", &mut db).expect("drop");
+
+        let pages_after = db.pager.as_ref().unwrap().header().page_count;
+        assert_eq!(
+            pages_after, pages_before,
+            "below MIN_PAGES_FOR_AUTO_VACUUM, drop must not trigger compaction"
+        );
+        assert!(
+            db.pager.as_ref().unwrap().header().freelist_head != 0,
+            "drop must still populate the freelist normally"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Setter rejects NaN, infinities, and values outside `0.0..=1.0`
+    /// rather than silently saturating.
+    #[test]
+    fn set_auto_vacuum_threshold_rejects_out_of_range() {
+        let mut db = Database::new("t".to_string());
+        for bad in [-0.01_f32, 1.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = db.set_auto_vacuum_threshold(Some(bad)).unwrap_err();
+            assert!(
+                format!("{err}").contains("auto_vacuum_threshold"),
+                "expected a typed range error for {bad}, got: {err}"
+            );
+        }
+        // The default survives the rejected sets unchanged.
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+        // And valid values land.
+        db.set_auto_vacuum_threshold(Some(0.0)).unwrap();
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.0));
+        db.set_auto_vacuum_threshold(Some(1.0)).unwrap();
+        assert_eq!(db.auto_vacuum_threshold(), Some(1.0));
+        db.set_auto_vacuum_threshold(None).unwrap();
+        assert_eq!(db.auto_vacuum_threshold(), None);
     }
 
     /// VACUUM modifiers (FULL, REINDEX, table targets, …) are rejected

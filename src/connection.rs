@@ -153,6 +153,30 @@ impl Connection {
         self.db.in_transaction()
     }
 
+    /// Returns the current auto-VACUUM threshold (SQLR-10). After a
+    /// page-releasing DDL (DROP TABLE / DROP INDEX / ALTER TABLE DROP
+    /// COLUMN) commits, the engine compacts the file in place if the
+    /// freelist exceeds this fraction of `page_count`. New connections
+    /// default to `Some(0.25)` (SQLite parity); `None` means the
+    /// trigger is disabled. See [`Connection::set_auto_vacuum_threshold`].
+    pub fn auto_vacuum_threshold(&self) -> Option<f32> {
+        self.db.auto_vacuum_threshold()
+    }
+
+    /// Sets the auto-VACUUM threshold (SQLR-10). `Some(t)` with `t` in
+    /// `0.0..=1.0` arms the trigger; `None` disables it. Values outside
+    /// `0.0..=1.0` (or NaN / infinite) return a typed error rather than
+    /// silently saturating. The setting is per-connection runtime
+    /// state — closing the connection drops it; new connections start
+    /// at the default `Some(0.25)`.
+    ///
+    /// Calling this on an in-memory or read-only database is allowed
+    /// (it just won't fire — there's nothing to compact / no writes
+    /// will reach the trigger).
+    pub fn set_auto_vacuum_threshold(&mut self, threshold: Option<f32>) -> Result<()> {
+        self.db.set_auto_vacuum_threshold(threshold)
+    }
+
     /// Returns `true` if the connection was opened read-only. Mutating
     /// statements on a read-only connection return a typed error.
     pub fn is_read_only(&self) -> bool {
@@ -632,6 +656,37 @@ mod tests {
         let stmt = conn.prepare("INSERT INTO t VALUES (1);").unwrap();
         let err = stmt.query().unwrap_err();
         assert!(format!("{err}").contains("SELECT"));
+    }
+
+    /// SQLR-10: fresh connections expose the SQLite-parity 25% default,
+    /// the setter validates its input, and `None` opts out cleanly.
+    #[test]
+    fn auto_vacuum_threshold_default_and_setter() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            conn.auto_vacuum_threshold(),
+            Some(0.25),
+            "fresh connection should ship with the SQLite-parity default"
+        );
+
+        conn.set_auto_vacuum_threshold(None).unwrap();
+        assert_eq!(conn.auto_vacuum_threshold(), None);
+
+        conn.set_auto_vacuum_threshold(Some(0.5)).unwrap();
+        assert_eq!(conn.auto_vacuum_threshold(), Some(0.5));
+
+        // Out-of-range values must be rejected with a typed error and
+        // must not stomp the previously-set value.
+        let err = conn.set_auto_vacuum_threshold(Some(1.5)).unwrap_err();
+        assert!(
+            format!("{err}").contains("auto_vacuum_threshold"),
+            "expected typed range error, got: {err}"
+        );
+        assert_eq!(
+            conn.auto_vacuum_threshold(),
+            Some(0.5),
+            "rejected setter call must not mutate the threshold"
+        );
     }
 
     #[test]

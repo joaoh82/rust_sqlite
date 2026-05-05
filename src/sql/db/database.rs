@@ -14,6 +14,13 @@ pub struct TxnSnapshot {
     pub(crate) tables: HashMap<String, Table>,
 }
 
+/// Default fraction of free pages that triggers an auto-VACUUM after
+/// a page-releasing DDL (DROP TABLE / DROP INDEX / ALTER TABLE DROP
+/// COLUMN). Matches SQLite's classic 25% heuristic. Override per
+/// connection with [`Database::set_auto_vacuum_threshold`] (or
+/// `Connection::set_auto_vacuum_threshold`); pass `None` to disable.
+pub const DEFAULT_AUTO_VACUUM_THRESHOLD: f32 = 0.25;
+
 /// The database is represented by this structure.assert_eq!
 #[derive(Debug)]
 pub struct Database {
@@ -36,6 +43,14 @@ pub struct Database {
     /// - nested `BEGIN` is rejected
     /// - `ROLLBACK` restores `tables` from the snapshot
     pub txn: Option<TxnSnapshot>,
+    /// Auto-VACUUM trigger (SQLR-10). After a page-releasing DDL
+    /// (DROP TABLE / DROP INDEX / ALTER TABLE DROP COLUMN) commits and
+    /// flushes, if the freelist exceeds this fraction of `page_count`
+    /// the engine quietly compacts the file. `None` disables the
+    /// trigger; defaults to `Some(DEFAULT_AUTO_VACUUM_THRESHOLD)`
+    /// (SQLite parity at 25%). Per-connection runtime state — not
+    /// persisted across reopens.
+    pub auto_vacuum_threshold: Option<f32>,
 }
 
 impl Database {
@@ -54,7 +69,32 @@ impl Database {
             source_path: None,
             pager: None,
             txn: None,
+            auto_vacuum_threshold: Some(DEFAULT_AUTO_VACUUM_THRESHOLD),
         }
+    }
+
+    /// Returns the current auto-VACUUM threshold, or `None` if disabled.
+    /// See [`Database::set_auto_vacuum_threshold`] for semantics.
+    pub fn auto_vacuum_threshold(&self) -> Option<f32> {
+        self.auto_vacuum_threshold
+    }
+
+    /// Sets the auto-VACUUM threshold (SQLR-10). `Some(t)` with `t` in
+    /// `0.0..=1.0` arms the trigger: after a page-releasing DDL
+    /// commits, if the freelist exceeds `t * page_count` the engine
+    /// runs a full-file compact. `None` disables the trigger. Values
+    /// outside `0.0..=1.0` (or NaN / infinite) return a typed error
+    /// rather than silently saturating.
+    pub fn set_auto_vacuum_threshold(&mut self, threshold: Option<f32>) -> Result<()> {
+        if let Some(t) = threshold {
+            if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+                return Err(SQLRiteError::General(format!(
+                    "auto_vacuum_threshold must be in 0.0..=1.0, got {t}"
+                )));
+            }
+        }
+        self.auto_vacuum_threshold = threshold;
+        Ok(())
     }
 
     /// Returns true if the database contains a table with the specified key as a table name.

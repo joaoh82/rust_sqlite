@@ -260,7 +260,7 @@ DROP TABLE [IF EXISTS] <table>;
 - Reserved-name rejection: `DROP TABLE sqlrite_master` errors with the same message `CREATE TABLE` uses.
 - All indexes attached to the table (auto, explicit, HNSW, FTS) disappear with the table — they live inside the `Table` struct and ride along.
 - Without `IF EXISTS`, dropping a table that doesn't exist errors. With it, that's a benign 0-tables-dropped no-op.
-- **Disk pages move onto the freelist.** Pages the dropped table occupied are pushed onto a persisted free-page list (SQLR-6) so subsequent `CREATE TABLE` or inserts can reuse them. The file doesn't shrink until [`VACUUM;`](#vacuum) compacts it.
+- **Disk pages move onto the freelist.** Pages the dropped table occupied are pushed onto a persisted free-page list (SQLR-6) so subsequent `CREATE TABLE` or inserts can reuse them. The file shrinks automatically when the freelist crosses 25% of `page_count` (SQLR-10 auto-VACUUM, default-on); embedders that need the prior "manual `VACUUM;` only" behavior can call `Connection::set_auto_vacuum_threshold(None)` at open time.
 
 ---
 
@@ -444,6 +444,24 @@ Compacts the database file: rewrites every live table, index, HNSW graph, FTS po
 - **Format-version side effect.** A v4/v5 file that has been promoted to v6 by an earlier drop stays at v6 after VACUUM (v6 is a strict superset; we don't downgrade). A file that's already at v4/v5 because no drop ever happened on it doesn't get bumped by VACUUM.
 
 When to run it: any time after a string of `DROP TABLE` / `DROP INDEX` / `ALTER TABLE DROP COLUMN` operations if you care about file size. SQLRite reuses freelist pages on subsequent inserts, so a write-heavy workload may not need VACUUM at all — its main use is reclaiming space when you don't expect to grow back.
+
+### Auto-VACUUM (SQLR-10)
+
+Manual `VACUUM;` is rarely needed in practice: by default, every page-releasing DDL (`DROP TABLE`, `DROP INDEX`, `ALTER TABLE DROP COLUMN`) checks the freelist after committing and runs `vacuum_database` automatically when the freelist exceeds **25%** of `page_count` (SQLite parity). The trigger:
+
+- skips databases under 16 pages (64 KiB) so tiny files don't churn,
+- skips inside an explicit transaction (the freelist isn't accurate until `COMMIT`),
+- skips on in-memory and read-only databases.
+
+The threshold is tunable per-connection from Rust:
+
+```rust
+let mut conn = Connection::open("db.sqlrite")?;
+conn.set_auto_vacuum_threshold(Some(0.5))?; // fire only when freelist > 50%
+conn.set_auto_vacuum_threshold(None)?;       // disable entirely (manual VACUUM only)
+```
+
+The setting is per-`Connection` runtime state — it's not persisted in the file header, so every reopen starts at the default `Some(0.25)`. A SQL-level `PRAGMA auto_vacuum` knob is on the roadmap but not yet implemented (SDK consumers currently configure it via the per-binding glue or fall back to the default).
 
 ---
 
