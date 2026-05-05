@@ -157,7 +157,7 @@ sqlrite> DELETE FROM users WHERE age < 30;
 | `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN`. Auto-creates `sqlrite_autoindex_<table>_<col>` for every PK + UNIQUE column |
 | `CREATE [UNIQUE] INDEX` | Single-column, named indexes; `IF NOT EXISTS`; persists as a dedicated cell-based B-Tree. INTEGER + TEXT columns only |
 | `INSERT INTO` | Explicit column list required; auto-ROWID for `INTEGER PRIMARY KEY`; multi-row `VALUES (…), (…)`; UNIQUE enforcement; clean type errors (no panics); NULL padding for omitted columns |
-| `SELECT` | `*` or column list; `WHERE`; single-column `ORDER BY [ASC\|DESC]`; `LIMIT n`. `WHERE col = literal` probes an index when one exists |
+| `SELECT` | `*` or column list with optional `AS alias`; `WHERE`; `DISTINCT`; `GROUP BY col[, col …]`; aggregate projections `COUNT(*)` / `COUNT([DISTINCT] col)` / `SUM` / `AVG` / `MIN` / `MAX`; single-column `ORDER BY [ASC\|DESC]` (also resolves alias and aggregate display names); `LIMIT n`. `WHERE col = literal` probes an index when one exists |
 | `UPDATE` | Multi-column `SET`; `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Real transactions, snapshot-based; WAL-backed commit; single-level (no savepoints); auto-rollback if `COMMIT`'s disk write fails |
@@ -166,12 +166,14 @@ Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 
 - Comparisons — `=`, `<>`, `<`, `<=`, `>`, `>=`
 - Null tests — `IS NULL`, `IS NOT NULL`
+- Pattern matching — `LIKE`, `NOT LIKE`, `ILIKE` (`%` and `_` wildcards, `\`-escaped literals; case-insensitive ASCII to match SQLite's default)
+- Set membership — `IN (list)`, `NOT IN (list)` (literal lists only; subquery form is not supported yet)
 - Logical — `AND`, `OR`, `NOT` (SQL three-valued logic; NULL-as-false in `WHERE`)
 - Arithmetic — `+`, `-`, `*`, `/`, `%` (integer ops stay integer; any `REAL` promotes to `f64`; divide/modulo by zero is a clean error)
 - String concat — `||`
 - Literals — integer + real numbers, `'single-quoted strings'`, `TRUE` / `FALSE`, `NULL`; parentheses for grouping
 
-**Not yet supported** (common ones): joins, subqueries, CTEs, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN`, expressions in the projection list, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
+**Not yet supported** (common ones): joins, subqueries, CTEs, `HAVING`, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `DISTINCT` on `SUM`/`AVG`/`MIN`/`MAX`, GROUP BY on expressions, expressions in the projection list, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
 
 #### Meta commands
 
@@ -310,7 +312,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 
 **Possible extras** *(no committed phase)*
 - Joins (`INNER`, `LEFT OUTER`, `CROSS` — SQLite does not support `RIGHT`/`FULL OUTER`)
-- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`
+- `HAVING`, `IN (subquery)`, `BETWEEN`, `GLOB` / `REGEXP`, `GROUP_CONCAT`, window functions
 - Composite and expression indexes (with cost analysis)
 - Alternate storage engines — LSM/SSTable for write-heavy workloads alongside the B-Tree
 - Benchmarks against SQLite

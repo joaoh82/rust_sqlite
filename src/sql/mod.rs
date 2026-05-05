@@ -1,3 +1,4 @@
+pub mod agg;
 pub mod db;
 pub mod executor;
 pub mod fts;

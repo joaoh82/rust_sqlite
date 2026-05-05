@@ -148,35 +148,63 @@ Hex literals, blob literals, and date/time functions are not supported.
 ## `SELECT`
 
 ```sql
-SELECT {* | col1, col2, ...}
+SELECT [DISTINCT] {* | <projection_item>[, <projection_item>, ...]}
 FROM <table>
   [WHERE <expr>]
-  [ORDER BY <col> [ASC|DESC]]
+  [GROUP BY <col>[, <col>, ...]]
+  [ORDER BY <expr> [ASC|DESC]]
   [LIMIT <non-negative-integer>];
+```
+
+`<projection_item>` is one of:
+
+```
+<column>                                       -- bare column reference
+COUNT(*)                                       -- counts every row, including all-NULL ones
+COUNT([DISTINCT] <column>)                     -- counts non-NULL values, optionally deduping
+{SUM | AVG | MIN | MAX}(<column>)              -- aggregate over a single column
+<projection_item> AS <alias>                   -- optional column alias
 ```
 
 ### What works
 
-- **Projection**: `*` (all columns in declaration order) or a bare column list. Columns not declared on the table are rejected.
-- **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering). Includes **`IS NULL`** / **`IS NOT NULL`** for explicit null tests.
-- **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. The sort key can be a bare column reference OR any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. Sort key types must match; mixing `INTEGER` and `TEXT` across rows under a single `ORDER BY` is a runtime error.
-- **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows).
+- **Projection**: `*` (all columns in declaration order), a bare column list, or an explicit list mixing bare columns and aggregate calls. Each item can carry an optional `AS alias` (the alias becomes the output column header and is recognized by `ORDER BY`).
+- **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering). Includes **`IS NULL`** / **`IS NOT NULL`** for explicit null tests, **`LIKE` / `NOT LIKE` / `ILIKE`** for pattern matching, and **`IN (list) / NOT IN (list)`** for set-membership against literal lists.
+- **`DISTINCT`**: `SELECT DISTINCT` deduplicates result rows after projection (and after aggregation, when both apply). `NULL` values compare equal to other `NULL`s for dedupe, matching SQL's DISTINCT semantic.
+- **`GROUP BY`**: one or more bare column names. Every non-aggregate item in the projection must appear in the `GROUP BY` list (the parser rejects the violation with a clear message). `GROUP BY <col>` without any aggregate behaves like an implicit `DISTINCT <col>`.
+- **Aggregates** (SQLR-3): `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`. `SUM` over an integer column stays `INTEGER` until a `REAL` input arrives or the running sum overflows `i64` (one-time promotion to `REAL`). `AVG` always returns `REAL` (or `NULL` on empty / all-NULL groups). `MIN` / `MAX` skip NULLs and use the same total order as `ORDER BY`. Aggregates over an empty table or empty group return `0` for `COUNT(*)` / `COUNT(col)` and `NULL` for the rest.
+- **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. For non-aggregating queries the key is any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. For aggregating queries the key resolves against the *output* row by name: a bare identifier matches an alias or a `GROUP BY` column, and a function call like `COUNT(*)` matches an aggregate projection by its canonical display form. Sort key types must match across rows.
+- **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows). When `DISTINCT` is in play, `LIMIT` is applied after deduplication so it counts unique rows.
 
 ### Index probing
 
-The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col> = <literal>` or `<literal> = <indexed_col>`, it probes the index and scans only matching rows. Mixed predicates (`WHERE a = 1 AND b > 2`), range predicates (`WHERE a > 1`), and OR-combined predicates fall back to a full table scan.
+The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col> = <literal>` or `<literal> = <indexed_col>`, it probes the index and scans only matching rows. Mixed predicates (`WHERE a = 1 AND b > 2`), range predicates (`WHERE a > 1`), and OR-combined predicates fall back to a full table scan. Aggregating queries (`GROUP BY` / aggregate functions) skip the rowid-shape optimizations (HNSW / FTS / bounded-heap top-k) since every matching row contributes to its group.
+
+### `LIKE` semantics
+
+- `%` matches any (possibly empty) char sequence; `_` matches exactly one char. `\` escapes the next character so `\%` matches a literal percent. Outside `\%` / `\_` / `\\`, a backslash is itself a literal — matching SQLite's loose default.
+- Case folding is **ASCII-only and on by default**, mirroring SQLite's default `PRAGMA case_sensitive_like = OFF`. `LIKE 'a%'` matches both `Apple` and `apple`. Non-ASCII characters compare by code point (no Unicode case folding).
+- `LIKE … ESCAPE '<char>'` is not supported. `LIKE ANY (...)` is not supported.
+- `NULL LIKE 'pattern'` evaluates to `NULL`; in a `WHERE` that excludes the row.
+
+### `IN` semantics
+
+- Only the literal-list form is supported: `WHERE x IN (1, 2, 3)` and `WHERE x NOT IN (...)`.
+- Three-valued logic: if the LHS is `NULL`, the result is `NULL`; if the RHS list contains a `NULL` and no other entry matches, the result is `NULL`. In a `WHERE` both cases collapse to "row excluded", matching SQLite.
+- `IN (subquery)`, `IN UNNEST(...)`, and `BETWEEN` are not supported yet.
 
 ### What doesn't work
 
 - **Joins** of any kind (`INNER`, `LEFT OUTER`, `CROSS`, comma-join)
 - **Subqueries**, CTEs (`WITH`), views
-- **`GROUP BY`**, aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `HAVING`
-- **`DISTINCT`**
-- **`LIKE`**, **`IN`**, `BETWEEN`
-- **Expressions in the projection list** (`SELECT age + 1 FROM users`) — projection is bare column references only
-- **Multi-column `ORDER BY`**, `NULLS FIRST/LAST` (single sort key only; the sort key itself can be an expression as of Phase 7b)
+- **`HAVING`** — pre-aggregation `WHERE` works; post-aggregation filtering does not yet
+- **`DISTINCT`** on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
+- **`GROUP BY` on expressions** — bare column names only in v1
+- **`LIKE … ESCAPE '<char>'`**, **`IN (subquery)`**, **`BETWEEN`**, **`GLOB`**, **`REGEXP`**
+- **Expressions in the projection list** beyond aggregate calls (`SELECT age + 1 FROM users` is still rejected; aggregates are the one allowed expression form)
+- **Multi-column `ORDER BY`**, `NULLS FIRST/LAST` (single sort key only)
 - **`OFFSET`**
-- **Column aliases** (`SELECT name AS n FROM users`)
+- **Window functions** (`OVER (...)`, `FILTER (WHERE ...)`, `WITHIN GROUP`)
 
 Any of the above reaches the executor as a parsed AST node that execution doesn't handle, producing either `NotImplemented` or a more specific error (e.g., `joins are not supported`).
 
@@ -286,6 +314,9 @@ Expressions work inside `WHERE` (both in `SELECT`, `UPDATE`, `DELETE`) and on th
 | Category | Operators |
 |---|---|
 | Comparison | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Null tests | `IS NULL`, `IS NOT NULL` |
+| Pattern | `LIKE`, `NOT LIKE`, `ILIKE` (`%`, `_`, `\`-escape; case-insensitive ASCII) |
+| Set | `IN (list)`, `NOT IN (list)` (literal lists only) |
 | Logical | `AND`, `OR`, `NOT` |
 | Arithmetic | `+`, `-`, `*`, `/`, `%` |
 | String | `\|\|` (concatenation) |
