@@ -520,7 +520,7 @@ Final docs pass — canonical [`fts.md`](fts.md) reference (mirrors `ask.md`'s s
 ## "Possible extras" not pinned to a phase
 
 - Joins (`INNER`, `LEFT OUTER`, `CROSS`)
-- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`, `IS NULL`
+- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`
 - Composite and expression indexes
 - Alternate storage engines (LSM/SSTable for write-heavy workloads)
 - Benchmarks against SQLite

@@ -645,16 +645,184 @@ mod tests {
     }
 
     #[test]
-    fn process_command_insert_missing_integer_returns_error_test() {
-        // Non-PK INTEGER without a value should error (not panic on "Null".parse()).
+    fn insert_omitted_integer_column_is_stored_as_null() {
+        // SQLR-7 — pre-fix this errored because the omitted column was
+        // padded with the literal `"Null"` and then re-parsed as i32. The
+        // new INSERT pipeline carries `Option<Value>` from the parser
+        // through to `insert_row`, so a missing non-PK column is just
+        // SQL NULL (matches SQLite).
+        use crate::sql::db::table::Value;
+
         let mut db = Database::new("tempdb".to_string());
         process_command(
             "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER);",
             &mut db,
         )
         .unwrap();
-        let result = process_command("INSERT INTO items (id) VALUES (1);", &mut db);
-        assert!(result.is_err(), "expected error, got {result:?}");
+        process_command("INSERT INTO items (id) VALUES (1);", &mut db)
+            .expect("INSERT with omitted INTEGER column should succeed and store NULL");
+
+        let table = db.get_table("items".to_string()).unwrap();
+        let rowid = table.rowids().pop().expect("one row");
+        // BTreeMap entry was never written → get_value returns None,
+        // which the executor renders as Value::Null.
+        assert_eq!(table.get_value("qty", rowid), None);
+        // IS NULL via the executor sees the same NULL.
+        let response = process_command("SELECT id FROM items WHERE qty IS NULL;", &mut db)
+            .expect("select IS NULL");
+        assert!(
+            response.contains("1 row returned"),
+            "qty IS NULL should match the omitted-column row, got: {response}"
+        );
+        // Sanity: explicit literal stays Integer.
+        process_command("INSERT INTO items (id, qty) VALUES (2, 7);", &mut db).unwrap();
+        let table = db.get_table("items".to_string()).unwrap();
+        let row_two = table
+            .rowids()
+            .into_iter()
+            .find(|r| table.get_value("id", *r) == Some(Value::Integer(2)))
+            .unwrap();
+        assert_eq!(table.get_value("qty", row_two), Some(Value::Integer(7)));
+    }
+
+    #[test]
+    fn insert_explicit_null_into_integer_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, n) VALUES (1, NULL);", &mut db)
+            .expect("INSERT explicit NULL into INTEGER must not panic on parse::<i32>()");
+        let table = db.get_table("t".to_string()).unwrap();
+        let rowid = table.rowids().pop().unwrap();
+        assert_eq!(table.get_value("n", rowid), None);
+    }
+
+    #[test]
+    fn insert_explicit_null_into_text_column() {
+        // Pre-fix: the literal string "Null" was stored in the BTreeMap and
+        // a read-side workaround (`if v == "Null"`) re-mapped it back to
+        // Value::Null. Post-fix: nothing is stored at all, so a user-typed
+        // string `'Null'` no longer collides with SQL NULL.
+        use crate::sql::db::table::Value;
+
+        let mut db = Database::new("tempdb".to_string());
+        process_command("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);", &mut db).unwrap();
+        process_command("INSERT INTO t (id, s) VALUES (1, NULL);", &mut db).unwrap();
+        process_command("INSERT INTO t (id, s) VALUES (2, 'hi');", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        let row_one = table
+            .rowids()
+            .into_iter()
+            .find(|r| table.get_value("id", *r) == Some(Value::Integer(1)))
+            .unwrap();
+        let row_two = table
+            .rowids()
+            .into_iter()
+            .find(|r| table.get_value("id", *r) == Some(Value::Integer(2)))
+            .unwrap();
+        assert_eq!(table.get_value("s", row_one), None);
+        assert_eq!(
+            table.get_value("s", row_two),
+            Some(Value::Text("hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn insert_explicit_null_into_real_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, score REAL);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, score) VALUES (1, NULL);", &mut db)
+            .expect("INSERT explicit NULL into REAL must not panic on parse::<f32>()");
+        let table = db.get_table("t".to_string()).unwrap();
+        let rowid = table.rowids().pop().unwrap();
+        assert_eq!(table.get_value("score", rowid), None);
+    }
+
+    #[test]
+    fn insert_explicit_null_into_bool_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, flag) VALUES (1, NULL);", &mut db)
+            .expect("INSERT explicit NULL into BOOL must not panic on parse::<bool>()");
+        let table = db.get_table("t".to_string()).unwrap();
+        let rowid = table.rowids().pop().unwrap();
+        assert_eq!(table.get_value("flag", rowid), None);
+    }
+
+    #[test]
+    fn insert_explicit_null_into_vector_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3));",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, v) VALUES (1, NULL);", &mut db)
+            .expect("INSERT explicit NULL into VECTOR must not panic on parse_vector_literal");
+        let table = db.get_table("t".to_string()).unwrap();
+        let rowid = table.rowids().pop().unwrap();
+        assert_eq!(table.get_value("v", rowid), None);
+    }
+
+    #[test]
+    fn insert_explicit_null_into_json_column() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSON);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, doc) VALUES (1, NULL);", &mut db)
+            .expect("INSERT explicit NULL into JSON must skip serde_json validation");
+        let table = db.get_table("t".to_string()).unwrap();
+        let rowid = table.rowids().pop().unwrap();
+        assert_eq!(table.get_value("doc", rowid), None);
+    }
+
+    #[test]
+    fn default_does_not_override_explicit_null() {
+        // Restored from SQLR-2 (was dropped because it collided with the
+        // stringly-typed NULL handling SQLR-7 fixes). Column has DEFAULT 0;
+        // an explicit NULL in the INSERT must override the default and
+        // store NULL — the default only fires when the column is omitted.
+        use crate::sql::db::table::Value;
+
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 0);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("INSERT INTO t (id, n) VALUES (1, NULL);", &mut db).unwrap();
+        process_command("INSERT INTO t (id) VALUES (2);", &mut db).unwrap();
+
+        let table = db.get_table("t".to_string()).unwrap();
+        let row_one = table
+            .rowids()
+            .into_iter()
+            .find(|r| table.get_value("id", *r) == Some(Value::Integer(1)))
+            .unwrap();
+        let row_two = table
+            .rowids()
+            .into_iter()
+            .find(|r| table.get_value("id", *r) == Some(Value::Integer(2)))
+            .unwrap();
+        // Explicit NULL: stored as NULL, not the default.
+        assert_eq!(table.get_value("n", row_one), None);
+        // Omitted: stored as the DEFAULT 0.
+        assert_eq!(table.get_value("n", row_two), Some(Value::Integer(0)));
     }
 
     #[test]
@@ -934,6 +1102,61 @@ mod tests {
         let mut wal = path.as_os_str().to_owned();
         wal.push("-wal");
         let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    }
+
+    #[test]
+    fn null_values_round_trip_through_disk() {
+        // SQLR-7 — explicit NULLs and omitted columns must persist.
+        // Pre-fix, restore_row rejected NULL for INTEGER/REAL/BOOL/VECTOR
+        // columns ("Integer column 'n' cannot store NULL — corrupt
+        // cell?"), so any DB containing a NULL in those types failed to
+        // reopen.
+        use crate::sql::db::table::Value;
+        use crate::sql::pager::open_database;
+
+        let (path, mut db) = seed_file_backed(
+            "nullrt",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT, score REAL, flag BOOLEAN);",
+        );
+        process_command(
+            "INSERT INTO t (id, n, s, score, flag) VALUES (1, 10, 'hi', 1.5, true);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "INSERT INTO t (id, n, s, score, flag) VALUES (2, NULL, NULL, NULL, NULL);",
+            &mut db,
+        )
+        .unwrap();
+        // Row 3 omits every nullable column.
+        process_command("INSERT INTO t (id) VALUES (3);", &mut db).unwrap();
+
+        drop(db); // release pager lock
+
+        let reopened = open_database(&path, "t".to_string()).unwrap();
+        let t = reopened.get_table("t".to_string()).unwrap();
+        let by_id = |id: i64| {
+            t.rowids()
+                .into_iter()
+                .find(|r| t.get_value("id", *r) == Some(Value::Integer(id)))
+                .unwrap_or_else(|| panic!("row id={id} not found"))
+        };
+
+        let r1 = by_id(1);
+        assert_eq!(t.get_value("n", r1), Some(Value::Integer(10)));
+        assert_eq!(t.get_value("s", r1), Some(Value::Text("hi".to_string())));
+        assert_eq!(t.get_value("score", r1), Some(Value::Real(1.5)));
+        assert_eq!(t.get_value("flag", r1), Some(Value::Bool(true)));
+
+        for r in [by_id(2), by_id(3)] {
+            assert_eq!(t.get_value("n", r), None, "INTEGER NULL must round-trip");
+            assert_eq!(t.get_value("s", r), None, "TEXT NULL must round-trip");
+            assert_eq!(t.get_value("score", r), None, "REAL NULL must round-trip");
+            assert_eq!(t.get_value("flag", r), None, "BOOL NULL must round-trip");
+        }
+
+        drop(reopened);
+        cleanup_file(&path);
     }
 
     #[test]

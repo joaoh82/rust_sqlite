@@ -667,46 +667,26 @@ impl Table {
                 })?;
 
                 match (cell, &value) {
+                    // SQL NULL: leave the per-column BTreeMap entry
+                    // absent. `Row::*::get` returns `None` for missing
+                    // rowids, which `Table::get_value` relays and the
+                    // executor's `Identifier` arm renders as
+                    // `Value::Null`. Mirrors `insert_row`'s NULL path.
+                    (_, None) => { /* nothing to insert */ }
                     (Row::Integer(map), Some(Value::Integer(v))) => {
                         map.insert(rowid, *v as i32);
-                    }
-                    (Row::Integer(_), None) => {
-                        return Err(SQLRiteError::Internal(format!(
-                            "Integer column '{col_name}' cannot store NULL — corrupt cell?"
-                        )));
                     }
                     (Row::Text(map), Some(Value::Text(s))) => {
                         map.insert(rowid, s.clone());
                     }
-                    (Row::Text(map), None) => {
-                        // Matches the on-insert convention: NULL in Text
-                        // storage is represented by the literal "Null"
-                        // sentinel and not added to the index.
-                        map.insert(rowid, "Null".to_string());
-                    }
                     (Row::Real(map), Some(Value::Real(v))) => {
                         map.insert(rowid, *v as f32);
-                    }
-                    (Row::Real(_), None) => {
-                        return Err(SQLRiteError::Internal(format!(
-                            "Real column '{col_name}' cannot store NULL — corrupt cell?"
-                        )));
                     }
                     (Row::Bool(map), Some(Value::Bool(v))) => {
                         map.insert(rowid, *v);
                     }
-                    (Row::Bool(_), None) => {
-                        return Err(SQLRiteError::Internal(format!(
-                            "Bool column '{col_name}' cannot store NULL — corrupt cell?"
-                        )));
-                    }
                     (Row::Vector(map), Some(Value::Vector(v))) => {
                         map.insert(rowid, v.clone());
-                    }
-                    (Row::Vector(_), None) => {
-                        return Err(SQLRiteError::Internal(format!(
-                            "Vector column '{col_name}' cannot store NULL — corrupt cell?"
-                        )));
                     }
                     (row, v) => {
                         return Err(SQLRiteError::Internal(format!(
@@ -892,7 +872,7 @@ impl Table {
     pub fn validate_unique_constraint(
         &mut self,
         cols: &Vec<String>,
-        values: &Vec<String>,
+        values: &Vec<Option<Value>>,
     ) -> Result<()> {
         for (idx, name) in cols.iter().enumerate() {
             let column = self
@@ -904,52 +884,80 @@ impl Table {
                 continue;
             }
             let datatype = &column.datatype;
-            let val = &values[idx];
 
-            // Parse the string value into a runtime Value according to the
-            // declared column type. If parsing fails the caller's insert
-            // would also fail with the same error; surface it here so we
-            // don't emit a misleading "unique OK" on bad input.
-            let parsed = match datatype {
-                DataType::Integer => val.parse::<i64>().map(Value::Integer).map_err(|_| {
-                    SQLRiteError::General(format!(
-                        "Type mismatch: expected INTEGER for column '{name}', got '{val}'"
-                    ))
-                })?,
-                DataType::Text => Value::Text(val.clone()),
-                DataType::Real => val.parse::<f64>().map(Value::Real).map_err(|_| {
-                    SQLRiteError::General(format!(
-                        "Type mismatch: expected REAL for column '{name}', got '{val}'"
-                    ))
-                })?,
-                DataType::Bool => val.parse::<bool>().map(Value::Bool).map_err(|_| {
-                    SQLRiteError::General(format!(
-                        "Type mismatch: expected BOOL for column '{name}', got '{val}'"
-                    ))
-                })?,
-                DataType::Vector(declared_dim) => {
-                    let parsed_vec = parse_vector_literal(val).map_err(|e| {
-                        SQLRiteError::General(format!(
-                            "Type mismatch: expected VECTOR({declared_dim}) for column '{name}', {e}"
-                        ))
-                    })?;
+            // Standard SQL UNIQUE allows multiple NULLs — skip the check.
+            let supplied = match &values[idx] {
+                None => continue,
+                Some(v) => v,
+            };
+
+            // Type-check the supplied Value against the column's declared
+            // datatype. Same shape as the dispatch in `insert_row`: an
+            // INTEGER column accepts Value::Integer; REAL accepts Real or
+            // widens Integer; TEXT/JSON accepts Text; BOOL accepts Bool;
+            // VECTOR accepts Vector with a matching dimension. Anything
+            // else short-circuits the insert with the same error message
+            // `insert_row` would emit for the same input.
+            let parsed: Value = match (datatype, supplied) {
+                (DataType::Integer, Value::Integer(n)) => Value::Integer(*n),
+                (DataType::Integer, other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected INTEGER for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::Text, Value::Text(s)) => Value::Text(s.clone()),
+                (DataType::Text, other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected TEXT for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::Real, Value::Real(f)) => Value::Real(*f),
+                (DataType::Real, Value::Integer(n)) => Value::Real(*n as f64),
+                (DataType::Real, other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected REAL for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::Bool, Value::Bool(b)) => Value::Bool(*b),
+                (DataType::Bool, other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected BOOL for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::Vector(declared_dim), Value::Vector(parsed_vec)) => {
                     if parsed_vec.len() != *declared_dim {
                         return Err(SQLRiteError::General(format!(
                             "Vector dimension mismatch for column '{name}': declared {declared_dim}, got {}",
                             parsed_vec.len()
                         )));
                     }
-                    Value::Vector(parsed_vec)
+                    Value::Vector(parsed_vec.clone())
                 }
-                DataType::Json => {
+                (DataType::Vector(_), other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected VECTOR for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::Json, Value::Text(s)) => {
                     // JSON values stored as Text. UNIQUE on a JSON column
                     // compares the canonical text representation
                     // verbatim — `{"a": 1}` and `{"a":1}` are distinct.
                     // Document this if anyone actually requests UNIQUE
                     // JSON; for MVP, treat-as-text is fine.
-                    Value::Text(val.clone())
+                    Value::Text(s.clone())
                 }
-                DataType::None | DataType::Invalid => {
+                (DataType::Json, other) => {
+                    return Err(SQLRiteError::General(format!(
+                        "Type mismatch: expected JSON for column '{name}', got '{}'",
+                        other.to_display_string()
+                    )));
+                }
+                (DataType::None | DataType::Invalid, _) => {
                     return Err(SQLRiteError::Internal(format!(
                         "column '{name}' has an unsupported datatype"
                     )));
@@ -959,7 +967,8 @@ impl Table {
             if let Some(secondary) = self.index_for_column(name) {
                 if secondary.would_violate_unique(&parsed) {
                     return Err(SQLRiteError::General(format!(
-                        "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
+                        "UNIQUE constraint violated for column '{name}': value '{}' already exists",
+                        parsed.to_display_string()
                     )));
                 }
             } else {
@@ -967,7 +976,8 @@ impl Table {
                 for other in self.rowids() {
                     if self.get_value(name, other).as_ref() == Some(&parsed) {
                         return Err(SQLRiteError::General(format!(
-                            "UNIQUE constraint violated for column '{name}': value '{val}' already exists"
+                            "UNIQUE constraint violated for column '{name}': value '{}' already exists",
+                            parsed.to_display_string()
                         )));
                     }
                 }
@@ -986,7 +996,7 @@ impl Table {
     ///
     /// Returns `Err` (leaving the table unchanged) when the user supplies an
     /// incompatibly-typed value — no more panics on bad input.
-    pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<String>) -> Result<()> {
+    pub fn insert_row(&mut self, cols: &Vec<String>, values: &Vec<Option<Value>>) -> Result<()> {
         let mut next_rowid = self.last_rowid + 1;
 
         // Auto-assign INTEGER PRIMARY KEY when the user omits it; otherwise
@@ -1022,13 +1032,22 @@ impl Table {
             } else {
                 for i in 0..cols.len() {
                     if cols[i] == self.primary_key {
-                        let val = &values[i];
-                        next_rowid = val.parse::<i64>().map_err(|_| {
-                            SQLRiteError::General(format!(
-                                "Type mismatch: PRIMARY KEY column '{}' expects INTEGER, got '{val}'",
-                                self.primary_key
-                            ))
-                        })?;
+                        next_rowid = match &values[i] {
+                            Some(Value::Integer(n)) => *n,
+                            None => {
+                                return Err(SQLRiteError::General(format!(
+                                    "Type mismatch: PRIMARY KEY column '{}' cannot be NULL",
+                                    self.primary_key
+                                )));
+                            }
+                            Some(other) => {
+                                return Err(SQLRiteError::General(format!(
+                                    "Type mismatch: PRIMARY KEY column '{}' expects INTEGER, got '{}'",
+                                    self.primary_key,
+                                    other.to_display_string()
+                                )));
+                            }
+                        };
                     }
                 }
             }
@@ -1043,13 +1062,16 @@ impl Table {
             .collect::<Vec<String>>();
         let mut j: usize = 0;
         for i in 0..column_names.len() {
-            let mut val = String::from("Null");
+            // `None` means SQL NULL: leave the column's BTreeMap entry
+            // absent so reads come back as Value::Null via the missing-
+            // rowid path.
+            let mut val: Option<Value> = None;
             let key = &column_names[i];
             let mut column_supplied = false;
 
             if let Some(supplied_key) = cols.get(j) {
                 if supplied_key == &column_names[i] {
-                    val = values[j].to_string();
+                    val = values[j].clone();
                     column_supplied = true;
                     j += 1;
                 } else if self.primary_key == column_names[i] {
@@ -1062,13 +1084,14 @@ impl Table {
 
             // Column was omitted from the INSERT column list. Substitute its
             // DEFAULT literal if one was declared at CREATE TABLE time;
-            // otherwise it stays as the "Null" sentinel set above. SQLite
-            // semantics: an *explicit* NULL is preserved as NULL — the
-            // default only fires for omitted columns.
+            // otherwise it stays as None. SQLite semantics: an *explicit*
+            // NULL is preserved as NULL — the default only fires for
+            // omitted columns. `DEFAULT NULL` is treated as no default.
             if !column_supplied {
-                if let Some(default) = &self.columns[i].default {
-                    val = default.to_default_insert_string();
-                }
+                val = self.columns[i]
+                    .default
+                    .clone()
+                    .filter(|v| !matches!(v, Value::Null));
             }
 
             // Step 1: write into row storage and compute the typed Value
@@ -1080,67 +1103,86 @@ impl Table {
                     SQLRiteError::Internal(format!("Row storage missing for column '{key}'"))
                 })?;
 
-                match table_col_data {
-                    Row::Integer(tree) => {
-                        let parsed = val.parse::<i32>().map_err(|_| {
-                            SQLRiteError::General(format!(
-                                "Type mismatch: expected INTEGER for column '{key}', got '{val}'"
-                            ))
-                        })?;
-                        tree.insert(next_rowid, parsed);
-                        Some(Value::Integer(parsed as i64))
+                match (table_col_data, &val) {
+                    // SQL NULL: leave the BTreeMap entry absent. Indexes are
+                    // skipped (Step 2 below short-circuits on None).
+                    (_, None) => None,
+
+                    (Row::Integer(tree), Some(Value::Integer(n))) => {
+                        tree.insert(next_rowid, *n as i32);
+                        Some(Value::Integer(*n))
                     }
-                    Row::Text(tree) => {
-                        // Phase 7e — JSON columns also reach here (they
-                        // share Row::Text storage with TEXT columns).
-                        // Validate the value parses as JSON before
-                        // storing; otherwise we'd happily write
-                        // `not-json-at-all` and only fail when
-                        // json_extract tried to parse it later.
-                        if matches!(self.columns[i].datatype, DataType::Json) && val != "Null" {
-                            if let Err(e) = serde_json::from_str::<serde_json::Value>(&val) {
+                    (Row::Integer(_), Some(other)) => {
+                        return Err(SQLRiteError::General(format!(
+                            "Type mismatch: expected INTEGER for column '{key}', got '{}'",
+                            other.to_display_string()
+                        )));
+                    }
+
+                    (Row::Text(tree), Some(Value::Text(s))) => {
+                        // Phase 7e — JSON columns share Row::Text storage.
+                        // Validate the value parses as JSON before storing;
+                        // otherwise we'd happily write `not-json-at-all`
+                        // and only fail when json_extract tried to parse
+                        // it later.
+                        if matches!(self.columns[i].datatype, DataType::Json) {
+                            if let Err(e) = serde_json::from_str::<serde_json::Value>(s) {
                                 return Err(SQLRiteError::General(format!(
-                                    "Type mismatch: expected JSON for column '{key}', got '{val}': {e}"
+                                    "Type mismatch: expected JSON for column '{key}', got '{s}': {e}"
                                 )));
                             }
                         }
-                        tree.insert(next_rowid, val.to_string());
-                        // "Null" sentinel stays out of the index — it isn't a
-                        // real user value.
-                        if val != "Null" {
-                            Some(Value::Text(val.to_string()))
+                        tree.insert(next_rowid, s.clone());
+                        Some(Value::Text(s.clone()))
+                    }
+                    (Row::Text(_), Some(other)) => {
+                        let label = if matches!(self.columns[i].datatype, DataType::Json) {
+                            "JSON"
                         } else {
-                            None
-                        }
+                            "TEXT"
+                        };
+                        return Err(SQLRiteError::General(format!(
+                            "Type mismatch: expected {label} for column '{key}', got '{}'",
+                            other.to_display_string()
+                        )));
                     }
-                    Row::Real(tree) => {
-                        let parsed = val.parse::<f32>().map_err(|_| {
-                            SQLRiteError::General(format!(
-                                "Type mismatch: expected REAL for column '{key}', got '{val}'"
-                            ))
-                        })?;
-                        tree.insert(next_rowid, parsed);
-                        Some(Value::Real(parsed as f64))
+
+                    (Row::Real(tree), Some(Value::Real(f))) => {
+                        let f32_val = *f as f32;
+                        tree.insert(next_rowid, f32_val);
+                        Some(Value::Real(*f))
                     }
-                    Row::Bool(tree) => {
-                        let parsed = val.parse::<bool>().map_err(|_| {
-                            SQLRiteError::General(format!(
-                                "Type mismatch: expected BOOL for column '{key}', got '{val}'"
-                            ))
-                        })?;
-                        tree.insert(next_rowid, parsed);
-                        Some(Value::Bool(parsed))
+                    // Allow integer literals to widen into REAL columns
+                    // (matches the previous string-parse behavior where
+                    // `INSERT … VALUES (42)` into a REAL column worked).
+                    (Row::Real(tree), Some(Value::Integer(n))) => {
+                        let f32_val = *n as f32;
+                        tree.insert(next_rowid, f32_val);
+                        Some(Value::Real(*n as f64))
                     }
-                    Row::Vector(tree) => {
-                        // The parser put a bracket-array literal into `val`
-                        // (e.g. "[0.1,0.2,0.3]"). Parse it back here and
+                    (Row::Real(_), Some(other)) => {
+                        return Err(SQLRiteError::General(format!(
+                            "Type mismatch: expected REAL for column '{key}', got '{}'",
+                            other.to_display_string()
+                        )));
+                    }
+
+                    (Row::Bool(tree), Some(Value::Bool(b))) => {
+                        tree.insert(next_rowid, *b);
+                        Some(Value::Bool(*b))
+                    }
+                    (Row::Bool(_), Some(other)) => {
+                        return Err(SQLRiteError::General(format!(
+                            "Type mismatch: expected BOOL for column '{key}', got '{}'",
+                            other.to_display_string()
+                        )));
+                    }
+
+                    (Row::Vector(tree), Some(Value::Vector(parsed))) => {
+                        // The parser already turned a bracket-array literal
+                        // into a typed Value::Vector. We still need to
                         // dim-check against the column's declared
                         // DataType::Vector(N).
-                        let parsed = parse_vector_literal(&val).map_err(|e| {
-                            SQLRiteError::General(format!(
-                                "Type mismatch: expected VECTOR for column '{key}', {e}"
-                            ))
-                        })?;
                         let declared_dim = match &self.columns[i].datatype {
                             DataType::Vector(d) => *d,
                             other => {
@@ -1156,9 +1198,16 @@ impl Table {
                             )));
                         }
                         tree.insert(next_rowid, parsed.clone());
-                        Some(Value::Vector(parsed))
+                        Some(Value::Vector(parsed.clone()))
                     }
-                    Row::None => {
+                    (Row::Vector(_), Some(other)) => {
+                        return Err(SQLRiteError::General(format!(
+                            "Type mismatch: expected VECTOR for column '{key}', got '{}'",
+                            other.to_display_string()
+                        )));
+                    }
+
+                    (Row::None, _) => {
                         return Err(SQLRiteError::Internal(format!(
                             "Column '{key}' has no row storage"
                         )));
@@ -1531,25 +1580,6 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Vector(v) => format_vector_for_display(v),
             Value::Null => String::from("NULL"),
-        }
-    }
-
-    /// Renders this value in the same stringly format that
-    /// [`crate::sql::parser::insert::InsertQuery::new`] produces for INSERT
-    /// values, so a DEFAULT can be substituted into the existing
-    /// `insert_row` parse pipeline without a parallel typed path.
-    ///
-    /// The differences from [`Self::to_display_string`] that matter:
-    ///   - `NULL` renders as the `"Null"` sentinel that `insert_row` matches.
-    ///   - Text stays unquoted (the insert pipeline strips quotes upstream).
-    pub fn to_default_insert_string(&self) -> String {
-        match self {
-            Value::Integer(v) => v.to_string(),
-            Value::Text(s) => s.clone(),
-            Value::Real(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Vector(v) => format_vector_for_display(v),
-            Value::Null => String::from("Null"),
         }
     }
 }

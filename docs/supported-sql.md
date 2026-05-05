@@ -158,7 +158,7 @@ FROM <table>
 ### What works
 
 - **Projection**: `*` (all columns in declaration order) or a bare column list. Columns not declared on the table are rejected.
-- **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering).
+- **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering). Includes **`IS NULL`** / **`IS NOT NULL`** for explicit null tests.
 - **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. The sort key can be a bare column reference OR any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. Sort key types must match; mixing `INTEGER` and `TEXT` across rows under a single `ORDER BY` is a runtime error.
 - **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows).
 
@@ -172,7 +172,7 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 - **Subqueries**, CTEs (`WITH`), views
 - **`GROUP BY`**, aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `HAVING`
 - **`DISTINCT`**
-- **`LIKE`**, **`IN`**, **`IS NULL`** / **`IS NOT NULL`**, `BETWEEN`
+- **`LIKE`**, **`IN`**, `BETWEEN`
 - **Expressions in the projection list** (`SELECT age + 1 FROM users`) — projection is bare column references only
 - **Multi-column `ORDER BY`**, `NULLS FIRST/LAST` (single sort key only; the sort key itself can be an expression as of Phase 7b)
 - **`OFFSET`**
@@ -382,7 +382,7 @@ See [`docs/fts.md`](fts.md) for the canonical FTS reference (tokenizer rules, BM
 
 SQLRite follows standard SQL three-valued logic:
 
-- **Comparisons involving NULL** (`NULL = 1`, `1 < NULL`) evaluate to unknown, which behaves as `false` inside `WHERE`. Neither the NULL = NULL equality nor the NULL <> NULL inequality is true — use `IS NULL` / `IS NOT NULL` for explicit null tests (both **not yet supported**).
+- **Comparisons involving NULL** (`NULL = 1`, `1 < NULL`) evaluate to unknown, which behaves as `false` inside `WHERE`. Neither the NULL = NULL equality nor the NULL <> NULL inequality is true — use **`IS NULL`** / **`IS NOT NULL`** for explicit null tests (`SELECT … WHERE col IS NULL`). NULLs are not stored in secondary, HNSW, or FTS indexes, so `IS NULL` always falls through to a full scan; that's correct, just not as fast as an indexed equality probe.
 - **Logical operators with NULL**: `NULL AND false` → `false`, `NULL AND true` → `NULL`, `NULL OR true` → `true`, `NOT NULL` → `NULL`. The short-circuit rules prevent NULL from propagating when one operand already decides the result.
 - **Arithmetic with NULL**: any operand NULL → result NULL. `NULL + 1` → `NULL`.
 - **String concat with NULL**: `'foo' || NULL` → `NULL` (same propagation as arithmetic).
@@ -503,7 +503,6 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 ### Predicate & expression
 - `LIKE`, `GLOB`, `REGEXP`
 - `IN (...)`, `NOT IN`, `BETWEEN`
-- `IS NULL`, `IS NOT NULL` (pending — use `col = NULL` is NOT a workaround since it's always false; the only current way to select NULL rows is to rely on the NULL-as-false-in-WHERE behavior being absent when the column isn't referenced)
 - `CASE WHEN ... THEN ... END`
 - Expressions in the `SELECT` projection list
 - Column aliases (`AS`)

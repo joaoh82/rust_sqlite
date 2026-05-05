@@ -42,9 +42,9 @@ Quick hits worth knowing when you're working at the REPL:
 - **One statement per call.** The REPL / `Connection::execute` expects a single statement; multi-statement strings return `Expected a single query statement, but there are N`. For batch execution use the SDKs' `executescript` / `execute_batch`.
 - **Transactions are real.** `BEGIN` / `COMMIT` / `ROLLBACK` land as expected; auto-save is suppressed inside a transaction and everything flushes in one WAL commit frame on `COMMIT`. No nested transactions yet.
 - **Arithmetic stays honest.** Integer-only operations stay integer; any `REAL` operand promotes to `f64`; divide-by-zero is a typed runtime error, never a panic.
-- **NULL follows three-valued logic.** `NULL = NULL` is unknown (not true) — treated as false in `WHERE`. Use `IS NULL` / `IS NOT NULL` — oh wait, [those aren't supported yet](supported-sql.md#not-yet-supported). Track via Roadmap.
+- **NULL follows three-valued logic.** `NULL = NULL` is unknown (not true) — treated as false in `WHERE`. Use `IS NULL` / `IS NOT NULL` for explicit null tests, e.g. `SELECT id FROM t WHERE qty IS NULL;`.
 - **Identifiers are case-sensitive** (table / column names; no normalization), but keywords aren't. String literals preserve case.
-- **Not yet supported**: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, projection expressions, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. See the [full list in the reference](supported-sql.md#not-yet-supported).
+- **Not yet supported**: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN`, projection expressions, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. See the [full list in the reference](supported-sql.md#not-yet-supported).
 
 ## History
 
