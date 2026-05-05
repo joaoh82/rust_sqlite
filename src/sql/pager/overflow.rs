@@ -139,8 +139,17 @@ impl PagedEntry {
     }
 
     /// Dispatches on the kind tag and returns the appropriate variant.
+    ///
+    /// Only `KIND_LOCAL` and `KIND_OVERFLOW` are valid here — `PagedEntry`
+    /// is the table-leaf-cell type, so any other kind means a caller
+    /// pointed the wrong decoder at this page (the slot directory layout
+    /// is shared across leaf B-Trees, but secondary-index, HNSW, and
+    /// FTS leaves carry kind-specific cells decoded by `IndexCell::decode`,
+    /// `HnswNodeCell::decode`, and `FtsPostingCell::decode` respectively).
+    /// The named-kind error makes that mistake obvious next time.
     pub fn decode(buf: &[u8], pos: usize) -> Result<(PagedEntry, usize)> {
-        match Cell::peek_kind(buf, pos)? {
+        let kind = Cell::peek_kind(buf, pos)?;
+        match kind {
             KIND_LOCAL => {
                 let (c, n) = Cell::decode(buf, pos)?;
                 Ok((PagedEntry::Local(c), n))
@@ -150,9 +159,38 @@ impl PagedEntry {
                 Ok((PagedEntry::Overflow(r), n))
             }
             other => Err(SQLRiteError::Internal(format!(
-                "unknown paged-entry kind tag {other:#x} at offset {pos}"
+                "PagedEntry::decode at offset {pos} got kind tag {other:#x} ({}); \
+                 expected KIND_LOCAL (0x01) or KIND_OVERFLOW (0x02). \
+                 The caller is reading a {} page with the table-leaf decoder.",
+                kind_name(other),
+                kind_btree_hint(other),
             ))),
         }
+    }
+}
+
+/// Human-readable label for a cell kind tag — used in error messages
+/// to make wrong-decoder mistakes self-explanatory.
+fn kind_name(tag: u8) -> &'static str {
+    match tag {
+        crate::sql::pager::cell::KIND_LOCAL => "KIND_LOCAL",
+        crate::sql::pager::cell::KIND_OVERFLOW => "KIND_OVERFLOW",
+        crate::sql::pager::cell::KIND_INTERIOR => "KIND_INTERIOR",
+        crate::sql::pager::cell::KIND_INDEX => "KIND_INDEX",
+        crate::sql::pager::cell::KIND_HNSW => "KIND_HNSW",
+        crate::sql::pager::cell::KIND_FTS_POSTING => "KIND_FTS_POSTING",
+        _ => "unknown kind",
+    }
+}
+
+/// Hint pointing at which B-Tree owns a cell of the given kind.
+fn kind_btree_hint(tag: u8) -> &'static str {
+    match tag {
+        crate::sql::pager::cell::KIND_INTERIOR => "B-Tree interior",
+        crate::sql::pager::cell::KIND_INDEX => "secondary-index",
+        crate::sql::pager::cell::KIND_HNSW => "HNSW",
+        crate::sql::pager::cell::KIND_FTS_POSTING => "FTS",
+        _ => "non-table",
     }
 }
 
@@ -282,6 +320,50 @@ mod tests {
         let overflow_bytes = overflow.encode();
         let (decoded, _) = PagedEntry::decode(&overflow_bytes, 0).unwrap();
         assert_eq!(decoded, PagedEntry::Overflow(overflow));
+    }
+
+    /// SQLR-1 — `PagedEntry::decode` is the table-leaf-cell decoder.
+    /// Pointing it at a secondary-index leaf used to surface as a
+    /// cryptic `unknown paged-entry kind tag 0x4`. The new error
+    /// message names the offending kind and the B-Tree the caller
+    /// is mistakenly walking.
+    #[test]
+    fn paged_entry_decode_rejects_index_kind_with_clear_error() {
+        use crate::sql::pager::index_cell::IndexCell;
+        let ic = IndexCell::new(42, Value::Text("alice".into()));
+        let bytes = ic.encode().unwrap();
+        let err = PagedEntry::decode(&bytes, 0).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("KIND_INDEX"),
+            "expected error to name KIND_INDEX, got: {msg}",
+        );
+        assert!(
+            msg.contains("secondary-index"),
+            "expected error to identify the secondary-index B-Tree, got: {msg}",
+        );
+    }
+
+    /// Symmetric coverage for HNSW and FTS — same wrong-decoder shape,
+    /// same diagnostic guarantee.
+    #[test]
+    fn paged_entry_decode_rejects_hnsw_and_fts_kinds() {
+        use crate::sql::pager::cell::{KIND_FTS_POSTING, KIND_HNSW};
+        // Build minimal byte sequences carrying the right kind tag at
+        // the right offset. Body content past the kind tag doesn't
+        // matter — we expect the dispatch to short-circuit on the tag.
+        for (tag, hint) in [(KIND_HNSW, "HNSW"), (KIND_FTS_POSTING, "FTS")] {
+            // body_len declared as 1 (the kind tag itself); body is the
+            // tag and nothing else. Honest about what's in the buffer
+            // so a future tightening of `peek_kind` doesn't bite us.
+            let bytes = vec![/*body_len varint=*/ 1u8, tag];
+            let err = PagedEntry::decode(&bytes, 0).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(hint),
+                "expected error to identify the {hint} B-Tree, got: {msg}",
+            );
+        }
     }
 
     #[test]

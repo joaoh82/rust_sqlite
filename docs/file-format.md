@@ -139,6 +139,8 @@ body           variable        depends on kind_tag
 
 The shared prefix means `Cell::peek_rowid` works uniformly across all kinds — useful for binary search over a page's slot directory without decoding full bodies.
 
+**Decoder dispatch is per-B-tree, not per-cell.** Each B-Tree owns one cell kind on its leaves: table B-Trees carry `Local`/`Overflow` cells (decoded via `PagedEntry::decode`), secondary-index B-Trees carry `Index` cells (`IndexCell::decode`), HNSW carries `HNSW` cells (`HnswNodeCell::decode`), FTS carries `FTS Posting` cells (`FtsPostingCell::decode`), and every interior node — regardless of the leaf kind below it — carries `Interior` divider cells (`InteriorCell::decode`). Callers must dispatch on the *page's owning B-Tree*, not on the kind tag they happen to see; pointing the wrong decoder at a leaf yields an `Internal` error that names both the offending kind and the B-Tree it belongs to (SQLR-1).
+
 ### Local cell body
 
 ```
