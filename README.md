@@ -165,12 +165,13 @@ sqlrite> DELETE FROM users WHERE age < 30;
 Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 
 - Comparisons — `=`, `<>`, `<`, `<=`, `>`, `>=`
+- Null tests — `IS NULL`, `IS NOT NULL`
 - Logical — `AND`, `OR`, `NOT` (SQL three-valued logic; NULL-as-false in `WHERE`)
 - Arithmetic — `+`, `-`, `*`, `/`, `%` (integer ops stay integer; any `REAL` promotes to `f64`; divide/modulo by zero is a clean error)
 - String concat — `||`
 - Literals — integer + real numbers, `'single-quoted strings'`, `TRUE` / `FALSE`, `NULL`; parentheses for grouping
 
-**Not yet supported** (common ones): joins, subqueries, CTEs, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN` / `IS NULL`, expressions in the projection list, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
+**Not yet supported** (common ones): joins, subqueries, CTEs, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN`, expressions in the projection list, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
 
 #### Meta commands
 
@@ -309,7 +310,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 
 **Possible extras** *(no committed phase)*
 - Joins (`INNER`, `LEFT OUTER`, `CROSS` — SQLite does not support `RIGHT`/`FULL OUTER`)
-- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`, `IS NULL`
+- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`
 - Composite and expression indexes (with cost analysis)
 - Alternate storage engines — LSM/SSTable for write-heavy workloads alongside the B-Tree
 - Benchmarks against SQLite

@@ -1,22 +1,28 @@
-use sqlparser::ast::{Expr, Insert, SetExpr, Statement, Value, Values};
+use sqlparser::ast::{Expr, Insert, SetExpr, Statement, Value as AstValue, Values};
 
 use crate::error::{Result, SQLRiteError};
+use crate::sql::db::table::{Value, parse_vector_literal};
 
-/// The following structure represents a INSERT query already parsed
-/// and broken down into `table_name` a `Vec<String>` representing the `Columns`
-/// and `Vec<Vec<String>>` representing the list of `Rows` to be inserted
+/// Parsed INSERT statement: target table, declared column list, and one
+/// or more rows of typed values.
+///
+/// `rows` is `Vec<Vec<Option<Value>>>` rather than `Vec<Vec<String>>` so
+/// SQL `NULL` can be represented faithfully as `None` instead of leaking
+/// out as the string sentinel `"Null"` (which used to break INTEGER /
+/// REAL / BOOL inserts and silently round-trip as the literal text
+/// `"Null"` in TEXT columns).
 #[derive(Debug)]
 pub struct InsertQuery {
     pub table_name: String,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<Option<Value>>>,
 }
 
 impl InsertQuery {
     pub fn new(statement: &Statement) -> Result<InsertQuery> {
         let tname: Option<String>;
         let mut columns: Vec<String> = vec![];
-        let mut all_values: Vec<Vec<String>> = vec![];
+        let mut all_values: Vec<Vec<Option<Value>>> = vec![];
 
         match statement {
             Statement::Insert(Insert {
@@ -38,25 +44,32 @@ impl InsertQuery {
 
                 if let SetExpr::Values(Values { rows, .. }) = source.body.as_ref() {
                     for row in rows {
-                        let mut value_set: Vec<String> = vec![];
+                        let mut value_set: Vec<Option<Value>> = vec![];
                         for e in row {
                             match e {
                                 Expr::Value(v) => match &v.value {
-                                    Value::Number(n, _) => {
-                                        value_set.push(n.to_string());
-                                    }
-                                    Value::Boolean(b) => {
-                                        if *b {
-                                            value_set.push("true".to_string());
+                                    AstValue::Number(n, _) => {
+                                        // Try integer first; if the literal has
+                                        // a decimal point or exponent, i64 fails
+                                        // and we fall through to f64.
+                                        if let Ok(i) = n.parse::<i64>() {
+                                            value_set.push(Some(Value::Integer(i)));
+                                        } else if let Ok(f) = n.parse::<f64>() {
+                                            value_set.push(Some(Value::Real(f)));
                                         } else {
-                                            value_set.push("false".to_string());
+                                            return Err(SQLRiteError::General(format!(
+                                                "Could not parse numeric literal '{n}'"
+                                            )));
                                         }
                                     }
-                                    Value::SingleQuotedString(sqs) => {
-                                        value_set.push(sqs.to_string());
+                                    AstValue::Boolean(b) => {
+                                        value_set.push(Some(Value::Bool(*b)));
                                     }
-                                    Value::Null => {
-                                        value_set.push("Null".to_string());
+                                    AstValue::SingleQuotedString(sqs) => {
+                                        value_set.push(Some(Value::Text(sqs.to_string())));
+                                    }
+                                    AstValue::Null => {
+                                        value_set.push(None);
                                     }
                                     _ => {}
                                 },
@@ -66,17 +79,21 @@ impl InsertQuery {
                                     // bracket-quoted identifiers (it inherits
                                     // MSSQL-style `[name]` quoting). Detect
                                     // that by `quote_style == Some('[')` and
-                                    // re-wrap with brackets so the
-                                    // `parse_vector_literal` helper at
-                                    // insert_row time can recognize and parse
-                                    // it. Regular unquoted identifiers (column
-                                    // refs, which don't make sense in INSERT
-                                    // VALUES anyway) keep the existing
-                                    // pass-through-as-string behavior.
+                                    // parse it eagerly into a typed
+                                    // `Value::Vector` so the rest of the
+                                    // pipeline sees a real vector. Dimension
+                                    // checking against the column declaration
+                                    // happens at insert_row time.
                                     if i.quote_style == Some('[') {
-                                        value_set.push(format!("[{}]", i.value));
+                                        let raw = format!("[{}]", i.value);
+                                        let parsed = parse_vector_literal(&raw).map_err(|e| {
+                                            SQLRiteError::General(format!(
+                                                "Could not parse vector literal '{raw}': {e}"
+                                            ))
+                                        })?;
+                                        value_set.push(Some(Value::Vector(parsed)));
                                     } else {
-                                        value_set.push(i.to_string());
+                                        value_set.push(Some(Value::Text(i.to_string())));
                                     }
                                 }
                                 _ => {}

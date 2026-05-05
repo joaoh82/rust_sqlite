@@ -1621,6 +1621,22 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             ))),
         },
 
+        // SQLR-7 — `col IS NULL` / `col IS NOT NULL`. Identifier
+        // evaluation already maps a missing rowid in the column's
+        // BTreeMap to `Value::Null`, so this works uniformly for
+        // explicit NULL inserts, omitted columns, and (post-Phase 7e)
+        // legacy "Null"-sentinel TEXT cells. NULLs are never inserted
+        // into secondary / HNSW / FTS indexes, so an IS NULL probe
+        // correctly falls through to a full scan via `select_rowids`.
+        Expr::IsNull(inner) => {
+            let v = eval_expr(inner, table, rowid)?;
+            Ok(Value::Bool(matches!(v, Value::Null)))
+        }
+        Expr::IsNotNull(inner) => {
+            let v = eval_expr(inner, table, rowid)?;
+            Ok(Value::Bool(!matches!(v, Value::Null)))
+        }
+
         // Phase 7b — function-call dispatch. Currently only the three
         // vector-distance functions; this match arm becomes the single
         // place to register more SQL functions later (e.g. abs(),
@@ -2604,6 +2620,134 @@ mod tests {
         assert!(
             ratio > 1.4,
             "bounded heap should be substantially faster than full sort, but ratio = {ratio:.2}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-7 — IS NULL / IS NOT NULL
+    // ---------------------------------------------------------------------
+
+    /// Helper for IS NULL tests: run a SELECT through process_command and
+    /// return the rendered table as a String so the test can assert on the
+    /// row-count line without re-implementing the executor.
+    fn run_select(db: &mut Database, sql: &str) -> String {
+        crate::sql::process_command(sql, db).expect("select")
+    }
+
+    #[test]
+    fn where_is_null_returns_null_rows() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (1, 10);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (2, NULL);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (3, 30);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (4, NULL);", &mut db).unwrap();
+
+        let response = run_select(&mut db, "SELECT id FROM t WHERE n IS NULL;");
+        assert!(
+            response.contains("2 rows returned"),
+            "IS NULL should return 2 rows, got: {response}"
+        );
+    }
+
+    #[test]
+    fn where_is_not_null_returns_non_null_rows() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (1, 10);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (2, NULL);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (3, 30);", &mut db).unwrap();
+
+        let response = run_select(&mut db, "SELECT id FROM t WHERE n IS NOT NULL;");
+        assert!(
+            response.contains("2 rows returned"),
+            "IS NOT NULL should return 2 rows, got: {response}"
+        );
+    }
+
+    #[test]
+    fn where_is_null_on_indexed_column() {
+        // UNIQUE on a TEXT column gets an automatic secondary index.
+        // NULLs aren't stored in the index, so IS NULL falls through to
+        // a full scan via select_rowids — verify the full-scan path is
+        // still correct.
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, name) VALUES (1, 'alice');", &mut db)
+            .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, name) VALUES (2, NULL);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, name) VALUES (3, 'bob');", &mut db)
+            .unwrap();
+
+        let null_rows = run_select(&mut db, "SELECT id FROM t WHERE name IS NULL;");
+        assert!(
+            null_rows.contains("1 row returned"),
+            "indexed IS NULL should return 1 row, got: {null_rows}"
+        );
+        let not_null_rows = run_select(&mut db, "SELECT id FROM t WHERE name IS NOT NULL;");
+        assert!(
+            not_null_rows.contains("2 rows returned"),
+            "indexed IS NOT NULL should return 2 rows, got: {not_null_rows}"
+        );
+    }
+
+    #[test]
+    fn where_is_null_works_on_omitted_column() {
+        // No DEFAULT, column missing from the INSERT column list — the
+        // BTreeMap entry never gets written, get_value returns None,
+        // eval_expr maps that to Value::Null, and IS NULL matches.
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, label TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command(
+            "INSERT INTO t (id, qty, label) VALUES (1, 7, 'a');",
+            &mut db,
+        )
+        .unwrap();
+        // qty omitted on row 2.
+        crate::sql::process_command("INSERT INTO t (id, label) VALUES (2, 'b');", &mut db).unwrap();
+
+        let response = run_select(&mut db, "SELECT id FROM t WHERE qty IS NULL;");
+        assert!(
+            response.contains("1 row returned"),
+            "IS NULL should match the omitted-column row, got: {response}"
+        );
+    }
+
+    #[test]
+    fn where_is_null_combines_with_and_or() {
+        // Sanity check that the new arms compose with the existing
+        // boolean operators in eval_expr — `n IS NULL AND id > 1`
+        // should narrow correctly.
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (1, NULL);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (2, NULL);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (id, n) VALUES (3, 30);", &mut db).unwrap();
+
+        let response = run_select(&mut db, "SELECT id FROM t WHERE n IS NULL AND id > 1;");
+        assert!(
+            response.contains("1 row returned"),
+            "IS NULL combined with AND should match exactly row 2, got: {response}"
         );
     }
 }
