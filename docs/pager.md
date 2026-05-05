@@ -201,6 +201,20 @@ After staging, pages that were live before this save but didn't get restaged thi
 
 Format-version side effect: a save that produces a non-empty freelist promotes the file from v4/v5 to v6 (mirrors Phase 8c's v4→v5 FTS rule). VACUUM clears the freelist but doesn't downgrade — v6 is a strict superset.
 
+### Auto-VACUUM trigger (SQLR-10)
+
+After SQLR-6, the file still required a manual `VACUUM;` to actually shrink — the freelist absorbed orphan pages but the high-water mark stayed put. SQLR-10 adds a heuristic that fires `vacuum_database` automatically after a page-releasing DDL (`DROP TABLE`, `DROP INDEX`, `ALTER TABLE DROP COLUMN`) when the freelist exceeds a configurable fraction of `page_count`.
+
+Configuration lives on `Database::auto_vacuum_threshold: Option<f32>` and is exposed at the connection level via `Connection::set_auto_vacuum_threshold` / `auto_vacuum_threshold`. Defaults: `Some(0.25)` (SQLite parity at 25%); pass `None` to opt out per connection. The threshold is per-`Connection` runtime state and is not persisted in the file header — every reopen starts at the default. A SQL-level `PRAGMA auto_vacuum` is tracked separately (out of scope for SQLR-10).
+
+The trigger lives at the end of [`process_command_with_render`](../src/sql/mod.rs), immediately after the auto-save. Order matters: the freelist isn't accurate until the bottom-up rebuild runs during save, so we save first, then check the ratio. The check itself is `freelist::should_auto_vacuum(pager, threshold)`, which:
+
+- skips databases under `MIN_PAGES_FOR_AUTO_VACUUM` (16 pages = 64 KiB) so tiny files don't churn,
+- counts both leaf and trunk pages in the freelist (trunks are reclaimable bytes too),
+- returns `true` iff `(leaves + trunks) / page_count > threshold`.
+
+Auto-VACUUM is also skipped mid-transaction (no save → freelist is stale and the compact would publish in-flight work) and on in-memory databases (no file). The path bypasses `executor::execute_vacuum` — that wrapper builds a user-facing status string and rejects in-transaction calls, both wrong for a silent maintenance hook — and calls `vacuum_database` directly.
+
 ## What it doesn't do (yet)
 
 - **No LRU eviction.** `on_disk` + `wal_cache` together grow with the page count. For a 1 GiB database, that's ~1 GiB of page cache. Bounded cache is future work.

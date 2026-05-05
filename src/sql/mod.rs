@@ -10,7 +10,7 @@ use parser::create::CreateQuery;
 use parser::insert::InsertQuery;
 use parser::select::SelectQuery;
 
-use sqlparser::ast::{ObjectType, Statement};
+use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
 
@@ -175,6 +175,22 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             | Statement::Vacuum(_)
     );
     let is_vacuum = matches!(&query, Statement::Vacuum(_));
+
+    // SQLR-10: statements that release pages onto the freelist.
+    // After the auto-save flushes them, we'll consult
+    // `db.auto_vacuum_threshold` and possibly compact in place.
+    // ALTER TABLE here matches only DROP COLUMN — RENAME / ADD COLUMN
+    // don't grow the freelist, so they shouldn't pay the trigger cost.
+    let releases_pages = match &query {
+        Statement::Drop { object_type, .. } => {
+            matches!(object_type, ObjectType::Table | ObjectType::Index)
+        }
+        Statement::AlterTable(alter) => alter
+            .operations
+            .iter()
+            .any(|op| matches!(op, AlterTableOperation::DropColumn { .. })),
+        _ => false,
+    };
 
     // Early-reject mutations on a read-only database before they touch
     // in-memory state. Phase 4e: without this, a user running INSERT
@@ -387,6 +403,30 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
     if is_write_statement && !is_vacuum && db.source_path.is_some() && !db.in_transaction() {
         let path = db.source_path.clone().unwrap();
         pager::save_database(db, &path)?;
+    }
+
+    // SQLR-10 auto-VACUUM trigger. Runs *after* the auto-save above so
+    // the orphaned pages from the just-executed DROP/ALTER have actually
+    // landed on the freelist (the bottom-up rebuild populates it during
+    // save). Skipped mid-transaction (no commit yet → no save → freelist
+    // is stale), on in-memory DBs (nothing to compact), and when the
+    // user has explicitly disabled the trigger via
+    // `set_auto_vacuum_threshold(None)`. We deliberately bypass
+    // `executor::execute_vacuum` and call `pager::vacuum_database`
+    // directly: the executor wrapper builds a user-facing status string
+    // and rejects in-transaction calls — both wrong for this silent
+    // maintenance path.
+    if releases_pages && !db.in_transaction() {
+        if let (Some(threshold), Some(path)) = (db.auto_vacuum_threshold(), db.source_path.clone())
+        {
+            let should = match db.pager.as_ref() {
+                Some(p) => pager::freelist::should_auto_vacuum(p, threshold)?,
+                None => false,
+            };
+            if should {
+                pager::vacuum_database(db, &path)?;
+            }
+        }
     }
 
     Ok(CommandOutput {
