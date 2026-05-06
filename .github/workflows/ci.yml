@@ -91,12 +91,20 @@ jobs:
       #   rlib targets (unresolved Python/Node symbols). The per-SDK
       #   `python-sdk` + `nodejs-sdk` jobs below exercise these
       #   crates through their native tooling (maturin / napi-rs).
+      #
+      # - `sqlrite-benchmarks` is the SQLR-4 / SQLR-16 bench harness.
+      #   Excluded from CI for two reasons: criterion benches are
+      #   noisy on shared GitHub runners (the published numbers come
+      #   from a pinned local host per Q1), and the bundled rusqlite
+      #   build pulls in a heavy C toolchain that we don't want to
+      #   pay on every PR. Run locally with `make bench`.
       - name: cargo build
         run: |
           cargo build --workspace \
             --exclude sqlrite-desktop \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
+            --exclude sqlrite-benchmarks \
             --all-targets
 
       - name: cargo test
@@ -104,7 +112,8 @@ jobs:
           cargo test --workspace \
             --exclude sqlrite-desktop \
             --exclude sqlrite-python \
-            --exclude sqlrite-nodejs
+            --exclude sqlrite-nodejs \
+            --exclude sqlrite-benchmarks
 
   # ---------------------------------------------------------------------------
   # Rust: lint — fmt + clippy + doc. One cell (ubuntu) because these
@@ -140,6 +149,7 @@ jobs:
             --exclude sqlrite-desktop \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
+            --exclude sqlrite-benchmarks \
             --all-targets
 
       - name: cargo doc
@@ -150,6 +160,7 @@ jobs:
             --exclude sqlrite-desktop \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
+            --exclude sqlrite-benchmarks \
             --no-deps
 
   # ---------------------------------------------------------------------------

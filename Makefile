@@ -41,3 +41,13 @@ code-lines:
 generate-docs:
 	@echo '${GREEN}Generating${RESET} ${YELLOW}documentation ${RESET} for SQLRite'
 	@cargo doc --open
+
+.PHONY: bench
+## Run the benchmark suite (SQLR-4 / SQLR-16) — SQLRite vs SQLite (lean)
+bench:
+	@echo '${GREEN}Running${RESET} ${YELLOW}benchmark suite${RESET} (SQLRite vs SQLite, lean profile)'
+	@./benchmarks/scripts/run.sh
+
+# `make bench-duckdb` lands alongside the DuckDB driver in sub-phase 9.5
+# (Group B only). Until then, the `duckdb` feature isn't declared on
+# the bench crate so invoking it would be a build error.

@@ -1,6 +1,6 @@
 # Benchmarks plan — SQLRite vs SQLite (and friends)
 
-**Status:** *draft 2026-05-06 — design proposal awaiting review (Q1–Q8 below).* No harness code lands until the open questions are answered. Tracks task **SQLR-4**.
+**Status:** *approved 2026-05-06 — Q1–Q8 resolved; sub-phase 9.1 in flight.* All eight design questions were resolved by the project owner; see the **Decisions** section below for the canonical answers. Tracks task **SQLR-4** / **SQLR-16** (execution).
 
 **TL;DR.** Stand up a small, focused benchmark suite that pits the engine against `SQLite` (mandatory) and `DuckDB` (optional, analytical-slice only) under a curated set of OLTP + analytical + AI-era workloads. Skip distributed and network-resident options (`Cloudflare D1`, `rqlite`) — they don't share SQLRite's deployment shape. Defer `libSQL` until we have a vector- or replication-flavored axis that justifies a third row-oriented embedded engine. Suite lives in a new top-level `benchmarks/` workspace member, not built by default, runs on demand on a pinned host, emits JSON for trend tracking.
 
@@ -165,7 +165,7 @@ Rationale: SQLRite's WAL is mandatory + checkpointer is always on; SQLRite's com
 
 ## Repository layout
 
-New top-level `benchmarks/` workspace member. **Not** added to the default `cargo build --workspace` exclude list (so CI's existing build/test still skips it via the existing `--exclude` pattern, mirroring how `sqlrite-desktop` is handled today).
+New top-level `benchmarks/` workspace member. CI skips it via an explicit `--exclude sqlrite-benchmarks` on every `cargo build` / `cargo test` / `cargo clippy` / `cargo doc` invocation (the same pattern that hides `sqlrite-desktop`, `sqlrite-python`, and `sqlrite-nodejs`). Run locally with `make bench`.
 
 ```
 benchmarks/
@@ -277,57 +277,73 @@ Add the `duckdb-rs` driver under a `--features duckdb` flag. Wire only into Grou
 
 ---
 
-## Decisions
+## Decisions (was: open questions)
 
-Same Q-list shape as the phase plans. Each one is "decide before sub-phase 9.1 starts."
+Q1–Q8 were resolved by the project owner on 2026-05-06. Each question keeps its original options + recommendation as a record of the rationale; the **Decided:** line at the top is the canonical answer the implementation should follow.
 
 ### Q1. Bench harness host
 
+> **Decided: pinned local M-series MBP for v1.** Bare-metal hosts (Hetzner / Equinix) revisited post-9.6 once we're publishing numbers externally and want stability across runs. The JSON envelope already captures CPU model / RAM / OS / kernel so a future host swap is documentable, not a silent break.
+
 Pinned local M-series MBP for v1, or rent a bare-metal box (Hetzner / Equinix) for stable numbers from day one?
 
-**Lean:** local laptop. Cheaper, faster iteration, "developer wall-clock" is the right unit at this stage. Switch to bare-metal when we want to publish numbers externally (post-9.6).
+**Recommendation:** local laptop. Cheaper, faster iteration, "developer wall-clock" is the right unit at this stage. Switch to bare-metal when we want to publish numbers externally (post-9.6).
 
 ### Q2. SLO thresholds
 
+> **Decided: no PR-gating in v1.** The harness publishes numbers; it does not fail PRs. Tracked as a post-9.6 follow-up — needs ~3+ same-host baseline runs before any threshold (e.g. "regress >20% on workload X") is anything but noise-fitting.
+
 Should the bench harness gate PRs ("fail if SQLRite regresses >X% on workload Y")?
 
-**Lean:** no for v1. Need ~3+ baseline runs to know what "noise" looks like before setting a threshold. Document as a Post-9.6 idea.
+**Recommendation:** no for v1. Need ~3+ baseline runs to know what "noise" looks like before setting a threshold. Document as a Post-9.6 idea.
 
 ### Q3. SQLite tuning
 
+> **Decided: tuned (WAL + `synchronous=NORMAL`) is the headline.** SQLite-default (`journal_mode=DELETE` + `synchronous=FULL`) is the *secondary* column — opt-in via the harness, not the default `make bench` axis. Rationale stays in `docs/benchmarks.md` so anyone reading "SQLite Y ms vs SQLRite Z ms" sees up front that both engines are durability-comparable, not "SQLRite vs SQLite's most paranoid mode."
+
 Compare against SQLite default settings (`journal_mode=DELETE`, `synchronous=FULL`) or tuned (`WAL` + `synchronous=NORMAL`)?
 
-**Lean:** tuned (WAL+NORMAL) as the headline number, with a note in `benchmarks.md` explaining why. Optionally publish a "SQLite-default" column too, since some users compare against the default. Apples-to-apples is the goal — SQLRite has no `synchronous=FULL` mode to opt into.
+**Recommendation:** tuned (WAL+NORMAL) as the headline number, with a note in `benchmarks.md` explaining why. Optionally publish a "SQLite-default" column too, since some users compare against the default. Apples-to-apples is the goal — SQLRite has no `synchronous=FULL` mode to opt into.
 
 ### Q4. DuckDB inclusion
 
+> **Decided: opt-in via `--features duckdb`** on the bench crate. `make bench` stays lean (rusqlite + sqlrite only); `make bench-duckdb` pulls the heavy dep and runs only Group B (W7–W9), per the viability section.
+
 Hard-out, opt-in feature, or default-on?
 
-**Lean:** opt-in via `--features duckdb`. Heavy dep, only useful on Group B. `make bench` stays lean.
+**Recommendation:** opt-in via `--features duckdb`. Heavy dep, only useful on Group B. `make bench` stays lean.
 
 ### Q5. libSQL
 
+> **Decided: punted to post-9.6.** Embedded libSQL tracks SQLite within a few percent on the OLTP path; not enough signal to justify a third row-oriented driver in v1. Revisit alongside any "vector-only" benchmark page (post-9.4) where a non-extension vector competitor would be informative.
+
 Add as a +1 driver in 9.5 alongside DuckDB, or punt to post-9.6?
 
-**Lean:** punt. The OLTP numbers will track SQLite within a few percent and add noise without insight. Worth adding when we want a non-extension vector competitor on W10.
+**Recommendation:** punt. The OLTP numbers will track SQLite within a few percent and add noise without insight. Worth adding when we want a non-extension vector competitor on W10.
 
 ### Q6. D1 / rqlite
 
+> **Decided: out of scope.** Both are network-resident; round-trip latency dominates every workload. Out-of-scope rationale already lives in the [viability section](#comparison-target-viability); no driver work, no follow-up. Revisit only if SQLRite ever ships a remote-server / distributed mode.
+
 Already proposed out-of-scope in the [viability section](#comparison-target-viability). Confirming by Q.
 
-**Lean:** out. Document the rationale, don't burn cycles.
+**Recommendation:** out. Document the rationale, don't burn cycles.
 
 ### Q7. Where to publish
 
+> **Decided: in-repo.** Canonical reference at `docs/benchmarks.md` (lands in 9.6); raw JSON committed under `benchmarks/results/` keyed by date + host + commit; cross-link from `README.md` and `docs/_index.md`. A standalone docs site can grow out of this if/when demand appears, but versioned-with-the-code is the right v1 default.
+
 In-repo Markdown (`docs/benchmarks.md` + raw JSON in `benchmarks/results/`), or a separate docs site?
 
-**Lean:** in-repo. Versioned with the code, no extra infra, clickable from the README. A separate site can grow out of this if there's demand.
+**Recommendation:** in-repo. Versioned with the code, no extra infra, clickable from the README. A separate site can grow out of this if there's demand.
 
 ### Q8. Workload shape changes mid-suite
 
+> **Decided: workloads carry an explicit version (`W1.v1`, `W1.v2`, …).** The JSON output schema includes `workload_version` per row; the comparison script only diffs same-version pairs and warns on cross-version compares. Bumping the version is the explicit "we changed the benchmark" gesture; old JSON files remain readable forever.
+
 If we add a column or change a query in a workload between releases, how do we keep historical comparison meaningful?
 
-**Lean:** workloads are versioned (`W1.v1`, `W1.v2`). Old JSON keeps the old workload-version key; results page only compares same-version runs. Cheap, opt-in, avoids "we silently changed the benchmark" mistakes.
+**Recommendation:** workloads are versioned (`W1.v1`, `W1.v2`). Old JSON keeps the old workload-version key; results page only compares same-version runs. Cheap, opt-in, avoids "we silently changed the benchmark" mistakes.
 
 ---
 
