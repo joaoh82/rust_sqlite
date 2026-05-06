@@ -8,13 +8,14 @@ SQLRite is a from-scratch SQLite-style embedded database written in Rust. It's p
 
 ## Workspace layout
 
-`Cargo.toml` is a workspace whose members are: `.` (the engine, package `sqlrite-engine`, lib `sqlrite`), `desktop/src-tauri`, `sqlrite-ffi`, `sqlrite-ask`, `sqlrite-mcp`, `sdk/python`, `sdk/nodejs`. `sdk/wasm` and `sdk/go` are deliberately **not** workspace members (wasm32 target / cgo separation).
+`Cargo.toml` is a workspace whose members are: `.` (the engine, package `sqlrite-engine`, lib `sqlrite`), `desktop/src-tauri`, `sqlrite-ffi`, `sqlrite-ask`, `sqlrite-mcp`, `sdk/python`, `sdk/nodejs`, `benchmarks`. `sdk/wasm` and `sdk/go` are deliberately **not** workspace members (wasm32 target / cgo separation).
 
 - `src/` — engine. Public API is `Connection`/`Statement`/`Rows`/`Row`/`Value` from [src/connection.rs](src/connection.rs), re-exported via [src/lib.rs](src/lib.rs). Any new SDK should bind only to this surface.
 - `sqlrite-ask/` — pure-Rust LLM adapter (Anthropic/OpenAI/Ollama) for natural-language → SQL. The engine's `ask` feature provides the thin `ConnectionAskExt::ask` glue.
 - `sqlrite-mcp/` — MCP stdio server. Seven tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`. `--read-only` opens with a shared lock and hides `execute`.
 - `sqlrite-ffi/` — C ABI cdylib + generated `sqlrite.h` header. Backs the Go SDK and any C consumer.
 - `desktop/` — Tauri 2 + Svelte 5 GUI. Embeds the engine directly (no FFI hop).
+- `benchmarks/` — SQLR-4 / SQLR-16 bench harness. `Driver` trait + SQLRite + SQLite (rusqlite-bundled) drivers + criterion-driven workloads. Excluded from the default CI build/test/clippy/doc commands; run locally with `make bench` (or `make bench-duckdb`). See [docs/benchmarks-plan.md](docs/benchmarks-plan.md).
 
 Architecture deep-dive: [docs/architecture.md](docs/architecture.md). The full doc index is [docs/_index.md](docs/_index.md).
 
@@ -24,20 +25,20 @@ SQL string → [src/sql/mod.rs](src/sql/mod.rs) `process_command` parses with th
 
 ## Commands
 
-CI is the source of truth — the workspace excludes that follow are required because the desktop crate needs a Svelte build first and the PyO3/napi-rs cdylibs can't link standalone test binaries.
+CI is the source of truth — the workspace excludes that follow are required because the desktop crate needs a Svelte build first, the PyO3/napi-rs cdylibs can't link standalone test binaries, and the `benchmarks/` harness deliberately stays out of CI (criterion is noisy on shared runners; the rusqlite-bundled build is heavy).
 
 ```sh
 # Build / test the Rust workspace (matches CI)
-cargo build --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --all-targets
-cargo test  --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs
+cargo build --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
+cargo test  --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks
 
 # Single test (exact name; --nocapture to see println!)
 cargo test <test_name> -- --nocapture
 
 # Lint (CI runs all three)
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --all-targets
-cargo doc    --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --no-deps
+cargo clippy --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
+cargo doc    --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --no-deps
 
 # Run the REPL (default features include cli + ask + file-locks)
 cargo run                                  # in-memory
@@ -48,6 +49,10 @@ cargo run -- --readonly path/to/db.sqlrite # shared-lock open
 cargo build --release -p sqlrite-ffi       # C cdylib + sqlrite.h
 cd desktop && npm install && npm run tauri dev   # desktop app dev mode
 cargo run -p sqlrite-mcp -- /path/to.sqlrite     # MCP server (stdio)
+
+# Benchmarks (SQLR-4 / SQLR-16) — local-only, never CI
+make bench                                 # SQLRite + SQLite (lean)
+# make bench-duckdb                        # adds DuckDB driver (Group B only) — lands in 9.5
 
 # Release plumbing
 scripts/bump-version.sh 0.2.0              # bumps version across 11 manifests

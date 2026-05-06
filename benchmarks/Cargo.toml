@@ -1,0 +1,83 @@
+[package]
+# SQLR-4 / SQLR-16 — benchmark suite for SQLRite vs SQLite (and friends).
+# See `docs/benchmarks-plan.md` for the canonical design + decisions.
+#
+# Not published to crates.io. Not built by default in CI — the engine's
+# `rust-build-and-test` job carries an `--exclude sqlrite-benchmarks`
+# alongside `sqlrite-desktop` because criterion benches don't make sense
+# in CI (noisy on shared runners) and the heavy `rusqlite[bundled]`
+# build is also undesirable on every PR.
+#
+# Run locally with `make bench` (lean: SQLRite + SQLite only) or
+# `make bench-duckdb` (adds the optional DuckDB driver for Group B).
+name = "sqlrite-benchmarks"
+version = "0.0.0"
+authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Benchmark suite — SQLRite vs SQLite (and friends). Not for crates.io."
+license = "MIT"
+
+[lib]
+name = "sqlrite_benchmarks"
+path = "src/lib.rs"
+
+# Aggregator binary — walks `target/criterion/` after `cargo bench` and
+# emits a single results JSON file under `benchmarks/results/`. Run via
+# `scripts/run.sh` (which `make bench` invokes); not for direct use.
+[[bin]]
+name = "aggregate"
+path = "src/bin/aggregate.rs"
+
+# Single criterion entry point. Fans out (workload × driver) pairs via
+# the `Driver` trait. Adding a workload = one file in `src/workloads/`
+# + one register-call in this entry point.
+[[bench]]
+name = "suite"
+path = "benches/suite.rs"
+harness = false
+
+[features]
+default = []
+
+# `duckdb` feature lands alongside the driver in sub-phase 9.5
+# (Group B only). Heavy dep — keeping it out of the dep graph until
+# the driver is actually wired up.
+
+[dependencies]
+# The engine. Default features off (no rustyline / clap / `ask`), but
+# `file-locks` is on so the comparison runs the same lock-acquisition
+# path that any real SQLRite consumer pays.
+sqlrite = { package = "sqlrite-engine", path = "..", version = "0.8.0", default-features = false, features = ["file-locks"] }
+
+# SQLite via rusqlite, with `bundled` so the comparison is against a
+# known SQLite version (not whatever happens to be on the host).
+# `extra_check` and `column_decltype` would be nice-to-have but cost
+# binary size; skipping until a workload needs them.
+rusqlite = { version = "0.36", features = ["bundled"] }
+
+# Criterion for the actual measurement loop. v0.5 ships HDR-style
+# sampling, statistical confidence intervals, and JSON output to
+# `target/criterion/` that the `aggregate` binary harvests.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+# Deterministic data generation (Q8: workloads versioned; the seed is
+# part of the workload's contract so v1 inputs reproduce byte-for-byte).
+rand = "0.8"
+rand_chacha = "0.3"
+
+# JSON envelope for `benchmarks/results/*.json`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Per-run temp dirs so each iteration starts from a clean DB file.
+# Prevents page-cache / WAL-state bleed across runs.
+tempfile = "3"
+
+# Anyhow for driver-level error reporting. The bench harness is
+# end-user code; we don't need to surface a typed error ladder.
+anyhow = "1"
+
+# Walk `target/criterion/` for the aggregator binary.
+walkdir = "2"

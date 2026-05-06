@@ -1,0 +1,7 @@
+# Local bench runs land here. Only the "official" pinned-host runs
+# get committed (lands in 9.6 — see `docs/benchmarks-plan.md`). Until
+# 9.6, ignore everything except this rule + .gitkeep so the directory
+# stays in git.
+*
+!.gitkeep
+!.gitignore
