@@ -277,7 +277,7 @@ Add the `duckdb-rs` driver under a `--features duckdb` flag. Wire only into Grou
 
 ---
 
-## Open design questions
+## Decisions
 
 Same Q-list shape as the phase plans. Each one is "decide before sub-phase 9.1 starts."
 
