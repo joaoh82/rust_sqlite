@@ -149,7 +149,8 @@ Hex literals, blob literals, and date/time functions are not supported.
 
 ```sql
 SELECT [DISTINCT] {* | <projection_item>[, <projection_item>, ...]}
-FROM <table>
+FROM <table> [AS <alias>]
+  [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> [AS <alias>] ON <expr>]*
   [WHERE <expr>]
   [GROUP BY <col>[, <col>, ...]]
   [ORDER BY <expr> [ASC|DESC]]
@@ -176,6 +177,34 @@ COUNT([DISTINCT] <column>)                     -- counts non-NULL values, option
 - **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. For non-aggregating queries the key is any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. For aggregating queries the key resolves against the *output* row by name: a bare identifier matches an alias or a `GROUP BY` column, and a function call like `COUNT(*)` matches an aggregate projection by its canonical display form. Sort key types must match across rows.
 - **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows). When `DISTINCT` is in play, `LIMIT` is applied after deduplication so it counts unique rows.
 
+### `JOIN` semantics (SQLR-5)
+
+Four flavors are supported, all with explicit `ON` conditions:
+
+| Flavor | Keeps unmatched rows from… |
+|---|---|
+| `INNER JOIN` | …neither side. Only ON-matched pairs survive. |
+| `LEFT [OUTER] JOIN` | …the left side; right-side columns become `NULL` for unmatched left rows. |
+| `RIGHT [OUTER] JOIN` | …the right side; left-side columns become `NULL` for unmatched right rows. |
+| `FULL [OUTER] JOIN` | …both sides, NULL-padded on the unmatched side. |
+
+- **Engine choice:** SQLite ships only `INNER` and `LEFT OUTER`. SQLRite implements all four because the per-flavor differences boil down to NULL-padding policy on top of one shared nested-loop driver — adding `RIGHT` / `FULL` was effectively free once the executor had a multi-table scope. See [`docs/design-decisions.md`](design-decisions.md) for the rationale.
+- **Aliases:** `FROM customers AS c INNER JOIN orders AS o ON c.id = o.customer_id`. When an alias is supplied the original table name leaves scope (SQL standard) — qualifier resolution uses the alias.
+- **Qualified column references:** `<table>.<col>` and `<alias>.<col>` resolve to that specific side. Bare `<col>` references must resolve to exactly one in-scope table; ambiguous references error with a "qualify it as `<table>.col`" hint.
+- **Output of `SELECT *`** over a join is every column of every in-scope table, in source order. Duplicate header names are permitted (SQLite-style). Disambiguate with explicit `SELECT t.col AS t_col, u.col AS u_col`.
+- **Multi-join** chains left-fold: `A JOIN B ON ... JOIN C ON ...` evaluates as `(A ⨝ B) ⨝ C`. Each new clause sees every prior alias / table in its `ON` expression.
+- **Self-joins** require an alias on at least one side: `FROM nodes AS p INNER JOIN nodes AS c ON p.id = c.parent_id`. Without one, you get a `duplicate table reference` error so qualifiers stay unambiguous.
+- **`WHERE` runs after joins.** A `WHERE right.col IS NULL` filter on a `LEFT JOIN` correctly returns left rows with no match (the standard "anti-join via outer-join" idiom).
+- **`ORDER BY` and `LIMIT`** apply to the fully joined row stream.
+- **Algorithm:** plain nested-loop join, O(N×M) per join level. Adequate for an embedded learning database; hash / merge joins on equi-join shapes are a future optimization.
+
+#### What's not supported in JOINs
+
+- `JOIN ... USING (col)` and `NATURAL JOIN` — explicit `ON` only. (Both are deferred — `USING` is straightforward but adds a column-resolution rule we haven't needed yet.)
+- `CROSS JOIN` (write `INNER JOIN ... ON true` instead) and comma-separated FROM lists.
+- Aggregates / `GROUP BY` / `DISTINCT` *over* a join. The single-table aggregator is wired against one rowid stream; rewiring it for joined rows is a separate increment. Surfaces as a clean `NotImplemented` at parse time.
+- `fts_match` / `bm25_score` inside a JOIN expression. They need to look up an FTS index by column, which is single-table-bound today. Use them on a single-table SELECT first, or fold the FTS lookup into the FROM side.
+
 ### Index probing
 
 The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col> = <literal>` or `<literal> = <indexed_col>`, it probes the index and scans only matching rows. Mixed predicates (`WHERE a = 1 AND b > 2`), range predicates (`WHERE a > 1`), and OR-combined predicates fall back to a full table scan. Aggregating queries (`GROUP BY` / aggregate functions) skip the rowid-shape optimizations (HNSW / FTS / bounded-heap top-k) since every matching row contributes to its group.
@@ -195,7 +224,8 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 
 ### What doesn't work
 
-- **Joins** of any kind (`INNER`, `LEFT OUTER`, `CROSS`, comma-join)
+- **`CROSS JOIN`**, **comma-separated FROM lists**, **`NATURAL JOIN`**, **`JOIN ... USING (col)`** — explicit `INNER` / `LEFT` / `RIGHT` / `FULL OUTER JOIN ... ON ...` only (see [JOIN semantics](#join-semantics-sqlr-5))
+- **Aggregates** / **`GROUP BY`** / **`DISTINCT`** over a JOIN — pipe through a subquery once subqueries land
 - **Subqueries**, CTEs (`WITH`), views
 - **`HAVING`** — pre-aggregation `WHERE` works; post-aggregation filtering does not yet
 - **`DISTINCT`** on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
@@ -521,7 +551,8 @@ A REPL launched with `sqlrite --readonly foo.sqlrite` (or `sqlrite::open_databas
 For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when these land:
 
 ### Joins & composition
-- `INNER` / `LEFT OUTER` / `RIGHT OUTER` / `CROSS JOIN`, comma joins
+- `INNER` / `LEFT OUTER` / `RIGHT OUTER` / `FULL OUTER JOIN ... ON ...` — **supported** (SQLR-5)
+- `CROSS JOIN`, comma joins, `NATURAL JOIN`, `JOIN ... USING` — not yet
 - Subqueries (scalar, `IN (SELECT ...)`, correlated)
 - CTEs (`WITH`), recursive CTEs
 - Views (`CREATE VIEW`)

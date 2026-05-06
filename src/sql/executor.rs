@@ -21,8 +21,151 @@ use crate::sql::db::table::{
 use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{
-    AggregateArg, OrderByClause, Projection, ProjectionItem, ProjectionKind, SelectQuery,
+    AggregateArg, JoinType, OrderByClause, Projection, ProjectionItem, ProjectionKind, SelectQuery,
 };
+
+// -----------------------------------------------------------------
+// SQLR-5 — Row-scope abstraction
+// -----------------------------------------------------------------
+//
+// Single-table SELECT / UPDATE / DELETE evaluate WHERE / ORDER BY /
+// projection expressions over `(&Table, rowid)`. JOIN evaluation
+// needs the same expression evaluator to look up columns across
+// multiple tables, with NULL padding for unmatched outer-join rows.
+//
+// Rather than fork the evaluator, we abstract "what's in scope when
+// I see a column reference" behind a trait. Every callsite that
+// previously took `(table, rowid)` now takes `&dyn RowScope`. The
+// single-table case constructs a tiny `SingleTableScope`; the join
+// case constructs a `JoinedScope` that knows about every table in
+// scope plus the per-table rowid (or `None` for a NULL-padded row).
+//
+// The trait stays small on purpose:
+//
+//   - `lookup` resolves a column reference (`col` or `t.col`) to a
+//     `Value`. NULL-padded joined rows yield `Value::Null` for any
+//     column from their side. Ambiguous unqualified references in
+//     joined scope error.
+//
+//   - `single_table_view` lets index-probing helpers (FTS, HNSW,
+//     vec_distance) bail out cleanly when invoked over a join — they
+//     need a `(Table, rowid)` pair to look up an index, and the
+//     joined case can't answer without per-call disambiguation we
+//     haven't plumbed yet. Returns `None` in joined scope.
+pub(crate) trait RowScope {
+    fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value>;
+
+    /// `Some((table, rowid))` for a single-table scope; `None` for a
+    /// joined scope. v1 join support delegates "needs single-table"
+    /// helpers (FTS / HNSW / vec_distance with column args) to the
+    /// single-table path; calling them from a joined query produces
+    /// a `NotImplemented` error rather than wrong results.
+    fn single_table_view(&self) -> Option<(&Table, i64)>;
+}
+
+/// The default scope for non-join queries: one table, one rowid.
+pub(crate) struct SingleTableScope<'a> {
+    table: &'a Table,
+    rowid: i64,
+}
+
+impl<'a> SingleTableScope<'a> {
+    pub(crate) fn new(table: &'a Table, rowid: i64) -> Self {
+        Self { table, rowid }
+    }
+}
+
+impl RowScope for SingleTableScope<'_> {
+    fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value> {
+        // The qualifier (if any) is ignored — we only have one table
+        // in scope, so `t.col` resolves the same as `col`. This
+        // matches the historical single-table path which did the
+        // same thing in `eval_expr`.
+        let _ = qualifier;
+        Ok(self.table.get_value(col, self.rowid).unwrap_or(Value::Null))
+    }
+
+    fn single_table_view(&self) -> Option<(&Table, i64)> {
+        Some((self.table, self.rowid))
+    }
+}
+
+/// One table participating in a joined query, plus the user-visible
+/// name to match against `t.col` qualifiers (alias if present, else
+/// the bare table name).
+pub(crate) struct JoinedTableRef<'a> {
+    pub table: &'a Table,
+    pub scope_name: String,
+}
+
+/// Multi-table scope used during join execution. `rowids[i]` is the
+/// rowid in `tables[i]`, or `None` for a NULL-padded row coming out
+/// of an outer join.
+pub(crate) struct JoinedScope<'a> {
+    pub tables: &'a [JoinedTableRef<'a>],
+    pub rowids: &'a [Option<i64>],
+}
+
+impl RowScope for JoinedScope<'_> {
+    fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value> {
+        if let Some(q) = qualifier {
+            // Qualified reference: pick the matching table; if it's
+            // NULL-padded, the column is NULL; else fetch from row.
+            let pos = self
+                .tables
+                .iter()
+                .position(|t| t.scope_name.eq_ignore_ascii_case(q))
+                .ok_or_else(|| {
+                    SQLRiteError::Internal(format!(
+                        "unknown table qualifier '{q}' in column reference '{q}.{col}'"
+                    ))
+                })?;
+            if !self.tables[pos].table.contains_column(col.to_string()) {
+                return Err(SQLRiteError::Internal(format!(
+                    "column '{col}' does not exist on '{}'",
+                    self.tables[pos].scope_name
+                )));
+            }
+            return Ok(match self.rowids[pos] {
+                None => Value::Null,
+                Some(r) => self.tables[pos]
+                    .table
+                    .get_value(col, r)
+                    .unwrap_or(Value::Null),
+            });
+        }
+        // Unqualified: search every in-scope table. Exactly-one match
+        // wins; zero matches → unknown column; multi matches →
+        // ambiguous, prompt the user to qualify.
+        let mut hit: Option<usize> = None;
+        for (i, t) in self.tables.iter().enumerate() {
+            if t.table.contains_column(col.to_string()) {
+                if hit.is_some() {
+                    return Err(SQLRiteError::Internal(format!(
+                        "column reference '{col}' is ambiguous — qualify it as <table>.{col}"
+                    )));
+                }
+                hit = Some(i);
+            }
+        }
+        let i = hit.ok_or_else(|| {
+            SQLRiteError::Internal(format!(
+                "unknown column '{col}' in joined SELECT (no in-scope table has it)"
+            ))
+        })?;
+        Ok(match self.rowids[i] {
+            None => Value::Null,
+            Some(r) => self.tables[i]
+                .table
+                .get_value(col, r)
+                .unwrap_or(Value::Null),
+        })
+    }
+
+    fn single_table_view(&self) -> Option<(&Table, i64)> {
+        None
+    }
+}
 
 /// Executes a parsed `SelectQuery` against the database and returns a
 /// human-readable rendering of the result set (prettytable). Also returns
@@ -41,6 +184,14 @@ pub struct SelectResult {
 /// what the new public API streams to callers; the REPL / Tauri app
 /// pre-render into a prettytable via `execute_select`.
 pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectResult> {
+    // SQLR-5 — joined SELECTs go through a dedicated executor that
+    // knows how to thread a multi-table scope through expression
+    // evaluation. The single-table fast path below stays untouched
+    // (and so do its HNSW / FTS / bounded-heap optimizations).
+    if !query.joins.is_empty() {
+        return execute_select_rows_joined(query, db);
+    }
+
     let table = db
         .get_table(query.table_name.clone())
         .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
@@ -54,7 +205,10 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
             .column_names()
             .into_iter()
             .map(|c| ProjectionItem {
-                kind: ProjectionKind::Column(c),
+                kind: ProjectionKind::Column {
+                    qualifier: None,
+                    name: c,
+                },
                 alias: None,
             })
             .collect(),
@@ -65,7 +219,7 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         .any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)));
     // Validate bare-column references against the table schema.
     for item in &proj_items {
-        if let ProjectionKind::Column(c) = &item.kind
+        if let ProjectionKind::Column { name: c, .. } = &item.kind
             && !table.contains_column(c.clone())
         {
             return Err(SQLRiteError::Internal(format!(
@@ -210,7 +364,7 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     let projected_cols: Vec<String> = proj_items
         .iter()
         .map(|i| match &i.kind {
-            ProjectionKind::Column(c) => c.clone(),
+            ProjectionKind::Column { name, .. } => name.clone(),
             ProjectionKind::Aggregate(_) => unreachable!("aggregation handled above"),
         })
         .collect();
@@ -232,6 +386,295 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         if let Some(k) = query.limit {
             rows.truncate(k);
         }
+    }
+
+    Ok(SelectResult { columns, rows })
+}
+
+// -----------------------------------------------------------------
+// SQLR-5 — Joined SELECT execution
+// -----------------------------------------------------------------
+//
+// The strategy is a left-folded nested-loop join: start with the
+// rowids of the leading FROM table, then for each JOIN clause
+// combine the accumulator (`Vec<Vec<Option<i64>>>`) with the rowids
+// of the next table. Each join flavor differs only in how it
+// handles unmatched left / right rows:
+//
+//   INNER       — drop unmatched on both sides
+//   LEFT OUTER  — keep every left row; pad right side with NULL
+//   RIGHT OUTER — keep every right row; pad left side with NULL
+//   FULL OUTER  — keep both unmatched sets, NULL-padding the other
+//
+// This isn't a hash join — every join is O(N×M) in the size of the
+// accumulator and the right table. Adequate for SQLRite's "embedded
+// learning database" niche; a future phase could layer hash / merge
+// joins on equi-join shapes without changing the surface API.
+//
+// Aggregates / GROUP BY / DISTINCT over joined results are rejected
+// at parse time (see SelectQuery::new). They aren't impossible —
+// the joined-row stream is just a different rowid source feeding
+// the same aggregator — but we left the validator that ties bare
+// columns to GROUP BY a single-table assumption, and reworking it
+// is outside this phase. Surfaces as a clean NotImplemented today.
+fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<SelectResult> {
+    // Resolve every participating table once and capture its scope
+    // name (alias if supplied, else table name). Scope names are
+    // case-sensitive in matching the original identifier text;
+    // qualifier matches in `JoinedScope::lookup` use
+    // `eq_ignore_ascii_case` so `T1.c1` works whether the user
+    // wrote `T1`, `t1`, or `T1` differently than the alias.
+    let mut joined_tables: Vec<JoinedTableRef<'_>> = Vec::with_capacity(1 + query.joins.len());
+
+    let primary = db
+        .get_table(query.table_name.clone())
+        .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
+    joined_tables.push(JoinedTableRef {
+        table: primary,
+        scope_name: query
+            .table_alias
+            .clone()
+            .unwrap_or_else(|| query.table_name.clone()),
+    });
+    for j in &query.joins {
+        let t = db
+            .get_table(j.right_table.clone())
+            .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", j.right_table)))?;
+        joined_tables.push(JoinedTableRef {
+            table: t,
+            scope_name: j
+                .right_alias
+                .clone()
+                .unwrap_or_else(|| j.right_table.clone()),
+        });
+    }
+
+    // Reject duplicate scope names — `FROM t JOIN t ON ...` without
+    // an alias on one side would silently collapse qualifiers and
+    // produce confusing results. Forcing the user to alias one side
+    // keeps `t1.col` / `t2.col` unambiguous.
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &joined_tables {
+            let key = t.scope_name.to_ascii_lowercase();
+            if !seen.insert(key) {
+                return Err(SQLRiteError::Internal(format!(
+                    "duplicate table reference '{}' in FROM/JOIN — use AS to alias one side",
+                    t.scope_name
+                )));
+            }
+        }
+    }
+
+    // Validate qualified projection column references against the
+    // table they qualify. Unqualified names are validated by the
+    // first scope lookup at row materialization — the runtime check
+    // there gives the same "ambiguous / unknown" message we'd want
+    // here, so we don't pre-resolve them.
+    let proj_items: Vec<ProjectionItem> = match &query.projection {
+        Projection::All => {
+            // `SELECT *` over a join expands to every column of every
+            // in-scope table, in source order. We use the bare column
+            // name as both the projected identifier and the output
+            // header — qualified expansion (`t1.col`) would force
+            // composite headers like `t1.col` which conflict with
+            // alias-less convention. Duplicate header names are
+            // permitted (matches SQLite); callers needing
+            // disambiguation can `SELECT t.col AS t_col`.
+            let mut all = Vec::new();
+            for t in &joined_tables {
+                for col in t.table.column_names() {
+                    all.push(ProjectionItem {
+                        kind: ProjectionKind::Column {
+                            // Qualify the synthetic items so duplicate
+                            // column names across tables route to the
+                            // right side at projection time. The output
+                            // header still uses the bare `name`.
+                            qualifier: Some(t.scope_name.clone()),
+                            name: col,
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            all
+        }
+        Projection::Items(items) => items.clone(),
+    };
+
+    let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
+
+    // Stage 1: enumerate rows of the leading table. The accumulator
+    // is `Vec<Vec<Option<i64>>>` where each inner `Vec` is a join
+    // row whose i-th slot is the rowid of `joined_tables[i]` (or
+    // None for a NULL-padded row from an outer join).
+    let mut acc: Vec<Vec<Option<i64>>> = primary
+        .rowids()
+        .into_iter()
+        .map(|r| {
+            let mut row = Vec::with_capacity(joined_tables.len());
+            row.push(Some(r));
+            row
+        })
+        .collect();
+
+    // Stage 2: fold each JOIN clause into the accumulator. After
+    // join `i`, every row in `acc` has length `i + 2` (primary +
+    // i+1 right tables joined). Unmatched-side handling depends on
+    // the join flavor.
+    for (j_idx, join) in query.joins.iter().enumerate() {
+        let right_pos = j_idx + 1;
+        let right_table = joined_tables[right_pos].table;
+        let right_rowids: Vec<i64> = right_table.rowids();
+
+        // Track which right rowids matched at least once across the
+        // entire left accumulator. Used by RIGHT / FULL to emit
+        // unmatched right rows after the loop.
+        let mut right_matched: Vec<bool> = vec![false; right_rowids.len()];
+
+        let mut next_acc: Vec<Vec<Option<i64>>> = Vec::with_capacity(acc.len());
+
+        // ON evaluation only sees tables that are in scope *at this
+        // join level* — the leading FROM table plus every right
+        // table joined so far, including the one we're matching.
+        // Restricting the scope means a typo like `JOIN c ON a.id =
+        // c.id JOIN c ON ...` (referencing `c` before it joins)
+        // surfaces as "unknown table qualifier 'c'" rather than
+        // silently `NULL → false`-ing every row.
+        let on_scope_tables: &[JoinedTableRef<'_>] = &joined_tables[..=right_pos];
+
+        for left_row in acc.into_iter() {
+            // Build a row prefix and extend it with each candidate
+            // right rowid; record whether any matched (for outer
+            // padding on the left side).
+            let mut left_match_count = 0usize;
+            for (r_idx, &rrid) in right_rowids.iter().enumerate() {
+                let mut on_rowids: Vec<Option<i64>> = left_row.clone();
+                on_rowids.push(Some(rrid));
+                debug_assert_eq!(on_rowids.len(), on_scope_tables.len());
+                let scope = JoinedScope {
+                    tables: on_scope_tables,
+                    rowids: &on_rowids,
+                };
+                // Reuse `eval_predicate_scope` so ON shares the same
+                // truthiness rule WHERE uses — non-zero integers are
+                // truthy, NULL is false, etc. — instead of rejecting
+                // anything that isn't a literal bool.
+                if eval_predicate_scope(&join.on, &scope)? {
+                    left_match_count += 1;
+                    right_matched[r_idx] = true;
+                    // Accumulator entries carry only as many slots
+                    // as join levels processed so far; the next
+                    // iteration extends them again. No trailing
+                    // padding needed here.
+                    next_acc.push(on_rowids);
+                }
+            }
+
+            if left_match_count == 0
+                && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+            {
+                // Outer-join NULL pad on the right side: keep the
+                // left row, push None for the right rowid.
+                let mut padded = left_row;
+                padded.push(None);
+                next_acc.push(padded);
+            }
+        }
+
+        // Right-only emission for RIGHT / FULL: any right rowid that
+        // never matched on the entire accumulator surfaces with all
+        // left positions NULL-padded.
+        if matches!(join.join_type, JoinType::RightOuter | JoinType::FullOuter) {
+            for (r_idx, matched) in right_matched.iter().enumerate() {
+                if *matched {
+                    continue;
+                }
+                let mut row: Vec<Option<i64>> = vec![None; right_pos];
+                row.push(Some(right_rowids[r_idx]));
+                next_acc.push(row);
+            }
+        }
+
+        acc = next_acc;
+    }
+
+    // Stage 3: apply WHERE on each fully-joined row. Outer-join
+    // NULL-padded rows where WHERE references a NULL'd column will
+    // (per SQL three-valued logic) be excluded — this is the same
+    // posture as the single-table path.
+    let mut filtered: Vec<Vec<Option<i64>>> = if let Some(where_expr) = &query.selection {
+        let mut out = Vec::with_capacity(acc.len());
+        for row in acc {
+            let scope = JoinedScope {
+                tables: &joined_tables,
+                rowids: &row,
+            };
+            if eval_predicate_scope(where_expr, &scope)? {
+                out.push(row);
+            }
+        }
+        out
+    } else {
+        acc
+    };
+
+    // Stage 4: ORDER BY across the joined scope. We pre-compute the
+    // sort key per row (same approach as `sort_rowids`) so the
+    // comparator runs on Values, not against the expression tree.
+    if let Some(order) = &query.order_by {
+        // Validate up front so a bad ORDER BY surfaces a clear
+        // error before sort starts.
+        let mut keys: Vec<(usize, Value)> = Vec::with_capacity(filtered.len());
+        for (i, row) in filtered.iter().enumerate() {
+            let scope = JoinedScope {
+                tables: &joined_tables,
+                rowids: row,
+            };
+            let v = eval_expr_scope(&order.expr, &scope)?;
+            keys.push((i, v));
+        }
+        keys.sort_by(|(_, a), (_, b)| {
+            let ord = compare_values(Some(a), Some(b));
+            if order.ascending { ord } else { ord.reverse() }
+        });
+        let mut sorted = Vec::with_capacity(filtered.len());
+        for (i, _) in keys {
+            sorted.push(filtered[i].clone());
+        }
+        filtered = sorted;
+    }
+
+    // Stage 5: LIMIT.
+    if let Some(k) = query.limit {
+        filtered.truncate(k);
+    }
+
+    // Stage 6: project. For each row, evaluate every projection item
+    // through the joined scope.
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(filtered.len());
+    for row in &filtered {
+        let scope = JoinedScope {
+            tables: &joined_tables,
+            rowids: row,
+        };
+        let mut out_row = Vec::with_capacity(proj_items.len());
+        for item in &proj_items {
+            let v = match &item.kind {
+                ProjectionKind::Column { qualifier, name } => {
+                    scope.lookup(qualifier.as_deref(), name)?
+                }
+                ProjectionKind::Aggregate(_) => {
+                    // SelectQuery::new already rejects this combination,
+                    // but defense in depth keeps the pattern match total.
+                    return Err(SQLRiteError::Internal(
+                        "aggregate functions over JOIN are not supported".to_string(),
+                    ));
+                }
+            };
+            out_row.push(v);
+        }
+        rows.push(out_row);
     }
 
     Ok(SelectResult { columns, rows })
@@ -1576,7 +2019,14 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 
 /// Returns `true` if the row at `rowid` matches the predicate expression.
 pub fn eval_predicate(expr: &Expr, table: &Table, rowid: i64) -> Result<bool> {
-    let v = eval_expr(expr, table, rowid)?;
+    eval_predicate_scope(expr, &SingleTableScope::new(table, rowid))
+}
+
+/// Scope-aware predicate evaluation. The single-table fast path wraps
+/// this with a [`SingleTableScope`]; the join executor wraps it with
+/// a [`JoinedScope`].
+pub(crate) fn eval_predicate_scope(expr: &Expr, scope: &dyn RowScope) -> Result<bool> {
+    let v = eval_expr_scope(expr, scope)?;
     match v {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false), // SQL NULL in a WHERE is treated as false
@@ -1588,9 +2038,14 @@ pub fn eval_predicate(expr: &Expr, table: &Table, rowid: i64) -> Result<bool> {
     }
 }
 
+/// Single-table convenience wrapper around [`eval_expr_scope`].
 fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
+    eval_expr_scope(expr, &SingleTableScope::new(table, rowid))
+}
+
+fn eval_expr_scope(expr: &Expr, scope: &dyn RowScope) -> Result<Value> {
     match expr {
-        Expr::Nested(inner) => eval_expr(inner, table, rowid),
+        Expr::Nested(inner) => eval_expr_scope(inner, scope),
 
         Expr::Identifier(ident) => {
             // Phase 7b — sqlparser parses bracket-array literals like
@@ -1607,22 +2062,29 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
                 let v = parse_vector_literal(&raw)?;
                 return Ok(Value::Vector(v));
             }
-            Ok(table.get_value(&ident.value, rowid).unwrap_or(Value::Null))
+            scope.lookup(None, &ident.value)
         }
 
         Expr::CompoundIdentifier(parts) => {
-            // Accept `table.col` — we only have one table in scope, so ignore the qualifier.
-            let col = parts
-                .last()
-                .map(|i| i.value.as_str())
-                .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?;
-            Ok(table.get_value(col, rowid).unwrap_or(Value::Null))
+            // `qualifier.col` — single-table scope ignores the qualifier
+            // (legacy behavior). Joined scope dispatches to the table
+            // matching `qualifier`. The compound form must have at
+            // least two parts; deeper paths (`db.schema.t.col`) are
+            // not supported.
+            match parts.as_slice() {
+                [only] => scope.lookup(None, &only.value),
+                [q, c] => scope.lookup(Some(&q.value), &c.value),
+                _ => Err(SQLRiteError::NotImplemented(format!(
+                    "compound identifier with {} parts is not supported",
+                    parts.len()
+                ))),
+            }
         }
 
         Expr::Value(v) => convert_literal(&v.value),
 
         Expr::UnaryOp { op, expr } => {
-            let inner = eval_expr(expr, table, rowid)?;
+            let inner = eval_expr_scope(expr, scope)?;
             match op {
                 UnaryOperator::Not => match inner {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
@@ -1650,13 +2112,13 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
 
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                let l = eval_expr(left, table, rowid)?;
-                let r = eval_expr(right, table, rowid)?;
+                let l = eval_expr_scope(left, scope)?;
+                let r = eval_expr_scope(right, scope)?;
                 Ok(Value::Bool(as_bool(&l)? && as_bool(&r)?))
             }
             BinaryOperator::Or => {
-                let l = eval_expr(left, table, rowid)?;
-                let r = eval_expr(right, table, rowid)?;
+                let l = eval_expr_scope(left, scope)?;
+                let r = eval_expr_scope(right, scope)?;
                 Ok(Value::Bool(as_bool(&l)? || as_bool(&r)?))
             }
             cmp @ (BinaryOperator::Eq
@@ -1665,8 +2127,8 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
             | BinaryOperator::GtEq) => {
-                let l = eval_expr(left, table, rowid)?;
-                let r = eval_expr(right, table, rowid)?;
+                let l = eval_expr_scope(left, scope)?;
+                let r = eval_expr_scope(right, scope)?;
                 // Any comparison involving NULL is unknown → false in a WHERE.
                 if matches!(l, Value::Null) || matches!(r, Value::Null) {
                     return Ok(Value::Bool(false));
@@ -1688,13 +2150,13 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             | BinaryOperator::Multiply
             | BinaryOperator::Divide
             | BinaryOperator::Modulo) => {
-                let l = eval_expr(left, table, rowid)?;
-                let r = eval_expr(right, table, rowid)?;
+                let l = eval_expr_scope(left, scope)?;
+                let r = eval_expr_scope(right, scope)?;
                 eval_arith(arith, &l, &r)
             }
             BinaryOperator::StringConcat => {
-                let l = eval_expr(left, table, rowid)?;
-                let r = eval_expr(right, table, rowid)?;
+                let l = eval_expr_scope(left, scope)?;
+                let r = eval_expr_scope(right, scope)?;
                 if matches!(l, Value::Null) || matches!(r, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -1717,11 +2179,11 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
         // into secondary / HNSW / FTS indexes, so an IS NULL probe
         // correctly falls through to a full scan via `select_rowids`.
         Expr::IsNull(inner) => {
-            let v = eval_expr(inner, table, rowid)?;
+            let v = eval_expr_scope(inner, scope)?;
             Ok(Value::Bool(matches!(v, Value::Null)))
         }
         Expr::IsNotNull(inner) => {
-            let v = eval_expr(inner, table, rowid)?;
+            let v = eval_expr_scope(inner, scope)?;
             Ok(Value::Bool(!matches!(v, Value::Null)))
         }
 
@@ -1738,8 +2200,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             pattern,
             escape_char,
         } => eval_like(
-            table,
-            rowid,
+            scope,
             *negated,
             *any,
             lhs,
@@ -1754,8 +2215,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             pattern,
             escape_char,
         } => eval_like(
-            table,
-            rowid,
+            scope,
             *negated,
             *any,
             lhs,
@@ -1773,7 +2233,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             expr: lhs,
             list,
             negated,
-        } => eval_in_list(table, rowid, lhs, list, *negated),
+        } => eval_in_list(scope, lhs, list, *negated),
         Expr::InSubquery { .. } => Err(SQLRiteError::NotImplemented(
             "IN (subquery) is not supported (only literal lists are)".to_string(),
         )),
@@ -1788,7 +2248,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
         // string-preprocessing pass or a sqlparser fork). Deferred to
         // a follow-up sub-phase; see docs/phase-7-plan.md's "Scope
         // corrections" note.
-        Expr::Function(func) => eval_function(func, table, rowid),
+        Expr::Function(func) => eval_function(func, scope),
 
         other => Err(SQLRiteError::NotImplemented(format!(
             "unsupported expression in WHERE/projection: {other:?}"
@@ -1800,7 +2260,7 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
 /// Currently only the three vec_distance_* functions; other functions
 /// surface as `NotImplemented` errors with the function name in the
 /// message so users see what they tried.
-fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> Result<Value> {
+fn eval_function(func: &sqlparser::ast::Function, scope: &dyn RowScope) -> Result<Value> {
     // Function name lives in `name.0[0]` for unqualified calls. Anything
     // qualified (e.g. `pkg.fn(...)`) falls through to NotImplemented.
     let name = match func.name.0.as_slice() {
@@ -1815,7 +2275,7 @@ fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> 
 
     match name.as_str() {
         "vec_distance_l2" | "vec_distance_cosine" | "vec_distance_dot" => {
-            let (a, b) = extract_two_vector_args(&name, &func.args, table, rowid)?;
+            let (a, b) = extract_two_vector_args(&name, &func.args, scope)?;
             let dist = match name.as_str() {
                 "vec_distance_l2" => vec_distance_l2(&a, &b),
                 "vec_distance_cosine" => vec_distance_cosine(&a, &b)?,
@@ -1833,21 +2293,35 @@ fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> 
         // demand (we don't cache parsed values), then resolve a path
         // (default `$` = root). The path resolver handles `.key` for
         // object access and `[N]` for array index. SQLite-style.
-        "json_extract" => json_fn_extract(&name, &func.args, table, rowid),
-        "json_type" => json_fn_type(&name, &func.args, table, rowid),
-        "json_array_length" => json_fn_array_length(&name, &func.args, table, rowid),
-        "json_object_keys" => json_fn_object_keys(&name, &func.args, table, rowid),
+        "json_extract" => json_fn_extract(&name, &func.args, scope),
+        "json_type" => json_fn_type(&name, &func.args, scope),
+        "json_array_length" => json_fn_array_length(&name, &func.args, scope),
+        "json_object_keys" => json_fn_object_keys(&name, &func.args, scope),
         // Phase 8b — FTS scalars. Both consult an FTS index attached to
         // the named column; both error if no index exists (the index is
         // a hard prerequisite, mirroring SQLite FTS5's MATCH).
-        "fts_match" => {
-            let (entry, query) = resolve_fts_args(&name, &func.args, table, rowid)?;
-            Ok(Value::Bool(entry.index.matches(rowid, &query)))
-        }
-        "bm25_score" => {
-            let (entry, query) = resolve_fts_args(&name, &func.args, table, rowid)?;
-            let s = entry.index.score(rowid, &query, &Bm25Params::default());
-            Ok(Value::Real(s))
+        //
+        // SQLR-5 — these only work in a single-table scope because they
+        // need the owning `Table` to look up an FTS index by name and
+        // they key results by the row's rowid. In a joined query the
+        // index lookup would be ambiguous (which table's FTS?) and the
+        // scoring rowid is per-table. Reject up front rather than
+        // silently wrong-result.
+        "fts_match" | "bm25_score" => {
+            let Some((table, rowid)) = scope.single_table_view() else {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "{name}() is not yet supported inside a JOIN query — \
+                     use it on a single-table SELECT or move the FTS lookup into a subquery"
+                )));
+            };
+            let (entry, query) = resolve_fts_args(&name, &func.args, table, scope)?;
+            Ok(match name.as_str() {
+                "fts_match" => Value::Bool(entry.index.matches(rowid, &query)),
+                "bm25_score" => {
+                    Value::Real(entry.index.score(rowid, &query, &Bm25Params::default()))
+                }
+                _ => unreachable!(),
+            })
         }
         // SQLR-3: catch aggregate names used in scalar position (e.g.
         // `WHERE COUNT(*) > 1`) with a clearer message than "unknown
@@ -1870,7 +2344,7 @@ fn resolve_fts_args<'t>(
     fn_name: &str,
     args: &FunctionArguments,
     table: &'t Table,
-    rowid: i64,
+    scope: &dyn RowScope,
 ) -> Result<(&'t FtsIndexEntry, String)> {
     let arg_list = match args {
         FunctionArguments::List(l) => &l.args,
@@ -1922,7 +2396,7 @@ fn resolve_fts_args<'t>(
             )));
         }
     };
-    let query = match eval_expr(q_expr, table, rowid)? {
+    let query = match eval_expr_scope(q_expr, scope)? {
         Value::Text(s) => s,
         other => {
             return Err(SQLRiteError::General(format!(
@@ -1961,8 +2435,7 @@ fn resolve_fts_args<'t>(
 fn extract_json_and_path(
     fn_name: &str,
     args: &FunctionArguments,
-    table: &Table,
-    rowid: i64,
+    scope: &dyn RowScope,
 ) -> Result<(String, String)> {
     let arg_list = match args {
         FunctionArguments::List(l) => &l.args,
@@ -1987,7 +2460,7 @@ fn extract_json_and_path(
             )));
         }
     };
-    let json_text = match eval_expr(first_expr, table, rowid)? {
+    let json_text = match eval_expr_scope(first_expr, scope)? {
         Value::Text(s) => s,
         Value::Null => {
             return Err(SQLRiteError::General(format!(
@@ -2012,7 +2485,7 @@ fn extract_json_and_path(
                 )));
             }
         };
-        match eval_expr(path_expr, table, rowid)? {
+        match eval_expr_scope(path_expr, scope)? {
             Value::Text(s) => s,
             other => {
                 return Err(SQLRiteError::General(format!(
@@ -2131,13 +2604,8 @@ fn json_value_to_sql(v: &serde_json::Value) -> Value {
     }
 }
 
-fn json_fn_extract(
-    name: &str,
-    args: &FunctionArguments,
-    table: &Table,
-    rowid: i64,
-) -> Result<Value> {
-    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+fn json_fn_extract(name: &str, args: &FunctionArguments, scope: &dyn RowScope) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, scope)?;
     let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
         SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
     })?;
@@ -2147,8 +2615,8 @@ fn json_fn_extract(
     }
 }
 
-fn json_fn_type(name: &str, args: &FunctionArguments, table: &Table, rowid: i64) -> Result<Value> {
-    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+fn json_fn_type(name: &str, args: &FunctionArguments, scope: &dyn RowScope) -> Result<Value> {
+    let (json_text, path) = extract_json_and_path(name, args, scope)?;
     let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
         SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
     })?;
@@ -2177,10 +2645,9 @@ fn json_fn_type(name: &str, args: &FunctionArguments, table: &Table, rowid: i64)
 fn json_fn_array_length(
     name: &str,
     args: &FunctionArguments,
-    table: &Table,
-    rowid: i64,
+    scope: &dyn RowScope,
 ) -> Result<Value> {
-    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let (json_text, path) = extract_json_and_path(name, args, scope)?;
     let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
         SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
     })?;
@@ -2199,10 +2666,9 @@ fn json_fn_array_length(
 fn json_fn_object_keys(
     name: &str,
     args: &FunctionArguments,
-    table: &Table,
-    rowid: i64,
+    scope: &dyn RowScope,
 ) -> Result<Value> {
-    let (json_text, path) = extract_json_and_path(name, args, table, rowid)?;
+    let (json_text, path) = extract_json_and_path(name, args, scope)?;
     let parsed: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
         SQLRiteError::General(format!("{name}() got invalid JSON `{json_text}`: {e}"))
     })?;
@@ -2234,8 +2700,7 @@ fn json_fn_object_keys(
 fn extract_two_vector_args(
     fn_name: &str,
     args: &FunctionArguments,
-    table: &Table,
-    rowid: i64,
+    scope: &dyn RowScope,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let arg_list = match args {
         FunctionArguments::List(l) => &l.args,
@@ -2261,7 +2726,7 @@ fn extract_two_vector_args(
                 )));
             }
         };
-        let val = eval_expr(expr, table, rowid)?;
+        let val = eval_expr_scope(expr, scope)?;
         match val {
             Value::Vector(v) => out.push(v),
             other => {
@@ -2421,8 +2886,7 @@ fn as_bool(v: &Value) -> Result<bool> {
 
 #[allow(clippy::too_many_arguments)]
 fn eval_like(
-    table: &Table,
-    rowid: i64,
+    scope: &dyn RowScope,
     negated: bool,
     any: bool,
     lhs: &Expr,
@@ -2441,8 +2905,8 @@ fn eval_like(
         ));
     }
 
-    let l = eval_expr(lhs, table, rowid)?;
-    let p = eval_expr(pattern, table, rowid)?;
+    let l = eval_expr_scope(lhs, scope)?;
+    let p = eval_expr_scope(pattern, scope)?;
     if matches!(l, Value::Null) || matches!(p, Value::Null) {
         return Ok(Value::Null);
     }
@@ -2458,20 +2922,14 @@ fn eval_like(
     Ok(Value::Bool(if negated { !m } else { m }))
 }
 
-fn eval_in_list(
-    table: &Table,
-    rowid: i64,
-    lhs: &Expr,
-    list: &[Expr],
-    negated: bool,
-) -> Result<Value> {
-    let l = eval_expr(lhs, table, rowid)?;
+fn eval_in_list(scope: &dyn RowScope, lhs: &Expr, list: &[Expr], negated: bool) -> Result<Value> {
+    let l = eval_expr_scope(lhs, scope)?;
     if matches!(l, Value::Null) {
         return Ok(Value::Null);
     }
     let mut saw_null = false;
     for item in list {
-        let r = eval_expr(item, table, rowid)?;
+        let r = eval_expr_scope(item, scope)?;
         if matches!(r, Value::Null) {
             saw_null = true;
             continue;
@@ -2512,7 +2970,7 @@ fn aggregate_rows(
         .iter()
         .map(|i| match &i.kind {
             ProjectionKind::Aggregate(call) => Some(AggState::new(call)),
-            ProjectionKind::Column(_) => None,
+            ProjectionKind::Column { .. } => None,
         })
         .collect();
 
@@ -2575,7 +3033,7 @@ fn aggregate_rows(
         let mut row: Vec<Value> = Vec::with_capacity(proj_items.len());
         for (slot, item) in proj_items.iter().enumerate() {
             match &item.kind {
-                ProjectionKind::Column(c) => {
+                ProjectionKind::Column { name: c, .. } => {
                     // The validation in execute_select_rows guarantees
                     // bare-column projections are also in `group_by`.
                     let pos = group_by
@@ -3491,5 +3949,474 @@ mod tests {
         crate::sql::process_command("INSERT INTO t (x) VALUES (1);", &mut db).unwrap();
         let err = crate::sql::process_command("SELECT x FROM t WHERE COUNT(*) > 0;", &mut db);
         assert!(err.is_err(), "aggregates must not be allowed in WHERE");
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-5 — JOINs (INNER / LEFT OUTER / RIGHT OUTER / FULL OUTER)
+    // ---------------------------------------------------------------------
+
+    /// Two-table fixture used across the join tests. `customers` has
+    /// (1: Alice, 2: Bob, 3: Carol). `orders` has (id, customer_id,
+    /// amount): (1, 1, 100), (2, 1, 200), (3, 2, 50), (4, 4, 999).
+    /// Customer 3 (Carol) has no orders; order 4 has no customer
+    /// (dangling foreign key) — together they exercise both sides of
+    /// the outer-join NULL-padding.
+    fn seed_join_fixture() -> Database {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);",
+            "INSERT INTO customers (name) VALUES ('Alice');",
+            "INSERT INTO customers (name) VALUES ('Bob');",
+            "INSERT INTO customers (name) VALUES ('Carol');",
+            "INSERT INTO orders (customer_id, amount) VALUES (1, 100);",
+            "INSERT INTO orders (customer_id, amount) VALUES (1, 200);",
+            "INSERT INTO orders (customer_id, amount) VALUES (2, 50);",
+            "INSERT INTO orders (customer_id, amount) VALUES (4, 999);",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn inner_join_returns_only_matched_rows() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        assert_eq!(r.columns, vec!["name".to_string(), "amount".to_string()]);
+        // Alice: 100, 200; Bob: 50. Carol drops (no orders), order 4 drops
+        // (no customer). 3 rows.
+        let pairs: Vec<(String, i64)> = r
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row[0].to_display_string(),
+                    match row[1] {
+                        Value::Integer(i) => i,
+                        ref v => panic!("expected integer amount, got {v:?}"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(pairs.len(), 3);
+        assert!(pairs.contains(&("Alice".to_string(), 100)));
+        assert!(pairs.contains(&("Alice".to_string(), 200)));
+        assert!(pairs.contains(&("Bob".to_string(), 50)));
+    }
+
+    #[test]
+    fn bare_join_defaults_to_inner() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name FROM customers \
+             JOIN orders ON customers.id = orders.customer_id;",
+        );
+        assert_eq!(r.rows.len(), 3, "JOIN without prefix should be INNER");
+    }
+
+    #[test]
+    fn left_outer_join_preserves_unmatched_left() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             LEFT OUTER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        // Alice: two rows. Bob: one row. Carol: one NULL-padded row.
+        // Order 4 is dropped (left side has no customer for id=4).
+        assert_eq!(r.rows.len(), 4);
+        let carol = r
+            .rows
+            .iter()
+            .find(|row| row[0].to_display_string() == "Carol")
+            .expect("Carol should appear with a NULL-padded right side");
+        assert_eq!(carol[1], Value::Null);
+    }
+
+    #[test]
+    fn right_outer_join_preserves_unmatched_right() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             RIGHT OUTER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        // 3 matched rows + 1 dangling order (id=4, customer_id=4 with no
+        // matching customer). Total 4. Carol drops because the right
+        // table has no row pointing at her.
+        assert_eq!(r.rows.len(), 4);
+        let dangling = r
+            .rows
+            .iter()
+            .find(|row| matches!(row[1], Value::Integer(999)))
+            .expect("dangling order 999 should appear with a NULL-padded customer name");
+        assert_eq!(dangling[0], Value::Null);
+    }
+
+    #[test]
+    fn full_outer_join_preserves_both_sides() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             FULL OUTER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        // 3 matched + 1 unmatched left (Carol) + 1 unmatched right
+        // (order 999) = 5 rows.
+        assert_eq!(r.rows.len(), 5);
+        // Carol with NULL amount.
+        assert!(
+            r.rows
+                .iter()
+                .any(|row| row[0].to_display_string() == "Carol" && matches!(row[1], Value::Null))
+        );
+        // 999 with NULL name.
+        assert!(
+            r.rows
+                .iter()
+                .any(|row| matches!(row[1], Value::Integer(999)) && matches!(row[0], Value::Null))
+        );
+    }
+
+    #[test]
+    fn join_with_table_aliases_resolves_qualifiers() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT c.name, o.amount FROM customers AS c \
+             INNER JOIN orders AS o ON c.id = o.customer_id;",
+        );
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.columns, vec!["name".to_string(), "amount".to_string()]);
+    }
+
+    #[test]
+    fn join_with_where_filter_applies_after_join() {
+        let db = seed_join_fixture();
+        // Filter to only orders >= 100. With INNER JOIN, this drops Bob's
+        // 50-amount order, leaving Alice's 100 and 200.
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             WHERE orders.amount >= 100;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert!(
+            r.rows
+                .iter()
+                .all(|row| row[0].to_display_string() == "Alice")
+        );
+    }
+
+    #[test]
+    fn left_join_with_where_on_right_side_is_not_inner() {
+        // WHERE on the right side that excludes NULL turns LEFT JOIN
+        // back into INNER JOIN semantically. Verify the executor
+        // applies the WHERE *after* the join padded NULLs in.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             LEFT OUTER JOIN orders ON customers.id = orders.customer_id \
+             WHERE orders.amount IS NULL;",
+        );
+        // Only Carol survives — she's the only customer with no order.
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "Carol");
+        assert_eq!(r.rows[0][1], Value::Null);
+    }
+
+    #[test]
+    fn select_star_over_join_emits_all_columns_from_both_tables() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT * FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        // customers has 2 cols (id, name), orders has 3 cols
+        // (id, customer_id, amount). 5 columns total. Header order
+        // follows source order — primary table first.
+        assert_eq!(
+            r.columns,
+            vec![
+                "id".to_string(),
+                "name".to_string(),
+                "id".to_string(),
+                "customer_id".to_string(),
+                "amount".to_string(),
+            ]
+        );
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn join_order_by_sorts_full_joined_rows() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT c.name, o.amount FROM customers AS c \
+             INNER JOIN orders AS o ON c.id = o.customer_id \
+             ORDER BY o.amount;",
+        );
+        let amounts: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|row| match row[1] {
+                Value::Integer(i) => i,
+                ref v => panic!("expected integer, got {v:?}"),
+            })
+            .collect();
+        assert_eq!(amounts, vec![50, 100, 200]);
+    }
+
+    #[test]
+    fn join_limit_truncates_after_join_and_sort() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT c.name, o.amount FROM customers AS c \
+             INNER JOIN orders AS o ON c.id = o.customer_id \
+             ORDER BY o.amount DESC LIMIT 2;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // Top two by amount DESC: 200 (Alice), 100 (Alice).
+        let amounts: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|row| match row[1] {
+                Value::Integer(i) => i,
+                ref v => panic!("expected integer, got {v:?}"),
+            })
+            .collect();
+        assert_eq!(amounts, vec![200, 100]);
+    }
+
+    #[test]
+    fn three_table_join_chains_correctly() {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, label TEXT);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, tag TEXT);",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, note TEXT);",
+            "INSERT INTO a (label) VALUES ('a-one');",
+            "INSERT INTO a (label) VALUES ('a-two');",
+            "INSERT INTO b (a_id, tag) VALUES (1, 'b1');",
+            "INSERT INTO b (a_id, tag) VALUES (2, 'b2');",
+            "INSERT INTO c (b_id, note) VALUES (1, 'c1');",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let r = run_rows(
+            &db,
+            "SELECT a.label, b.tag, c.note FROM a \
+             INNER JOIN b ON a.id = b.a_id \
+             INNER JOIN c ON b.id = c.b_id;",
+        );
+        // Only b1 has a c row. So one combined row.
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "a-one");
+        assert_eq!(r.rows[0][1].to_display_string(), "b1");
+        assert_eq!(r.rows[0][2].to_display_string(), "c1");
+    }
+
+    #[test]
+    fn ambiguous_unqualified_column_in_join_errors() {
+        // Both customers and orders have a column named `id`. An
+        // unqualified `id` in the SELECT must error rather than
+        // silently picking one side.
+        let db = seed_join_fixture();
+        let q = parse_select(
+            "SELECT id FROM customers INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        let res = execute_select_rows(q, &db);
+        assert!(res.is_err(), "unqualified ambiguous 'id' should error");
+    }
+
+    #[test]
+    fn join_self_without_alias_is_rejected() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE n (id INTEGER PRIMARY KEY, parent INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let q = parse_select("SELECT n.id FROM n INNER JOIN n ON n.id = n.parent;");
+        let res = execute_select_rows(q, &db);
+        assert!(
+            res.is_err(),
+            "self-join without an alias should error on duplicate qualifier"
+        );
+    }
+
+    #[test]
+    fn using_or_natural_join_returns_not_implemented() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command("CREATE TABLE a (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        crate::sql::process_command("CREATE TABLE b (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        let err = crate::sql::process_command("SELECT * FROM a INNER JOIN b USING (id);", &mut db);
+        assert!(err.is_err(), "USING is not yet supported");
+
+        let err = crate::sql::process_command("SELECT * FROM a NATURAL JOIN b;", &mut db);
+        assert!(err.is_err(), "NATURAL is not supported");
+    }
+
+    #[test]
+    fn aggregates_over_join_are_rejected() {
+        let db = seed_join_fixture();
+        let err = crate::sql::process_command(
+            "SELECT COUNT(*) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+            &mut seed_join_fixture(),
+        );
+        assert!(err.is_err(), "aggregates over JOIN are not yet supported");
+        let _ = db; // keep compiler happy if unused
+    }
+
+    #[test]
+    fn left_join_with_no_matches_pads_every_row() {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER);",
+            "INSERT INTO a (x) VALUES (1);",
+            "INSERT INTO a (x) VALUES (2);",
+            "INSERT INTO b (y) VALUES (10);",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        // ON condition matches nothing.
+        let r = run_rows(
+            &db,
+            "SELECT a.x, b.y FROM a LEFT OUTER JOIN b ON a.x = b.y;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        for row in &r.rows {
+            assert_eq!(row[1], Value::Null);
+        }
+    }
+
+    #[test]
+    fn left_outer_join_order_by_places_nulls_first() {
+        // NULL ordering matches the engine-wide rule: NULL is Less
+        // than every concrete value (see compare_values). So an
+        // ORDER BY of a NULL-padded right column puts the
+        // outer-join row at the top under ASC.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT c.name, o.amount FROM customers AS c \
+             LEFT OUTER JOIN orders AS o ON c.id = o.customer_id \
+             ORDER BY o.amount ASC;",
+        );
+        assert_eq!(r.rows.len(), 4);
+        // Carol's NULL amount sorts first.
+        assert_eq!(r.rows[0][0].to_display_string(), "Carol");
+        assert_eq!(r.rows[0][1], Value::Null);
+    }
+
+    #[test]
+    fn chained_left_outer_join_preserves_left_through_two_levels() {
+        // A LEFT JOIN B LEFT JOIN C — a row in A with no match in B
+        // must survive both joins with NULL padding for both sides.
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, label TEXT);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, tag TEXT);",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, note TEXT);",
+            "INSERT INTO a (label) VALUES ('a-one');",
+            "INSERT INTO a (label) VALUES ('a-two');",
+            // b only matches a-one.
+            "INSERT INTO b (a_id, tag) VALUES (1, 'b1');",
+            // No c rows at all.
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let r = run_rows(
+            &db,
+            "SELECT a.label, b.tag, c.note FROM a \
+             LEFT OUTER JOIN b ON a.id = b.a_id \
+             LEFT OUTER JOIN c ON b.id = c.b_id;",
+        );
+        // Two rows: a-one + b1 with c=NULL, and a-two with b=NULL+c=NULL.
+        assert_eq!(r.rows.len(), 2);
+        let by_label: std::collections::HashMap<String, &Vec<Value>> = r
+            .rows
+            .iter()
+            .map(|row| (row[0].to_display_string(), row))
+            .collect();
+        assert_eq!(by_label["a-one"][1].to_display_string(), "b1");
+        assert_eq!(by_label["a-one"][2], Value::Null);
+        assert_eq!(by_label["a-two"][1], Value::Null);
+        assert_eq!(by_label["a-two"][2], Value::Null);
+    }
+
+    #[test]
+    fn on_clause_referencing_not_yet_joined_table_errors_clearly() {
+        // ON should only see tables joined so far. Referencing a
+        // table that hasn't joined yet is a clean error rather than
+        // silently NULL-coalescing into "ON evaluated false".
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, x INTEGER);",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER);",
+            "INSERT INTO a (x) VALUES (1);",
+            "INSERT INTO b (x) VALUES (1);",
+            "INSERT INTO c (x) VALUES (1);",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let q =
+            parse_select("SELECT a.x FROM a INNER JOIN b ON a.x = c.x INNER JOIN c ON b.x = c.x;");
+        let res = execute_select_rows(q, &db);
+        assert!(
+            res.is_err(),
+            "ON referencing not-yet-joined table 'c' should error"
+        );
+    }
+
+    #[test]
+    fn join_on_truthy_integer_is_accepted() {
+        // ON `1` should be treated as true, like WHERE 1. Verifies
+        // the executor reuses eval_predicate_scope's truthiness
+        // semantic on JOIN conditions.
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER);",
+            "INSERT INTO a (x) VALUES (1);",
+            "INSERT INTO a (x) VALUES (2);",
+            "INSERT INTO b (y) VALUES (10);",
+            "INSERT INTO b (y) VALUES (20);",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let r = run_rows(&db, "SELECT a.x, b.y FROM a INNER JOIN b ON 1;");
+        // ON 1 is always true → cross product → 2 × 2 = 4 rows.
+        assert_eq!(r.rows.len(), 4);
+    }
+
+    #[test]
+    fn full_join_on_empty_tables_returns_empty() {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER);",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let r = run_rows(
+            &db,
+            "SELECT a.x, b.y FROM a FULL OUTER JOIN b ON a.x = b.y;",
+        );
+        assert!(r.rows.is_empty());
     }
 }

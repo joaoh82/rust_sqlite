@@ -1,6 +1,7 @@
 use sqlparser::ast::{
-    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
+    JoinOperator, LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins,
 };
 
 use crate::error::{Result, SQLRiteError};
@@ -84,12 +85,15 @@ pub struct ProjectionItem {
 impl ProjectionItem {
     /// Resolve the user-visible column header for this projection item.
     /// Alias if supplied, else the bare column name or aggregate display.
+    /// For qualified `t.col` shapes the header is just `col` — this
+    /// matches SQLite, where qualifiers don't propagate to output
+    /// column names.
     pub fn output_name(&self) -> String {
         if let Some(a) = &self.alias {
             return a.clone();
         }
         match &self.kind {
-            ProjectionKind::Column(c) => c.clone(),
+            ProjectionKind::Column { name, .. } => name.clone(),
             ProjectionKind::Aggregate(a) => a.display_name(),
         }
     }
@@ -98,8 +102,15 @@ impl ProjectionItem {
 /// What an individual projection item produces.
 #[derive(Debug, Clone)]
 pub enum ProjectionKind {
-    /// Bare column reference: `SELECT a, b, c`.
-    Column(String),
+    /// Column reference. `qualifier` is `Some` for `t.col` shapes
+    /// (SQLR-5 — needed so JOIN execution can disambiguate
+    /// same-named columns across tables); `None` for bare `col`.
+    /// The single-table path ignores the qualifier and looks up the
+    /// name directly, preserving legacy behavior.
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
     /// Aggregate function call: `COUNT(*)`, `SUM(col)`, etc.
     Aggregate(AggregateCall),
 }
@@ -127,10 +138,58 @@ pub struct OrderByClause {
     pub ascending: bool,
 }
 
+/// SQLR-5 — flavor of join. SQLite ships INNER and LEFT OUTER; we
+/// implement the full quartet on top of a single nested-loop driver
+/// because the per-flavor differences are small (NULL-padding policy
+/// for unmatched left/right rows). RIGHT OUTER and FULL OUTER aren't
+/// in SQLite — see `docs/design-decisions.md` for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+}
+
+impl JoinType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JoinType::Inner => "INNER",
+            JoinType::LeftOuter => "LEFT OUTER",
+            JoinType::RightOuter => "RIGHT OUTER",
+            JoinType::FullOuter => "FULL OUTER",
+        }
+    }
+}
+
+/// One JOIN clause from the FROM list. Multi-join queries
+/// (`A JOIN B ... JOIN C ...`) become a `Vec<JoinClause>` evaluated
+/// left-to-right against the accumulator. v1 requires an ON condition;
+/// USING / NATURAL / CROSS are deferred.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub right_table: String,
+    /// `AS alias` if the right table introduced one. Stored separately
+    /// from `right_table` so the executor can normalize on
+    /// `alias.unwrap_or(right_table)` for qualifier matching.
+    pub right_alias: Option<String>,
+    /// `ON <expr>` — required. Evaluated per-row by the executor over
+    /// the multi-table scope.
+    pub on: Expr,
+}
+
 /// A parsed, simplified SELECT query.
 #[derive(Debug, Clone)]
 pub struct SelectQuery {
     pub table_name: String,
+    /// Optional `AS alias` on the leading FROM table. The executor's
+    /// scope resolver treats `alias.unwrap_or(table_name)` as the
+    /// qualifier name.
+    pub table_alias: Option<String>,
+    /// SQLR-5 — JOIN clauses in source order. Empty = single-table
+    /// SELECT, the existing fast path.
+    pub joins: Vec<JoinClause>,
     pub projection: Projection,
     /// Raw sqlparser WHERE expression, evaluated by the executor at run time.
     pub selection: Option<Expr>,
@@ -223,7 +282,7 @@ impl SelectQuery {
             }
         };
 
-        let table_name = extract_single_table_name(from)?;
+        let (table_name, table_alias, joins) = extract_from_clause(from)?;
         let projection = parse_projection(projection)?;
         let order_by = parse_order_by(order_by.as_ref())?;
         let limit = parse_limit(limit_clause.as_ref())?;
@@ -235,7 +294,7 @@ impl SelectQuery {
             && let Projection::Items(items) = &projection
         {
             for item in items {
-                if let ProjectionKind::Column(c) = &item.kind
+                if let ProjectionKind::Column { name: c, .. } = &item.kind
                     && !group_by_cols.contains(c)
                 {
                     return Err(SQLRiteError::Internal(format!(
@@ -245,8 +304,33 @@ impl SelectQuery {
             }
         }
 
+        // SQLR-5 — aggregations across joined results aren't covered
+        // by the current single-table grouping pipeline. Reject GROUP
+        // BY / aggregates over a join up front so the user gets a clear
+        // message rather than wrong results.
+        if !joins.is_empty() {
+            let has_agg = matches!(
+                &projection,
+                Projection::Items(items)
+                    if items.iter().any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)))
+            );
+            if has_agg || !group_by_cols.is_empty() {
+                return Err(SQLRiteError::NotImplemented(
+                    "GROUP BY / aggregate functions over JOIN results are not supported yet"
+                        .to_string(),
+                ));
+            }
+            if distinct_flag {
+                return Err(SQLRiteError::NotImplemented(
+                    "SELECT DISTINCT over JOIN results is not supported yet".to_string(),
+                ));
+            }
+        }
+
         Ok(SelectQuery {
             table_name,
+            table_alias,
+            joins,
             projection,
             selection: selection.clone(),
             order_by,
@@ -257,22 +341,93 @@ impl SelectQuery {
     }
 }
 
-fn extract_single_table_name(from: &[TableWithJoins]) -> Result<String> {
+/// Pull the leading FROM table (with optional alias) and any JOIN
+/// clauses out of the parsed FROM list. v1 supports a single base
+/// table plus zero or more INNER / LEFT / RIGHT / FULL OUTER joins
+/// with explicit `ON` conditions. Comma-separated FROM lists,
+/// USING / NATURAL constraints, and CROSS / SEMI / ANTI / ASOF joins
+/// surface as `NotImplemented`.
+fn extract_from_clause(
+    from: &[TableWithJoins],
+) -> Result<(String, Option<String>, Vec<JoinClause>)> {
+    if from.is_empty() {
+        return Err(SQLRiteError::Internal(
+            "SELECT requires a FROM clause".to_string(),
+        ));
+    }
     if from.len() != 1 {
         return Err(SQLRiteError::NotImplemented(
-            "SELECT from multiple tables (joins / comma-joins) is not supported yet".to_string(),
+            "comma-separated FROM lists are not supported — use explicit JOIN syntax".to_string(),
         ));
     }
     let twj = &from[0];
-    if !twj.joins.is_empty() {
-        return Err(SQLRiteError::NotImplemented(
-            "JOIN is not supported yet".to_string(),
-        ));
+    let (table_name, table_alias) = extract_table_factor(&twj.relation)?;
+
+    let mut joins = Vec::with_capacity(twj.joins.len());
+    for j in &twj.joins {
+        let (right_table, right_alias) = extract_table_factor(&j.relation)?;
+        let (join_type, on_expr) = match &j.join_operator {
+            // Bare `JOIN` defaults to INNER per SQL standard.
+            JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, parse_on(c)?),
+            JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                (JoinType::LeftOuter, parse_on(c)?)
+            }
+            JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
+                (JoinType::RightOuter, parse_on(c)?)
+            }
+            JoinOperator::FullOuter(c) => (JoinType::FullOuter, parse_on(c)?),
+            other => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "join flavor {other:?} is not supported \
+                     (only INNER / LEFT OUTER / RIGHT OUTER / FULL OUTER with ON)"
+                )));
+            }
+        };
+        joins.push(JoinClause {
+            join_type,
+            right_table,
+            right_alias,
+            on: on_expr,
+        });
     }
-    match &twj.relation {
-        TableFactor::Table { name, .. } => Ok(name.to_string()),
+
+    Ok((table_name, table_alias, joins))
+}
+
+fn extract_table_factor(tf: &TableFactor) -> Result<(String, Option<String>)> {
+    match tf {
+        TableFactor::Table { name, alias, .. } => {
+            let table_name = name.to_string();
+            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            // We don't yet support alias column lists like `(c1, c2)` —
+            // they only matter for table-valued functions / derived
+            // tables, which we don't have either.
+            if let Some(a) = alias.as_ref()
+                && !a.columns.is_empty()
+            {
+                return Err(SQLRiteError::NotImplemented(
+                    "table alias column lists are not supported".to_string(),
+                ));
+            }
+            Ok((table_name, alias_name))
+        }
         _ => Err(SQLRiteError::NotImplemented(
-            "Only SELECT from a plain table is supported".to_string(),
+            "only plain table references are supported in FROM / JOIN".to_string(),
+        )),
+    }
+}
+
+fn parse_on(constraint: &JoinConstraint) -> Result<Expr> {
+    match constraint {
+        JoinConstraint::On(expr) => Ok(expr.clone()),
+        JoinConstraint::Using(_) => Err(SQLRiteError::NotImplemented(
+            "JOIN ... USING (...) is not supported yet — use JOIN ... ON instead".to_string(),
+        )),
+        JoinConstraint::Natural => Err(SQLRiteError::NotImplemented(
+            "NATURAL JOIN is not supported".to_string(),
+        )),
+        JoinConstraint::None => Err(SQLRiteError::NotImplemented(
+            "JOIN without an ON condition is not supported (use INNER JOIN ... ON ...)".to_string(),
         )),
     }
 }
@@ -308,18 +463,32 @@ fn parse_select_item(item: &SelectItem) -> Result<ProjectionItem> {
 fn parse_projection_expr(expr: &Expr, alias: Option<String>) -> Result<ProjectionItem> {
     match expr {
         Expr::Identifier(ident) => Ok(ProjectionItem {
-            kind: ProjectionKind::Column(ident.value.clone()),
+            kind: ProjectionKind::Column {
+                qualifier: None,
+                name: ident.value.clone(),
+            },
             alias,
         }),
-        Expr::CompoundIdentifier(parts) => {
-            let name = parts.last().map(|p| p.value.clone()).ok_or_else(|| {
-                SQLRiteError::Internal("empty qualified column reference".to_string())
-            })?;
-            Ok(ProjectionItem {
-                kind: ProjectionKind::Column(name),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [only] => Ok(ProjectionItem {
+                kind: ProjectionKind::Column {
+                    qualifier: None,
+                    name: only.value.clone(),
+                },
                 alias,
-            })
-        }
+            }),
+            [q, c] => Ok(ProjectionItem {
+                kind: ProjectionKind::Column {
+                    qualifier: Some(q.value.clone()),
+                    name: c.value.clone(),
+                },
+                alias,
+            }),
+            _ => Err(SQLRiteError::NotImplemented(format!(
+                "compound identifier with {} parts is not supported in projection",
+                parts.len()
+            ))),
+        },
         Expr::Function(func) => {
             let call = parse_aggregate_call(func)?;
             Ok(ProjectionItem {
