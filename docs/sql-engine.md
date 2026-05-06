@@ -45,13 +45,15 @@ The `sqlparser` AST is designed to cover every SQL dialect, so its types are hug
 |---|---|---|
 | `Statement::CreateTable(CreateTable)` | `CreateQuery { table_name, columns: Vec<ParsedColumn> }` | [`create.rs`](../src/sql/parser/create.rs) |
 | `Statement::Insert(Insert)` | `InsertQuery { table_name, columns, rows }` | [`insert.rs`](../src/sql/parser/insert.rs) |
-| `Statement::Query(_)` | `SelectQuery { table_name, projection, selection, order_by, limit, distinct, group_by }` | [`select.rs`](../src/sql/parser/select.rs) |
+| `Statement::Query(_)` | `SelectQuery { table_name, table_alias, joins, projection, selection, order_by, limit, distinct, group_by }` | [`select.rs`](../src/sql/parser/select.rs) |
 
 `UPDATE` and `DELETE` don't have a dedicated internal struct — the executor pattern-matches the sqlparser types directly because there's less transformation needed.
 
-`SelectQuery::projection` is now `Projection::All | Projection::Items(Vec<ProjectionItem>)`, where each item carries a `ProjectionKind::Column(name)` or `ProjectionKind::Aggregate(AggregateCall)` plus an optional `AS alias`. `AggregateCall` covers `COUNT(*)`, `COUNT([DISTINCT] col)`, `SUM` / `AVG` / `MIN` / `MAX` of a bare column. `group_by` is a `Vec<String>` of bare column names (empty = no GROUP BY); the parser validates that every non-aggregate projection item appears in `GROUP BY`.
+`SelectQuery::projection` is now `Projection::All | Projection::Items(Vec<ProjectionItem>)`, where each item carries a `ProjectionKind::Column { qualifier, name }` (qualifier is `Some` for `t.col` shapes, used by JOIN execution to disambiguate) or `ProjectionKind::Aggregate(AggregateCall)` plus an optional `AS alias`. `AggregateCall` covers `COUNT(*)`, `COUNT([DISTINCT] col)`, `SUM` / `AVG` / `MIN` / `MAX` of a bare column. `group_by` is a `Vec<String>` of bare column names (empty = no GROUP BY); the parser validates that every non-aggregate projection item appears in `GROUP BY`.
 
-Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — `JOIN`, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there.
+`SelectQuery::joins` (SQLR-5) is a `Vec<JoinClause>` evaluated left-to-right by `execute_select_rows_joined`. Each clause carries a `JoinType` (`Inner` / `LeftOuter` / `RightOuter` / `FullOuter`), the right-table name + optional alias, and a required `ON` expression. Empty = single-table SELECT, the existing fast path with HNSW / FTS / bounded-heap optimizations.
+
+Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — `JOIN ... USING`, `NATURAL JOIN`, `CROSS JOIN`, comma joins, aggregates / GROUP BY / DISTINCT over JOINs, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there.
 
 ## Statement dispatch
 

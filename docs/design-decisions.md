@@ -156,6 +156,25 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+### 14a. Implement RIGHT OUTER and FULL OUTER joins (SQLR-5)
+
+**Decision.** SQLRite supports the full quartet — `INNER`, `LEFT OUTER`, `RIGHT OUTER`, `FULL OUTER` — via [`execute_select_rows_joined`](../src/sql/executor.rs). SQLite ships only `INNER` and `LEFT OUTER`; SQLite users typically rewrite a `RIGHT JOIN` as a `LEFT JOIN` with the operands swapped, and a `FULL JOIN` as a `UNION` of `LEFT` and a back-anti-`LEFT`.
+
+**Why.** Once the executor has a multi-table scope (the `RowScope` trait), the per-flavor difference is just NULL-padding policy on top of one shared nested-loop driver:
+
+- `INNER`: drop unmatched on both sides
+- `LEFT OUTER`: keep unmatched left, NULL the right
+- `RIGHT OUTER`: keep unmatched right, NULL the left
+- `FULL OUTER`: do both
+
+Adding the missing two flavors costs ~30 lines in the join driver and a `right_matched: Vec<bool>` to track unmatched right rows across the accumulator. That's much cheaper than the rewrite-by-hand experience SQLite users get, and removes the pedagogical "why doesn't this work" stumble — the whole project's premise is "implement these things to learn how they work", and `RIGHT` / `FULL` are interesting precisely because most engines support them and SQLite's choice not to is itself a design conversation.
+
+**Cost.** Slightly more code in the join driver and the doc burden of explaining we diverge from SQLite. The single-table fast path is unchanged, so SQLite users hitting this engine without joins see no behavioral difference. The implementation is plain nested-loop (O(N×M) per join level) with no hash / merge optimization — same complexity as the LEFT path; both flavors will benefit equally when that work lands later.
+
+**Cross-reference.** Implementation in [`src/sql/executor.rs`](../src/sql/executor.rs) (`execute_select_rows_joined`); per-flavor table in [`docs/supported-sql.md`](supported-sql.md#join-semantics-sqlr-5).
+
+---
+
 ### 14. Deterministic page-number ordering when saving
 
 **Decision.** [`save_database`](../src/sql/pager/mod.rs) sorts table names alphabetically before writing. Same DB contents → same bytes at same page numbers, every time.

@@ -136,9 +136,8 @@ Steps 1–7 are purely in-memory; step 8 is the only disk contact, and after the
 
 The roadmap has shipped far enough that the original "deliberately missing" list mostly turned into shipped features. What's still left:
 
-- **No query optimizer** beyond the bounded-heap top-k pass for KNN (Phase 7c) and the HNSW probe shortcut (7d.2). Equality-on-PK probes are direct; everything else is a table scan.
-- **No joins.** `INNER` / `LEFT OUTER` / `CROSS` are parsed but rejected by the executor. On the "possible extras" list in [roadmap.md](roadmap.md).
-- **No aggregates.** `COUNT(*)` / `SUM` / `AVG` / `GROUP BY` aren't implemented yet — the parser accepts them but the executor errors. Phase 8 candidate alongside FTS.
+- **No query optimizer** beyond the bounded-heap top-k pass for KNN (Phase 7c) and the HNSW probe shortcut (7d.2). Equality-on-PK probes are direct; everything else is a table scan. Joins use plain nested-loop (O(N×M) per join level); hash / merge joins on equi-join shapes are a future increment.
+- **Aggregates / GROUP BY / DISTINCT over joined results.** The single-table aggregator is wired against one rowid stream; the multi-table join executor produces joined rows but doesn't yet feed them through the aggregator. Surfaces as a clean `NotImplemented` at parse time. The single-table aggregation path (SQLR-3) is fully shipped.
 - **No network layer.** SQLRite is embedded-only. The closest thing is the [`sqlrite-mcp`](mcp.md) server, which is stdio (not network). A real wire protocol isn't on the roadmap.
 - **No streaming row cursor.** `Rows` is currently backed by an eager `Vec` (Phase 5a). The `Rows::next` API is shaped to support a real cursor — the swap is deferred to **5a.2**.
 
