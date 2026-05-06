@@ -45,11 +45,13 @@ The `sqlparser` AST is designed to cover every SQL dialect, so its types are hug
 |---|---|---|
 | `Statement::CreateTable(CreateTable)` | `CreateQuery { table_name, columns: Vec<ParsedColumn> }` | [`create.rs`](../src/sql/parser/create.rs) |
 | `Statement::Insert(Insert)` | `InsertQuery { table_name, columns, rows }` | [`insert.rs`](../src/sql/parser/insert.rs) |
-| `Statement::Query(_)` | `SelectQuery { table_name, projection, selection, order_by, limit }` | [`select.rs`](../src/sql/parser/select.rs) |
+| `Statement::Query(_)` | `SelectQuery { table_name, projection, selection, order_by, limit, distinct, group_by }` | [`select.rs`](../src/sql/parser/select.rs) |
 
 `UPDATE` and `DELETE` don't have a dedicated internal struct — the executor pattern-matches the sqlparser types directly because there's less transformation needed.
 
-Each parser module also rejects features we don't implement with `SQLRiteError::NotImplemented` — `JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there.
+`SelectQuery::projection` is now `Projection::All | Projection::Items(Vec<ProjectionItem>)`, where each item carries a `ProjectionKind::Column(name)` or `ProjectionKind::Aggregate(AggregateCall)` plus an optional `AS alias`. `AggregateCall` covers `COUNT(*)`, `COUNT([DISTINCT] col)`, `SUM` / `AVG` / `MIN` / `MAX` of a bare column. `group_by` is a `Vec<String>` of bare column names (empty = no GROUP BY); the parser validates that every non-aggregate projection item appears in `GROUP BY`.
+
+Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — `JOIN`, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there.
 
 ## Statement dispatch
 
@@ -90,6 +92,9 @@ match query {
 |---|---|
 | Logical | `AND`, `OR`, `NOT` |
 | Comparison | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Null tests | `IS NULL`, `IS NOT NULL` |
+| Pattern | `LIKE`, `NOT LIKE`, `ILIKE` (`%`, `_`, `\`-escape; case-insensitive ASCII) |
+| Set | `IN (list)`, `NOT IN (list)` (literal lists only) |
 | Arithmetic | `+`, `-`, `*`, `/`, `%` |
 | String | `\|\|` |
 | Unary | `+`, `-`, `NOT` |
@@ -138,6 +143,41 @@ ORDER BY bm25_score(<col>, '<q>') DESC LIMIT k
 Returns top-k from the inverted index in `O(query-term-count × k log k)`. The probe matches only when ORDER BY direction is `DESC` (BM25 is "higher = better"; ASC almost certainly means user error and falls through). The query string in `WHERE fts_match` and `ORDER BY bm25_score` must literally match. If WHERE has additional conditions beyond the canonical `fts_match` predicate, those conditions are silently dropped on the optimizer fast path — same posture as `try_hnsw_probe` per [Phase 8 plan Q6](phase-8-plan.md#q6-filtered-fts).
 
 The full canonical FTS reference is in [`docs/fts.md`](fts.md).
+
+### Aggregation phase
+
+When a SELECT contains an aggregate projection or a GROUP BY clause, the
+rowid-shaped optimizations don't compose with grouping (every row
+contributes to its group), so the executor takes a separate path:
+
+1. Filter by `WHERE` exactly as before — including the index-probe fast
+   path — to get the matching rowid set.
+2. For each matching rowid, derive a **group key** as a
+   `Vec<DistinctKey>` (one entry per `GROUP BY` column; empty key for
+   queries with aggregates but no `GROUP BY`).
+3. Update one `AggState` per (group, aggregate-projection-slot) —
+   `AggState` lives in [`src/sql/agg.rs`](../src/sql/agg.rs) and tracks
+   the SQLite numeric type rules (`SUM` stays `INTEGER` until a `REAL`
+   input or `i64` overflow promotes it; `AVG` is always `REAL`; `MIN`/`MAX`
+   reuse the executor's total order; `COUNT(DISTINCT col)` uses a
+   `HashSet<DistinctKey>`).
+4. Emit one output row per group, in projection order — bare-column
+   slots emit the captured group-key value, aggregate slots emit
+   `AggState::finalize()`.
+5. Apply DISTINCT (post-projection dedup), then ORDER BY (resolved
+   against the *output* row by alias, bare column name, or aggregate
+   display form), then LIMIT.
+
+Aggregate function names (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) used in WHERE
+or any other scalar position get a friendly error redirecting the user
+to the projection list (since `HAVING` isn't supported yet). DISTINCT
+on `SUM`/`AVG`/`MIN`/`MAX` is rejected at parse time; only
+`COUNT(DISTINCT col)` is in v1.
+
+`LIKE` / `ILIKE` use a hand-rolled iterative two-pointer matcher in
+`agg.rs::like_match` (no regex dep). `IN (list)` follows SQLite's
+three-valued logic for NULL on either side, which collapses to "row
+excluded" under WHERE's NULL-as-false rule.
 
 ## Two-pass pattern for UPDATE and DELETE
 

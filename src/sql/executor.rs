@@ -12,6 +12,7 @@ use sqlparser::ast::{
 };
 
 use crate::error::{Result, SQLRiteError};
+use crate::sql::agg::{AggState, DistinctKey, like_match};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::db::table::{
@@ -19,7 +20,9 @@ use crate::sql::db::table::{
 };
 use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
-use crate::sql::parser::select::{OrderByClause, Projection, SelectQuery};
+use crate::sql::parser::select::{
+    AggregateArg, OrderByClause, Projection, ProjectionItem, ProjectionKind, SelectQuery,
+};
 
 /// Executes a parsed `SelectQuery` against the database and returns a
 /// human-readable rendering of the result set (prettytable). Also returns
@@ -42,22 +45,43 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         .get_table(query.table_name.clone())
         .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
 
-    // Resolve projection to a concrete ordered column list.
-    let projected_cols: Vec<String> = match &query.projection {
-        Projection::All => table.column_names(),
-        Projection::Columns(cols) => {
-            for c in cols {
-                if !table.contains_column(c.to_string()) {
-                    return Err(SQLRiteError::Internal(format!(
-                        "Column '{c}' does not exist on table '{}'",
-                        query.table_name
-                    )));
-                }
-            }
-            cols.clone()
-        }
+    // SQLR-3: Materialize the projection as `Vec<ProjectionItem>` so
+    // both the simple-row path and the aggregation path can iterate the
+    // same shape. `Projection::All` expands to bare-column items in
+    // declaration order; that path then runs the existing rowid pipeline.
+    let proj_items: Vec<ProjectionItem> = match &query.projection {
+        Projection::All => table
+            .column_names()
+            .into_iter()
+            .map(|c| ProjectionItem {
+                kind: ProjectionKind::Column(c),
+                alias: None,
+            })
+            .collect(),
+        Projection::Items(items) => items.clone(),
     };
-
+    let has_aggregates = proj_items
+        .iter()
+        .any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)));
+    // Validate bare-column references against the table schema.
+    for item in &proj_items {
+        if let ProjectionKind::Column(c) = &item.kind
+            && !table.contains_column(c.clone())
+        {
+            return Err(SQLRiteError::Internal(format!(
+                "Column '{c}' does not exist on table '{}'",
+                query.table_name
+            )));
+        }
+    }
+    for c in &query.group_by {
+        if !table.contains_column(c.clone()) {
+            return Err(SQLRiteError::Internal(format!(
+                "GROUP BY references unknown column '{c}' on table '{}'",
+                query.table_name
+            )));
+        }
+    }
     // Collect matching rowids. If the WHERE is the shape `col = literal`
     // and `col` has a secondary index, probe the index for an O(log N)
     // seek; otherwise fall back to the full table scan.
@@ -66,10 +90,10 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         RowidSource::FullScan => {
             let mut out = Vec::new();
             for rowid in table.rowids() {
-                if let Some(expr) = &query.selection {
-                    if !eval_predicate(expr, table, rowid)? {
-                        continue;
-                    }
+                if let Some(expr) = &query.selection
+                    && !eval_predicate(expr, table, rowid)?
+                {
+                    continue;
                 }
                 out.push(rowid);
             }
@@ -77,6 +101,50 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         }
     };
     let mut matching = matching;
+
+    let aggregating = has_aggregates || !query.group_by.is_empty();
+
+    // SQLR-3: aggregation path. When the SELECT contains aggregates or a
+    // GROUP BY, the rowid-shaped optimizations (HNSW / FTS / bounded
+    // heap) don't compose with grouping — every row contributes to its
+    // group, so we walk the full filtered rowid set, accumulate, then
+    // sort/truncate the resulting *output rows*.
+    if aggregating {
+        // Validate aggregate column args.
+        for item in &proj_items {
+            if let ProjectionKind::Aggregate(call) = &item.kind
+                && let AggregateArg::Column(c) = &call.arg
+                && !table.contains_column(c.clone())
+            {
+                return Err(SQLRiteError::Internal(format!(
+                    "{}({}) references unknown column '{c}' on table '{}'",
+                    call.func.as_str(),
+                    c,
+                    query.table_name
+                )));
+            }
+        }
+
+        let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
+        let mut rows = aggregate_rows(table, &matching, &query.group_by, &proj_items)?;
+
+        if query.distinct {
+            rows = dedupe_rows(rows);
+        }
+
+        if let Some(order) = &query.order_by {
+            sort_output_rows(&mut rows, &columns, &proj_items, order)?;
+        }
+        if let Some(k) = query.limit {
+            rows.truncate(k);
+        }
+
+        return Ok(SelectResult { columns, rows });
+    }
+
+    // Non-aggregating path — same flow as before, with the extra
+    // affordances that (a) the projection list now goes through
+    // `ProjectionItem` and (b) DISTINCT applies after row materialization.
 
     // Phase 7c — bounded-heap top-k optimization.
     //
@@ -107,6 +175,11 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     //   3. ORDER BY + LIMIT k where k < |matching|            → bounded heap (7c).
     //   4. ORDER BY without LIMIT, or LIMIT >= |matching|     → full sort.
     //   5. LIMIT without ORDER BY                              → just truncate.
+    //
+    // DISTINCT is applied post-projection (we'd over-truncate if LIMIT
+    // ran before DISTINCT had a chance to collapse duplicates), so when
+    // DISTINCT is on we defer truncation past the dedupe step.
+    let defer_limit_for_distinct = query.distinct;
     match (&query.order_by, query.limit) {
         (Some(order), Some(k)) if try_hnsw_probe(table, &order.expr, k).is_some() => {
             matching = try_hnsw_probe(table, &order.expr, k).unwrap();
@@ -116,20 +189,31 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         {
             matching = try_fts_probe(table, &order.expr, order.ascending, k).unwrap();
         }
-        (Some(order), Some(k)) if k < matching.len() => {
+        (Some(order), Some(k)) if !defer_limit_for_distinct && k < matching.len() => {
             matching = select_topk(&matching, table, order, k)?;
         }
         (Some(order), _) => {
             sort_rowids(&mut matching, table, order)?;
-            if let Some(k) = query.limit {
+            if let Some(k) = query.limit
+                && !defer_limit_for_distinct
+            {
                 matching.truncate(k);
             }
         }
-        (None, Some(k)) => {
+        (None, Some(k)) if !defer_limit_for_distinct => {
             matching.truncate(k);
         }
-        (None, None) => {}
+        _ => {}
     }
+
+    let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
+    let projected_cols: Vec<String> = proj_items
+        .iter()
+        .map(|i| match &i.kind {
+            ProjectionKind::Column(c) => c.clone(),
+            ProjectionKind::Aggregate(_) => unreachable!("aggregation handled above"),
+        })
+        .collect();
 
     // Build typed rows. Missing cells surface as `Value::Null` — that
     // maps a column-not-present-for-this-rowid case onto the public
@@ -143,10 +227,14 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         rows.push(row);
     }
 
-    Ok(SelectResult {
-        columns: projected_cols,
-        rows,
-    })
+    if query.distinct {
+        rows = dedupe_rows(rows);
+        if let Some(k) = query.limit {
+            rows.truncate(k);
+        }
+    }
+
+    Ok(SelectResult { columns, rows })
 }
 
 /// Executes a SELECT and returns `(rendered_table, row_count)`. The
@@ -1637,6 +1725,59 @@ fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
             Ok(Value::Bool(!matches!(v, Value::Null)))
         }
 
+        // SQLR-3 — LIKE / NOT LIKE / ILIKE. Pattern matching uses our
+        // own iterative two-pointer matcher (see `agg::like_match`).
+        // SQLite's default is case-insensitive ASCII; we follow that.
+        // ILIKE is also case-insensitive (a no-op switch here, but we
+        // keep the arm explicit so SQLite users typing ILIKE get the
+        // expected semantics rather than a NotImplemented).
+        Expr::Like {
+            negated,
+            any,
+            expr: lhs,
+            pattern,
+            escape_char,
+        } => eval_like(
+            table,
+            rowid,
+            *negated,
+            *any,
+            lhs,
+            pattern,
+            escape_char.as_ref(),
+            true,
+        ),
+        Expr::ILike {
+            negated,
+            any,
+            expr: lhs,
+            pattern,
+            escape_char,
+        } => eval_like(
+            table,
+            rowid,
+            *negated,
+            *any,
+            lhs,
+            pattern,
+            escape_char.as_ref(),
+            true,
+        ),
+
+        // SQLR-3 — IN (list) / NOT IN (list). Subquery form is rejected.
+        // Three-valued logic: if the LHS is NULL, return NULL; if any
+        // list entry is NULL and no match was found, return NULL too.
+        // WHERE coerces NULL → false at line ~1494, so the practical
+        // effect is "row excluded" — matches SQLite.
+        Expr::InList {
+            expr: lhs,
+            list,
+            negated,
+        } => eval_in_list(table, rowid, lhs, list, *negated),
+        Expr::InSubquery { .. } => Err(SQLRiteError::NotImplemented(
+            "IN (subquery) is not supported (only literal lists are)".to_string(),
+        )),
+
         // Phase 7b — function-call dispatch. Currently only the three
         // vector-distance functions; this match arm becomes the single
         // place to register more SQL functions later (e.g. abs(),
@@ -1708,6 +1849,13 @@ fn eval_function(func: &sqlparser::ast::Function, table: &Table, rowid: i64) -> 
             let s = entry.index.score(rowid, &query, &Bm25Params::default());
             Ok(Value::Real(s))
         }
+        // SQLR-3: catch aggregate names used in scalar position (e.g.
+        // `WHERE COUNT(*) > 1`) with a clearer message than "unknown
+        // function". HAVING isn't supported yet, hence the explicit nudge.
+        "count" | "sum" | "avg" | "min" | "max" => Err(SQLRiteError::NotImplemented(format!(
+            "aggregate function '{name}' is not allowed in WHERE / projection-scalar position; \
+             use it as a top-level projection item (HAVING is not yet supported)"
+        ))),
         other => Err(SQLRiteError::NotImplemented(format!(
             "unknown function: {other}(...)"
         ))),
@@ -2267,6 +2415,304 @@ fn as_bool(v: &Value) -> Result<bool> {
     }
 }
 
+// -----------------------------------------------------------------
+// SQLR-3 — LIKE / IN evaluators
+// -----------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn eval_like(
+    table: &Table,
+    rowid: i64,
+    negated: bool,
+    any: bool,
+    lhs: &Expr,
+    pattern: &Expr,
+    escape_char: Option<&AstValue>,
+    case_insensitive: bool,
+) -> Result<Value> {
+    if any {
+        return Err(SQLRiteError::NotImplemented(
+            "LIKE ANY (...) is not supported".to_string(),
+        ));
+    }
+    if escape_char.is_some() {
+        return Err(SQLRiteError::NotImplemented(
+            "LIKE ... ESCAPE '<char>' is not supported (default `\\` escape only)".to_string(),
+        ));
+    }
+
+    let l = eval_expr(lhs, table, rowid)?;
+    let p = eval_expr(pattern, table, rowid)?;
+    if matches!(l, Value::Null) || matches!(p, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let text = match l {
+        Value::Text(s) => s,
+        other => other.to_display_string(),
+    };
+    let pat = match p {
+        Value::Text(s) => s,
+        other => other.to_display_string(),
+    };
+    let m = like_match(&text, &pat, case_insensitive);
+    Ok(Value::Bool(if negated { !m } else { m }))
+}
+
+fn eval_in_list(
+    table: &Table,
+    rowid: i64,
+    lhs: &Expr,
+    list: &[Expr],
+    negated: bool,
+) -> Result<Value> {
+    let l = eval_expr(lhs, table, rowid)?;
+    if matches!(l, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let mut saw_null = false;
+    for item in list {
+        let r = eval_expr(item, table, rowid)?;
+        if matches!(r, Value::Null) {
+            saw_null = true;
+            continue;
+        }
+        if compare_values(Some(&l), Some(&r)) == Ordering::Equal {
+            return Ok(Value::Bool(!negated));
+        }
+    }
+    if saw_null {
+        // SQLite three-valued IN: unmatched + a NULL on the RHS → NULL.
+        // WHERE coerces NULL → false, so the row is excluded either way.
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Bool(negated))
+    }
+}
+
+// -----------------------------------------------------------------
+// SQLR-3 — Aggregation phase, DISTINCT, post-projection sort
+// -----------------------------------------------------------------
+
+/// Walk `matching` rowids, partition into groups (one synthetic group
+/// when `group_by` is empty), update one `AggState` per aggregate
+/// projection slot per group, then materialize one output row per
+/// group in projection order. Group-key columns surface their original
+/// `Value` (captured the first time the group was seen); aggregate
+/// slots surface `AggState::finalize()`.
+fn aggregate_rows(
+    table: &Table,
+    matching: &[i64],
+    group_by: &[String],
+    proj_items: &[ProjectionItem],
+) -> Result<Vec<Vec<Value>>> {
+    // Build the per-projection-slot accumulator template once. Each
+    // group clones this template on first sight. Non-aggregate slots
+    // hold a "captured group-key value" (`None` until set).
+    let template: Vec<Option<AggState>> = proj_items
+        .iter()
+        .map(|i| match &i.kind {
+            ProjectionKind::Aggregate(call) => Some(AggState::new(call)),
+            ProjectionKind::Column(_) => None,
+        })
+        .collect();
+
+    // Linear-scan group lookup. For typical ad-hoc queries (cardinality
+    // ≪ 10k), this is fine; if grouping cardinality grows, swap to a
+    // HashMap<Vec<DistinctKey>, usize> keyed by the same DistinctKey
+    // wrapper. Order-preserving for readable output (groups appear in
+    // first-occurrence order, matching SQLite's typical behavior).
+    let mut keys: Vec<Vec<DistinctKey>> = Vec::new();
+    let mut group_states: Vec<Vec<Option<AggState>>> = Vec::new();
+    let mut group_key_values: Vec<Vec<Value>> = Vec::new();
+
+    for &rowid in matching {
+        let mut key_values: Vec<Value> = Vec::with_capacity(group_by.len());
+        let mut key: Vec<DistinctKey> = Vec::with_capacity(group_by.len());
+        for col in group_by {
+            let v = table.get_value(col, rowid).unwrap_or(Value::Null);
+            key.push(DistinctKey::from_value(&v));
+            key_values.push(v);
+        }
+        let idx = match keys.iter().position(|k| k == &key) {
+            Some(i) => i,
+            None => {
+                keys.push(key);
+                group_states.push(template.clone());
+                group_key_values.push(key_values);
+                keys.len() - 1
+            }
+        };
+
+        for (slot, item) in proj_items.iter().enumerate() {
+            if let ProjectionKind::Aggregate(call) = &item.kind {
+                let v = match &call.arg {
+                    AggregateArg::Star => Value::Null,
+                    AggregateArg::Column(c) => table.get_value(c, rowid).unwrap_or(Value::Null),
+                };
+                if let Some(state) = group_states[idx][slot].as_mut() {
+                    state.update(&v)?;
+                }
+            }
+        }
+    }
+
+    // No groups but no aggregate-only "implicit one row" semantic to
+    // emit: e.g. `SELECT dept FROM t GROUP BY dept` over an empty
+    // matching set should produce zero rows. `SELECT COUNT(*) FROM t`
+    // (no GROUP BY) DOES produce one row even on empty input — the
+    // single-synthetic-group path below handles it.
+    if keys.is_empty() && group_by.is_empty() {
+        // Synthetic single empty group so we still emit one row with
+        // initial accumulator finals (e.g. COUNT(*) → 0).
+        keys.push(Vec::new());
+        group_states.push(template.clone());
+        group_key_values.push(Vec::new());
+    }
+
+    // Project: one row per group, in projection order.
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(keys.len());
+    for (group_idx, _) in keys.iter().enumerate() {
+        let mut row: Vec<Value> = Vec::with_capacity(proj_items.len());
+        for (slot, item) in proj_items.iter().enumerate() {
+            match &item.kind {
+                ProjectionKind::Column(c) => {
+                    // The validation in execute_select_rows guarantees
+                    // bare-column projections are also in `group_by`.
+                    let pos = group_by
+                        .iter()
+                        .position(|g| g == c)
+                        .expect("validated to be in GROUP BY");
+                    row.push(group_key_values[group_idx][pos].clone());
+                }
+                ProjectionKind::Aggregate(_) => {
+                    let state = group_states[group_idx][slot]
+                        .as_ref()
+                        .expect("aggregate slot has state");
+                    row.push(state.finalize());
+                }
+            }
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// SELECT DISTINCT post-pass. Walks the rows once with a `HashSet` of
+/// row-keys, preserving first-occurrence order. NULL == NULL for
+/// dedupe purposes, which matches the SQL DISTINCT semantic.
+fn dedupe_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<Vec<DistinctKey>> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key: Vec<DistinctKey> = row.iter().map(DistinctKey::from_value).collect();
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Sort output rows for the aggregating path. ORDER BY can reference
+/// either an output column name (alias or bare GROUP BY column) or an
+/// aggregate function call by display form (e.g. `COUNT(*)`).
+fn sort_output_rows(
+    rows: &mut [Vec<Value>],
+    columns: &[String],
+    proj_items: &[ProjectionItem],
+    order: &OrderByClause,
+) -> Result<()> {
+    let target_idx = resolve_order_by_index(&order.expr, columns, proj_items)?;
+    rows.sort_by(|a, b| {
+        let va = &a[target_idx];
+        let vb = &b[target_idx];
+        let ord = compare_values(Some(va), Some(vb));
+        if order.ascending { ord } else { ord.reverse() }
+    });
+    Ok(())
+}
+
+/// Map an ORDER BY expression to the index of the output column that
+/// should drive the sort.
+fn resolve_order_by_index(
+    expr: &Expr,
+    columns: &[String],
+    proj_items: &[ProjectionItem],
+) -> Result<usize> {
+    // Bare identifier — match against output names (alias-first).
+    let target_name: Option<String> = match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+        Expr::Function(_) => None,
+        Expr::Nested(inner) => return resolve_order_by_index(inner, columns, proj_items),
+        other => {
+            return Err(SQLRiteError::NotImplemented(format!(
+                "ORDER BY expression not supported on aggregating queries: {other:?}"
+            )));
+        }
+    };
+    if let Some(name) = target_name {
+        if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(&name)) {
+            return Ok(i);
+        }
+        return Err(SQLRiteError::Internal(format!(
+            "ORDER BY references unknown column '{name}' in the SELECT output"
+        )));
+    }
+    // Function form: match by display name against any aggregate item
+    // whose canonical display equals the user's call. Tolerate case
+    // differences in the function name.
+    if let Expr::Function(func) = expr {
+        let user_disp = format_function_display(func);
+        for (i, item) in proj_items.iter().enumerate() {
+            if let ProjectionKind::Aggregate(call) = &item.kind
+                && call.display_name().eq_ignore_ascii_case(&user_disp)
+            {
+                return Ok(i);
+            }
+        }
+        return Err(SQLRiteError::Internal(format!(
+            "ORDER BY references aggregate '{user_disp}' that isn't in the SELECT output"
+        )));
+    }
+    Err(SQLRiteError::Internal(
+        "ORDER BY expression could not be resolved against the output columns".to_string(),
+    ))
+}
+
+/// Format a sqlparser function call into the same canonical form
+/// `AggregateCall::display_name()` uses, so ORDER BY on
+/// `COUNT(*)` / `SUM(salary)` matches its projection counterpart.
+fn format_function_display(func: &sqlparser::ast::Function) -> String {
+    let name = match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => ident.value.to_uppercase(),
+        _ => format!("{:?}", func.name).to_uppercase(),
+    };
+    let inner = match &func.args {
+        FunctionArguments::List(l) => {
+            let distinct = matches!(
+                l.duplicate_treatment,
+                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+            );
+            let arg = l.args.first().map(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => "*".to_string(),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(i))) => i.value.clone(),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+                    parts.last().map(|p| p.value.clone()).unwrap_or_default()
+                }
+                _ => String::new(),
+            });
+            match (distinct, arg) {
+                (true, Some(a)) if a != "*" => format!("DISTINCT {a}"),
+                (_, Some(a)) => a,
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    format!("{name}({inner})")
+}
+
 fn convert_literal(v: &sqlparser::ast::Value) -> Result<Value> {
     use sqlparser::ast::Value as AstValue;
     match v {
@@ -2749,5 +3195,301 @@ mod tests {
             response.contains("1 row returned"),
             "IS NULL combined with AND should match exactly row 2, got: {response}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-3 — LIKE / IN / DISTINCT / GROUP BY / aggregates
+    // ---------------------------------------------------------------------
+
+    /// Seed a small employees table the analytical tests share.
+    fn seed_employees() -> Database {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        let rows = [
+            "INSERT INTO emp (name, dept, salary) VALUES ('Alice', 'eng', 100);",
+            "INSERT INTO emp (name, dept, salary) VALUES ('alex',  'eng', 120);",
+            "INSERT INTO emp (name, dept, salary) VALUES ('Bob',   'eng', 100);",
+            "INSERT INTO emp (name, dept, salary) VALUES ('Carol', 'sales', 90);",
+            "INSERT INTO emp (name, dept, salary) VALUES ('Dave',  'sales', NULL);",
+            "INSERT INTO emp (name, dept, salary) VALUES ('Eve',   'ops', 80);",
+        ];
+        for sql in rows {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        db
+    }
+
+    /// Drive `execute_select_rows` directly so tests can assert on typed values.
+    fn run_rows(db: &Database, sql: &str) -> SelectResult {
+        let q = parse_select(sql);
+        execute_select_rows(q, db).expect("select")
+    }
+
+    // ----- LIKE -----
+
+    #[test]
+    fn like_percent_prefix_case_insensitive() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT name FROM emp WHERE name LIKE 'a%';");
+        // Matches Alice and alex (case-insensitive ASCII).
+        let names: Vec<_> = r.rows.iter().map(|r| r[0].to_display_string()).collect();
+        assert_eq!(names.len(), 2, "expected 2 rows, got {names:?}");
+        assert!(names.contains(&"Alice".to_string()));
+        assert!(names.contains(&"alex".to_string()));
+    }
+
+    #[test]
+    fn like_underscore_singlechar() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT name FROM emp WHERE name LIKE '_ve';");
+        // Eve matches; alex does not (3 chars vs 4).
+        let names: Vec<_> = r.rows.iter().map(|r| r[0].to_display_string()).collect();
+        assert_eq!(names, vec!["Eve".to_string()]);
+    }
+
+    #[test]
+    fn not_like_excludes_match() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT name FROM emp WHERE name NOT LIKE 'a%';");
+        // Excludes Alice + alex; 4 rows remain.
+        assert_eq!(r.rows.len(), 4);
+    }
+
+    #[test]
+    fn like_with_null_excludes_row() {
+        let db = seed_employees();
+        // Match 'sales' rows where salary is NULL → just Dave.
+        let r = run_rows(
+            &db,
+            "SELECT name FROM emp WHERE dept LIKE 'sales' AND salary IS NULL;",
+        );
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "Dave");
+    }
+
+    // ----- IN -----
+
+    #[test]
+    fn in_list_positive() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT name FROM emp WHERE id IN (1, 3, 5);");
+        let names: Vec<_> = r.rows.iter().map(|r| r[0].to_display_string()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"Alice".to_string()));
+        assert!(names.contains(&"Bob".to_string()));
+        assert!(names.contains(&"Dave".to_string()));
+    }
+
+    #[test]
+    fn not_in_excludes_listed() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT name FROM emp WHERE id NOT IN (1, 2);");
+        // 6 rows total - 2 excluded = 4.
+        assert_eq!(r.rows.len(), 4);
+    }
+
+    #[test]
+    fn in_list_with_null_three_valued() {
+        let db = seed_employees();
+        // x = 1 should match; for other rows the NULL in the list yields
+        // unknown → false in WHERE → excluded.
+        let r = run_rows(&db, "SELECT name FROM emp WHERE id IN (1, NULL);");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "Alice");
+    }
+
+    // ----- DISTINCT -----
+
+    #[test]
+    fn distinct_single_column() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT DISTINCT dept FROM emp;");
+        // 3 distinct depts: eng, sales, ops.
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn distinct_multi_column_with_null() {
+        let db = seed_employees();
+        // (dept, salary) tuples — the two 'eng' / 100 rows collapse.
+        let r = run_rows(&db, "SELECT DISTINCT dept, salary FROM emp;");
+        // 6 input rows; (eng, 100) appears twice → 5 distinct tuples.
+        assert_eq!(r.rows.len(), 5);
+    }
+
+    // ----- Aggregates without GROUP BY -----
+
+    #[test]
+    fn count_star_no_groupby() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT COUNT(*) FROM emp;");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Integer(6));
+    }
+
+    #[test]
+    fn count_col_skips_nulls() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT COUNT(salary) FROM emp;");
+        // 6 rows, 1 NULL salary → COUNT(salary) = 5.
+        assert_eq!(r.rows[0][0], Value::Integer(5));
+    }
+
+    #[test]
+    fn count_distinct_dedupes_and_skips_nulls() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT COUNT(DISTINCT salary) FROM emp;");
+        // Distinct non-null salaries: {100, 120, 90, 80} → 4.
+        assert_eq!(r.rows[0][0], Value::Integer(4));
+    }
+
+    #[test]
+    fn sum_int_stays_integer() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT SUM(salary) FROM emp;");
+        // 100 + 120 + 100 + 90 + 80 = 490 (NULL skipped).
+        assert_eq!(r.rows[0][0], Value::Integer(490));
+    }
+
+    #[test]
+    fn avg_returns_real() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT AVG(salary) FROM emp;");
+        // 490 / 5 = 98.0
+        match &r.rows[0][0] {
+            Value::Real(v) => assert!((v - 98.0).abs() < 1e-9),
+            other => panic!("expected Real, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_max_skip_nulls() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT MIN(salary), MAX(salary) FROM emp;");
+        assert_eq!(r.rows[0][0], Value::Integer(80));
+        assert_eq!(r.rows[0][1], Value::Integer(120));
+    }
+
+    #[test]
+    fn aggregates_on_empty_table_emit_one_row() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command("CREATE TABLE t (x INTEGER);", &mut db).unwrap();
+        let r = run_rows(
+            &db,
+            "SELECT COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t;",
+        );
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Integer(0));
+        assert_eq!(r.rows[0][1], Value::Null);
+        assert_eq!(r.rows[0][2], Value::Null);
+        assert_eq!(r.rows[0][3], Value::Null);
+        assert_eq!(r.rows[0][4], Value::Null);
+    }
+
+    // ----- GROUP BY -----
+
+    #[test]
+    fn group_by_single_col_with_count() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT dept, COUNT(*) FROM emp GROUP BY dept;");
+        assert_eq!(r.rows.len(), 3);
+        // Build a map for a stable assertion regardless of group order.
+        let mut by_dept: std::collections::HashMap<String, i64> = Default::default();
+        for row in &r.rows {
+            let d = row[0].to_display_string();
+            let c = match &row[1] {
+                Value::Integer(i) => *i,
+                v => panic!("expected Integer count, got {v:?}"),
+            };
+            by_dept.insert(d, c);
+        }
+        assert_eq!(by_dept["eng"], 3);
+        assert_eq!(by_dept["sales"], 2);
+        assert_eq!(by_dept["ops"], 1);
+    }
+
+    #[test]
+    fn group_by_with_where_filter() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, SUM(salary) FROM emp WHERE salary > 80 GROUP BY dept;",
+        );
+        // After WHERE, ops drops out (Eve = 80 excluded). eng has 3 rows
+        // contributing (100+120+100=320); sales has 1 (90; Dave NULL skipped).
+        let by: std::collections::HashMap<String, i64> = r
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row[0].to_display_string(),
+                    match &row[1] {
+                        Value::Integer(i) => *i,
+                        v => panic!("expected Integer sum, got {v:?}"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(by.len(), 2);
+        assert_eq!(by["eng"], 320);
+        assert_eq!(by["sales"], 90);
+    }
+
+    #[test]
+    fn group_by_without_aggregates_is_distinct() {
+        let db = seed_employees();
+        let r = run_rows(&db, "SELECT dept FROM emp GROUP BY dept;");
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn order_by_count_desc() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, COUNT(*) AS n FROM emp GROUP BY dept ORDER BY n DESC LIMIT 2;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        // Top group is 'eng' with 3.
+        assert_eq!(r.rows[0][0].to_display_string(), "eng");
+        assert_eq!(r.rows[0][1], Value::Integer(3));
+    }
+
+    #[test]
+    fn order_by_aggregate_call_form() {
+        let db = seed_employees();
+        // No alias — ORDER BY references the aggregate by its display form.
+        let r = run_rows(
+            &db,
+            "SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY COUNT(*) DESC;",
+        );
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0].to_display_string(), "eng");
+    }
+
+    #[test]
+    fn group_by_invalid_bare_column_errors() {
+        // `name` is neither aggregated nor in GROUP BY → must error at parse.
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, dept TEXT, name TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        let err = crate::sql::process_command("SELECT dept, name FROM t GROUP BY dept;", &mut db);
+        assert!(err.is_err(), "should reject bare 'name' not in GROUP BY");
+    }
+
+    #[test]
+    fn aggregate_in_where_errors_friendly() {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command("CREATE TABLE t (x INTEGER);", &mut db).unwrap();
+        crate::sql::process_command("INSERT INTO t (x) VALUES (1);", &mut db).unwrap();
+        let err = crate::sql::process_command("SELECT x FROM t WHERE COUNT(*) > 0;", &mut db);
+        assert!(err.is_err(), "aggregates must not be allowed in WHERE");
     }
 }
