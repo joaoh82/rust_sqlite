@@ -62,6 +62,7 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 
 - [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `ask()` API across REPL/library/SDKs/desktop/MCP, MCP server). **Implementation complete except 7f, which deferred to Phase 8.**
 - [Phase 8 plan](phase-8-plan.md) — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. **All six sub-phases (8a–8f) shipped.** Canonical reference: [`docs/fts.md`](fts.md).
+- [Benchmarks plan](benchmarks-plan.md) — design proposal for an SQLRite-vs-SQLite (and friends) benchmark suite. SQLR-4. Tracks 10 curated workloads across OLTP, SQL-feature scaling, and AI-era differentiators (HNSW / BM25 / hybrid retrieval); proposes a `benchmarks/` workspace member with a small `Driver` trait that lets workloads run engine-agnostically.
 
 ## Conventions
 
