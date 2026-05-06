@@ -523,6 +523,6 @@ Final docs pass — canonical [`fts.md`](fts.md) reference (mirrors `ask.md`'s s
 - `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`
 - Composite and expression indexes
 - Alternate storage engines (LSM/SSTable for write-heavy workloads)
-- Benchmarks against SQLite
+- Benchmarks against SQLite — design proposal in [`benchmarks-plan.md`](benchmarks-plan.md) (SQLR-4). Confirmed comparison targets: SQLite (mandatory baseline), DuckDB on analytical-slice workloads (optional). libSQL deferred; Cloudflare D1 + rqlite explicitly out-of-scope (network-resident, not embedded).
 
 These will slot in where they make sense — many are natural side effects of Phase 3 storage work or Phase 5's library API.
