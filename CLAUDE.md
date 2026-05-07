@@ -52,7 +52,7 @@ cargo run -p sqlrite-mcp -- /path/to.sqlrite     # MCP server (stdio)
 
 # Benchmarks (SQLR-4 / SQLR-16) — local-only, never CI
 make bench                                 # SQLRite + SQLite (lean)
-# make bench-duckdb                        # adds DuckDB driver (Group B only) — lands in 9.5
+make bench-duckdb                          # adds DuckDB driver (Group B only)
 
 # Release plumbing
 scripts/bump-version.sh 0.2.0              # bumps version across 11 manifests

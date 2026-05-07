@@ -12,7 +12,7 @@
 pub mod sqlite;
 pub mod sqlrite;
 
-// DuckDB driver lands in sub-phase 9.5 (Group B only). Feature-gated
-// then; the module file gets created alongside the implementation.
-// #[cfg(feature = "duckdb")]
-// pub mod duckdb;
+// DuckDB driver — Group B only. Feature-gated to keep the heavy
+// `libduckdb` dep out of the default `make bench` build.
+#[cfg(feature = "duckdb")]
+pub mod duckdb;

@@ -41,9 +41,10 @@ harness = false
 [features]
 default = []
 
-# `duckdb` feature lands alongside the driver in sub-phase 9.5
-# (Group B only). Heavy dep — keeping it out of the dep graph until
-# the driver is actually wired up.
+# Optional DuckDB driver (Group B only — W7 / W8 / W9). Heavy dep
+# (~50 MB compiled), so kept off by default. `make bench-duckdb`
+# enables it; the regular `make bench` stays lean.
+duckdb = ["dep:duckdb"]
 
 [dependencies]
 # The engine. Default features off (no rustyline / clap / `ask`), but
@@ -56,6 +57,10 @@ sqlrite = { package = "sqlrite-engine", path = "..", version = "0.8.0", default-
 # `extra_check` and `column_decltype` would be nice-to-have but cost
 # binary size; skipping until a workload needs them.
 rusqlite = { version = "0.36", features = ["bundled"] }
+
+# DuckDB via duckdb-rs (optional, feature-gated). `bundled` for the
+# same reason as rusqlite — pin a known DuckDB version.
+duckdb = { version = "1.4", features = ["bundled"], optional = true }
 
 # Criterion for the actual measurement loop. v0.5 ships HDR-style
 # sampling, statistical confidence intervals, and JSON output to

@@ -62,7 +62,7 @@ See the [Roadmap](roadmap.md) for the full phase plan.
 
 - [Phase 7 plan](phase-7-plan.md) — AI-era extensions (vector column type + HNSW, JSON, NL→SQL `ask()` API across REPL/library/SDKs/desktop/MCP, MCP server). **Implementation complete except 7f, which deferred to Phase 8.**
 - [Phase 8 plan](phase-8-plan.md) — Full-text search (FTS5-style BM25) + hybrid retrieval. The deferred 7f scope. **All six sub-phases (8a–8f) shipped.** Canonical reference: [`docs/fts.md`](fts.md).
-- [Benchmarks plan](benchmarks-plan.md) — SQLRite-vs-SQLite (and friends) benchmark suite. SQLR-4 / SQLR-16. Q1–Q8 resolved 2026-05-06. **Sub-phases 9.1 (harness + W1), 9.2 (Group A: W2–W6), 9.3 (Group B: W7–W9), and 9.4 (Group C: W10–W12) shipped.** Lives under [`benchmarks/`](../benchmarks/) — workspace member, run via `make bench`. The canonical user-facing reference (`docs/benchmarks.md`) lands in 9.6.
+- [Benchmarks plan](benchmarks-plan.md) — SQLRite-vs-SQLite (and friends) benchmark suite. SQLR-4 / SQLR-16. Q1–Q8 resolved 2026-05-06. **Sub-phases 9.1 (harness + W1), 9.2 (Group A: W2–W6), 9.3 (Group B: W7–W9), 9.4 (Group C: W10–W12) and 9.5 (DuckDB driver) shipped.** Lives under [`benchmarks/`](../benchmarks/) — workspace member, run via `make bench` (or `make bench-duckdb`). The canonical user-facing reference (`docs/benchmarks.md`) lands in 9.6.
 
 ## Conventions
 

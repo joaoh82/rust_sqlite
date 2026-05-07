@@ -48,6 +48,8 @@ bench:
 	@echo '${GREEN}Running${RESET} ${YELLOW}benchmark suite${RESET} (SQLRite vs SQLite, lean profile)'
 	@./benchmarks/scripts/run.sh
 
-# `make bench-duckdb` lands alongside the DuckDB driver in sub-phase 9.5
-# (Group B only). Until then, the `duckdb` feature isn't declared on
-# the bench crate so invoking it would be a build error.
+.PHONY: bench-duckdb
+## Run the benchmark suite with DuckDB enabled (Group B only — W7/W8/W9)
+bench-duckdb:
+	@echo '${GREEN}Running${RESET} ${YELLOW}benchmark suite${RESET} (with DuckDB driver, Group B only)'
+	@FEATURES=duckdb ./benchmarks/scripts/run.sh

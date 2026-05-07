@@ -26,6 +26,8 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
 use sqlrite_benchmarks::Driver;
+#[cfg(feature = "duckdb")]
+use sqlrite_benchmarks::drivers::duckdb::DuckDBDriver;
 use sqlrite_benchmarks::drivers::sqlite::SQLiteDriver;
 use sqlrite_benchmarks::drivers::sqlrite::SQLRiteDriver;
 use sqlrite_benchmarks::workloads::{
@@ -494,10 +496,16 @@ fn benches(c: &mut Criterion) {
     register_w6(c, SQLiteDriver);
     register_w7(c, SQLRiteDriver);
     register_w7(c, SQLiteDriver);
+    #[cfg(feature = "duckdb")]
+    register_w7(c, DuckDBDriver);
     register_w8(c, SQLRiteDriver);
     register_w8(c, SQLiteDriver);
+    #[cfg(feature = "duckdb")]
+    register_w8(c, DuckDBDriver);
     register_w9(c, SQLRiteDriver);
     register_w9(c, SQLiteDriver);
+    #[cfg(feature = "duckdb")]
+    register_w9(c, DuckDBDriver);
     register_w10(c, SQLRiteDriver);
     register_w10(c, SQLiteDriver); // skipped via driver_supports
     register_w11(c, SQLRiteDriver);
