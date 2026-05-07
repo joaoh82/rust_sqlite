@@ -14,8 +14,11 @@
 //!    mitigation: catch divergent semantics across engines before the
 //!    "winner" measurement is meaningful).
 
+pub mod aggregate;
 pub mod bulk_insert;
+pub mod group_by;
 pub mod index_lookup;
+pub mod join;
 pub mod kv;
 pub mod mixed_oltp;
 pub mod range_scan;

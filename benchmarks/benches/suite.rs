@@ -29,8 +29,8 @@ use sqlrite_benchmarks::Driver;
 use sqlrite_benchmarks::drivers::sqlite::SQLiteDriver;
 use sqlrite_benchmarks::drivers::sqlrite::SQLRiteDriver;
 use sqlrite_benchmarks::workloads::{
-    bulk_insert as w3, index_lookup as w6, kv as w1, mixed_oltp as w5, range_scan as w2,
-    single_insert as w4,
+    aggregate as w7, bulk_insert as w3, group_by as w8, index_lookup as w6, join as w9, kv as w1,
+    mixed_oltp as w5, range_scan as w2, single_insert as w4,
 };
 
 /// Pick a DB filename inside `dir` based on the driver — keeps a
@@ -277,6 +277,105 @@ fn register_w6<D: Driver>(c: &mut Criterion, driver: D) {
 }
 
 // ---------------------------------------------------------------------------
+// W7 — SUM aggregate over 1M rows
+// ---------------------------------------------------------------------------
+
+fn register_w7<D: Driver>(c: &mut Criterion, driver: D) {
+    let tmp = tempdir_for("w7", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w7");
+    let (mut conn, dataset) = w7::setup(&driver, &path).expect("W7 setup");
+    w7::correctness_check(&driver, &mut conn, &dataset).expect("W7 correctness check");
+
+    let mut group = c.benchmark_group(w7::W7.full());
+    // SUM over 1M rows is single-shot heavy work — drop sample size
+    // so a smoke run finishes in a couple of minutes per driver.
+    group.sample_size(10);
+    let bench_id = format!("{}/default", driver.name());
+    group.bench_function(&bench_id, |b| {
+        b.iter(|| {
+            let n = w7::bench_iter(&driver, &mut conn).expect("W7 SUM");
+            black_box(n)
+        });
+    });
+    group.finish();
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// W8 — GROUP BY at three cardinalities (10 / 1k / 100k groups)
+// ---------------------------------------------------------------------------
+
+fn register_w8<D: Driver>(c: &mut Criterion, driver: D) {
+    let tmp = tempdir_for("w8", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w8");
+    let (mut conn, _dataset) = w8::setup(&driver, &path).expect("W8 setup");
+    w8::correctness_check(&driver, &mut conn).expect("W8 correctness check");
+
+    for &(label, bucket, _expected) in &w8::BUCKETS {
+        // SQLRite's GROUP BY at 100k-cardinality over 1M rows is
+        // pathologically slow today (~245 s per iter on an M-series
+        // MBP — see SQLR-19 for the investigation follow-up). That
+        // would block a smoke run for ~40 min, so we skip the cell
+        // by default. Set `SQLRITE_BENCH_W8_CARD_100K_SQLRITE=1` to
+        // force-include it once the blowup is resolved.
+        if label == "card-100k"
+            && driver.name() == "sqlrite"
+            && std::env::var("SQLRITE_BENCH_W8_CARD_100K_SQLRITE")
+                .ok()
+                .as_deref()
+                != Some("1")
+        {
+            continue;
+        }
+        let group_name = format!("{}/{}", w8::W8.full(), label);
+        let mut group = c.benchmark_group(&group_name);
+        group.sample_size(10);
+        let bench_id = format!("{}/default", driver.name());
+        group.bench_function(&bench_id, |b| {
+            b.iter(|| {
+                let n = w8::bench_iter(&driver, &mut conn, bucket).expect("W8 GROUP BY");
+                black_box(n)
+            });
+        });
+        group.finish();
+    }
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// W9 — INNER JOIN, customer ↔ order, probe by customer PK
+// ---------------------------------------------------------------------------
+
+fn register_w9<D: Driver>(c: &mut Criterion, driver: D) {
+    let tmp = tempdir_for("w9", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w9");
+    let (mut conn, dataset) = w9::setup(&driver, &path).expect("W9 setup");
+    w9::correctness_check(&driver, &mut conn, &dataset).expect("W9 correctness check");
+
+    let mut group = c.benchmark_group(w9::W9.full());
+    // SQLRite's nested-loop join + un-indexed inner scan is heavy
+    // (~100k rows scanned per probe). Cap the sample size so a
+    // smoke run finishes; override at the CLI for a sharper estimate.
+    group.sample_size(10);
+    let bench_id = format!("{}/default", driver.name());
+    let probes = dataset.probes.clone();
+    let mut idx = 0usize;
+    group.bench_function(&bench_id, |b| {
+        b.iter(|| {
+            let cid = probes[idx % probes.len()];
+            idx = idx.wrapping_add(1);
+            let row = w9::bench_iter(&driver, &mut conn, cid).expect("W9 JOIN");
+            black_box(row)
+        });
+    });
+    group.finish();
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -293,6 +392,12 @@ fn benches(c: &mut Criterion) {
     register_w5(c, SQLiteDriver);
     register_w6(c, SQLRiteDriver);
     register_w6(c, SQLiteDriver);
+    register_w7(c, SQLRiteDriver);
+    register_w7(c, SQLiteDriver);
+    register_w8(c, SQLRiteDriver);
+    register_w8(c, SQLiteDriver);
+    register_w9(c, SQLRiteDriver);
+    register_w9(c, SQLiteDriver);
 }
 
 criterion_group!(suite, benches);

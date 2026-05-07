@@ -2,7 +2,7 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-06):** sub-phases 9.1 + 9.2 landed — harness + Group A (W1–W6). W7–W12 land in 9.3–9.4. The first official pinned-host JSON gets committed in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
+> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 landed — harness + Group A (W1–W6) + Group B (W7–W9). W10–W12 land in 9.4. The first official pinned-host JSON gets committed in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
@@ -27,7 +27,7 @@ Three drivers, in plan order:
 Three groups (full descriptions in [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md#workloads)):
 
 - **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. ✅ shipped (9.1 + 9.2).
-- **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. Lands in 9.3.
+- **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. ✅ shipped (9.3).
 - **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. Lands in 9.4.
 
 Workloads are versioned (`W1.v1`, `W1.v2`, …) per Q8 — bumping the version is the explicit "I changed the benchmark" gesture.
@@ -124,6 +124,46 @@ Unique-index probes — every probe matches exactly one row. SQLRite's optimizer
 
 **Read this as:** secondary-index path is healthy — same ~5–8× per-iter-parse-cost band as W1. The index probe itself is fine; what we're measuring is mostly `sqlparser` per call.
 
+### W7 — `SELECT SUM(v) FROM big` (1M-row full-scan aggregate)
+
+Single-statement aggregate. No WHERE, no GROUP BY. Both engines walk every row through their executor; the question is how cheap the per-row "touch" is.
+
+| Engine | Median per SUM | Throughput (rows/s) |
+|---|---|---|
+| SQLRite | ~111 ms | ~9.0M |
+| SQLite (rusqlite, WAL+NORMAL) | ~31 ms | ~32M |
+| **Ratio** | **~3.5×** | |
+
+**Read this as:** healthy. The full-scan aggregator is the closest "engine throughput" measurement we have — no parse cache miss to amortize, just per-row work. Closer to SQLite than W1 (~8×) suggests the per-row machinery is tighter than the per-iter parse path. Encouraging; says the executor isn't broadly slow.
+
+### W8 — `SELECT k, COUNT(*) FROM big GROUP BY k` (three cardinalities)
+
+1M-row table, GROUP BY at 10 / 1k / 100k distinct keys.
+
+| Cardinality | SQLRite | SQLite (rusqlite, WAL+NORMAL) | Notes |
+|---|---|---|---|
+| 10 groups | ~204 ms | ~460 ms | SQLRite faster — likely SQLite's planner picks a sort-then-group path here (small group counts often slower than a hash). Not the headline; small samples. |
+| 1,000 groups | ~1.50 s | ~242 ms | ~6.2× |
+| 100,000 groups | **skipped** | ~241 ms | SQLRite skipped by default — see note below |
+
+**SQLRite × 100k-cardinality is skipped by default** in `make bench`. A first measurement clocked ~245 s/iter (~41 min for 10 samples), strongly suggesting an O(n × cardinality) path inside the GROUP BY executor (a hash aggregator should be O(n + groups)). **SQLR-19** tracks the investigation. Set `SQLRITE_BENCH_W8_CARD_100K_SQLRITE=1` once that lands to re-include the bucket.
+
+**Read this as:** GROUP BY at low cardinality is fine; high-cardinality work is broken. The fix is probably a `Vec`-backed group store → `HashMap`-backed.
+
+### W9 — INNER JOIN, customer ↔ order, probe by customer PK
+
+Plan target was two **100k-row tables**. v1 ships at **10k rows** because SQLRite's join executor doesn't push the ON predicate down to an index probe on the inner side — at the 100k scale, per-iter cost was >5 minutes (88 minutes of measured runtime didn't produce a single sample before the smoke run was killed). **SQLR-20** tracks the join-planner / inner-side index-probe fix. Until then, v1 = 10k rows; bumping to 100k follows the fix + a `W9.v2` tag.
+
+Even at 10k scale, the gap is large:
+
+| Engine | Median per probe | Throughput (probes/s) |
+|---|---|---|
+| SQLRite | ~32 s | ~0.03 |
+| SQLite (rusqlite, WAL+NORMAL) | ~2.3 µs | ~459k |
+| **Ratio** | **~14,000,000×** ⚠️ | |
+
+**Read this as:** SQLRite's join executor scans the entire inner table per outer row (no index probe pushdown), and the per-pair overhead is much higher than a single-table full scan. At 32 s for ~10k inner-row checks, the per-row cost is ~3 ms — about **3,000× slower** than W2's full-scan rate (1 µs/row). The inner-side index probe is the obvious next unlock; the per-pair overhead is the second.
+
 ## Adding a workload
 
 Per the [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md#sub-phases) sequencing:
@@ -165,7 +205,10 @@ benchmarks/
 │   │   ├── bulk_insert.rs   — W3 bulk insert (100k/txn)
 │   │   ├── single_insert.rs — W4 single-row insert
 │   │   ├── mixed_oltp.rs    — W5 50/50 SELECT+UPDATE
-│   │   └── index_lookup.rs  — W6 secondary-index lookup
+│   │   ├── index_lookup.rs  — W6 secondary-index lookup
+│   │   ├── aggregate.rs     — W7 SUM(v) over 1M rows
+│   │   ├── group_by.rs      — W8 GROUP BY (10/1k/100k cardinalities)
+│   │   └── join.rs          — W9 INNER JOIN, customer ↔ order
 │   └── bin/
 │       └── aggregate.rs   — walks target/criterion/ → results/*.json
 ├── benches/
