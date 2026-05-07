@@ -2,14 +2,14 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 + 9.4 landed — harness + Group A (W1–W6) + Group B (W7–W9) + Group C (W10–W12). The full workload set is in. The first official pinned-host JSON + canonical `docs/benchmarks.md` reference land in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
+> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 + 9.4 + 9.5 landed — harness + all 12 workloads + DuckDB driver. The first official pinned-host JSON + canonical `docs/benchmarks.md` reference land in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
 ```sh
 # From repo root.
 make bench                  # SQLRite + SQLite (lean, ~4 min)
-# make bench-duckdb         # adds DuckDB driver (Group B only) — lands in 9.5
+make bench-duckdb           # adds DuckDB driver (Group B only — W7/W8/W9)
 ```
 
 Each invocation runs the criterion suite, then aggregates the per-bench JSON criterion writes under `target/criterion/` into a single envelope under [`results/`](results/), keyed by date + host fingerprint + commit short-SHA. The shape is locked in [`src/envelope.rs`](src/envelope.rs).
@@ -38,7 +38,7 @@ Workloads are versioned (`W1.v1`, `W1.v2`, …) per Q8 — bumping the version i
 |---|---|---|---|
 | SQLRite | `sqlrite-engine` (path dep, `default-features = false` + `file-locks`) | Default | ✅ 9.1 |
 | SQLite | `rusqlite` v0.36 (bundled libsqlite3) | `WAL` + `synchronous=NORMAL` + 64 MB cache + `temp_store=MEMORY` (Q3 — tuned headline) | ✅ 9.1 |
-| DuckDB | `duckdb-rs` | Defaults | 🟡 9.5, opt-in via `--features duckdb` |
+| DuckDB | `duckdb-rs` v1.4 (bundled libduckdb) | Defaults — DuckDB's MVCC + commit semantics are uniform; no equivalent to SQLite's WAL+NORMAL opt-in | ✅ 9.5, opt-in via `--features duckdb` (Group B only) |
 | libSQL | — | — | 🟡 deferred (post-9.6) |
 
 The SQLite driver runs the **tuned profile** as the headline (Q3). A SQLite-default column is opt-in, post-9.6.
@@ -126,15 +126,29 @@ Unique-index probes — every probe matches exactly one row. SQLRite's optimizer
 
 ### W7 — `SELECT SUM(v) FROM big` (1M-row full-scan aggregate)
 
-Single-statement aggregate. No WHERE, no GROUP BY. Both engines walk every row through their executor; the question is how cheap the per-row "touch" is.
+Single-statement aggregate. No WHERE, no GROUP BY. All three engines walk every row through their executor; the question is how cheap the per-row "touch" is — and how much an OLAP-shaped engine wins on a workload built for it.
 
 | Engine | Median per SUM | Throughput (rows/s) |
 |---|---|---|
 | SQLRite | ~111 ms | ~9.0M |
 | SQLite (rusqlite, WAL+NORMAL) | ~31 ms | ~32M |
-| **Ratio** | **~3.5×** | |
+| DuckDB (default) | ~378 µs | **~2.6B** |
 
-**Read this as:** healthy. The full-scan aggregator is the closest "engine throughput" measurement we have — no parse cache miss to amortize, just per-row work. Closer to SQLite than W1 (~8×) suggests the per-row machinery is tighter than the per-iter parse path. Encouraging; says the executor isn't broadly slow.
+**Read this as:** vectorized columnar wins big on a workload built for it. DuckDB is **~80× faster than SQLite** on the same SUM-over-1M, and ~290× faster than SQLRite. SQLite-vs-SQLRite is the closest gap (~3.5×) — solid for our row-store. The DuckDB column is the "what does a different storage model look like?" sister number from the plan.
+
+### W8 — `SELECT k, COUNT(*) FROM big GROUP BY k` (three cardinalities)
+
+1M-row table, GROUP BY at 10 / 1k / 100k distinct keys.
+
+| Cardinality | SQLRite | SQLite (WAL+NORMAL) | DuckDB | Notes |
+|---|---|---|---|---|
+| 10 groups | ~204 ms | ~460 ms | ~634 µs | DuckDB **~720×** faster than SQLite |
+| 1,000 groups | ~1.50 s | ~242 ms | ~701 µs | DuckDB **~345×** faster than SQLite |
+| 100,000 groups | **skipped** | ~241 ms | ~20.4 ms | SQLR-19 (SQLRite); DuckDB still ~12× faster than SQLite |
+
+**SQLRite × 100k-cardinality is skipped by default** in `make bench`. A first measurement clocked ~245 s/iter (~41 min for 10 samples), strongly suggesting an O(n × cardinality) path inside the GROUP BY executor (a hash aggregator should be O(n + groups)). **SQLR-19** tracks the investigation. Set `SQLRITE_BENCH_W8_CARD_100K_SQLRITE=1` once that lands to re-include the bucket.
+
+**Read this as:** GROUP BY at low cardinality is fine on SQLRite; high-cardinality work is broken. DuckDB's vectorized hash aggregator dominates SQLite at every cardinality — that's the analytical-engine value proposition in one workload.
 
 ### W8 — `SELECT k, COUNT(*) FROM big GROUP BY k` (three cardinalities)
 
@@ -163,6 +177,8 @@ Even at 10k scale, the gap is large:
 | **Ratio** | **~14,000,000×** ⚠️ | |
 
 **Read this as:** SQLRite's join executor scans the entire inner table per outer row (no index probe pushdown), and the per-pair overhead is much higher than a single-table full scan. At 32 s for ~10k inner-row checks, the per-row cost is ~3 ms — about **3,000× slower** than W2's full-scan rate (1 µs/row). The inner-side index probe is the obvious next unlock; the per-pair overhead is the second.
+
+**DuckDB on W9 (10k×10k):** ~500 µs / probe — about **220× slower than SQLite**. Per-PK probe + single-row JOIN is the workload SQLite was built for; DuckDB pays a much higher per-query overhead because it's optimized for analytical scans, not sub-millisecond OLTP probes. The plan's viability section flags exactly this — DuckDB is "apples-to-oranges" on PK-probe-by-rowid workloads and we include it here for the directional comparison only.
 
 ### W10 — vector top-10 (cosine), brute-force vs HNSW
 
@@ -237,7 +253,7 @@ benchmarks/
 │   │   ├── mod.rs
 │   │   ├── sqlrite.rs     — engine-side driver (inlines params)
 │   │   ├── sqlite.rs      — rusqlite + Q3 tuned profile
-│   │   └── duckdb.rs      — feature-gated; lands in 9.5
+│   │   └── duckdb.rs      — feature-gated; Group B only
 │   ├── workloads/
 │   │   ├── mod.rs
 │   │   ├── kv.rs            — W1 read-by-PK

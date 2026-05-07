@@ -1,6 +1,6 @@
 # Benchmarks plan — SQLRite vs SQLite (and friends)
 
-**Status:** *approved 2026-05-06 — Q1–Q8 resolved; sub-phases 9.1 + 9.2 + 9.3 + 9.4 shipped.* All eight design questions were resolved by the project owner; see the **Decisions** section below for the canonical answers. Tracks task **SQLR-4** / **SQLR-16** (execution).
+**Status:** *approved 2026-05-06 — Q1–Q8 resolved; sub-phases 9.1 + 9.2 + 9.3 + 9.4 + 9.5 shipped.* All eight design questions were resolved by the project owner; see the **Decisions** section below for the canonical answers. Tracks task **SQLR-4** / **SQLR-16** (execution).
 
 **TL;DR.** Stand up a small, focused benchmark suite that pits the engine against `SQLite` (mandatory) and `DuckDB` (optional, analytical-slice only) under a curated set of OLTP + analytical + AI-era workloads. Skip distributed and network-resident options (`Cloudflare D1`, `rqlite`) — they don't share SQLRite's deployment shape. Defer `libSQL` until we have a vector- or replication-flavored axis that justifies a third row-oriented embedded engine. Suite lives in a new top-level `benchmarks/` workspace member, not built by default, runs on demand on a pinned host, emits JSON for trend tracking.
 
