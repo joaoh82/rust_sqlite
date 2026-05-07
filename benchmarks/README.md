@@ -2,7 +2,7 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-06):** sub-phase 9.1 landed — harness + W1. W2–W12 land in 9.2–9.4. The first official pinned-host JSON gets committed in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
+> **Status (2026-05-06):** sub-phases 9.1 + 9.2 landed — harness + Group A (W1–W6). W7–W12 land in 9.3–9.4. The first official pinned-host JSON gets committed in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
@@ -26,7 +26,7 @@ Three drivers, in plan order:
 
 Three groups (full descriptions in [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md#workloads)):
 
-- **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. Lands in 9.1 (W1) + 9.2.
+- **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. ✅ shipped (9.1 + 9.2).
 - **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. Lands in 9.3.
 - **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. Lands in 9.4.
 
@@ -49,18 +49,80 @@ Each `make bench` invocation drops a JSON file under `results/`. The `.gitignore
 
 The table below is updated as new workloads land. Numbers are placeholders until 9.6 commits an official pinned-host run; ratios shown here are illustrative output from the sub-phase 9.1 development run on the project owner's M-series MBP.
 
+> All numbers below come from a **smoke run** (criterion `--warm-up-time 1 --measurement-time 1-2 --sample-size 10`) on the project owner's M1 Pro / 32 GiB / macOS 23.5.0 host on `bench-9.2-group-a`. They're directionally honest but the official pinned-host publication is sub-phase 9.6's job. Open `target/criterion/report/index.html` after a local `make bench` for the full criterion HTML.
+
 ### W1 — read-by-PK (`SELECT name, payload FROM kv WHERE id = ?`)
 
 100k-row table, 10k random keys, in-process, prepared statement on the SQLite side / per-call parse on the SQLRite side (no parameter binding yet — see [`src/drivers/sqlrite.rs`](src/drivers/sqlrite.rs)).
 
 | Engine | Median latency | Throughput (ops/s) | Notes |
 |---|---|---|---|
-| SQLRite (this branch) | ~12 µs | ~84k | Per-iter parse + plan; no prepared params yet |
-| SQLite (rusqlite, WAL+NORMAL) | ~2.5 µs | ~395k | `prepare_cached` + bound `?` params |
+| SQLRite | ~19 µs | ~53k | Per-iter parse + plan; no prepared params yet |
+| SQLite (rusqlite, WAL+NORMAL) | ~2.4 µs | ~423k | `prepare_cached` + bound `?` params |
 
-**Read this as:** SQLRite is ~5× slower than SQLite on the hottest-path SELECT-by-PK on a sub-µs-per-op workload. Most of that gap is per-iteration parsing — SQLRite has no prepared-plan cache, so every iteration walks the `sqlparser` AST again. A future "prepared statement support" follow-up will tighten this; the W1 number is the baseline that work needs to move.
+**Read this as:** ~8× slower on the hottest-path SELECT-by-PK. Most of the gap is per-iteration parsing — SQLRite has no prepared-plan cache, so every iteration walks the `sqlparser` AST again. A future "prepared statement support" follow-up will tighten this.
 
-> Replace these numbers with the official pinned-host run that lands in 9.6. The sample command above also writes raw criterion HTML reports to `target/criterion/` for the curious — open `target/criterion/report/index.html`.
+### W2 — range scan (`WHERE secondary >= ? AND secondary <= ?`)
+
+100k-row table with a unique-index on `secondary` (a permutation of `1..=100_000`). Three width buckets, all measuring how the scan time scales with the number of matching rows.
+
+> SQLRite's tiny optimizer only probes the index on `<col> = <literal>` shape ([`docs/supported-sql.md:210`](../docs/supported-sql.md)) — range predicates fall back to full table scan, which is why all three width buckets land at ~the same SQLRite latency. SQLite uses the index for range scans.
+
+| Width | SQLRite | SQLite | Ratio |
+|---|---|---|---|
+| 100 rows | ~36.6 ms | ~60 µs | ~610× |
+| 1,000 rows | ~32.2 ms | ~594 µs | ~54× |
+| 10,000 rows | ~33.8 ms | ~6.5 ms | ~5× |
+
+**Read this as:** the ratio collapses as the matching set grows — SQLite's index range scan does its work, SQLRite's full-table scan does its (constant) work, and at 10k matching rows of a 100k table they converge. A future range-scan optimizer is the roadmap unlock here; the 100-row bucket gap is its yardstick.
+
+### W3 — bulk insert (100k rows in one transaction)
+
+`BEGIN; INSERT…×100k; COMMIT`. Per criterion sample is one full transaction; each sample starts from a fresh DB (`iter_batched(BatchSize::PerIteration)`). Only 10 samples requested per driver because each sample is expensive — re-run with `cargo bench -- --sample-size 30 --measurement-time 30 W3` to sharpen the estimate.
+
+| Engine | Median per 100k-row txn | Rows/s |
+|---|---|---|
+| SQLRite | ~1.35 s | ~74k |
+| SQLite (rusqlite, WAL+NORMAL) | ~206 ms | ~485k |
+| **Ratio** | **~6.6×** | |
+
+**Read this as:** in-transaction bulk paths are tractably close. The gap is mostly per-row parse + execute (no prepared cache on SQLRite), with one COMMIT amortized across all 100k rows. Same root cause as W1's per-iter parse, scaled up.
+
+### W4 — single-row insert (each in its own implicit transaction)
+
+`INSERT INTO kv_writes …` — auto-committed per row. Preloaded with 1,000 rows so the table size is stable across iterations (otherwise the bottom-up rebuild's O(N) commit cost would ramp through the bench window). See [`src/workloads/single_insert.rs`](src/workloads/single_insert.rs) for the preload rationale.
+
+| Engine | Median latency | Throughput (ops/s) |
+|---|---|---|
+| SQLRite | ~7.34 ms | ~136 |
+| SQLite (rusqlite, WAL+NORMAL) | ~10.9 µs | ~91k |
+| **Ratio** | **~673×** ⚠️ | |
+
+**Read this as:** every COMMIT triggers a full bottom-up B-tree rebuild on SQLRite. Even at a tiny 1k-row preload, the rebuild + WAL append + checkpoint per row dominates. **Investigation follow-up filed (SQLR-18)** per the plan's "if W4 shows >100× gap" heuristic — informational, not a release gate. The fix is a phase-level change (in-place B-tree splits, or LSM/SSTable swap), not a bench-suite tweak.
+
+### W5 — mixed OLTP (50/50 SELECT-by-PK + UPDATE-by-PK)
+
+YCSB-A flavor over the Group-A 100k-row table. Even iterations are SELECTs, odd iterations are UPDATEs. SELECTs are fast on both engines; UPDATEs hit the same per-row commit path as W4 — but on a 100k-row preload, so the rebuild cost is much larger.
+
+| Engine | Median per mixed op | Throughput (ops/s) |
+|---|---|---|
+| SQLRite | ~71.1 ms | ~14 |
+| SQLite (rusqlite, WAL+NORMAL) | ~12.3 µs | ~81k |
+| **Ratio** | **~5,800×** | |
+
+**Read this as:** same root cause as W4, amplified by 100× the preload (1k → 100k). The median sits in the bimodal "every other op is an O(100k) rebuild" zone. Tracked together with W4 under SQLR-18.
+
+### W6 — secondary-index lookup (`WHERE secondary = ?`)
+
+Unique-index probes — every probe matches exactly one row. SQLRite's optimizer fast-paths `<indexed_col> = <literal>`, so this exercises the same code path on both engines: B-tree probe + ROWID indirection + row reassembly.
+
+| Engine | Median latency | Throughput (ops/s) |
+|---|---|---|
+| SQLRite | ~14.6 µs | ~68k |
+| SQLite (rusqlite, WAL+NORMAL) | ~3.1 µs | ~323k |
+| **Ratio** | **~5×** | |
+
+**Read this as:** secondary-index path is healthy — same ~5–8× per-iter-parse-cost band as W1. The index probe itself is fine; what we're measuring is mostly `sqlparser` per call.
 
 ## Adding a workload
 
@@ -98,7 +160,12 @@ benchmarks/
 │   │   └── duckdb.rs      — feature-gated; lands in 9.5
 │   ├── workloads/
 │   │   ├── mod.rs
-│   │   └── kv.rs          — W1 read-by-PK (this PR)
+│   │   ├── kv.rs            — W1 read-by-PK
+│   │   ├── range_scan.rs    — W2 range scan (100/1k/10k)
+│   │   ├── bulk_insert.rs   — W3 bulk insert (100k/txn)
+│   │   ├── single_insert.rs — W4 single-row insert
+│   │   ├── mixed_oltp.rs    — W5 50/50 SELECT+UPDATE
+│   │   └── index_lookup.rs  — W6 secondary-index lookup
 │   └── bin/
 │       └── aggregate.rs   — walks target/criterion/ → results/*.json
 ├── benches/
