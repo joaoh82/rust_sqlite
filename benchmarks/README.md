@@ -2,7 +2,7 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 landed — harness + Group A (W1–W6) + Group B (W7–W9). W10–W12 land in 9.4. The first official pinned-host JSON gets committed in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
+> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 + 9.4 landed — harness + Group A (W1–W6) + Group B (W7–W9) + Group C (W10–W12). The full workload set is in. The first official pinned-host JSON + canonical `docs/benchmarks.md` reference land in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
@@ -28,7 +28,7 @@ Three groups (full descriptions in [`docs/benchmarks-plan.md`](../docs/benchmark
 
 - **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. ✅ shipped (9.1 + 9.2).
 - **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. ✅ shipped (9.3).
-- **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. Lands in 9.4.
+- **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. ✅ shipped (9.4).
 
 Workloads are versioned (`W1.v1`, `W1.v2`, …) per Q8 — bumping the version is the explicit "I changed the benchmark" gesture.
 
@@ -164,6 +164,46 @@ Even at 10k scale, the gap is large:
 
 **Read this as:** SQLRite's join executor scans the entire inner table per outer row (no index probe pushdown), and the per-pair overhead is much higher than a single-table full scan. At 32 s for ~10k inner-row checks, the per-row cost is ~3 ms — about **3,000× slower** than W2's full-scan rate (1 µs/row). The inner-side index probe is the obvious next unlock; the per-pair overhead is the second.
 
+### W10 — vector top-10 (cosine), brute-force vs HNSW
+
+10k 384-dim vectors. Two variants per the plan: brute-force (no index) and HNSW (`CREATE INDEX … USING hnsw`). SQLRite-only — `sqlite-vec` extension wiring is a follow-up (`rusqlite[bundled]` doesn't ship it; loading a pre-compiled `.dylib` at runtime is non-trivial and was out of scope for v1).
+
+| Variant | SQLRite median | Throughput |
+|---|---|---|
+| brute-force | ~122 ms | ~8 ops/s |
+| hnsw | ~132 ms | ~7 ops/s |
+
+**Read this as:** at 10k vectors × 384 dim, **HNSW barely beats brute-force**. That's not the index's fault — both numbers are dominated by the **per-iter SQL parse cost** (the 384-element bracket-array literal in the `ORDER BY` clause is ~4 KB of SQL the parser walks every iteration; the actual cosine work is ~3.8M FP ops ≈ a few ms). At a much larger corpus (millions of vectors) HNSW would dominate; at 10k the parser cost masks the algorithmic win. A future "prepare-vector-query-once" path or VECTOR-bind binding would surface the real HNSW vs brute-force gap.
+
+### W11 — BM25 top-10
+
+**1000 synthetic docs.** Plan target was 10k docs; SQLRite's FTS doc-lengths sidecar must fit in one 4 KiB page, capping the corpus at ~1,360 docs until Phase 8.1 ships overflow chaining. **SQLR-21** tracks that. Engine-asymmetric setup:
+
+- **SQLRite**: `CREATE TABLE docs (id, body) + CREATE INDEX … USING fts (body)` + `SELECT id FROM docs WHERE fts_match(body, ?) ORDER BY bm25_score(body, ?) DESC LIMIT 10`.
+- **SQLite**: `CREATE VIRTUAL TABLE docs USING fts5(body)` + `SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT 10`. Query terms are joined with explicit `OR` to match SQLRite's any-of semantics (FTS5's default operator is `AND`).
+
+Both engines use an inverted index + BM25 ranker; the SQL shapes differ because FTS5 is a virtual table while SQLRite attaches the index to a regular table. See [`benchmarks/src/workloads/fts.rs`](src/workloads/fts.rs) for the per-driver branch.
+
+| Engine | Median per query | Throughput (ops/s) |
+|---|---|---|
+| SQLRite | ~533 µs | ~1,876 |
+| SQLite (FTS5) | ~24 µs | ~42,000 |
+| **Ratio** | **~22×** | |
+
+**Read this as:** healthy. ~22× is a much smaller gap than W4 / W5 / W9 — SQLRite's BM25 path is in the same band as the W1 / W6 per-iter-parse-dominated workloads. The dominant cost is again the per-call SQL parsing of the BM25 query; once SQLRite gains prepared-statement support, this should close further.
+
+### W12 — hybrid retrieval (BM25 + cosine fusion)
+
+**1000 docs with both a text body and a 384-dim embedding.** Hot loop: `WHERE fts_match(body, ?) ORDER BY 0.5 * (1 − bm25_score/10) + 0.5 * vec_distance_cosine(embedding, [...]) ASC LIMIT 10`. Mirrors [`examples/hybrid-retrieval/`](../examples/hybrid-retrieval/).
+
+**SQLRite-only.** No off-the-shelf comparator exists in a single embedded engine that can compose BM25 + vector cosine in one query — that's the plan's stated stance. The number stands on its own as the baseline for the "SQLRite for RAG" pitch. (Same 1000-doc cap as W11 per SQLR-21.)
+
+| Engine | Median per query | Throughput (ops/s) |
+|---|---|---|
+| SQLRite | ~654 µs | ~1,529 |
+
+**Read this as:** absolute number for the headline RAG pitch. ~650 µs/query for "filter by FTS, rank by 50/50 BM25 + cosine over 384-dim embeddings" on a 1000-doc corpus is solid — competitive with what a Python+sklearn user would pay round-tripping to a separate vector DB + BM25 engine. The number scales with corpus size; bumping the cap (post Phase 8.1) is what unlocks larger-scale headlines.
+
 ## Adding a workload
 
 Per the [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md#sub-phases) sequencing:
@@ -208,7 +248,10 @@ benchmarks/
 │   │   ├── index_lookup.rs  — W6 secondary-index lookup
 │   │   ├── aggregate.rs     — W7 SUM(v) over 1M rows
 │   │   ├── group_by.rs      — W8 GROUP BY (10/1k/100k cardinalities)
-│   │   └── join.rs          — W9 INNER JOIN, customer ↔ order
+│   │   ├── join.rs          — W9 INNER JOIN, customer ↔ order
+│   │   ├── vector.rs        — W10 vector top-10 (brute-force + HNSW)
+│   │   ├── fts.rs           — W11 BM25 top-10 (vs SQLite FTS5)
+│   │   └── hybrid.rs        — W12 hybrid BM25 + cosine fusion
 │   └── bin/
 │       └── aggregate.rs   — walks target/criterion/ → results/*.json
 ├── benches/
