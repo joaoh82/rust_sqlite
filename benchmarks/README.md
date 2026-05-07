@@ -2,7 +2,7 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-07):** sub-phases 9.1 + 9.2 + 9.3 + 9.4 + 9.5 landed — harness + all 12 workloads + DuckDB driver. The first official pinned-host JSON + canonical `docs/benchmarks.md` reference land in 9.6. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the canonical design + the resolved Q1–Q8 decisions.
+> **Status (2026-05-07):** all six sub-phases (9.1–9.6) shipped — harness + 12 workloads + DuckDB driver + canonical [`docs/benchmarks.md`](../docs/benchmarks.md) reference + first official pinned-host run committed under [`results/`](results/). See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the design rationale + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
@@ -29,6 +29,8 @@ Three groups (full descriptions in [`docs/benchmarks-plan.md`](../docs/benchmark
 - **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. ✅ shipped (9.1 + 9.2).
 - **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. ✅ shipped (9.3).
 - **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. ✅ shipped (9.4).
+
+For headline numbers + reading-the-numbers methodology + the engineering debts the suite surfaced, see the canonical [**`docs/benchmarks.md`**](../docs/benchmarks.md).
 
 Workloads are versioned (`W1.v1`, `W1.v2`, …) per Q8 — bumping the version is the explicit "I changed the benchmark" gesture.
 
@@ -149,20 +151,6 @@ Single-statement aggregate. No WHERE, no GROUP BY. All three engines walk every 
 **SQLRite × 100k-cardinality is skipped by default** in `make bench`. A first measurement clocked ~245 s/iter (~41 min for 10 samples), strongly suggesting an O(n × cardinality) path inside the GROUP BY executor (a hash aggregator should be O(n + groups)). **SQLR-19** tracks the investigation. Set `SQLRITE_BENCH_W8_CARD_100K_SQLRITE=1` once that lands to re-include the bucket.
 
 **Read this as:** GROUP BY at low cardinality is fine on SQLRite; high-cardinality work is broken. DuckDB's vectorized hash aggregator dominates SQLite at every cardinality — that's the analytical-engine value proposition in one workload.
-
-### W8 — `SELECT k, COUNT(*) FROM big GROUP BY k` (three cardinalities)
-
-1M-row table, GROUP BY at 10 / 1k / 100k distinct keys.
-
-| Cardinality | SQLRite | SQLite (rusqlite, WAL+NORMAL) | Notes |
-|---|---|---|---|
-| 10 groups | ~204 ms | ~460 ms | SQLRite faster — likely SQLite's planner picks a sort-then-group path here (small group counts often slower than a hash). Not the headline; small samples. |
-| 1,000 groups | ~1.50 s | ~242 ms | ~6.2× |
-| 100,000 groups | **skipped** | ~241 ms | SQLRite skipped by default — see note below |
-
-**SQLRite × 100k-cardinality is skipped by default** in `make bench`. A first measurement clocked ~245 s/iter (~41 min for 10 samples), strongly suggesting an O(n × cardinality) path inside the GROUP BY executor (a hash aggregator should be O(n + groups)). **SQLR-19** tracks the investigation. Set `SQLRITE_BENCH_W8_CARD_100K_SQLRITE=1` once that lands to re-include the bucket.
-
-**Read this as:** GROUP BY at low cardinality is fine; high-cardinality work is broken. The fix is probably a `Vec`-backed group store → `HashMap`-backed.
 
 ### W9 — INNER JOIN, customer ↔ order, probe by customer PK
 

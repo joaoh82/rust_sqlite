@@ -114,6 +114,12 @@ In-depth documentation lives under [`docs/`](docs/). Start at [`docs/_index.md`]
 - [Design decisions](docs/design-decisions.md), [Roadmap](docs/roadmap.md)
 - Internals: [File format](docs/file-format.md), [Pager](docs/pager.md), [Storage model](docs/storage-model.md), [SQL engine](docs/sql-engine.md)
 
+### Benchmarks
+
+SQLRite ships with a [curated benchmark suite](docs/benchmarks.md) that pits the engine against `SQLite` (and optionally `DuckDB`) on twelve OLTP, SQL-feature-scaling, and AI-era workloads (vector top-10, BM25, hybrid retrieval). Run locally with `make bench` (lean, ~5 min) or `make bench-duckdb` (with the analytical comparator on Group B, ~30 min). Pinned-host JSON envelopes get committed under [`benchmarks/results/`](benchmarks/results/) so trends can be diffed mechanically; `benchmarks/scripts/compare.py` renders any two runs as a Markdown diff.
+
+The [canonical reference](docs/benchmarks.md) carries headline numbers, methodology notes (Q3 SQLite tuning, parser-tax framing), and the engineering debts (SQLR-18 / 19 / 20 / 21) the suite surfaced honestly.
+
 ### Requirements
 Before you begin, ensure you have met the following requirements:
 * Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
