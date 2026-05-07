@@ -29,8 +29,9 @@ use sqlrite_benchmarks::Driver;
 use sqlrite_benchmarks::drivers::sqlite::SQLiteDriver;
 use sqlrite_benchmarks::drivers::sqlrite::SQLRiteDriver;
 use sqlrite_benchmarks::workloads::{
-    aggregate as w7, bulk_insert as w3, group_by as w8, index_lookup as w6, join as w9, kv as w1,
-    mixed_oltp as w5, range_scan as w2, single_insert as w4,
+    aggregate as w7, bulk_insert as w3, fts as w11, group_by as w8, hybrid as w12,
+    index_lookup as w6, join as w9, kv as w1, mixed_oltp as w5, range_scan as w2,
+    single_insert as w4, vector as w10,
 };
 
 /// Pick a DB filename inside `dir` based on the driver — keeps a
@@ -376,6 +377,105 @@ fn register_w9<D: Driver>(c: &mut Criterion, driver: D) {
 }
 
 // ---------------------------------------------------------------------------
+// W10 — vector top-10, brute-force vs HNSW (SQLRite-only — see
+//        `vector::driver_supports`)
+// ---------------------------------------------------------------------------
+
+fn register_w10<D: Driver>(c: &mut Criterion, driver: D) {
+    if !w10::driver_supports(driver.name()) {
+        return;
+    }
+    for &(label, with_hnsw) in &w10::VARIANTS {
+        let tmp = tempdir_for(&format!("w10-{label}"), driver.name());
+        let path = db_path(tmp.path(), driver.name(), "w10");
+        let (mut conn, dataset) = w10::setup(&driver, &path, with_hnsw).expect("W10 setup");
+        w10::correctness_check(&driver, &mut conn, &dataset).expect("W10 correctness check");
+
+        let group_name = format!("{}/{}", w10::W10.full(), label);
+        let mut group = c.benchmark_group(&group_name);
+        // 10k-vector top-10 cosine probes — brute-force per probe is
+        // hundreds of ms on SQLRite. Cap samples so the smoke run
+        // finishes quickly; override at the CLI for a sharper estimate.
+        group.sample_size(10);
+        let bench_id = format!("{}/default", driver.name());
+        let queries = dataset.queries.clone();
+        let mut idx = 0usize;
+        group.bench_function(&bench_id, |b| {
+            b.iter(|| {
+                let q = &queries[idx % queries.len()];
+                idx = idx.wrapping_add(1);
+                let n = w10::bench_iter(&driver, &mut conn, q).expect("W10 query");
+                black_box(n)
+            });
+        });
+        group.finish();
+        drop(conn);
+        drop(tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W11 — BM25 top-10 (SQLRite USING fts vs SQLite FTS5 virtual table)
+// ---------------------------------------------------------------------------
+
+fn register_w11<D: Driver>(c: &mut Criterion, driver: D) {
+    let tmp = tempdir_for("w11", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w11");
+    let (mut conn, dataset) = w11::setup(&driver, &path).expect("W11 setup");
+    w11::correctness_check(&driver, &mut conn, &dataset).expect("W11 correctness check");
+
+    let mut group = c.benchmark_group(w11::W11.full());
+    group.sample_size(10);
+    let bench_id = format!("{}/default", driver.name());
+    let queries = dataset.queries.clone();
+    let mut idx = 0usize;
+    group.bench_function(&bench_id, |b| {
+        b.iter(|| {
+            let q = &queries[idx % queries.len()];
+            idx = idx.wrapping_add(1);
+            let n = w11::bench_iter(&driver, &mut conn, q).expect("W11 query");
+            black_box(n)
+        });
+    });
+    group.finish();
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// W12 — hybrid retrieval (SQLRite-only)
+// ---------------------------------------------------------------------------
+
+fn register_w12<D: Driver>(c: &mut Criterion, driver: D) {
+    if !w12::driver_supports(driver.name()) {
+        return;
+    }
+    let tmp = tempdir_for("w12", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w12");
+    let (mut conn, dataset) = w12::setup(&driver, &path).expect("W12 setup");
+    w12::correctness_check(&driver, &mut conn, &dataset).expect("W12 correctness check");
+
+    let mut group = c.benchmark_group(w12::W12.full());
+    group.sample_size(10);
+    let bench_id = format!("{}/default", driver.name());
+    let text_queries = dataset.fts.queries.clone();
+    let vec_queries = dataset.vec.queries.clone();
+    let mut idx = 0usize;
+    group.bench_function(&bench_id, |b| {
+        b.iter(|| {
+            let tq = &text_queries[idx % text_queries.len()];
+            let vq = &vec_queries[idx % vec_queries.len()];
+            idx = idx.wrapping_add(1);
+            let n = w12::bench_iter(&driver, &mut conn, tq, vq).expect("W12 query");
+            black_box(n)
+        });
+    });
+    group.finish();
+    drop(conn);
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -398,6 +498,12 @@ fn benches(c: &mut Criterion) {
     register_w8(c, SQLiteDriver);
     register_w9(c, SQLRiteDriver);
     register_w9(c, SQLiteDriver);
+    register_w10(c, SQLRiteDriver);
+    register_w10(c, SQLiteDriver); // skipped via driver_supports
+    register_w11(c, SQLRiteDriver);
+    register_w11(c, SQLiteDriver);
+    register_w12(c, SQLRiteDriver);
+    register_w12(c, SQLiteDriver); // skipped via driver_supports
 }
 
 criterion_group!(suite, benches);

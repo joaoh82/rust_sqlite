@@ -16,10 +16,13 @@
 
 pub mod aggregate;
 pub mod bulk_insert;
+pub mod fts;
 pub mod group_by;
+pub mod hybrid;
 pub mod index_lookup;
 pub mod join;
 pub mod kv;
 pub mod mixed_oltp;
 pub mod range_scan;
 pub mod single_insert;
+pub mod vector;

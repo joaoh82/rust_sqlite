@@ -342,6 +342,187 @@ pub fn join_dataset() -> JoinDataset {
     }
 }
 
+// =====================================================================
+// Group C — differentiator workloads (W10 vector, W11 BM25, W12 hybrid)
+// =====================================================================
+
+/// Vector workload dataset (W10 / W12). 10k vectors at 384 dimensions.
+/// Each vector's coordinates are a deterministic hash of the row id, so
+/// runs reproduce byte-for-byte and queries have stable expected
+/// rankings.
+///
+/// Plan target: "10k 384-dim vectors, cosine top-10."
+pub struct VectorDataset {
+    /// `(id, embedding)` pairs.
+    pub rows: Vec<VectorRow>,
+    /// Pre-generated random query vectors for the criterion hot loop.
+    /// Seeded so every probe is deterministic across runs.
+    pub queries: Vec<Vec<f32>>,
+}
+
+pub struct VectorRow {
+    pub id: i64,
+    pub embedding: Vec<f32>,
+}
+
+pub const VECTOR_ROW_COUNT: usize = 10_000;
+pub const VECTOR_DIM: usize = 384;
+pub const VECTOR_QUERY_COUNT: usize = 64;
+const VECTOR_SEED: u64 = 46;
+
+pub fn vector_dataset() -> VectorDataset {
+    let mut rng = ChaCha8Rng::seed_from_u64(VECTOR_SEED);
+    let mut rows = Vec::with_capacity(VECTOR_ROW_COUNT);
+    for i in 1..=VECTOR_ROW_COUNT as i64 {
+        rows.push(VectorRow {
+            id: i,
+            embedding: gen_vector(i as u64, VECTOR_DIM),
+        });
+    }
+    let mut queries = Vec::with_capacity(VECTOR_QUERY_COUNT);
+    for _ in 0..VECTOR_QUERY_COUNT {
+        let mut v = Vec::with_capacity(VECTOR_DIM);
+        for _ in 0..VECTOR_DIM {
+            // Uniform [-1, 1) — cheap, stays away from zero-mag.
+            let x: f32 = rng.r#gen::<f32>() * 2.0 - 1.0;
+            v.push(x);
+        }
+        queries.push(v);
+    }
+    VectorDataset { rows, queries }
+}
+
+/// Deterministic per-id vector. Stable hash → repeatable rankings.
+fn gen_vector(seed: u64, dim: usize) -> Vec<f32> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(VECTOR_SEED));
+    let mut v = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        v.push(rng.r#gen::<f32>() * 2.0 - 1.0);
+    }
+    v
+}
+
+/// Render a `&[f32]` as the bracket-array literal SQLRite + the
+/// `[f32; 4]` example use: `[0.123, -0.456, …]`.
+pub fn vec_to_sql_literal(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 12 + 2);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!("{x}"));
+    }
+    s.push(']');
+    s
+}
+
+/// Full-text dataset (W11 / W12). 10k synthetic docs built from a small
+/// dictionary so queries hit a known mix of terms with varying selectivity.
+///
+/// Plan target: "10k-doc corpus, top-10 BM25."
+pub struct FtsDataset {
+    pub rows: Vec<FtsRow>,
+    /// Multi-term query strings for the criterion hot loop. Each is
+    /// 2–4 dictionary words joined by spaces; designed to match every
+    /// row in the corpus to at least one term so `fts_match` is a
+    /// non-empty filter.
+    pub queries: Vec<String>,
+}
+
+pub struct FtsRow {
+    pub id: i64,
+    pub body: String,
+}
+
+/// Plan-deviation note (W11 / W12): the plan target is **10k docs**.
+/// SQLRite's FTS index serializes a per-doc-length sidecar as a single
+/// cell, and that cell must fit inside a 4 KiB page (overflow chaining
+/// lands in Phase 8.1). At ~3 bytes per doc-length entry, 10k docs
+/// produces a ~30 KB sidecar that crashes setup with `posting cell 1
+/// of 31754 bytes exceeds empty-page capacity 4085`. The cap that
+/// actually fits is roughly `4085 / 3 ≈ 1360` docs.
+///
+/// v1 ships at **1000 docs** with a comfortable margin. Bumping back
+/// toward 10k follows Phase 8.1 (overflow chaining) + a `W11.v2` /
+/// `W12.v2` tag.
+pub const FTS_ROW_COUNT: usize = 1_000;
+pub const FTS_QUERY_COUNT: usize = 64;
+const FTS_SEED: u64 = 47;
+
+/// FTS dictionary size. **Engine constraint, not a free parameter.**
+/// SQLRite's FTS posting cells must fit in one 4 KiB page (overflow
+/// chaining is Phase 8.1, not yet shipped — the engine errors out
+/// with "posting cell N bytes exceeds empty-page capacity 4085" at
+/// COMMIT time if this isn't true). With a 16-word doc and
+/// `FTS_ROW_COUNT` docs, each term appears in roughly
+/// `FTS_ROW_COUNT × 16 / FTS_DICT_SIZE` docs on average — the
+/// per-term posting list size is proportional. A 32-word dictionary
+/// crashed setup with `posting cell 31754 bytes exceeds empty-page
+/// capacity 4085`. Bumping to 10k words puts the average posting list
+/// at ~16 docs, well under the page limit.
+const FTS_DICT_SIZE: usize = 10_000;
+
+/// Synthesize a deterministic dictionary word from an index. 6-char
+/// lowercase ASCII; the engine's tokenizer is ASCII-split + lowercase
+/// (per `docs/fts.md`) so no folding happens.
+fn fts_word(i: usize) -> String {
+    let mut s = String::with_capacity(6);
+    let mut x = i as u64;
+    for _ in 0..6 {
+        s.push((b'a' + (x % 26) as u8) as char);
+        x /= 26;
+    }
+    s
+}
+
+pub fn fts_dataset() -> FtsDataset {
+    let mut rng = ChaCha8Rng::seed_from_u64(FTS_SEED);
+
+    // Build the synthetic dictionary up front. ~60 KB of strings —
+    // cheap, regenerated per run.
+    let dict: Vec<String> = (0..FTS_DICT_SIZE).map(fts_word).collect();
+
+    let mut rows = Vec::with_capacity(FTS_ROW_COUNT);
+    for i in 1..=FTS_ROW_COUNT as i64 {
+        // 16 words per doc — enough for BM25 statistics to vary by
+        // term, small enough that 10k docs stay under a few MB of body
+        // text.
+        let mut words = Vec::with_capacity(16);
+        for _ in 0..16 {
+            words.push(dict[rng.r#gen::<usize>() % FTS_DICT_SIZE].clone());
+        }
+        rows.push(FtsRow {
+            id: i,
+            body: words.join(" "),
+        });
+    }
+
+    // Queries pull from a curated *small* slice of the dictionary so
+    // every query reliably matches a non-trivial number of rows.
+    // Without this, picking 2–4 words uniformly from 10k would almost
+    // always miss every doc (each term appears in ~16 of 10k = 0.16%
+    // of rows; a 4-term any-of query would still match <1% of the
+    // corpus on average — fine for BM25 correctness but boring as a
+    // benchmark).
+    let popular: Vec<&str> = dict
+        .iter()
+        .step_by(FTS_DICT_SIZE / 64)
+        .map(|s| s.as_str())
+        .collect();
+
+    let mut queries = Vec::with_capacity(FTS_QUERY_COUNT);
+    for _ in 0..FTS_QUERY_COUNT {
+        let n_terms = 2 + rng.r#gen::<usize>() % 3; // 2..=4
+        let mut terms = Vec::with_capacity(n_terms);
+        for _ in 0..n_terms {
+            terms.push(popular[rng.r#gen::<usize>() % popular.len()]);
+        }
+        queries.push(terms.join(" "));
+    }
+    FtsDataset { rows, queries }
+}
+
 /// W4 single-row-insert dataset. The bench loop generates rows on the
 /// fly with monotonically-increasing PKs starting at this base, so the
 /// preload (rows `1..=BASE-1`) sets a stable table size before timing
