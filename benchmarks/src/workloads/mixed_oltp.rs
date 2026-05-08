@@ -31,7 +31,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W5: WorkloadId = WorkloadId {
     id: "W5",
     name: "mixed-oltp",
-    version: "v1",
+    version: "v2",
 };
 
 pub const SELECT_SQL: &str = "SELECT id, secondary, payload FROM kv2 WHERE id = ?";

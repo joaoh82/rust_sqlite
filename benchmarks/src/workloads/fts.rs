@@ -47,11 +47,23 @@ use anyhow::{Context, Result};
 use crate::data::{FTS_QUERY_COUNT, FTS_ROW_COUNT, FtsDataset, fts_dataset};
 use crate::{Driver, Value, WorkloadId};
 
+/// SQLR-23 — bumped to v2 because the SQLRite path now binds the FTS
+/// query string through `?` placeholders (twice: once for `fts_match`,
+/// once for `bm25_score`) instead of inlining + escaping at call time.
+/// The "parser tax" the bench README has called out since 9.1
+/// disappears for this workload.
 pub const W11: WorkloadId = WorkloadId {
     id: "W11",
     name: "bm25-top10",
-    version: "v1",
+    version: "v2",
 };
+
+/// SQLRite-side hot-loop SQL — both `fts_match` and `bm25_score`
+/// reference the same query string via two `?` placeholders. Static
+/// across iterations so `prepare_cached` returns the same plan
+/// every call.
+const SQLRITE_SELECT_SQL: &str =
+    "SELECT id FROM docs WHERE fts_match(body, ?) ORDER BY bm25_score(body, ?) DESC LIMIT 10";
 
 pub fn setup<D: Driver>(driver: &D, path: &Path) -> Result<(D::Conn, FtsDataset)> {
     let mut conn = driver.open(path)?;
@@ -128,16 +140,20 @@ pub fn bench_iter<D: Driver>(driver: &D, conn: &mut D::Conn, query: &str) -> Res
             )?
         }
         _ => {
-            // SQLRite: fts_match filters, bm25_score ranks. The query
-            // string appears twice — once in the WHERE filter, once in
-            // the ORDER BY ranker (matches the engine's API; both
-            // calls share an internal cache per `docs/fts.md`).
-            let sql = format!(
-                "SELECT id FROM docs WHERE fts_match(body, '{}') ORDER BY bm25_score(body, '{}') DESC LIMIT 10",
-                escape_sql(query),
-                escape_sql(query),
-            );
-            driver.query_all(conn, &sql, &[])?
+            // SQLRite: fts_match filters, bm25_score ranks. SQLR-23 —
+            // bind the query string twice through two `?` slots, so the
+            // SQL template stays static and `prepare_cached` reuses the
+            // same parsed plan across every iteration. Both calls
+            // still share the engine's internal per-query FTS cache
+            // per `docs/fts.md`.
+            driver.query_all(
+                conn,
+                SQLRITE_SELECT_SQL,
+                &[
+                    Value::Text(query.to_string()),
+                    Value::Text(query.to_string()),
+                ],
+            )?
         }
     };
     Ok(rows.len())
@@ -161,8 +177,4 @@ pub fn correctness_check<D: Driver>(
         anyhow::bail!("W11 correctness: top-10 returned {n} rows (expected ≤ 10)");
     }
     Ok(())
-}
-
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
 }

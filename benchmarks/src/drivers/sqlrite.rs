@@ -1,16 +1,26 @@
 //! SQLRite driver.
 //!
 //! Binds against the engine's public [`sqlrite::Connection`] surface —
-//! the same API the language SDKs use. SQLRite has no parameter
-//! binding yet (see `connection.rs:145` — "parameter binding and
-//! prepared-plan caching are future work"), so the driver formats
-//! `[Value]` into the SQL string at call time. That's an honest cost
-//! to include in the comparison: a SQLRite user calling a hot SELECT
-//! today pays the same per-call parse + format overhead.
+//! the same API the language SDKs use.
 //!
-//! Once SQLRite gains parameter binding (post-9.6 follow-up), this
-//! driver will switch to the bound path and a workload `v` bump will
-//! capture the methodology change.
+//! ## SQLR-23 — bound + cached path
+//!
+//! SQLRite gained a prepared-statement plan cache + parameter binding
+//! in SQLR-23. This driver uses both:
+//!
+//! - `query_one` / `query_all` route through [`sqlrite::Connection::prepare_cached`]
+//!   so a hot SELECT pays the sqlparser walk exactly once across the
+//!   whole bench loop (cache cap defaults to 16, plenty for any single
+//!   workload).
+//! - `execute_with_params` does the same for INSERT-loop hot paths.
+//! - `Value::Vector` binds directly through `Statement::query_with_params`
+//!   without round-tripping through a 4 KB bracket-array SQL literal —
+//!   this is the W10/W12 unlock. The HNSW probe optimizer recognizes
+//!   the bound vector via the same in-band shape an inline `[…]` would
+//!   produce, so the optimizer hook still kicks in on bound queries.
+//!
+//! That's how a perf-conscious SQLRite user would write hot-path code
+//! today.
 
 use std::path::Path;
 
@@ -44,20 +54,23 @@ impl Driver for SQLRiteDriver {
         sql: &str,
         params: &[Value],
     ) -> Result<()> {
-        let inlined = inline_params(sql, params)?;
-        conn.execute(&inlined)
-            .map_err(|e| anyhow::anyhow!("sqlrite execute_with_params: {e}\n  sql: {inlined}"))?;
+        let bound = to_engine_values(params);
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|e| anyhow::anyhow!("sqlrite prepare_cached: {e}\n  sql: {sql}"))?;
+        stmt.execute_with_params(&bound)
+            .map_err(|e| anyhow::anyhow!("sqlrite execute_with_params: {e}\n  sql: {sql}"))?;
         Ok(())
     }
 
     fn query_one(&self, conn: &mut Self::Conn, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
-        let inlined = inline_params(sql, params)?;
+        let bound = to_engine_values(params);
         let stmt = conn
-            .prepare(&inlined)
-            .map_err(|e| anyhow::anyhow!("sqlrite prepare: {e}\n  sql: {inlined}"))?;
+            .prepare_cached(sql)
+            .map_err(|e| anyhow::anyhow!("sqlrite prepare_cached: {e}\n  sql: {sql}"))?;
         let mut rows = stmt
-            .query()
-            .map_err(|e| anyhow::anyhow!("sqlrite query: {e}\n  sql: {inlined}"))?;
+            .query_with_params(&bound)
+            .map_err(|e| anyhow::anyhow!("sqlrite query_with_params: {e}\n  sql: {sql}"))?;
         let row = rows
             .next()
             .map_err(|e| anyhow::anyhow!("sqlrite row read: {e}"))?
@@ -84,13 +97,13 @@ impl Driver for SQLRiteDriver {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        let inlined = inline_params(sql, params)?;
+        let bound = to_engine_values(params);
         let stmt = conn
-            .prepare(&inlined)
-            .map_err(|e| anyhow::anyhow!("sqlrite prepare: {e}\n  sql: {inlined}"))?;
+            .prepare_cached(sql)
+            .map_err(|e| anyhow::anyhow!("sqlrite prepare_cached: {e}\n  sql: {sql}"))?;
         let mut rows = stmt
-            .query()
-            .map_err(|e| anyhow::anyhow!("sqlrite query: {e}\n  sql: {inlined}"))?;
+            .query_with_params(&bound)
+            .map_err(|e| anyhow::anyhow!("sqlrite query_with_params: {e}\n  sql: {sql}"))?;
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
@@ -108,49 +121,19 @@ impl Driver for SQLRiteDriver {
     }
 }
 
-/// Inline `?`-positional placeholders with literal values. Replaces the
-/// first `?` with `params[0]`, the second with `params[1]`, etc. Errors
-/// if the count doesn't match. Strings are SQL-escaped.
-fn inline_params(sql: &str, params: &[Value]) -> Result<String> {
-    let mut out = String::with_capacity(sql.len() + params.len() * 16);
-    let mut iter = params.iter();
-    let mut in_string = false;
-    for ch in sql.chars() {
-        if ch == '\'' {
-            in_string = !in_string;
-            out.push(ch);
-            continue;
-        }
-        if ch == '?' && !in_string {
-            let p = iter
-                .next()
-                .context("inline_params: more `?` placeholders than params")?;
-            push_literal(&mut out, p);
-        } else {
-            out.push(ch);
-        }
-    }
-    if iter.next().is_some() {
-        anyhow::bail!("inline_params: more params than `?` placeholders");
-    }
-    Ok(out)
+/// Map the bench harness's `Value` to SQLRite's engine `Value`. Both
+/// enums carry the same logical shapes; this is just a name-mapping.
+fn to_engine_values(params: &[Value]) -> Vec<sqlrite::Value> {
+    params.iter().map(to_engine_value).collect()
 }
 
-fn push_literal(out: &mut String, v: &Value) {
+fn to_engine_value(v: &Value) -> sqlrite::Value {
     match v {
-        Value::Null => out.push_str("NULL"),
-        Value::Integer(i) => out.push_str(&i.to_string()),
-        Value::Real(f) => out.push_str(&format!("{f}")),
-        Value::Text(s) => {
-            out.push('\'');
-            for ch in s.chars() {
-                if ch == '\'' {
-                    out.push('\'');
-                }
-                out.push(ch);
-            }
-            out.push('\'');
-        }
+        Value::Null => sqlrite::Value::Null,
+        Value::Integer(i) => sqlrite::Value::Integer(*i),
+        Value::Real(f) => sqlrite::Value::Real(*f),
+        Value::Text(s) => sqlrite::Value::Text(s.clone()),
+        Value::Vector(v) => sqlrite::Value::Vector(v.clone()),
     }
 }
 
@@ -160,46 +143,10 @@ fn from_engine_value(v: sqlrite::Value) -> Value {
         sqlrite::Value::Integer(i) => Value::Integer(i),
         sqlrite::Value::Real(f) => Value::Real(f),
         sqlrite::Value::Text(s) => Value::Text(s),
-        // Bench inputs don't include booleans / vectors / JSON yet —
-        // when a workload starts using them, this match grows.
+        sqlrite::Value::Vector(v) => Value::Vector(v),
+        // Bool / JSON aren't yet a bench `Value` variant — workloads
+        // don't surface them. If a future workload reads one back,
+        // grow this match alongside the harness `Value` enum.
         other => Value::Text(format!("{other:?}")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inline_params_replaces_in_order() {
-        let s = inline_params(
-            "SELECT * FROM t WHERE a = ? AND b = ? AND c = ?",
-            &[Value::Integer(1), Value::Text("x".into()), Value::Null],
-        )
-        .unwrap();
-        assert_eq!(s, "SELECT * FROM t WHERE a = 1 AND b = 'x' AND c = NULL");
-    }
-
-    #[test]
-    fn inline_params_preserves_question_marks_in_strings() {
-        let s =
-            inline_params("SELECT 'what?', * FROM t WHERE a = ?", &[Value::Integer(7)]).unwrap();
-        assert_eq!(s, "SELECT 'what?', * FROM t WHERE a = 7");
-    }
-
-    #[test]
-    fn inline_params_escapes_quotes() {
-        let s = inline_params(
-            "SELECT * FROM t WHERE name = ?",
-            &[Value::Text("O'Hara".into())],
-        )
-        .unwrap();
-        assert_eq!(s, "SELECT * FROM t WHERE name = 'O''Hara'");
-    }
-
-    #[test]
-    fn inline_params_arity_mismatch_errors() {
-        assert!(inline_params("SELECT ?", &[]).is_err());
-        assert!(inline_params("SELECT 1", &[Value::Integer(1)]).is_err());
     }
 }

@@ -26,7 +26,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W6: WorkloadId = WorkloadId {
     id: "W6",
     name: "index-lookup",
-    version: "v1",
+    version: "v2",
 };
 
 pub const SELECT_SQL: &str = "SELECT id, payload FROM kv2 WHERE secondary = ?";

@@ -49,7 +49,7 @@ impl Driver for DuckDBDriver {
         sql: &str,
         params: &[Value],
     ) -> Result<()> {
-        let bound: Vec<duckdb::types::Value> = params.iter().map(to_duckdb).collect();
+        let bound = to_duckdb_params(params)?;
         conn.execute(sql, duckdb::params_from_iter(bound.iter()))
             .with_context(|| format!("duckdb execute: {sql}"))?;
         Ok(())
@@ -70,7 +70,7 @@ impl Driver for DuckDBDriver {
         let mut stmt = conn
             .prepare(sql)
             .with_context(|| format!("duckdb prepare: {sql}"))?;
-        let bound: Vec<duckdb::types::Value> = params.iter().map(to_duckdb).collect();
+        let bound = to_duckdb_params(params)?;
         let mut rows = stmt
             .query(duckdb::params_from_iter(bound.iter()))
             .with_context(|| format!("duckdb query: {sql}"))?;
@@ -102,7 +102,7 @@ impl Driver for DuckDBDriver {
         let mut stmt = conn
             .prepare(sql)
             .with_context(|| format!("duckdb prepare: {sql}"))?;
-        let bound: Vec<duckdb::types::Value> = params.iter().map(to_duckdb).collect();
+        let bound = to_duckdb_params(params)?;
         let mut rows = stmt
             .query(duckdb::params_from_iter(bound.iter()))
             .with_context(|| format!("duckdb query: {sql}"))?;
@@ -125,12 +125,24 @@ impl Driver for DuckDBDriver {
     }
 }
 
-fn to_duckdb(v: &Value) -> duckdb::types::Value {
+fn to_duckdb_params(params: &[Value]) -> Result<Vec<duckdb::types::Value>> {
+    params.iter().map(to_duckdb).collect()
+}
+
+fn to_duckdb(v: &Value) -> Result<duckdb::types::Value> {
     match v {
-        Value::Null => duckdb::types::Value::Null,
-        Value::Integer(i) => duckdb::types::Value::BigInt(*i),
-        Value::Real(f) => duckdb::types::Value::Double(*f),
-        Value::Text(s) => duckdb::types::Value::Text(s.clone()),
+        Value::Null => Ok(duckdb::types::Value::Null),
+        Value::Integer(i) => Ok(duckdb::types::Value::BigInt(*i)),
+        Value::Real(f) => Ok(duckdb::types::Value::Double(*f)),
+        Value::Text(s) => Ok(duckdb::types::Value::Text(s.clone())),
+        // VECTOR is SQLRite-only (DuckDB doesn't ship a comparable
+        // primitive). The Group C workloads gate on
+        // `driver_supports("sqlrite")`, so reaching this arm
+        // indicates a registration bug.
+        Value::Vector(_) => anyhow::bail!(
+            "duckdb driver: VECTOR params are SQLRite-only; this workload should not register \
+             against duckdb"
+        ),
     }
 }
 

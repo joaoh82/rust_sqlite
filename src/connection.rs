@@ -1,4 +1,4 @@
-//! Public `Connection` / `Statement` / `Rows` / `Row` API (Phase 5a).
+//! Public `Connection` / `Statement` / `Rows` / `Row` API (Phase 5a + SQLR-23).
 //!
 //! This is the stable surface external consumers bind against — Rust
 //! callers use it directly, language SDKs (Python, Node.js, Go) bind
@@ -33,9 +33,28 @@
 //! accessible via `sqlrite::sql::...` for the engine's own tests
 //! and for the desktop app — but those paths aren't considered
 //! stable API.
+//!
+//! # Prepared statements & parameter binding (SQLR-23)
+//!
+//! `Connection::prepare` parses the SQL once and stashes the AST on
+//! the returned `Statement`. Subsequent calls to `Statement::query` /
+//! `Statement::run` execute against the cached AST without re-running
+//! sqlparser. Bound versions ([`Statement::query_with_params`] /
+//! [`Statement::execute_with_params`]) accept a `&[Value]` slice that is
+//! substituted into the cached AST at execute time — including
+//! `Value::Vector(...)` for HNSW-eligible KNN queries, where binding
+//! the query vector skips per-iter lexing of the 4 KB bracket-array
+//! literal.
+//!
+//! [`Connection::prepare_cached`] adds a small per-connection LRU
+//! (default cap 16) so a hot SQL string is parsed exactly once across
+//! every call, not once per `prepare()`. Matches the rusqlite pattern.
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
 
+use sqlparser::ast::Statement as AstStatement;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
@@ -44,8 +63,13 @@ use crate::sql::db::database::Database;
 use crate::sql::db::table::Value;
 use crate::sql::executor::execute_select_rows;
 use crate::sql::pager::{AccessMode, open_database_with_mode, save_database};
+use crate::sql::params::{rewrite_placeholders, substitute_params};
 use crate::sql::parser::select::SelectQuery;
-use crate::sql::process_command;
+use crate::sql::process_ast_with_render;
+
+/// Default capacity of the per-connection prepared-statement plan cache.
+/// Matches rusqlite's default; tweak with [`Connection::set_prepared_cache_capacity`].
+const DEFAULT_PREP_CACHE_CAP: usize = 16;
 
 /// A handle to a SQLRite database. Opens a file or an in-memory DB;
 /// drop it to close. Every mutating statement auto-saves (except inside
@@ -68,6 +92,13 @@ use crate::sql::process_command;
 /// multi-threaded access.
 pub struct Connection {
     db: Database,
+    /// SQLR-23 — small SQL→cached-plan LRU. Keyed by the verbatim SQL
+    /// string the caller passed to `prepare_cached`. Stored as a
+    /// `VecDeque` rather than a HashMap+linked-list because the
+    /// expected capacity is small (default 16) — linear scan is fine
+    /// and the implementation stays dependency-free.
+    prep_cache: VecDeque<(String, Arc<CachedPlan>)>,
+    prep_cache_cap: usize,
 }
 
 impl Connection {
@@ -97,7 +128,7 @@ impl Connection {
             save_database(&mut fresh, path)?;
             fresh
         };
-        Ok(Self { db })
+        Ok(Self::wrap(db))
     }
 
     /// Opens an existing database file for read-only access. Takes a
@@ -113,16 +144,22 @@ impl Connection {
             .unwrap_or("db")
             .to_string();
         let db = open_database_with_mode(path, db_name, AccessMode::ReadOnly)?;
-        Ok(Self { db })
+        Ok(Self::wrap(db))
     }
 
     /// Opens a transient in-memory database. No file is touched and no
     /// locks are taken; state lives for the lifetime of the
     /// `Connection` and is discarded on drop.
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self {
-            db: Database::new("memdb".to_string()),
-        })
+        Ok(Self::wrap(Database::new("memdb".to_string())))
+    }
+
+    fn wrap(db: Database) -> Self {
+        Self {
+            db,
+            prep_cache: VecDeque::new(),
+            prep_cache_cap: DEFAULT_PREP_CACHE_CAP,
+        }
     }
 
     /// Parses and executes one SQL statement. For DDL (`CREATE TABLE`,
@@ -135,16 +172,67 @@ impl Connection {
     /// just returns the rendered status — use [`Connection::prepare`]
     /// and [`Statement::query`] to iterate typed rows.
     pub fn execute(&mut self, sql: &str) -> Result<String> {
-        process_command(sql, &mut self.db)
+        crate::sql::process_command(sql, &mut self.db)
     }
 
     /// Prepares a statement for repeated execution or row iteration.
-    /// The SQL is parsed once and validated; the resulting
-    /// [`Statement`] can be executed multiple times. Today this is
-    /// primarily useful for SELECT (to reach the typed-row API);
-    /// parameter binding and prepared-plan caching are future work.
+    /// SQLR-23: the SQL is parsed once at prepare time (sqlparser walk
+    /// plus placeholder rewriting), and the resulting AST is cached
+    /// on the [`Statement`] for re-execution without further parsing.
+    ///
+    /// Use [`Statement::query`] / [`Statement::run`] for unbound
+    /// execution, or [`Statement::query_with_params`] /
+    /// [`Statement::execute_with_params`] to substitute `?`
+    /// placeholders.
     pub fn prepare<'c>(&'c mut self, sql: &str) -> Result<Statement<'c>> {
-        Statement::new(self, sql)
+        let plan = Arc::new(CachedPlan::compile(sql)?);
+        Ok(Statement { conn: self, plan })
+    }
+
+    /// Same as [`Connection::prepare`], but consults a small
+    /// per-connection LRU first. SQLR-23 — for hot statements
+    /// (the body of an INSERT loop, a frequently-rerun lookup) the
+    /// sqlparser walk is amortized to once across the connection's
+    /// lifetime, not once per `prepare()`.
+    ///
+    /// Default cache capacity is 16; tune with
+    /// [`Connection::set_prepared_cache_capacity`].
+    pub fn prepare_cached<'c>(&'c mut self, sql: &str) -> Result<Statement<'c>> {
+        // Lookup-or-insert. Found entries are also moved to the back
+        // (most-recently-used) so capacity-eviction runs LRU.
+        let plan = if let Some(pos) = self.prep_cache.iter().position(|(k, _)| k == sql) {
+            let (k, v) = self.prep_cache.remove(pos).unwrap();
+            self.prep_cache.push_back((k, Arc::clone(&v)));
+            v
+        } else {
+            let plan = Arc::new(CachedPlan::compile(sql)?);
+            self.prep_cache
+                .push_back((sql.to_string(), Arc::clone(&plan)));
+            while self.prep_cache.len() > self.prep_cache_cap {
+                self.prep_cache.pop_front();
+            }
+            plan
+        };
+        Ok(Statement { conn: self, plan })
+    }
+
+    /// SQLR-23 — sets the maximum number of cached prepared plans
+    /// (matches `prepare_cached`'s default 16). Reducing below the
+    /// current size evicts the oldest entries; setting to 0 disables
+    /// caching but `prepare_cached` still works (it just always
+    /// re-parses).
+    pub fn set_prepared_cache_capacity(&mut self, cap: usize) {
+        self.prep_cache_cap = cap;
+        while self.prep_cache.len() > cap {
+            self.prep_cache.pop_front();
+        }
+    }
+
+    /// SQLR-23 — current number of plans held by the prepared-statement
+    /// cache. Useful for tests / introspection; not load-bearing for
+    /// the public API.
+    pub fn prepared_cache_len(&self) -> usize {
+        self.prep_cache.len()
     }
 
     /// Returns `true` while a `BEGIN … COMMIT/ROLLBACK` block is open
@@ -203,45 +291,38 @@ impl std::fmt::Debug for Connection {
             .field("in_transaction", &self.db.in_transaction())
             .field("read_only", &self.db.is_read_only())
             .field("tables", &self.db.tables.len())
+            .field("prep_cache_len", &self.prep_cache.len())
             .finish()
     }
 }
 
-/// A prepared statement bound to a specific connection lifetime.
-/// Today this is a thin wrapper around the raw SQL; Phase 5's cursor
-/// work will grow it into a real prepared-plan cache.
-pub struct Statement<'c> {
-    conn: &'c mut Connection,
+/// SQLR-23 — the parse-once-execute-many representation. Built by
+/// `CachedPlan::compile` (sqlparser walk + placeholder rewriting +
+/// SELECT narrowing) and shared between every `Statement` that hits
+/// the same SQL string in `prepare_cached`.
+#[derive(Debug)]
+struct CachedPlan {
+    /// Original SQL — kept for diagnostic output.
+    #[allow(dead_code)]
     sql: String,
-    kind: StatementKind,
+    /// AST after `?` → `?N` placeholder rewriting. Cloned per execute
+    /// so the substitution pass leaves the cached copy intact.
+    ast: AstStatement,
+    /// Total `?` placeholder count in the source SQL. Strict bind
+    /// validation in `query_with_params` / `execute_with_params`
+    /// uses this.
+    param_count: usize,
+    /// SELECT narrowing — cached so `query()` doesn't redo the
+    /// `SelectQuery::new` walk for unbound SELECTs. `None` for
+    /// non-SELECT statements.
+    select: Option<SelectQuery>,
 }
 
-enum StatementKind {
-    Select(SelectQuery),
-    Other,
-}
-
-impl std::fmt::Debug for Statement<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Statement")
-            .field("sql", &self.sql)
-            .field(
-                "kind",
-                &match self.kind {
-                    StatementKind::Select(_) => "Select",
-                    StatementKind::Other => "Other",
-                },
-            )
-            .finish()
-    }
-}
-
-impl<'c> Statement<'c> {
-    fn new(conn: &'c mut Connection, sql: &str) -> Result<Self> {
-        // Parse once at prepare time so syntax errors surface early.
+impl CachedPlan {
+    fn compile(sql: &str) -> Result<Self> {
         let dialect = SQLiteDialect {};
         let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
-        let Some(stmt) = ast.pop() else {
+        let Some(mut stmt) = ast.pop() else {
             return Err(SQLRiteError::General("no statement to prepare".to_string()));
         };
         if !ast.is_empty() {
@@ -249,54 +330,173 @@ impl<'c> Statement<'c> {
                 "prepare() accepts a single statement; found more than one".to_string(),
             ));
         }
-        let kind = match &stmt {
-            sqlparser::ast::Statement::Query(_) => StatementKind::Select(SelectQuery::new(&stmt)?),
-            _ => StatementKind::Other,
+        let param_count = rewrite_placeholders(&mut stmt);
+        let select = match &stmt {
+            AstStatement::Query(_) => Some(SelectQuery::new(&stmt)?),
+            _ => None,
         };
         Ok(Self {
-            conn,
             sql: sql.to_string(),
-            kind,
+            ast: stmt,
+            param_count,
+            select,
         })
+    }
+}
+
+/// A prepared statement bound to a specific connection lifetime.
+///
+/// SQLR-23 — `Statement` carries the parsed AST (parsed exactly once
+/// at prepare time), not just the raw SQL. `query` / `run` execute
+/// against the cached AST; `query_with_params` / `execute_with_params`
+/// clone the AST and substitute `?` placeholders before dispatch.
+pub struct Statement<'c> {
+    conn: &'c mut Connection,
+    plan: Arc<CachedPlan>,
+}
+
+impl std::fmt::Debug for Statement<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statement")
+            .field("sql", &self.plan.sql)
+            .field("param_count", &self.plan.param_count)
+            .field(
+                "kind",
+                &match self.plan.select {
+                    Some(_) => "Select",
+                    None => "Other",
+                },
+            )
+            .finish()
+    }
+}
+
+impl<'c> Statement<'c> {
+    /// Number of `?` placeholders detected in the source SQL. Strict
+    /// arity validation: passing a slice of a different length to
+    /// `query_with_params` / `execute_with_params` returns a typed
+    /// error.
+    pub fn parameter_count(&self) -> usize {
+        self.plan.param_count
     }
 
     /// Executes a prepared non-query statement. Equivalent to
     /// [`Connection::execute`] — included for parity with the
-    /// typed-row `query()` so callers who want `Statement::run` / `Statement::query`
-    /// symmetry get it.
+    /// typed-row `query()` so callers who want `Statement::run` /
+    /// `Statement::query` symmetry get it.
+    ///
+    /// Errors if the prepared SQL contains `?` placeholders — use
+    /// [`Statement::execute_with_params`] for those.
     pub fn run(&mut self) -> Result<String> {
-        self.conn.execute(&self.sql)
+        if self.plan.param_count > 0 {
+            return Err(SQLRiteError::General(format!(
+                "statement has {} `?` placeholder(s); call execute_with_params()",
+                self.plan.param_count
+            )));
+        }
+        let ast = self.plan.ast.clone();
+        process_ast_with_render(ast, &mut self.conn.db).map(|o| o.status)
+    }
+
+    /// SQLR-23 — executes a prepared non-SELECT statement after binding
+    /// `?` placeholders to `params` (positional, in source order).
+    ///
+    /// Use this for parameterized INSERT / UPDATE / DELETE — the
+    /// substitution clones the cached AST, fills in the `?` slots
+    /// from `params`, and dispatches without re-running sqlparser.
+    /// For SELECT, prefer [`Statement::query_with_params`].
+    pub fn execute_with_params(&mut self, params: &[Value]) -> Result<String> {
+        self.check_arity(params)?;
+        let mut ast = self.plan.ast.clone();
+        if !params.is_empty() {
+            substitute_params(&mut ast, params)?;
+        }
+        process_ast_with_render(ast, &mut self.conn.db).map(|o| o.status)
     }
 
     /// Runs a SELECT and returns a [`Rows`] iterator over typed rows.
     /// Errors if the prepared statement isn't a SELECT.
+    ///
+    /// SQLR-23 — uses the SELECT narrowing cached at prepare time;
+    /// no per-call sqlparser walk. Errors if the prepared SQL
+    /// contains `?` placeholders — use [`Statement::query_with_params`]
+    /// for those.
     pub fn query(&self) -> Result<Rows> {
-        match &self.kind {
-            StatementKind::Select(sq) => {
-                let result = execute_select_rows(sq.clone(), &self.conn.db)?;
-                Ok(Rows {
-                    columns: result.columns,
-                    rows: result.rows.into_iter(),
-                })
-            }
-            StatementKind::Other => Err(SQLRiteError::General(
-                "query() only works on SELECT statements; use run() for DDL/DML".to_string(),
-            )),
+        if self.plan.param_count > 0 {
+            return Err(SQLRiteError::General(format!(
+                "statement has {} `?` placeholder(s); call query_with_params()",
+                self.plan.param_count
+            )));
         }
+        let Some(sq) = self.plan.select.as_ref() else {
+            return Err(SQLRiteError::General(
+                "query() only works on SELECT statements; use run() for DDL/DML".to_string(),
+            ));
+        };
+        let result = execute_select_rows(sq.clone(), &self.conn.db)?;
+        Ok(Rows {
+            columns: result.columns,
+            rows: result.rows.into_iter(),
+        })
+    }
+
+    /// SQLR-23 — runs a SELECT and returns a [`Rows`] iterator after
+    /// binding `?` placeholders to `params`. Positional, source-order
+    /// indexing — `params[0]` is `?1`, `params[1]` is `?2`, etc.
+    ///
+    /// Vector parameters (`Value::Vector(...)`) substitute as the
+    /// in-band bracket-array shape the executor recognizes, so a
+    /// bound query vector still triggers the HNSW probe optimizer
+    /// (Phase 7d.2 KNN shortcut).
+    pub fn query_with_params(&self, params: &[Value]) -> Result<Rows> {
+        self.check_arity(params)?;
+        if self.plan.select.is_none() {
+            return Err(SQLRiteError::General(
+                "query_with_params() only works on SELECT statements; use execute_with_params() \
+                 for DDL/DML"
+                    .to_string(),
+            ));
+        }
+        // Re-narrow against the substituted AST. The narrow walk is
+        // cheap (it pulls projection/WHERE/ORDER BY into typed
+        // structs), and rerunning it ensures the substituted literals
+        // (e.g. a bracket-array vector) flow through `SelectQuery`.
+        let mut ast = self.plan.ast.clone();
+        if !params.is_empty() {
+            substitute_params(&mut ast, params)?;
+        }
+        let sq = SelectQuery::new(&ast)?;
+        let result = execute_select_rows(sq, &self.conn.db)?;
+        Ok(Rows {
+            columns: result.columns,
+            rows: result.rows.into_iter(),
+        })
+    }
+
+    fn check_arity(&self, params: &[Value]) -> Result<()> {
+        if params.len() != self.plan.param_count {
+            return Err(SQLRiteError::General(format!(
+                "expected {} parameter{}, got {}",
+                self.plan.param_count,
+                if self.plan.param_count == 1 { "" } else { "s" },
+                params.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Column names this statement will produce, in projection order.
     /// `None` for non-SELECT statements.
     pub fn column_names(&self) -> Option<Vec<String>> {
-        match &self.kind {
-            StatementKind::Select(_) => {
+        match &self.plan.select {
+            Some(_) => {
                 // We can't know the concrete column list without
                 // running the query (it depends on the table schema
                 // and the projection). Callers who need it up front
                 // should call query() and inspect Rows::columns.
                 None
             }
-            StatementKind::Other => None,
+            None => None,
         }
     }
 }
@@ -700,5 +900,241 @@ mod tests {
         let row = rows.next().unwrap().unwrap();
         let err = row.get::<i64>(99).unwrap_err();
         assert!(format!("{err}").contains("out of bounds"));
+    }
+
+    // -----------------------------------------------------------------
+    // SQLR-23 — prepared-statement plan cache + parameter binding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parameter_count_reflects_question_marks() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        let stmt = conn.prepare("SELECT a, b FROM t WHERE a = ?").unwrap();
+        assert_eq!(stmt.parameter_count(), 1);
+        let stmt = conn
+            .prepare("SELECT a, b FROM t WHERE a = ? AND b = ?")
+            .unwrap();
+        assert_eq!(stmt.parameter_count(), 2);
+        let stmt = conn.prepare("SELECT a FROM t").unwrap();
+        assert_eq!(stmt.parameter_count(), 0);
+    }
+
+    #[test]
+    fn query_with_params_binds_scalars() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (1, 'alice');")
+            .unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (2, 'bob');")
+            .unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (3, 'carol');")
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT b FROM t WHERE a = ?").unwrap();
+        let rows = stmt
+            .query_with_params(&[Value::Integer(2)])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String>(0).unwrap(), "bob");
+    }
+
+    #[test]
+    fn execute_with_params_binds_insert_values() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+
+        let mut stmt = conn.prepare("INSERT INTO t (a, b) VALUES (?, ?)").unwrap();
+        stmt.execute_with_params(&[Value::Integer(7), Value::Text("hi".into())])
+            .unwrap();
+        stmt.execute_with_params(&[Value::Integer(8), Value::Text("yo".into())])
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT a, b FROM t").unwrap();
+        let rows = stmt.query().unwrap().collect_all().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r.get::<i64>(0).unwrap() == 7 && r.get::<String>(1).unwrap() == "hi")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.get::<i64>(0).unwrap() == 8 && r.get::<String>(1).unwrap() == "yo")
+        );
+    }
+
+    #[test]
+    fn arity_mismatch_returns_clean_error() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        let stmt = conn
+            .prepare("SELECT * FROM t WHERE a = ? AND b = ?")
+            .unwrap();
+        let err = stmt.query_with_params(&[Value::Integer(1)]).unwrap_err();
+        assert!(format!("{err}").contains("expected 2 parameter"));
+    }
+
+    #[test]
+    fn run_and_query_reject_when_placeholders_present() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut stmt_select = conn.prepare("SELECT a FROM t WHERE a = ?").unwrap();
+        let err = stmt_select.query().unwrap_err();
+        assert!(format!("{err}").contains("query_with_params"));
+        let err = stmt_select.run().unwrap_err();
+        assert!(format!("{err}").contains("execute_with_params"));
+    }
+
+    #[test]
+    fn null_param_compares_against_null() {
+        // a = NULL is *false* in SQL three-valued logic; binding NULL
+        // must match SQLite's behavior so callers can rely on the same
+        // semantics.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t (a) VALUES (1);").unwrap();
+        let stmt = conn.prepare("SELECT a FROM t WHERE a = ?").unwrap();
+        let rows = stmt
+            .query_with_params(&[Value::Null])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn vector_param_substitutes_through_select() {
+        // Non-HNSW path: a small VECTOR table + brute-force ORDER BY
+        // exercises the substitution into the ORDER BY expression
+        // and the bracket-array shape eval_expr_scope expects.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(3));")
+            .unwrap();
+        conn.execute("INSERT INTO v (id, e) VALUES (1, [1.0, 0.0, 0.0]);")
+            .unwrap();
+        conn.execute("INSERT INTO v (id, e) VALUES (2, [0.0, 1.0, 0.0]);")
+            .unwrap();
+        conn.execute("INSERT INTO v (id, e) VALUES (3, [0.0, 0.0, 1.0]);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT id FROM v ORDER BY vec_distance_l2(e, ?) ASC LIMIT 1")
+            .unwrap();
+        let rows = stmt
+            .query_with_params(&[Value::Vector(vec![1.0, 0.0, 0.0])])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn prepare_cached_reuses_plans() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        for n in 1..=3 {
+            conn.execute(&format!("INSERT INTO t (a) VALUES ({n});"))
+                .unwrap();
+        }
+
+        // First call populates the cache; second hits the same entry.
+        let _ = conn.prepare_cached("SELECT a FROM t WHERE a = ?").unwrap();
+        let _ = conn.prepare_cached("SELECT a FROM t WHERE a = ?").unwrap();
+        assert_eq!(conn.prepared_cache_len(), 1);
+
+        // Distinct SQL widens the cache.
+        let _ = conn.prepare_cached("SELECT a FROM t").unwrap();
+        assert_eq!(conn.prepared_cache_len(), 2);
+    }
+
+    #[test]
+    fn prepare_cached_evicts_when_over_capacity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.set_prepared_cache_capacity(2);
+        let _ = conn.prepare_cached("SELECT a FROM t").unwrap();
+        let _ = conn.prepare_cached("SELECT a FROM t WHERE a = ?").unwrap();
+        assert_eq!(conn.prepared_cache_len(), 2);
+        // Third distinct SQL evicts the oldest entry (the FROM-only SELECT).
+        let _ = conn.prepare_cached("SELECT a FROM t WHERE a > ?").unwrap();
+        assert_eq!(conn.prepared_cache_len(), 2);
+    }
+
+    /// SQLR-23 — the headline VECTOR-binding case. With an HNSW index
+    /// attached, the optimizer hook recognizes
+    /// `ORDER BY vec_distance_l2(col, ?) LIMIT k` even when the second
+    /// arg is a bound parameter, because substitution lowers
+    /// `Value::Vector` into the same bracket-array shape an inline
+    /// `[…]` literal produces. Self-query: querying for one of the
+    /// corpus's own vectors must return that vector as the nearest.
+    #[test]
+    fn vector_bind_through_hnsw_optimizer() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(4));")
+            .unwrap();
+        let corpus: [(i64, [f32; 4]); 5] = [
+            (1, [1.0, 0.0, 0.0, 0.0]),
+            (2, [0.0, 1.0, 0.0, 0.0]),
+            (3, [0.0, 0.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 0.0, 1.0]),
+            (5, [0.5, 0.5, 0.5, 0.5]),
+        ];
+        for (id, vec) in corpus {
+            conn.execute(&format!(
+                "INSERT INTO v (id, e) VALUES ({id}, [{}, {}, {}, {}]);",
+                vec[0], vec[1], vec[2], vec[3]
+            ))
+            .unwrap();
+        }
+        conn.execute("CREATE INDEX v_hnsw ON v USING hnsw (e);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT id FROM v ORDER BY vec_distance_l2(e, ?) ASC LIMIT 1")
+            .unwrap();
+        // Query with id=3's vector — expect id=3 back.
+        let rows = stmt
+            .query_with_params(&[Value::Vector(vec![0.0, 0.0, 1.0, 0.0])])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 3);
+
+        // Query with id=1's vector — expect id=1.
+        let rows = stmt
+            .query_with_params(&[Value::Vector(vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn prepare_cached_executes_the_same_as_prepare() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);")
+            .unwrap();
+        let mut ins = conn
+            .prepare_cached("INSERT INTO t (a, b) VALUES (?, ?)")
+            .unwrap();
+        ins.execute_with_params(&[Value::Integer(1), Value::Text("alpha".into())])
+            .unwrap();
+        ins.execute_with_params(&[Value::Integer(2), Value::Text("beta".into())])
+            .unwrap();
+
+        let stmt = conn.prepare_cached("SELECT b FROM t WHERE a = ?").unwrap();
+        let rows = stmt
+            .query_with_params(&[Value::Integer(2)])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String>(0).unwrap(), "beta");
     }
 }

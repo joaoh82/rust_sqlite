@@ -41,18 +41,27 @@ pub mod workloads;
 
 /// Driver-side value type. Tight enough that any of the engines under
 /// test can map it onto their native bind types — rusqlite has
-/// [`rusqlite::ToSql`], DuckDB has its own; SQLRite has no parameter
-/// binding yet so the SQLRite driver inlines via SQL formatting.
+/// [`rusqlite::ToSql`], DuckDB has its own. SQLRite gained parameter
+/// binding in SQLR-23 (incl. `Value::Vector` for HNSW-eligible KNN
+/// queries), so the SQLRite driver now binds through
+/// `Statement::query_with_params` / `Statement::execute_with_params`
+/// instead of formatting a SQL string per call.
 ///
-/// Deliberately doesn't carry every type the engines support
-/// (booleans, vectors, JSON, blobs); workload inputs only need these
-/// four. New variants land alongside the workload that needs them.
+/// `Vector` is SQLRite-only: SQLite-side drivers raise a clean error
+/// rather than silently lying about the type, since the W10/W12
+/// workloads that exercise it are explicitly SQLRite-only via
+/// `driver_supports`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Integer(i64),
     Real(f64),
     Text(String),
+    /// Dense f32 query vector — bound directly into VECTOR columns
+    /// or distance-function args. SQLRite-only; comparator drivers
+    /// surface a typed error if a workload tries to bind a vector
+    /// against them.
+    Vector(Vec<f32>),
 }
 
 /// Engine-agnostic surface every workload binds to.

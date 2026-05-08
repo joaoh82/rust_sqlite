@@ -29,7 +29,7 @@ use crate::{Driver, WorkloadId};
 pub const W8: WorkloadId = WorkloadId {
     id: "W8",
     name: "group-by",
-    version: "v1",
+    version: "v2",
 };
 
 /// Cardinality buckets. `(label, group-key column, expected group count)`.

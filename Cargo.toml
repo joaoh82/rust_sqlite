@@ -101,7 +101,10 @@ file-locks = ["dep:fs2"]
 [dependencies]
 # Always-on engine deps — pure-Rust and wasm-compatible.
 log = "0.4"
-sqlparser = "0.61"
+# SQLR-23: the `visitor` feature unlocks `visit_expressions_mut`, which
+# we use for the prepared-statement `?` placeholder rewrite + bind
+# substitution pass in `src/sql/params.rs`.
+sqlparser = { version = "0.61", features = ["visitor"] }
 thiserror = "2.0"
 prettytable-rs = "0.10"
 # Phase 7e: JSON column type. `serde_json` powers both the validation

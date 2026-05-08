@@ -40,16 +40,29 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::data::{
-    FTS_ROW_COUNT, FtsDataset, VectorDataset, fts_dataset, vec_to_sql_literal, vector_dataset,
-};
+use crate::data::{FTS_ROW_COUNT, FtsDataset, VectorDataset, fts_dataset, vector_dataset};
 use crate::{Driver, Value, WorkloadId};
 
+/// SQLR-23 — bumped to v2 because the hybrid SQL is now fully
+/// parameterized (FTS query string twice + query vector once) instead
+/// of formatted into the SQL string per call. The static template
+/// hits the prepared-plan cache.
 pub const W12: WorkloadId = WorkloadId {
     id: "W12",
     name: "hybrid",
-    version: "v1",
+    version: "v2",
 };
+
+/// Hot-loop SQL for the hybrid query — three `?` placeholders:
+/// `?1` and `?2` are the FTS query string (used for both filter and
+/// ranker), `?3` is the cosine query vector. Static across iterations.
+pub const SELECT_SQL: &str = "SELECT id FROM docs \
+     WHERE fts_match(body, ?) \
+     ORDER BY 0.5 * (1.0 - bm25_score(body, ?) / 10.0) + 0.5 * vec_distance_cosine(embedding, ?) \
+     ASC LIMIT 10";
+
+/// Insert SQL for the seed pass — id, body, embedding all bound.
+pub const INSERT_SQL: &str = "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)";
 
 pub struct HybridDataset {
     pub fts: FtsDataset,
@@ -75,15 +88,19 @@ pub fn bench_iter<D: Driver>(
     text_query: &str,
     vec_query: &[f32],
 ) -> Result<usize> {
-    let lit = vec_to_sql_literal(vec_query);
-    let q = escape_sql(text_query);
-    let sql = format!(
-        "SELECT id FROM docs \
-         WHERE fts_match(body, '{q}') \
-         ORDER BY 0.5 * (1.0 - bm25_score(body, '{q}') / 10.0) + 0.5 * vec_distance_cosine(embedding, {lit}) \
-         ASC LIMIT 10"
-    );
-    let rows = driver.query_all(conn, &sql, &[])?;
+    // SQLR-23 — every component bound through `?`. The SQL template is
+    // identical across the 64 random query pairs, so the
+    // prepare_cached LRU keeps a single plan hot for the entire bench
+    // loop.
+    let rows = driver.query_all(
+        conn,
+        SELECT_SQL,
+        &[
+            Value::Text(text_query.to_string()),
+            Value::Text(text_query.to_string()),
+            Value::Vector(vec_query.to_vec()),
+        ],
+    )?;
     Ok(rows.len())
 }
 
@@ -125,21 +142,21 @@ fn insert_rows<D: Driver>(
     driver.execute(conn, "BEGIN").context("W12 BEGIN")?;
     for (f, v) in fts.rows.iter().zip(vec.rows.iter()) {
         debug_assert_eq!(f.id, v.id);
-        let lit = vec_to_sql_literal(&v.embedding);
-        let sql = format!("INSERT INTO docs (id, body, embedding) VALUES (?, ?, {lit})");
+        // SQLR-23 — id / body / embedding all bound. Same plan is
+        // cached and reused across every row of the seed pass.
         driver
             .execute_with_params(
                 conn,
-                &sql,
-                &[Value::Integer(f.id), Value::Text(f.body.clone())],
+                INSERT_SQL,
+                &[
+                    Value::Integer(f.id),
+                    Value::Text(f.body.clone()),
+                    Value::Vector(v.embedding.clone()),
+                ],
             )
             .with_context(|| format!("W12 INSERT id={}", f.id))?;
     }
     driver.execute(conn, "COMMIT").context("W12 COMMIT")?;
     debug_assert_eq!(fts.rows.len(), FTS_ROW_COUNT);
     Ok(())
-}
-
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
 }

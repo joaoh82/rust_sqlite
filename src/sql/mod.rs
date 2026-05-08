@@ -4,6 +4,7 @@ pub mod executor;
 pub mod fts;
 pub mod hnsw;
 pub mod pager;
+pub mod params;
 pub mod parser;
 // pub mod tokenizer;
 
@@ -87,8 +88,6 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 /// from the returned struct.
 pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<CommandOutput> {
     let dialect = SQLiteDialect {};
-    let message: String;
-    let mut rendered: Option<String> = None;
     let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 
     if ast.len() > 1 {
@@ -107,6 +106,16 @@ pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<Com
             rendered: None,
         });
     };
+    process_ast_with_render(query, db)
+}
+
+/// Same as [`process_command_with_render`] but takes a pre-parsed
+/// [`Statement`]. SQLR-23 — `Statement` / `Connection::prepare_cached`
+/// dispatch through this entry point so they pay the sqlparser cost
+/// once at prepare time, not per execute.
+pub fn process_ast_with_render(query: Statement, db: &mut Database) -> Result<CommandOutput> {
+    let message: String;
+    let mut rendered: Option<String> = None;
 
     // Transaction boundary statements are routed to Database-level
     // handlers before we even inspect the rest of the AST. They don't

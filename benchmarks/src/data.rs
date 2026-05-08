@@ -404,6 +404,11 @@ fn gen_vector(seed: u64, dim: usize) -> Vec<f32> {
 
 /// Render a `&[f32]` as the bracket-array literal SQLRite + the
 /// `[f32; 4]` example use: `[0.123, -0.456, …]`.
+///
+/// SQLR-23 — no longer used by W10/W12 (those bind via
+/// [`crate::Value::Vector`]); kept as a public helper for any future
+/// workload that needs a SQL-string vector literal.
+#[allow(dead_code)]
 pub fn vec_to_sql_literal(v: &[f32]) -> String {
     let mut s = String::with_capacity(v.len() * 12 + 2);
     s.push('[');

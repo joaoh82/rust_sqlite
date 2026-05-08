@@ -18,7 +18,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W7: WorkloadId = WorkloadId {
     id: "W7",
     name: "aggregate-sum",
-    version: "v1",
+    version: "v2",
 };
 
 pub const SELECT_SQL: &str = "SELECT SUM(v) FROM big";
