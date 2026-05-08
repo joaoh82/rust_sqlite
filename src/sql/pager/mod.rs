@@ -59,13 +59,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use sqlparser::dialect::SQLiteDialect;
+use crate::sql::dialect::SqlriteDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::db::table::{Column, DataType, Row, Table, Value};
+use crate::sql::hnsw::DistanceMetric;
 use crate::sql::pager::cell::Cell;
 use crate::sql::pager::header::DbHeader;
 use crate::sql::pager::index_cell::IndexCell;
@@ -403,9 +404,11 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
         master_rows.push(CatalogEntry {
             kind: "index".into(),
             name: entry.name.clone(),
-            sql: format!(
-                "CREATE INDEX {} ON {} USING hnsw ({})",
-                entry.name, table.tb_name, entry.column_name
+            sql: synthesize_hnsw_create_index_sql(
+                &entry.name,
+                &table.tb_name,
+                &entry.column_name,
+                entry.metric,
             ),
             rootpage,
             last_rowid: 0,
@@ -648,7 +651,7 @@ fn render_default_literal(value: &Value) -> String {
 /// Reverses `table_to_create_sql`: feeds the SQL back through `sqlparser`
 /// and produces our internal column list. Returns `(table_name, columns)`.
 fn parse_create_sql(sql: &str) -> Result<(String, Vec<Column>)> {
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
     let stmt = ast.pop().ok_or_else(|| {
         SQLRiteError::Internal("sqlrite_master row held an empty SQL string".to_string())
@@ -869,7 +872,7 @@ fn load_index_rows(pager: &Pager, idx: &mut SecondaryIndex, root_page: u32) -> R
 fn parse_create_index_sql(sql: &str) -> Result<(String, String, bool)> {
     use sqlparser::ast::{CreateIndex, Expr, Statement};
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
     let Some(Statement::CreateIndex(CreateIndex {
         table_name,
@@ -909,7 +912,7 @@ fn parse_create_index_sql(sql: &str) -> Result<(String, String, bool)> {
 fn create_index_sql_uses_hnsw(sql: &str) -> bool {
     use sqlparser::ast::{CreateIndex, IndexType, Statement};
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let Ok(mut ast) = Parser::parse_sql(&dialect, sql) else {
         return false;
     };
@@ -924,7 +927,7 @@ fn create_index_sql_uses_hnsw(sql: &str) -> bool {
 fn create_index_sql_uses_fts(sql: &str) -> bool {
     use sqlparser::ast::{CreateIndex, IndexType, Statement};
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let Ok(mut ast) = Parser::parse_sql(&dialect, sql) else {
         return false;
     };
@@ -952,7 +955,7 @@ fn rebuild_fts_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) ->
     use crate::sql::fts::PostingList;
     use sqlparser::ast::Statement;
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, &row.sql).map_err(SQLRiteError::from)?;
     let Some(stmt @ Statement::CreateIndex(_)) = ast.pop() else {
         return Err(SQLRiteError::Internal(format!(
@@ -990,7 +993,7 @@ fn rebuild_fts_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) ->
 fn parse_fts_create_index_sql(sql: &str) -> Result<(String, String)> {
     use sqlparser::ast::{CreateIndex, Expr, Statement};
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
     let Some(Statement::CreateIndex(CreateIndex {
         table_name,
@@ -1036,10 +1039,10 @@ fn parse_fts_create_index_sql(sql: &str) -> Result<(String, String)> {
 fn rebuild_hnsw_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) -> Result<()> {
     use crate::sql::db::table::HnswIndexEntry;
     use crate::sql::executor::execute_create_index;
-    use crate::sql::hnsw::{DistanceMetric, HnswIndex};
+    use crate::sql::hnsw::HnswIndex;
     use sqlparser::ast::Statement;
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, &row.sql).map_err(SQLRiteError::from)?;
     let Some(stmt @ Statement::CreateIndex(_)) = ast.pop() else {
         return Err(SQLRiteError::Internal(format!(
@@ -1054,13 +1057,16 @@ fn rebuild_hnsw_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) -
         return Ok(());
     }
 
-    // Persistence path — read the cell tree, deserialize.
+    // Persistence path — read the cell tree, deserialize. The metric
+    // travels through the synthesized CREATE INDEX SQL stored in
+    // `sqlrite_master`; pre-SQLR-28 rows omit the WITH clause and
+    // decode as L2, which matches what those graphs were built with.
+    let (tbl_name, col_name, metric) = parse_hnsw_create_index_sql(&row.sql)?;
     let nodes = load_hnsw_nodes(pager, row.rootpage)?;
-    let index = HnswIndex::from_persisted_nodes(DistanceMetric::L2, 0xC0FFEE, nodes);
+    let index = HnswIndex::from_persisted_nodes(metric, 0xC0FFEE, nodes);
 
     // Parse the CREATE INDEX to know which table + column to attach to
     // — same shape as the row-walk path; we just don't execute it.
-    let (tbl_name, col_name) = parse_hnsw_create_index_sql(&row.sql)?;
     let table_mut = db.get_table_mut(tbl_name.clone()).map_err(|_| {
         SQLRiteError::Internal(format!(
             "HNSW index '{}' references unknown table '{tbl_name}'",
@@ -1070,6 +1076,7 @@ fn rebuild_hnsw_index(db: &mut Database, pager: &Pager, row: &IndexCatalogRow) -
     table_mut.hnsw_indexes.push(HnswIndexEntry {
         name: row.name.clone(),
         column_name: col_name,
+        metric,
         index,
         needs_rebuild: false,
     });
@@ -1112,19 +1119,22 @@ fn load_hnsw_nodes(pager: &Pager, root_page: u32) -> Result<Vec<(i64, Vec<Vec<i6
     Ok(nodes)
 }
 
-/// Pulls (table_name, column_name) out of a `CREATE INDEX … USING hnsw (col)`
-/// SQL string. Used by the persistence path on open to know where to
-/// attach the loaded graph. Same shape as `parse_create_index_sql` for
-/// regular indexes — only the assertion differs (we don't care about
-/// UNIQUE for HNSW).
-fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String)> {
-    use sqlparser::ast::{CreateIndex, Expr, Statement};
+/// Pulls `(table_name, column_name, metric)` out of a CREATE INDEX
+/// SQL string of the form `CREATE INDEX … USING hnsw (col) [WITH
+/// (metric = '<m>')]`. Used by the persistence path on open to know
+/// where to attach the loaded graph and which distance metric to
+/// rebuild it under. Pre-SQLR-28 rows omit the WITH clause and
+/// default to L2.
+fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String, DistanceMetric)> {
+    use crate::sql::hnsw::DistanceMetric;
+    use sqlparser::ast::{BinaryOperator, CreateIndex, Expr, Statement, Value as AstValue};
 
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
     let Some(Statement::CreateIndex(CreateIndex {
         table_name,
         columns,
+        with,
         ..
     })) = ast.pop()
     else {
@@ -1148,7 +1158,34 @@ fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String)> {
             )));
         }
     };
-    Ok((table_name.to_string(), col))
+
+    // Pull the metric off the parsed WITH (...) bag. The user-facing
+    // CREATE INDEX path validates this in detail (typo'd metric names,
+    // unknown keys, etc.); here on the persistence read-path we trust
+    // what we previously wrote and surface a clean Internal error if
+    // it ever doesn't match.
+    let mut metric = DistanceMetric::L2;
+    for opt in &with {
+        if let Expr::BinaryOp { left, op, right } = opt {
+            if matches!(op, BinaryOperator::Eq) {
+                if let (Expr::Identifier(key), Expr::Value(v)) = (left.as_ref(), right.as_ref())
+                    && key.value.eq_ignore_ascii_case("metric")
+                {
+                    if let AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s) =
+                        &v.value
+                    {
+                        metric = DistanceMetric::from_sql_name(s).ok_or_else(|| {
+                            SQLRiteError::Internal(format!(
+                                "sqlrite_master HNSW row carries unknown metric '{s}'"
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((table_name.to_string(), col, metric))
 }
 
 /// Phase 7d.3 — rebuilds in-place any HnswIndexEntry whose
@@ -1163,23 +1200,25 @@ fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String)> {
 /// MVP, more sophisticated incremental delete strategies (soft-delete
 /// + tombstones, neighbor reconnection) are future polish.
 fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
-    use crate::sql::hnsw::{DistanceMetric, HnswIndex};
+    use crate::sql::hnsw::HnswIndex;
 
     for table in db.tables.values_mut() {
-        // Snapshot which (index_name, column) pairs need rebuilding,
-        // before we go grabbing column data — keeps the borrow
-        // structure simple.
-        let dirty: Vec<(String, String)> = table
+        // Snapshot which (index_name, column, metric) triples need
+        // rebuilding, before we go grabbing column data — keeps the
+        // borrow structure simple. The per-entry metric matters here:
+        // rebuilding a cosine-built graph as L2 (or vice versa) would
+        // silently corrupt the topology and break the SQLR-28 probe.
+        let dirty: Vec<(String, String, DistanceMetric)> = table
             .hnsw_indexes
             .iter()
             .filter(|e| e.needs_rebuild)
-            .map(|e| (e.name.clone(), e.column_name.clone()))
+            .map(|e| (e.name.clone(), e.column_name.clone(), e.metric))
             .collect();
         if dirty.is_empty() {
             continue;
         }
 
-        for (idx_name, col_name) in dirty {
+        for (idx_name, col_name, metric) in dirty {
             // Snapshot every (rowid, vec) for this column.
             let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
             {
@@ -1195,7 +1234,7 @@ fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
             let snapshot: std::collections::HashMap<i64, Vec<f32>> =
                 vectors.iter().cloned().collect();
 
-            let mut new_idx = HnswIndex::new(DistanceMetric::L2, 0xC0FFEE);
+            let mut new_idx = HnswIndex::new(metric, 0xC0FFEE);
             // Sort by id so the rebuild is deterministic across runs.
             vectors.sort_by_key(|(id, _)| *id);
             for (id, v) in &vectors {
@@ -1208,6 +1247,26 @@ fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
                 entry.needs_rebuild = false;
             }
         }
+    }
+}
+
+/// Synthesises the CREATE INDEX SQL stored back into `sqlrite_master`
+/// for an HNSW index. The metric travels through the SQL via an
+/// optional `WITH (metric = '<m>')` clause; L2 indexes omit the clause
+/// for byte-identical round-trip with pre-SQLR-28 catalogs.
+fn synthesize_hnsw_create_index_sql(
+    index_name: &str,
+    table_name: &str,
+    column_name: &str,
+    metric: DistanceMetric,
+) -> String {
+    if matches!(metric, DistanceMetric::L2) {
+        format!("CREATE INDEX {index_name} ON {table_name} USING hnsw ({column_name})")
+    } else {
+        format!(
+            "CREATE INDEX {index_name} ON {table_name} USING hnsw ({column_name}) WITH (metric = '{}')",
+            metric.sql_name()
+        )
     }
 }
 
@@ -2162,6 +2221,58 @@ mod tests {
         )
         .unwrap();
         assert!(resp.contains("3 rows returned"), "got: {resp}");
+
+        cleanup(&path);
+    }
+
+    /// SQLR-28 — the HNSW metric must round-trip across save+reopen.
+    /// Without this, the SQL re-synthesised into `sqlrite_master`
+    /// would drop the metric and a cosine-built graph would reload
+    /// as L2, silently breaking subsequent cosine probes.
+    #[test]
+    fn round_trip_preserves_hnsw_cosine_metric() {
+        use crate::sql::hnsw::DistanceMetric;
+        let path = tmp_path("hnsw_metric_roundtrip");
+
+        {
+            let mut db = Database::new("test".to_string());
+            process_command(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, e VECTOR(2));",
+                &mut db,
+            )
+            .unwrap();
+            for v in &["[1.0, 0.0]", "[0.0, 1.0]", "[0.7071, 0.7071]"] {
+                process_command(&format!("INSERT INTO docs (e) VALUES ({v});"), &mut db).unwrap();
+            }
+            process_command(
+                "CREATE INDEX ix_cos ON docs USING hnsw (e) WITH (metric = 'cosine');",
+                &mut db,
+            )
+            .unwrap();
+            save_database(&mut db, &path).expect("save");
+        }
+
+        let mut loaded = open_database(&path, "test".to_string()).expect("open");
+        {
+            let table = loaded.get_table("docs".to_string()).expect("docs");
+            assert_eq!(table.hnsw_indexes.len(), 1);
+            assert_eq!(
+                table.hnsw_indexes[0].metric,
+                DistanceMetric::Cosine,
+                "metric should round-trip through CREATE INDEX SQL"
+            );
+            assert_eq!(table.hnsw_indexes[0].index.distance, DistanceMetric::Cosine);
+        }
+
+        // Cosine probe still finds the self-vector after reopen — the
+        // optimizer's metric gate should match the loaded entry's
+        // metric, so this should hit the graph shortcut.
+        let resp = process_command(
+            "SELECT id FROM docs ORDER BY vec_distance_cosine(e, [1.0, 0.0]) ASC LIMIT 1;",
+            &mut loaded,
+        )
+        .unwrap();
+        assert!(resp.contains("1 row returned"), "got: {resp}");
 
         cleanup(&path);
     }

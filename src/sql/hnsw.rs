@@ -67,6 +67,40 @@ pub enum DistanceMetric {
 }
 
 impl DistanceMetric {
+    /// Parses the metric name from the `CREATE INDEX … WITH
+    /// (metric = '<name>')` clause. Case-insensitive. Returns `None`
+    /// for unknown values; the parser surfaces that as a user-visible
+    /// error so a typo doesn't silently fall back to L2.
+    pub fn from_sql_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "l2" | "euclidean" => Some(DistanceMetric::L2),
+            "cosine" => Some(DistanceMetric::Cosine),
+            "dot" | "inner_product" | "ip" => Some(DistanceMetric::Dot),
+            _ => None,
+        }
+    }
+
+    /// The canonical SQL-surface name for this metric. Used when
+    /// synthesizing CREATE INDEX SQL back into `sqlrite_master`.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            DistanceMetric::L2 => "l2",
+            DistanceMetric::Cosine => "cosine",
+            DistanceMetric::Dot => "dot",
+        }
+    }
+
+    /// The `vec_distance_*` SQL function whose result this metric
+    /// orders by. The optimizer's HNSW shortcut only fires when the
+    /// query's ORDER BY expression names this exact function.
+    pub fn matching_distance_fn(self) -> &'static str {
+        match self {
+            DistanceMetric::L2 => "vec_distance_l2",
+            DistanceMetric::Cosine => "vec_distance_cosine",
+            DistanceMetric::Dot => "vec_distance_dot",
+        }
+    }
+
     /// Computes the configured distance between two equal-dimension
     /// vectors. Returns `f32::INFINITY` for the cosine/zero-magnitude
     /// edge case; HNSW treats infinity as "worst possible candidate" and

@@ -1,7 +1,7 @@
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::secondary_index::{IndexOrigin, SecondaryIndex};
 use crate::sql::fts::PostingList;
-use crate::sql::hnsw::HnswIndex;
+use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::create::{CreateQuery, ParsedColumn};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -150,10 +150,11 @@ pub struct Table {
     pub primary_key: String,
 }
 
-/// One HNSW index attached to a table. Phase 7d.2 only supports L2
-/// distance; cosine and dot are 7d.x follow-ups (would require either
-/// distinct USING methods like `hnsw_cosine` or a `WITH (metric = …)`
-/// clause — see `docs/phase-7-plan.md` for the deferred decision).
+/// One HNSW index attached to a table. The distance metric is fixed
+/// at CREATE INDEX time via `USING hnsw (col) WITH (metric = '<m>')`
+/// (`l2` / `cosine` / `dot`); omitting the WITH clause defaults to L2,
+/// matching the pre-SQLR-28 behaviour for round-tripping older
+/// `sqlrite_master` rows that didn't carry a metric.
 #[derive(Debug, Clone)]
 pub struct HnswIndexEntry {
     /// User-supplied name from `CREATE INDEX <name> …`. Unique across
@@ -161,6 +162,13 @@ pub struct HnswIndexEntry {
     pub name: String,
     /// The VECTOR column this index covers.
     pub column_name: String,
+    /// Distance metric the graph was built for. The optimizer's HNSW
+    /// shortcut only fires when the query's `vec_distance_*` function
+    /// matches this metric — picking a non-matching distance falls
+    /// through to brute-force, since the graph topology is metric-
+    /// specific (an L2-pruned graph isn't a valid cosine search graph
+    /// in general, and vice versa).
+    pub metric: DistanceMetric,
     /// The graph itself.
     pub index: HnswIndex,
     /// Phase 7d.3 — true iff a DELETE or UPDATE-on-vector-col has
@@ -1628,7 +1636,7 @@ pub fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::dialect::SQLiteDialect;
+    use crate::sql::dialect::SqlriteDialect;
     use sqlparser::parser::Parser;
 
     #[test]
@@ -1766,7 +1774,7 @@ mod tests {
             active BOOL,
             score REAL
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
@@ -1802,7 +1810,7 @@ mod tests {
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULl
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")

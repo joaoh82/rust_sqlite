@@ -174,11 +174,11 @@ fn format_vector_inner(v: &[f32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::dialect::SQLiteDialect;
+    use crate::sql::dialect::SqlriteDialect;
     use sqlparser::parser::Parser;
 
     fn parse_one(sql: &str) -> Statement {
-        let mut ast = Parser::parse_sql(&SQLiteDialect {}, sql).unwrap();
+        let mut ast = Parser::parse_sql(&SqlriteDialect::new(), sql).unwrap();
         ast.pop().unwrap()
     }
 

@@ -903,6 +903,7 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         unique,
         if_not_exists,
         predicate,
+        with,
         ..
     }) = stmt
     else {
@@ -953,6 +954,13 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
         }
         None => IndexMethod::Btree,
     };
+
+    // Parse `WITH (key = value, …)` options (SQLR-28). The only key
+    // recognized today is `metric` for HNSW indexes — `'l2'` /
+    // `'cosine'` / `'dot'`. The clause is rejected on non-HNSW indexes
+    // so a typo doesn't silently sit on a btree index where it can't
+    // do anything useful.
+    let hnsw_metric = parse_hnsw_with_options(with, &index_name, method)?;
 
     let table_name_str = table_name.to_string();
     let column_name = match &columns[0].column.expr {
@@ -1030,6 +1038,7 @@ pub fn execute_create_index(stmt: &Statement, db: &mut Database) -> Result<Strin
             &column_name,
             &datatype,
             *unique,
+            hnsw_metric.unwrap_or(DistanceMetric::L2),
             &existing_rowids_and_values,
         ),
         IndexMethod::Fts => create_fts_index(
@@ -1397,6 +1406,7 @@ fn create_hnsw_index(
     column_name: &str,
     datatype: &DataType,
     unique: bool,
+    metric: DistanceMetric,
     existing: &[(i64, Value)],
 ) -> Result<String> {
     // HNSW only makes sense on VECTOR columns. Reject anything else
@@ -1416,15 +1426,18 @@ fn create_hnsw_index(
         ));
     }
 
-    // Build the in-memory graph. Distance metric is L2 by default
-    // (Phase 7d.2 doesn't yet expose a knob for picking cosine/dot —
-    // see `docs/phase-7-plan.md` for the deferral).
+    // Build the in-memory graph. The distance metric was picked at
+    // CREATE INDEX time (defaults to L2 if no `WITH (metric = …)`
+    // clause was supplied). The graph topology is metric-specific —
+    // L2 neighbour pruning ≠ cosine neighbour pruning — so the
+    // optimizer's HNSW shortcut only fires when the query's
+    // `vec_distance_*` function matches this value (SQLR-28).
     //
     // Seed: hash the index name so different indexes get different
     // graph topologies, but the same index always gets the same one
     // — useful when debugging recall / index size.
     let seed = hash_str_to_seed(index_name);
-    let mut idx = HnswIndex::new(DistanceMetric::L2, seed);
+    let mut idx = HnswIndex::new(metric, seed);
 
     // Snapshot the (rowid, vector) pairs into a side map so the
     // get_vec closure below can serve them by id without re-borrowing
@@ -1463,11 +1476,103 @@ fn create_hnsw_index(
     table_mut.hnsw_indexes.push(HnswIndexEntry {
         name: index_name.to_string(),
         column_name: column_name.to_string(),
+        metric,
         index: idx,
         // Freshly built — no DELETE/UPDATE has invalidated it yet.
         needs_rebuild: false,
     });
     Ok(index_name.to_string())
+}
+
+/// Parses the `WITH (metric = '<name>', …)` options bag on a CREATE
+/// INDEX statement. Returns the chosen metric (or `None` if no
+/// `metric` key was supplied) on HNSW indexes; raises a
+/// user-visible error on:
+///
+///   - WITH options on a non-HNSW index (btree / fts have no knobs we
+///     understand here),
+///   - unknown option keys,
+///   - unknown metric names (typo guard — silently falling back to L2
+///     would hide the user's intent and re-introduce the SQLR-28 bug).
+fn parse_hnsw_with_options(
+    with: &[Expr],
+    index_name: &str,
+    method: IndexMethod,
+) -> Result<Option<DistanceMetric>> {
+    if with.is_empty() {
+        return Ok(None);
+    }
+    if !matches!(method, IndexMethod::Hnsw) {
+        return Err(SQLRiteError::General(format!(
+            "CREATE INDEX '{index_name}' has a WITH (...) clause but its index method \
+             doesn't support any options — only `USING hnsw` recognises `WITH (metric = ...)`"
+        )));
+    }
+
+    let mut metric: Option<DistanceMetric> = None;
+    for opt in with {
+        let Expr::BinaryOp { left, op, right } = opt else {
+            return Err(SQLRiteError::General(format!(
+                "CREATE INDEX '{index_name}': unsupported WITH option {opt:?} \
+                 (expected `key = 'value'`)"
+            )));
+        };
+        if !matches!(op, BinaryOperator::Eq) {
+            return Err(SQLRiteError::General(format!(
+                "CREATE INDEX '{index_name}': WITH options must use `=` (got {op:?})"
+            )));
+        }
+        let key = match left.as_ref() {
+            Expr::Identifier(ident) => ident.value.clone(),
+            other => {
+                return Err(SQLRiteError::General(format!(
+                    "CREATE INDEX '{index_name}': WITH option key must be a bare identifier, \
+                     got {other:?}"
+                )));
+            }
+        };
+        let value = match right.as_ref() {
+            Expr::Value(v) => match &v.value {
+                AstValue::SingleQuotedString(s) => s.clone(),
+                AstValue::DoubleQuotedString(s) => s.clone(),
+                other => {
+                    return Err(SQLRiteError::General(format!(
+                        "CREATE INDEX '{index_name}': WITH option '{key}' value must be \
+                         a quoted string, got {other:?}"
+                    )));
+                }
+            },
+            Expr::Identifier(ident) => ident.value.clone(),
+            other => {
+                return Err(SQLRiteError::General(format!(
+                    "CREATE INDEX '{index_name}': WITH option '{key}' value must be a \
+                     quoted string, got {other:?}"
+                )));
+            }
+        };
+
+        if key.eq_ignore_ascii_case("metric") {
+            let parsed = DistanceMetric::from_sql_name(&value).ok_or_else(|| {
+                SQLRiteError::General(format!(
+                    "CREATE INDEX '{index_name}': unknown HNSW metric '{value}' \
+                     (try 'l2', 'cosine', or 'dot')"
+                ))
+            })?;
+            if metric.is_some() {
+                return Err(SQLRiteError::General(format!(
+                    "CREATE INDEX '{index_name}': metric specified more than once in WITH (...)"
+                )));
+            }
+            metric = Some(parsed);
+        } else {
+            return Err(SQLRiteError::General(format!(
+                "CREATE INDEX '{index_name}': unknown WITH option '{key}' \
+                 (only 'metric' is recognised on HNSW indexes)"
+            )));
+        }
+    }
+
+    Ok(metric)
 }
 
 /// Builds a Phase 8b FTS inverted index and attaches it to the table.
@@ -1654,22 +1759,25 @@ fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> 
 /// Recognizes the HNSW-probable query pattern and probes the graph
 /// if a matching index exists.
 ///
-/// Looks for ORDER BY `vec_distance_l2(<col>, <bracket-array literal>)`
-/// where the table has an HNSW index attached to `<col>`. On a match,
-/// returns the top-k rowids straight from the graph (O(log N)). On
-/// any miss — different function name, no matching index, query
-/// dimension wrong, etc. — returns `None` and the caller falls through
+/// Looks for ORDER BY `vec_distance_<l2|cosine|dot>(<col>, <bracket-
+/// array literal>)` where the table has an HNSW index attached to
+/// `<col>` *built for that same distance metric*. On a match, returns
+/// the top-k rowids straight from the graph (O(log N)). On any miss —
+/// different function name, no matching index, query dimension wrong,
+/// metric mismatch, etc. — returns `None` and the caller falls through
 /// to the bounded-heap brute-force path (7c) or the full sort (7b),
 /// preserving correct results regardless of whether the HNSW pathway
 /// kicked in.
 ///
-/// Phase 7d.2 caveats:
-/// - Only `vec_distance_l2` is recognized. Cosine and dot fall through
-///   to brute-force because we don't yet expose a per-index distance
-///   knob (deferred to Phase 7d.x — see `docs/phase-7-plan.md`).
+/// Caveats:
+/// - The index's metric and the query's `vec_distance_*` function must
+///   agree. An L2-built graph silently doesn't help cosine queries
+///   (different neighbour pruning policy → potentially different
+///   topology), so we don't pretend to.  Pick the metric at CREATE
+///   INDEX time via `WITH (metric = '<l2|cosine|dot>')` (SQLR-28).
 /// - Only ASCENDING order makes sense for "k nearest" — DESC ORDER BY
-///   `vec_distance_l2(...) LIMIT k` would mean "k farthest", which
-///   isn't what the index is built for. We don't bother to detect
+///   `vec_distance_*(...) LIMIT k` would mean "k farthest", which isn't
+///   what the index is built for. We don't bother to detect
 ///   `ascending == false` here; the optimizer just skips and the
 ///   fallback path handles it correctly (slower).
 fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>> {
@@ -1677,7 +1785,8 @@ fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>
         return None;
     }
 
-    // Pattern-match: order expr must be a function call vec_distance_l2(a, b).
+    // Pattern-match: order expr must be a function call
+    // vec_distance_<l2|cosine|dot>(a, b).
     let func = match order_expr {
         Expr::Function(f) => f,
         _ => return None,
@@ -1686,9 +1795,12 @@ fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>
         [ObjectNamePart::Identifier(ident)] => ident.value.to_lowercase(),
         _ => return None,
     };
-    if fname != "vec_distance_l2" {
-        return None;
-    }
+    let query_metric = match fname.as_str() {
+        "vec_distance_l2" => DistanceMetric::L2,
+        "vec_distance_cosine" => DistanceMetric::Cosine,
+        "vec_distance_dot" => DistanceMetric::Dot,
+        _ => return None,
+    };
 
     // Extract the two args as raw Exprs.
     let arg_list = match &func.args {
@@ -1721,11 +1833,14 @@ fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>
         },
     };
 
-    // Find the HNSW index on this column.
+    // Find the HNSW index on this column AND with a matching metric.
+    // Multiple indexes on the same column are allowed in principle
+    // (cosine-built + L2-built), and a query picks whichever metric
+    // its `vec_distance_*` function names.
     let entry = table
         .hnsw_indexes
         .iter()
-        .find(|e| e.column_name == col_name)?;
+        .find(|e| e.column_name == col_name && e.metric == query_metric)?;
 
     // Dimension sanity check — the query vector must match the
     // indexed column's declared dimension. If it doesn't, the brute-
@@ -3296,8 +3411,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::sql::db::database::Database;
+    use crate::sql::dialect::SqlriteDialect;
     use crate::sql::parser::select::SelectQuery;
-    use sqlparser::dialect::SQLiteDialect;
     use sqlparser::parser::Parser;
 
     /// Builds a `docs(id INTEGER PK, score REAL)` table with N rows of
@@ -3334,7 +3449,7 @@ mod tests {
     /// `select_topk` / `sort_rowids` directly without the rest of the
     /// process_command pipeline.
     fn parse_select(sql: &str) -> SelectQuery {
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, sql).expect("parse");
         let stmt = ast.pop().expect("one statement");
         SelectQuery::new(&stmt).expect("select-query")

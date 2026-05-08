@@ -163,6 +163,7 @@ SELECT id, title FROM docs ORDER BY embedding <-> [0.1, ...] LIMIT 10;
 > - **✅ 7d.1 — Pure HNSW algorithm** *(~700 LOC, shipped in v0.1.13).* `src/sql/hnsw.rs` standalone module: insert + search + layer assignment + beam search per layer + L2/cosine/dot distance dispatch. No SQL integration yet — vectors are passed in via a `get_vec` closure so the algorithm doesn't depend on table types. Tests verify recall@k ≥ 0.95 vs brute-force on randomly-generated vector sets; deterministic via a fixed RNG seed.
 > - **✅ 7d.2 — SQL integration** *(~500 LOC).* `CREATE INDEX … USING hnsw (col)` parser + engine, INSERT wiring (also calls `hnsw.insert()` incrementally), query optimizer hook (recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` and probes the HNSW instead of full-scanning). HNSW lives in memory only at this point; the **CREATE INDEX SQL persists in `sqlrite_master` and reopen rebuilds the graph from current rows** — partial persistence ahead of 7d.3. DELETE/UPDATE on HNSW-indexed tables refused with helpful error pointing at 7d.3.
 > - **✅ 7d.3 — Persistence** *(~600 LOC).* New `KIND_HNSW` cell tag and `HnswNodeCell` encoding (varint node_id + per-layer neighbor lists). Each HNSW index gets its own page tree parallel to secondary indexes. Open path loads cells directly into `HnswIndex::from_persisted_nodes` — no algorithm runs, exact bit-for-bit reproduction. Also unblocks DELETE / UPDATE on HNSW-indexed tables: those mark the index `needs_rebuild`, save rebuilds from current rows before staging. ~2× the original 300-LOC estimate because the cell encoding + tests + rebuild path together added more than expected.
+> - **✅ 7d.4 (SQLR-28) — Per-index distance metric.** Q2's "deferred per-index metric knob" lands as `CREATE INDEX … USING hnsw (col) WITH (metric = '<l2|cosine|dot>')`. The metric is stored on `HnswIndexEntry` and round-tripped via the synthesized CREATE INDEX SQL in `sqlrite_master` (no file-format bump — pre-SQLR-28 rows omit the WITH clause and decode as L2). The optimizer's `try_hnsw_probe` widens to all three `vec_distance_*` functions but only fires when the query function matches the index's metric; mismatches fall through to brute-force. Surfaced by the SQLR-23 v2 bench: W10 uses cosine, the optimizer was L2-only, and the HNSW variant had been silently brute-forcing the entire time. SQLR-25 (republish v2 numbers) was the gating consumer.
 >
 > Each 7d.x ships as its own PR + release wave. The user-facing value lands at 7d.2; 7d.3 closes the persistence loop. 7d.1 is foundational but ships a tested algorithmic primitive on its own — useful as documentation of the engine's "from scratch" theme.
 
@@ -368,12 +369,12 @@ Q1–Q10 were resolved by the project owner on 2026-04-26. Each question keeps i
 
 ### Q2. HNSW parameters: fixed defaults or per-index configurable?
 
-> **Decided: fixed defaults** (`M=16, ef_construction=200, ef_search=50`).
+> **Decided: fixed defaults** (`M=16, ef_construction=200, ef_search=50`) for the algorithmic knobs. **Distance metric** *did* land as a per-index `WITH (metric = '<l2|cosine|dot>')` clause in **SQLR-28 / sub-phase 7d.4** — see the 7d split note above. Was deferred from the original 7d.2 cut; surfaced as a gap by the SQLR-23 v2 bench, where W10's cosine query had been silently brute-forcing because the optimizer hook was L2-only.
 
 - **Fixed:** `M=16, ef_construction=200, ef_search=50`. Simpler API, less to test. Matches sqlite-vec's defaults.
 - **Configurable:** `CREATE INDEX … USING hnsw (col) WITH (m=32, ef_construction=400)`. Power-user knobs, more code, more test matrix.
 
-**Recommendation:** fixed defaults for MVP. Configurable can land as a follow-up if anyone actually asks.
+**Recommendation:** fixed defaults for MVP. Configurable can land as a follow-up if anyone actually asks. (`metric` already came back as a follow-up; `m` / `ef_*` haven't been requested yet.)
 
 ### Q3. JSON storage format
 

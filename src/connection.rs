@@ -54,8 +54,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::sql::dialect::SqlriteDialect;
 use sqlparser::ast::Statement as AstStatement;
-use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
@@ -320,7 +320,7 @@ struct CachedPlan {
 
 impl CachedPlan {
     fn compile(sql: &str) -> Result<Self> {
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, sql).map_err(SQLRiteError::from)?;
         let Some(mut stmt) = ast.pop() else {
             return Err(SQLRiteError::General("no statement to prepare".to_string()));
@@ -1113,6 +1113,158 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    }
+
+    /// SQLR-28 — cosine probe: an HNSW index built `WITH (metric =
+    /// 'cosine')` must serve `ORDER BY vec_distance_cosine(col, [...])`
+    /// from the graph. Self-query: querying for one of the corpus's
+    /// own vectors must come back as the nearest under cosine
+    /// distance.
+    #[test]
+    fn cosine_self_query_through_hnsw_optimizer() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(4));")
+            .unwrap();
+        let corpus: [(i64, [f32; 4]); 5] = [
+            (1, [1.0, 0.0, 0.0, 0.0]),
+            (2, [0.0, 1.0, 0.0, 0.0]),
+            (3, [0.0, 0.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 0.0, 1.0]),
+            (5, [0.5, 0.5, 0.5, 0.5]),
+        ];
+        for (id, vec) in corpus {
+            conn.execute(&format!(
+                "INSERT INTO v (id, e) VALUES ({id}, [{}, {}, {}, {}]);",
+                vec[0], vec[1], vec[2], vec[3]
+            ))
+            .unwrap();
+        }
+        conn.execute("CREATE INDEX v_hnsw ON v USING hnsw (e) WITH (metric = 'cosine');")
+            .unwrap();
+
+        // Self-query for id=2's vector — expected nearest under cosine
+        // distance is id=2 itself (cos distance 0).
+        let rows = conn
+            .prepare("SELECT id FROM v ORDER BY vec_distance_cosine(e, [0.0, 1.0, 0.0, 0.0]) ASC LIMIT 1")
+            .unwrap()
+            .query_with_params(&[])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+    }
+
+    /// SQLR-28 — dot probe: same shape as the cosine test, but the
+    /// index is built `WITH (metric = 'dot')` and the query uses
+    /// `vec_distance_dot`. Confirms the third metric variant lights up
+    /// the graph shortcut, not just l2 / cosine.
+    #[test]
+    fn dot_self_query_through_hnsw_optimizer() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(3));")
+            .unwrap();
+        // Data: distinguishable magnitudes so the dot metric resolves
+        // a clear winner. `vec_distance_dot(a, b) = -(a·b)` — smaller
+        // (more negative) is closer.
+        let corpus: [(i64, [f32; 3]); 4] = [
+            (1, [1.0, 0.0, 0.0]),
+            (2, [2.0, 0.0, 0.0]),
+            (3, [0.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+        ];
+        for (id, vec) in corpus {
+            conn.execute(&format!(
+                "INSERT INTO v (id, e) VALUES ({id}, [{}, {}, {}]);",
+                vec[0], vec[1], vec[2]
+            ))
+            .unwrap();
+        }
+        conn.execute("CREATE INDEX v_hnsw ON v USING hnsw (e) WITH (metric = 'dot');")
+            .unwrap();
+
+        // Query [3, 0, 0]: dot products are 3, 6, 0, 0 → distances
+        // -3, -6, 0, 0. id=2 has the smallest (most negative) distance.
+        let rows = conn
+            .prepare("SELECT id FROM v ORDER BY vec_distance_dot(e, [3.0, 0.0, 0.0]) ASC LIMIT 1")
+            .unwrap()
+            .query_with_params(&[])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+    }
+
+    /// SQLR-28 — metric mismatch must NOT take the graph shortcut.
+    /// An L2-built index queried with `vec_distance_cosine` falls
+    /// through to brute-force, which still returns the correct
+    /// answer. We confirm the answer is correct; the slow-path
+    /// behaviour itself is implicit (no error, no panic, no wrong
+    /// result), which is the user-visible contract that matters.
+    #[test]
+    fn metric_mismatch_falls_back_to_brute_force() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(2));")
+            .unwrap();
+        let half_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        let corpus: [(i64, [f32; 2]); 3] = [
+            (1, [1.0, 0.0]),
+            (2, [half_sqrt2, half_sqrt2]),
+            (3, [0.0, 1.0]),
+        ];
+        for (id, vec) in corpus {
+            conn.execute(&format!(
+                "INSERT INTO v (id, e) VALUES ({id}, [{}, {}]);",
+                vec[0], vec[1]
+            ))
+            .unwrap();
+        }
+        // Default L2 index — no WITH clause.
+        conn.execute("CREATE INDEX v_hnsw_l2 ON v USING hnsw (e);")
+            .unwrap();
+
+        // Query with cosine. Index can't help; brute-force still
+        // returns the correct nearest by cosine: id=1 (cos dist 0).
+        let rows = conn
+            .prepare("SELECT id FROM v ORDER BY vec_distance_cosine(e, [1.0, 0.0]) ASC LIMIT 1")
+            .unwrap()
+            .query_with_params(&[])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    }
+
+    /// SQLR-28 — a typo in the metric name must error at CREATE INDEX
+    /// time. Falling back to L2 silently is the bug we're fixing here,
+    /// not the behaviour to preserve.
+    #[test]
+    fn unknown_metric_name_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(2));")
+            .unwrap();
+        let err = conn
+            .execute("CREATE INDEX bad ON v USING hnsw (e) WITH (metric = 'cosin');")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown HNSW metric"), "got: {msg}");
+    }
+
+    /// SQLR-28 — WITH options on a non-HNSW index must error rather
+    /// than be silently ignored. An option that has no effect on the
+    /// resulting index is a footgun.
+    #[test]
+    fn with_metric_on_btree_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);")
+            .unwrap();
+        let err = conn
+            .execute("CREATE INDEX bad ON t (b) WITH (metric = 'cosine');")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("doesn't support any options"), "got: {msg}");
     }
 
     #[test]

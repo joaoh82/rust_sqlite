@@ -347,7 +347,7 @@ mod tests {
         );
         let expected_table_name = String::from("contacts");
 
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, &sql_input).unwrap();
 
         assert!(ast.len() == 1, "ast has more then one Statement");

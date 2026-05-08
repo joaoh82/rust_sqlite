@@ -1,5 +1,6 @@
 pub mod agg;
 pub mod db;
+pub mod dialect;
 pub mod executor;
 pub mod fts;
 pub mod hnsw;
@@ -13,8 +14,9 @@ use parser::insert::InsertQuery;
 use parser::select::SelectQuery;
 
 use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
-use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::{Parser, ParserError};
+
+use crate::sql::dialect::SqlriteDialect;
 
 use crate::error::{Result, SQLRiteError};
 use crate::sql::db::database::Database;
@@ -87,7 +89,7 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 /// to stdout.** The REPL is responsible for printing whatever it wants
 /// from the returned struct.
 pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<CommandOutput> {
-    let dialect = SQLiteDialect {};
+    let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 
     if ast.len() > 1 {
@@ -529,7 +531,7 @@ mod tests {
             id INTEGER PRIMARY KEY,
             name TEXT
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
@@ -563,7 +565,7 @@ mod tests {
         let query_statement = "CREATE TABLE users (
             name TEXT
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")

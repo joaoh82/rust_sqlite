@@ -3,8 +3,10 @@
 //! ```sql
 //! CREATE TABLE vecs (id INTEGER PRIMARY KEY, embedding VECTOR(384));
 //! -- 10k 384-dim vectors, deterministic per-id.
-//! -- HNSW variant adds:
-//! CREATE INDEX vecs_hnsw ON vecs USING hnsw (embedding);
+//! -- HNSW variant adds (SQLR-28: cosine-built index, matched to the
+//! -- query's vec_distance_cosine):
+//! CREATE INDEX vecs_hnsw ON vecs USING hnsw (embedding)
+//!     WITH (metric = 'cosine');
 //!
 //! -- Hot loop:
 //! SELECT id FROM vecs
@@ -12,12 +14,12 @@
 //! LIMIT 10;
 //! ```
 //!
-//! Two criterion groups land per driver: `W10.v1/brute-force` (no HNSW
+//! Two criterion groups land per driver: `W10.v3/brute-force` (no HNSW
 //! index — every probe full-scans + bounded-heap top-k) and
-//! `W10.v1/hnsw` (with the HNSW index, optimizer probes the graph
-//! per [`docs/supported-sql.md`](../../docs/supported-sql.md) "HNSW
-//! indexes"). The gap between the two is the headline number for
-//! "did Phase 7d's ANN actually deliver?"
+//! `W10.v3/hnsw` (with the cosine-built HNSW index, optimizer probes
+//! the graph per [`docs/supported-sql.md`](../../docs/supported-sql.md)
+//! "HNSW indexes"). The gap between the two is the headline number
+//! for "did Phase 7d's ANN actually deliver?"
 //!
 //! ## Comparator
 //!
@@ -40,10 +42,18 @@ use crate::{Driver, Value, WorkloadId};
 /// inlined as a 4 KB bracket-array literal in the SQL string. The
 /// brute-force-vs-HNSW gap should widen materially because the
 /// per-iter parser cost no longer dominates.
+///
+/// SQLR-28 — bumped again to v3: the HNSW variant now creates the
+/// index `WITH (metric = 'cosine')`, matching the hot-loop SQL's
+/// `vec_distance_cosine`. v1/v2 used the optimizer's L2-only probe,
+/// which silently fell through to brute-force on a cosine query —
+/// the HNSW variant was never actually exercising the graph. Numbers
+/// from before v3 are not comparable to v3 numbers and have been
+/// retired.
 pub const W10: WorkloadId = WorkloadId {
     id: "W10",
     name: "vector-top10",
-    version: "v2",
+    version: "v3",
 };
 
 /// `(label, with_hnsw_index)` — two variants per driver.
@@ -71,9 +81,13 @@ pub fn setup<D: Driver>(
     let dataset = vector_dataset();
     insert_rows(driver, &mut conn, &dataset)?;
     if with_hnsw {
+        // SQLR-28: build the graph for cosine — matches the hot-loop
+        // SQL's vec_distance_cosine. Without the metric clause the
+        // index defaults to L2 and the optimizer's metric gate falls
+        // through to brute-force, which is exactly the bug v3 fixes.
         driver.execute(
             &mut conn,
-            "CREATE INDEX vecs_hnsw ON vecs USING hnsw (embedding)",
+            "CREATE INDEX vecs_hnsw ON vecs USING hnsw (embedding) WITH (metric = 'cosine')",
         )?;
     }
     Ok((conn, dataset))

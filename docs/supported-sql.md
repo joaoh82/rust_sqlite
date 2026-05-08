@@ -113,15 +113,18 @@ These are full-citizen indexes — they're visible via `.tables`-adjacent catalo
 ### HNSW indexes (Phase 7d)
 
 ```sql
-CREATE INDEX <name> ON <table> USING hnsw (<vector_column>);
+CREATE INDEX <name> ON <table> USING hnsw (<vector_column>)
+  [WITH (metric = '<l2|cosine|dot>')];
 ```
 
-Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor index over a `VECTOR(N)` column. The query optimizer recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` (or the cosine / dot variants) on an HNSW-indexed column and probes the graph instead of full-scanning. SQLR-23 — the second arg can be either an inline `[...]` literal *or* a bound `Value::Vector(...)` parameter via `Statement::query_with_params`; the optimizer recognizes both, so prepared-statement KNN queries still take the graph shortcut.
+Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor index over a `VECTOR(N)` column. The query optimizer recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` (or the cosine / dot variants) on an HNSW-indexed column **whose metric matches the query's distance function**, and probes the graph instead of full-scanning. SQLR-23 — the second arg can be either an inline `[...]` literal *or* a bound `Value::Vector(...)` parameter via `Statement::query_with_params`; the optimizer recognizes both, so prepared-statement KNN queries still take the graph shortcut.
 
-- Recall@10 ≥ 0.95 at default parameters (`M=16`, `ef_construction=200`, `ef_search=50`). Parameters aren't tunable from SQL yet — see Q2 of [`docs/phase-7-plan.md`](phase-7-plan.md).
-- The index is built incrementally on `INSERT`. `DELETE` / `UPDATE` mark the index `needs_rebuild`; the next save rebuilds from current rows.
-- Persisted as a `KIND_HNSW` cell tree alongside the regular page hierarchy — open path loads the graph bit-for-bit, no algorithm runs.
-- Without an HNSW index, the same `ORDER BY vec_distance_… LIMIT k` query still works — it just brute-force-scans every row (Phase 7c's bounded-heap top-k optimization keeps the memory footprint to O(k)).
+The `WITH (metric = '…')` clause picks the distance the graph is built for. Three values are recognized: `'l2'` (Euclidean — the default, also accepts `'euclidean'`), `'cosine'`, and `'dot'` (negated dot-product — also accepts `'inner_product'` / `'ip'`). Omitting the clause is equivalent to `metric = 'l2'`, so pre-SQLR-28 catalogs round-trip unchanged. **The metric is not a query-time choice** — the graph topology depends on the metric used during INSERT (neighbour pruning is metric-specific), so a query whose `vec_distance_*` function doesn't match the index's metric falls through to brute-force rather than getting a wrong answer back from the graph. If you need both L2 and cosine probes on the same column, create two indexes.
+
+- Recall@10 ≥ 0.95 at default parameters (`M=16`, `ef_construction=200`, `ef_search=50`). The `M` / `ef_*` knobs aren't tunable from SQL yet — see Q2 of [`docs/phase-7-plan.md`](phase-7-plan.md).
+- The index is built incrementally on `INSERT`. `DELETE` / `UPDATE` mark the index `needs_rebuild`; the next save rebuilds from current rows under the same metric.
+- Persisted as a `KIND_HNSW` cell tree alongside the regular page hierarchy — open path loads the graph bit-for-bit, no algorithm runs. The metric travels through the synthesized CREATE INDEX SQL in `sqlrite_master`; no file-format bump.
+- Without an HNSW index — or with a metric mismatch — the same `ORDER BY vec_distance_… LIMIT k` query still works; it just brute-force-scans every row (Phase 7c's bounded-heap top-k optimization keeps the memory footprint to O(k)).
 
 ### FTS indexes (Phase 8)
 
