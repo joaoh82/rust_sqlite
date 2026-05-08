@@ -7,6 +7,7 @@ pub mod hnsw;
 pub mod pager;
 pub mod params;
 pub mod parser;
+pub mod pragma;
 // pub mod tokenizer;
 
 use parser::create::CreateQuery;
@@ -89,6 +90,14 @@ pub fn process_command(query: &str, db: &mut Database) -> Result<String> {
 /// to stdout.** The REPL is responsible for printing whatever it wants
 /// from the returned struct.
 pub fn process_command_with_render(query: &str, db: &mut Database) -> Result<CommandOutput> {
+    // SQLR-13 — intercept `PRAGMA` before sqlparser sees it. sqlparser's
+    // pragma-value parser rejects bare `OFF` / `NONE` (and other classic
+    // SQLite pragma idioms), so we tokenize and dispatch ourselves. Non-
+    // PRAGMA input falls through to the regular dispatcher unchanged.
+    if let Some(stmt) = pragma::try_parse_pragma(query)? {
+        return pragma::execute_pragma(stmt, db);
+    }
+
     let dialect = SqlriteDialect::new();
     let mut ast = Parser::parse_sql(&dialect, query).map_err(SQLRiteError::from)?;
 

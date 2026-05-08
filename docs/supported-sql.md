@@ -551,7 +551,16 @@ conn.set_auto_vacuum_threshold(Some(0.5))?; // fire only when freelist > 50%
 conn.set_auto_vacuum_threshold(None)?;       // disable entirely (manual VACUUM only)
 ```
 
-The setting is per-`Connection` runtime state — it's not persisted in the file header, so every reopen starts at the default `Some(0.25)`. A SQL-level `PRAGMA auto_vacuum` knob is on the roadmap but not yet implemented (SDK consumers currently configure it via the per-binding glue or fall back to the default).
+…or via SQL (SQLR-13), which is the path SDK / FFI / MCP consumers reach for since they can't call the Rust setter directly:
+
+```sql
+PRAGMA auto_vacuum;            -- read; renders a single-row result set
+PRAGMA auto_vacuum = 0.5;      -- arm the trigger at 50%
+PRAGMA auto_vacuum = 0;        -- arm at 0% (compact on any released page)
+PRAGMA auto_vacuum = OFF;      -- disable; equivalent: NONE, 'OFF', 'NONE'
+```
+
+Out-of-range values (anything outside `0.0..=1.0`, `NaN`, `±∞`) and unknown identifiers like `WAL` / `FULL` are rejected with a typed error — the trigger never silently saturates or falls back to a default. The setting is per-`Connection` runtime state — it's not persisted in the file header, so every reopen starts at the default `Some(0.25)`.
 
 ---
 
@@ -621,7 +630,7 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 
 ### Session / schema
 - Multiple attached databases (`ATTACH DATABASE`, `DETACH DATABASE`)
-- `PRAGMA` statements beyond what the parser accepts (none currently executed)
+- `PRAGMA` statements other than `auto_vacuum` (SQLR-13). The dispatcher is in place — adding a pragma is a single arm in `execute_pragma`. `journal_mode`, `synchronous`, `cache_size`, etc. are not yet wired up
 - `REPLACE INTO`, `INSERT OR IGNORE`, `INSERT OR REPLACE` (conflict-resolution clauses)
 
 ---
