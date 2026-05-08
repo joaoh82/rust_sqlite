@@ -2,7 +2,7 @@
 
 Benchmark suite for SQLRite vs SQLite (and friends). Tracks task **SQLR-4** / **SQLR-16**.
 
-> **Status (2026-05-07):** all six sub-phases (9.1–9.6) shipped — harness + 12 workloads + DuckDB driver + canonical [`docs/benchmarks.md`](../docs/benchmarks.md) reference + first official pinned-host run committed under [`results/`](results/). See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the design rationale + the resolved Q1–Q8 decisions.
+> **Status (2026-05-08):** all six sub-phases (9.1–9.6) shipped — harness + 12 workloads + DuckDB driver + canonical [`docs/benchmarks.md`](../docs/benchmarks.md) reference + pinned-host runs committed under [`results/`](results/). The v2 republish (SQLR-25) lands the post-SQLR-23 / SQLR-28 numbers; the v1 baseline is retained as historical. See [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md) for the design rationale + the resolved Q1–Q8 decisions.
 
 ## Quick start
 
@@ -172,7 +172,7 @@ Even at 10k scale, the gap is large:
 
 10k 384-dim vectors. Two variants per the plan: brute-force (no index) and HNSW (`CREATE INDEX … USING hnsw (embedding) WITH (metric = 'cosine')`, per SQLR-28). SQLRite-only — `sqlite-vec` extension wiring is a follow-up (`rusqlite[bundled]` doesn't ship it; loading a pre-compiled `.dylib` at runtime is non-trivial and was out of scope for v1).
 
-The **W10.v1** numbers below were taken before SQLR-23 (parser-bound) and SQLR-28 (HNSW probe was L2-only, so the HNSW variant silently fell through to brute-force on cosine queries) — they are retained for historical context only. **W10.v3** ships with the cosine-built index + cosine-aware optimizer probe; republish under SQLR-25.
+The **W10.v1** numbers below were taken before SQLR-23 (parser-bound) and SQLR-28 (HNSW probe was L2-only, so the HNSW variant silently fell through to brute-force on cosine queries) — they are retained for historical context only. **W10.v3** ships with the cosine-built index + cosine-aware optimizer probe and was republished under SQLR-25.
 
 | Variant | SQLRite median (v1, retired) | Throughput |
 |---|---|---|
@@ -183,7 +183,15 @@ The **W10.v1** numbers below were taken before SQLR-23 (parser-bound) and SQLR-2
 1. **Per-iter SQL parse cost** — the 384-element bracket-array literal in the `ORDER BY` clause was ~4 KB of SQL the parser walked every iteration. Fixed in SQLR-23 (`Value::Vector` bind).
 2. **Cosine queries silently brute-forced on the HNSW path** — the optimizer's `try_hnsw_probe` was L2-only; cosine queries never hit the graph. Fixed in SQLR-28 (per-index metric + matching probe).
 
-W10.v3 measures the *actual* HNSW-vs-brute-force gap with both fixes in place.
+#### W10.v3 — post-SQLR-23 + SQLR-28 (canonical pinned-host run, [`results/2026-05-08-apple-ac84d560.json`](results/2026-05-08-apple-ac84d560.json))
+
+| Variant | SQLRite median | Throughput |
+|---|---|---|
+| brute-force | 120.88 ms | ~8 ops/s |
+| **hnsw** | **2.40 ms** | **~417 ops/s** |
+| **HNSW vs brute-force** | **~50× faster** | |
+
+**Read this as:** with both fixes in place, the HNSW shortcut delivers what the algorithm promises. Brute-force barely moved (compute-bound: 10k × 384-dim cosine distances per query; the parser tax was a small slice of total time). HNSW dropped ~53× — bounded log-probe vs O(N×D) — and the brute-vs-HNSW gap is now ~50× at 10k corpus, the right order-of-magnitude for the algorithm and the corpus size. Bigger corpora widen the gap further; the existing harness can be tuned via the W10 corpus knob without an envelope-version bump.
 
 ### W11 — BM25 top-10
 

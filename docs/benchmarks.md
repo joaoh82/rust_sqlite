@@ -90,7 +90,7 @@ A few methodology notes that change how you read the table.
 - `Statement::query_with_params(&[Value])` / `Statement::execute_with_params(&[Value])` — bind `?` placeholders at execute time without re-running sqlparser.
 - `Value::Vector(Vec<f32>)` as a first-class bind type — the 4 KB query vector for W10 is now bound directly instead of being re-lexed every iteration. The HNSW probe optimizer still recognizes the bound shape, so the algorithmic shortcut keeps firing.
 
-The bench harness `Driver::query_one` / `query_all` paths route through `prepare_cached` + the bound API. Every workload's `WorkloadId.version` was bumped `v1 → v2` in lockstep — old JSON envelopes keep the v1 tag and stay readable, but cross-version comparisons require an explicit acknowledgment in the comparison script. The next official pinned-host run will land the post-binding numbers; treat the v1 row above as "before" and watch this section for the "after" once republished.
+The bench harness `Driver::query_one` / `query_all` paths route through `prepare_cached` + the bound API. Every workload's `WorkloadId.version` was bumped `v1 → v2` in lockstep — old JSON envelopes keep the v1 tag and stay readable, but cross-version comparisons require an explicit acknowledgment in the comparison script. The headline table below carries the v2 numbers from the post-SQLR-23 republished run (SQLR-25); the retired v1 baseline lives in the historical section underneath.
 
 **Where DuckDB is misleading.** Per-PK-probe single-row OLTP queries (W9) are SQLite's home turf, not DuckDB's. The plan flags this as "apples-to-oranges"; we still publish the number because the directional comparison is informative.
 
@@ -100,29 +100,53 @@ The bench harness `Driver::query_one` / `query_all` paths route through `prepare
 
 ## Headline numbers
 
-Median latency from the first official pinned-host run — [`benchmarks/results/2026-05-07-apple-9ffd55a5.json`](../benchmarks/results/2026-05-07-apple-9ffd55a5.json), Apple M1 Pro / macOS 23.5.0, criterion defaults (3 s warm-up, 5 s measurement, 100 samples on light workloads / 10 samples on heavy ones — see the JSON envelope's per-sample `samples` field). Only medians here; the JSON carries 95 % CIs, mean, std-dev, ops/s.
+Median latency from the post-SQLR-23 pinned-host run — [`benchmarks/results/2026-05-08-apple-ac84d560.json`](../benchmarks/results/2026-05-08-apple-ac84d560.json), Apple M1 Pro / macOS 23.5.0, criterion defaults (3 s warm-up, 5 s measurement, 100 samples on light workloads / 10 samples on heavy ones — see the JSON envelope's per-sample `samples` field). Only medians here; the JSON carries 95 % CIs, mean, std-dev, ops/s.
 
 | Workload | SQLRite | SQLite (WAL+NORMAL) | DuckDB | Notes |
 |---|---|---|---|---|
-| **W1** read-by-PK | 9.87 µs | 2.05 µs | — | ~5× — parser tax |
-| **W2** range-100 | 23.99 ms | 60.50 µs | — | ~400× — full-scan vs index range probe |
-| **W2** range-1k | 24.92 ms | 585.21 µs | — | ~43× |
-| **W2** range-10k | 30.15 ms | 6.24 ms | — | ~5× — converges as scan dominates |
-| **W3** bulk insert (100k/txn) | 1.029 s | 166.43 ms | — | ~6.2× |
-| **W4** single-row insert | 6.76 ms | 9.78 µs | — | **~691× ⚠️** SQLR-18 |
-| **W5** mixed OLTP | 55.63 ms | 9.96 µs | — | **~5,580× ⚠️** SQLR-18 |
-| **W6** index lookup | 10.45 µs | 2.50 µs | — | ~4× — parser tax |
-| **W7** SUM (1M rows) | 109.47 ms | 31.14 ms | 468.74 µs | DuckDB ~66× faster than SQLite |
-| **W8** GROUP BY card-10 | 201.80 ms | 438.09 ms | 761.40 µs | DuckDB ~575× faster than SQLite |
-| **W8** GROUP BY card-1k | 1.372 s | 251.13 ms | 871.80 µs | DuckDB ~288× faster than SQLite |
-| **W8** GROUP BY card-100k | _skipped_ | 238.96 ms | 19.58 ms | **SQLRite skipped ⚠️** SQLR-19; DuckDB ~12× faster than SQLite |
-| **W9** INNER JOIN (10k×10k) | 34.25 s | 2.23 µs | 699.23 µs | **~15M× ⚠️** SQLR-20; DuckDB ~313× slower than SQLite (analytical-engine OLTP weakness) |
-| **W10** vector top-10 (brute-force, 10k×384) | 138.66 ms | — | — | parser cost dominates |
-| **W10** vector top-10 (HNSW) | 126.81 ms | — | — | masked by parser cost |
-| **W11** BM25 top-10 (1k docs) | 1.079 ms | 25.03 µs | — | ~43× |
-| **W12** hybrid (1k docs) | 713.53 µs | — | — | RAG headline |
+| **W1** read-by-PK | 3.92 µs | 2.09 µs | — | ~1.9× — gap closed by SQLR-23 (was ~4.8× in v1) |
+| **W2** range-100 | 24.27 ms | 66.62 µs | — | ~364× — full-scan vs index range probe |
+| **W2** range-1k | 26.64 ms | 649.30 µs | — | ~41× |
+| **W2** range-10k | 30.73 ms | 7.01 ms | — | ~4.4× — converges as scan dominates |
+| **W3** bulk insert (100k/txn) | 606.20 ms | 183.96 ms | — | ~3.3× — 100k INSERT plan parsed once, not per-row (was ~6.2× in v1) |
+| **W4** single-row insert | 6.57 ms | 11.35 µs | — | **~579× ⚠️** SQLR-18 |
+| **W5** mixed OLTP | 58.00 ms | 9.65 µs | — | **~6,010× ⚠️** SQLR-18 |
+| **W6** index lookup | 4.04 µs | 2.56 µs | — | ~1.6× — gap closed by SQLR-23 (was ~4.2× in v1) |
+| **W7** SUM (1M rows) | 103.62 ms | 31.57 ms | 478.78 µs | DuckDB ~66× faster than SQLite |
+| **W8** GROUP BY card-10 | 197.32 ms | 366.52 ms | 949.75 µs | DuckDB ~386× faster than SQLite |
+| **W8** GROUP BY card-1k | 1.380 s | 240.64 ms | 1.039 ms | DuckDB ~232× faster than SQLite |
+| **W8** GROUP BY card-100k | _skipped_ | 239.72 ms | 22.93 ms | **SQLRite skipped ⚠️** SQLR-19; DuckDB ~10× faster than SQLite |
+| **W9** INNER JOIN (10k×10k) | 30.30 s | 2.16 µs | 484.97 µs | **~14M× ⚠️** SQLR-20; DuckDB ~225× slower than SQLite (analytical-engine OLTP weakness) |
+| **W10** vector top-10 (brute-force, 10k×384) | 120.88 ms | — | — | compute-bound; modest ~13% drop vs v1 |
+| **W10** vector top-10 (HNSW) | **2.40 ms** | — | — | **~53× faster than v1** ⭐ — SQLR-23 + SQLR-28 unmasked the index; HNSW now ~50× faster than brute-force |
+| **W11** BM25 top-10 (1k docs) | 501.63 µs | 23.65 µs | — | ~21× — `fts_match` / `bm25_score` no longer re-parsed (was ~43× in v1) |
+| **W12** hybrid (1k docs) | 607.90 µs | — | — | RAG headline (~15% faster than v1) |
 
-> The **canonical run** is [`benchmarks/results/2026-05-07-apple-9ffd55a5.json`](../benchmarks/results/2026-05-07-apple-9ffd55a5.json). The `dirty=true` flag in the commit metadata reflects the working-tree state when 9.6 PR was being authored (this doc + README updates uncommitted at run time); the **measurements themselves only depend on the bench binary**, which was built from the committed bench-9.5-duckdb tip. Subsequent official runs land alongside this file with their own date / host / commit.
+> The **canonical v2 run** is [`benchmarks/results/2026-05-08-apple-ac84d560.json`](../benchmarks/results/2026-05-08-apple-ac84d560.json). It supersedes the v1 baseline (table below) end-to-end: every workload was rerun on the same canonical Apple M1 Pro host after [SQLR-23](https://github.com/joaoh82/rust_sqlite/pulls?q=SQLR-23) bumped `WorkloadId.version` from `v1 → v2` in lockstep (W10 → `v3` after [SQLR-28](https://github.com/joaoh82/rust_sqlite/pulls?q=SQLR-28) widened the HNSW probe to cosine + dot). The `dirty=true` flag reflects the working-tree state at run time (this doc update + the new envelope itself uncommitted); the **measurements themselves only depend on the bench binary**, which was built from the clean `ac84d560` tip. Subsequent official runs land alongside this file with their own date / host / commit.
+
+### Historical (v1, retired)
+
+The pre-SQLR-23 baseline from [`benchmarks/results/2026-05-07-apple-9ffd55a5.json`](../benchmarks/results/2026-05-07-apple-9ffd55a5.json), retained so the methodology shift is visible. The v1→v2 jump is not an algorithmic improvement — it's the bench-driver methodology change (per-iter `inline_params` → `prepare_cached` + bound `?` parameters; `Value::Vector` for HNSW-eligible KNN). Cross-version comparisons (`W1.v1` vs `W1.v2`) are flagged in the comparison script per Q8; the [`compare.py`](../benchmarks/scripts/compare.py) v1↔v2 report walks each one.
+
+| Workload | SQLRite (v1) | SQLite (v1) | DuckDB (v1) |
+|---|---|---|---|
+| **W1** read-by-PK | 9.87 µs | 2.05 µs | — |
+| **W2** range-100 | 23.99 ms | 60.50 µs | — |
+| **W2** range-1k | 24.92 ms | 585.21 µs | — |
+| **W2** range-10k | 30.15 ms | 6.24 ms | — |
+| **W3** bulk insert (100k/txn) | 1.029 s | 166.43 ms | — |
+| **W4** single-row insert | 6.76 ms | 9.78 µs | — |
+| **W5** mixed OLTP | 55.63 ms | 9.96 µs | — |
+| **W6** index lookup | 10.45 µs | 2.50 µs | — |
+| **W7** SUM (1M rows) | 109.47 ms | 31.14 ms | 468.74 µs |
+| **W8** GROUP BY card-10 | 201.80 ms | 438.09 ms | 761.40 µs |
+| **W8** GROUP BY card-1k | 1.372 s | 251.13 ms | 871.80 µs |
+| **W8** GROUP BY card-100k | _skipped_ | 238.96 ms | 19.58 ms |
+| **W9** INNER JOIN (10k×10k) | 34.25 s | 2.23 µs | 699.23 µs |
+| **W10** brute-force | 138.66 ms | — | — |
+| **W10** HNSW | 126.81 ms | — | — |
+| **W11** BM25 top-10 (1k docs) | 1.079 ms | 25.03 µs | — |
+| **W12** hybrid (1k docs) | 713.53 µs | — | — |
 
 ---
 
