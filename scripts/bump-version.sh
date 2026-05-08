@@ -77,6 +77,21 @@ TOML_FILES=(
     "desktop/src-tauri/Cargo.toml"
 )
 
+# Files that pin `sqlrite-engine` (or any other workspace member) but
+# stay at their own fixed version because they're never published to a
+# registry. The bench crate is `version = "0.0.0"` on purpose
+# (internal-only workspace member); we DON'T want to bump its package
+# version, but its inter-workspace dep pin still has to track main or
+# `cargo build` fails to resolve (SQLR-23 release was the first run that
+# tripped this — see GH Action run 25559263224 for the failure mode).
+#
+# For these files we run only the path-pinned dep sweep (which rewrites
+# `version = "0.8.0"` → `version = "0.9.0"` on lines that also carry
+# `path = "..."`), not the top-level `version = "..."` sed.
+PIN_ONLY_TOML_FILES=(
+    "benchmarks/Cargo.toml"
+)
+
 for file in "${TOML_FILES[@]}"; do
     if [[ ! -f "$file" ]]; then
         echo "error: $file not found (are you in the repo root?)" >&2
@@ -101,6 +116,18 @@ for file in "${TOML_FILES[@]}"; do
     # the top of each manifest has no `path` on it and can't match.
     # Both inline-table orderings (version-first and path-first) work
     # because sed acts per-line, not per-token-order.
+    sed -E '/path *= *"[^"]*"/ s/version *= *"[^"]*"/version = "'"${VERSION}"'"/' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+done
+
+# Pin-only sweep: rewrite the inter-workspace dep version on these files
+# without touching their package-level `version = "..."` (see comment on
+# PIN_ONLY_TOML_FILES above).
+for file in "${PIN_ONLY_TOML_FILES[@]}"; do
+    if [[ ! -f "$file" ]]; then
+        echo "error: $file not found (are you in the repo root?)" >&2
+        exit 1
+    fi
     sed -E '/path *= *"[^"]*"/ s/version *= *"[^"]*"/version = "'"${VERSION}"'"/' "$file" > "$file.tmp"
     mv "$file.tmp" "$file"
 done
@@ -171,7 +198,11 @@ done
 # pin we missed. Catches future refactors that change pin shape (e.g.
 # someone splits a long dep line across multiple TOML lines, where the
 # single-line address would no longer match).
-for file in "${TOML_FILES[@]}"; do
+#
+# Runs over both the published manifests (`TOML_FILES`) and the
+# pin-only manifests (`PIN_ONLY_TOML_FILES`) — the bench crate is
+# unpublished but its `sqlrite-engine` dep still has to track main.
+for file in "${TOML_FILES[@]}" "${PIN_ONLY_TOML_FILES[@]}"; do
     bad="$(grep -nE 'path *= *"[^"]*"' "$file" \
            | grep -E 'version *= *"[^"]*"' \
            | grep -vE "version *= *\"${VERSION}\"" || true)"
