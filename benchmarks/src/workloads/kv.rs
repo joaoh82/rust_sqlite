@@ -30,7 +30,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W1: WorkloadId = WorkloadId {
     id: "W1",
     name: "read-by-pk",
-    version: "v1",
+    version: "v2",
 };
 
 /// SELECT used by the hot loop. Both engines support `?`-positional

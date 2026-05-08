@@ -50,7 +50,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W9: WorkloadId = WorkloadId {
     id: "W9",
     name: "inner-join",
-    version: "v1",
+    version: "v2",
 };
 
 pub const SELECT_SQL: &str = "SELECT c.id, c.name, o.amount FROM customers AS c INNER JOIN orders AS o ON c.id = o.customer_id WHERE c.id = ?";

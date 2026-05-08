@@ -64,7 +64,7 @@ impl Driver for SQLiteDriver {
         sql: &str,
         params: &[Value],
     ) -> Result<()> {
-        let bound: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
+        let bound = to_rusqlite_params(params)?;
         conn.execute(sql, rusqlite::params_from_iter(bound.iter()))
             .with_context(|| format!("rusqlite execute: {sql}"))?;
         Ok(())
@@ -79,7 +79,7 @@ impl Driver for SQLiteDriver {
         let mut stmt = conn
             .prepare_cached(sql)
             .with_context(|| format!("rusqlite prepare_cached: {sql}"))?;
-        let bound: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
+        let bound = to_rusqlite_params(params)?;
         let cols = stmt.column_count();
         let mut rows = stmt
             .query(rusqlite::params_from_iter(bound.iter()))
@@ -111,7 +111,7 @@ impl Driver for SQLiteDriver {
         let mut stmt = conn
             .prepare_cached(sql)
             .with_context(|| format!("rusqlite prepare_cached: {sql}"))?;
-        let bound: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
+        let bound = to_rusqlite_params(params)?;
         let cols = stmt.column_count();
         let mut rows = stmt
             .query(rusqlite::params_from_iter(bound.iter()))
@@ -131,12 +131,24 @@ impl Driver for SQLiteDriver {
     }
 }
 
-fn to_rusqlite(v: &Value) -> rusqlite::types::Value {
+fn to_rusqlite_params(params: &[Value]) -> Result<Vec<rusqlite::types::Value>> {
+    params.iter().map(to_rusqlite).collect()
+}
+
+fn to_rusqlite(v: &Value) -> Result<rusqlite::types::Value> {
     match v {
-        Value::Null => rusqlite::types::Value::Null,
-        Value::Integer(i) => rusqlite::types::Value::Integer(*i),
-        Value::Real(f) => rusqlite::types::Value::Real(*f),
-        Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
+        Value::Null => Ok(rusqlite::types::Value::Null),
+        Value::Integer(i) => Ok(rusqlite::types::Value::Integer(*i)),
+        Value::Real(f) => Ok(rusqlite::types::Value::Real(*f)),
+        Value::Text(s) => Ok(rusqlite::types::Value::Text(s.clone())),
+        // VECTOR is SQLRite-only; the W10/W12 workloads gate on
+        // `driver_supports("sqlrite")` so this branch indicates a
+        // bug in workload registration. Fail loudly rather than
+        // silently coercing.
+        Value::Vector(_) => anyhow::bail!(
+            "rusqlite driver: VECTOR params are SQLRite-only; this workload should not register \
+             against sqlite"
+        ),
     }
 }
 

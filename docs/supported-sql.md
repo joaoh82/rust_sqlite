@@ -21,6 +21,32 @@ If you're looking for _how_ to use SQLRite (REPL flow, meta-commands, history, e
 
 Statements the parser accepts (because sqlparser understands them in the SQLite dialect) but SQLRite doesn't execute yet return `SQL Statement not supported yet`. The [Not yet supported](#not-yet-supported) section below enumerates the common ones.
 
+### Parameter binding (SQLR-23)
+
+Every statement above accepts `?` placeholders anywhere a value literal is allowed (WHERE, ORDER BY, INSERT VALUES, …). Bind via the public Rust API:
+
+```rust
+use sqlrite::{Connection, Value};
+
+let mut conn = Connection::open_in_memory()?;
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")?;
+
+let mut ins = conn.prepare_cached("INSERT INTO users (name, age) VALUES (?, ?)")?;
+ins.execute_with_params(&[Value::Text("alice".into()), Value::Integer(30)])?;
+ins.execute_with_params(&[Value::Text("bob".into()),   Value::Integer(25)])?;
+
+let stmt = conn.prepare_cached("SELECT name FROM users WHERE age > ?")?;
+let rows = stmt
+    .query_with_params(&[Value::Integer(26)])?
+    .collect_all()?;
+# Ok::<(), sqlrite::SQLRiteError>(())
+```
+
+- **Positional only.** `?` placeholders are bound by source-order index (`params[0]` = first `?`, etc.). Named placeholders (`:foo`, `$1`) are not yet supported.
+- **Strict arity.** The slice length must match the placeholder count or `query_with_params` / `execute_with_params` returns a typed error.
+- **Vector binding.** `Value::Vector(Vec<f32>)` binds where a bracket-array literal would normally appear — including the second arg of `vec_distance_*` inside an HNSW-eligible `ORDER BY`. The optimizer recognizes the bound shape, so the graph shortcut still fires.
+- **Plan cache.** `Connection::prepare_cached` keeps a per-connection LRU (default cap 16; tune via `set_prepared_cache_capacity`) so a hot SQL string parses exactly once across the connection's lifetime. `Connection::prepare` always re-parses.
+
 ---
 
 ## `CREATE TABLE`
@@ -90,7 +116,7 @@ These are full-citizen indexes — they're visible via `.tables`-adjacent catalo
 CREATE INDEX <name> ON <table> USING hnsw (<vector_column>);
 ```
 
-Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor index over a `VECTOR(N)` column. The query optimizer recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` (or the cosine / dot variants) on an HNSW-indexed column and probes the graph instead of full-scanning.
+Builds an [HNSW](https://arxiv.org/abs/1603.09320) approximate-nearest-neighbor index over a `VECTOR(N)` column. The query optimizer recognizes `ORDER BY vec_distance_l2(col, literal) LIMIT k` (or the cosine / dot variants) on an HNSW-indexed column and probes the graph instead of full-scanning. SQLR-23 — the second arg can be either an inline `[...]` literal *or* a bound `Value::Vector(...)` parameter via `Statement::query_with_params`; the optimizer recognizes both, so prepared-statement KNN queries still take the graph shortcut.
 
 - Recall@10 ≥ 0.95 at default parameters (`M=16`, `ef_construction=200`, `ef_search=50`). Parameters aren't tunable from SQL yet — see Q2 of [`docs/phase-7-plan.md`](phase-7-plan.md).
 - The index is built incrementally on `INSERT`. `DELETE` / `UPDATE` mark the index `needs_rebuild`; the next save rebuilds from current rows.

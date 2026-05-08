@@ -32,19 +32,31 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::data::{
-    VECTOR_QUERY_COUNT, VECTOR_ROW_COUNT, VectorDataset, vec_to_sql_literal, vector_dataset,
-};
+use crate::data::{VECTOR_QUERY_COUNT, VECTOR_ROW_COUNT, VectorDataset, vector_dataset};
 use crate::{Driver, Value, WorkloadId};
 
+/// SQLR-23 — bumped to v2 because the bench-driver methodology changed:
+/// the query vector is now bound through `Value::Vector` instead of
+/// inlined as a 4 KB bracket-array literal in the SQL string. The
+/// brute-force-vs-HNSW gap should widen materially because the
+/// per-iter parser cost no longer dominates.
 pub const W10: WorkloadId = WorkloadId {
     id: "W10",
     name: "vector-top10",
-    version: "v1",
+    version: "v2",
 };
 
 /// `(label, with_hnsw_index)` — two variants per driver.
 pub const VARIANTS: [(&str, bool); 2] = [("brute-force", false), ("hnsw", true)];
+
+/// Hot-loop SQL — fully parameterized: the embedding column gets
+/// bound to a `Value::Vector(query)`. Static across iterations so
+/// `prepare_cached` returns the same plan every call.
+pub const SELECT_SQL: &str =
+    "SELECT id FROM vecs ORDER BY vec_distance_cosine(embedding, ?) ASC LIMIT 10";
+
+/// Insert SQL for the seed pass — id and embedding both bound.
+pub const INSERT_SQL: &str = "INSERT INTO vecs (id, embedding) VALUES (?, ?)";
 
 pub fn setup<D: Driver>(
     driver: &D,
@@ -69,11 +81,12 @@ pub fn setup<D: Driver>(
 
 /// One iteration: top-10 cosine-nearest probes for `query`. Returns
 /// the row count so criterion's black_box has a stable fingerprint.
+///
+/// SQLR-23: `query` binds through `Value::Vector` instead of being
+/// formatted into the SQL string. With the vector out of the lexer's
+/// hot path, the HNSW probe optimizer becomes visible vs brute-force.
 pub fn bench_iter<D: Driver>(driver: &D, conn: &mut D::Conn, query: &[f32]) -> Result<usize> {
-    let lit = vec_to_sql_literal(query);
-    let sql =
-        format!("SELECT id FROM vecs ORDER BY vec_distance_cosine(embedding, {lit}) ASC LIMIT 10");
-    let rows = driver.query_all(conn, &sql, &[])?;
+    let rows = driver.query_all(conn, SELECT_SQL, &[Value::Vector(query.to_vec())])?;
     Ok(rows.len())
 }
 
@@ -102,13 +115,14 @@ pub fn driver_supports(driver_name: &str) -> bool {
 fn insert_rows<D: Driver>(driver: &D, conn: &mut D::Conn, dataset: &VectorDataset) -> Result<()> {
     driver.execute(conn, "BEGIN").context("W10 BEGIN")?;
     for row in &dataset.rows {
-        let lit = vec_to_sql_literal(&row.embedding);
-        // Inline the vector literal directly — there's no `?`-bind for
-        // VECTOR values in SQLRite's current public API. Driver-side
-        // params handle id only.
-        let sql = format!("INSERT INTO vecs (id, embedding) VALUES (?, {lit})");
+        // SQLR-23 — both id and embedding are now bound. Same
+        // `prepare_cached` plan reused for every row.
         driver
-            .execute_with_params(conn, &sql, &[Value::Integer(row.id)])
+            .execute_with_params(
+                conn,
+                INSERT_SQL,
+                &[Value::Integer(row.id), Value::Vector(row.embedding.clone())],
+            )
             .with_context(|| format!("W10 INSERT id={}", row.id))?;
     }
     driver.execute(conn, "COMMIT").context("W10 COMMIT")?;

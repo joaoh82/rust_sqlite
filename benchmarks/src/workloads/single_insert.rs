@@ -43,7 +43,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W4: WorkloadId = WorkloadId {
     id: "W4",
     name: "single-insert",
-    version: "v1",
+    version: "v2",
 };
 
 /// Setup: open fresh DB, create `kv_writes`, preload [`W4_PRELOAD_ROWS`]

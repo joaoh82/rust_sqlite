@@ -82,12 +82,15 @@ A few methodology notes that change how you read the table.
 
 **Q3 — DuckDB runs at defaults.** No equivalent to SQLite's WAL+NORMAL knob; DuckDB's MVCC + commit semantics are uniform.
 
-**Where SQLRite still pays a parser tax.** The engine doesn't ship parameter binding or a prepared-plan cache yet — every iteration walks the full `sqlparser` AST again. Several workloads' headline numbers are dominated by this overhead, not the underlying execution path. Examples:
+**Parser tax — historical, addressed in SQLR-23.** Pre-SQLR-23, the engine parsed SQL on every `Connection::execute` / `Connection::prepare` call. The bench driver's SQLRite path inlined `?` placeholders into the SQL string, so every iteration also walked the full `sqlparser` AST. Several workloads' headline numbers were dominated by this overhead — W1 and W6 (sub-µs paths where parser cost was most of the per-iter time), W10 (the 384-dim bracket-array literal in `ORDER BY` was ~4 KB of SQL the parser walked every iteration; brute-force vs HNSW looked indistinguishable as a result).
 
-- W1 / W6 — sub-µs paths where parser cost is most of the per-iter time.
-- W10 — the 384-dim bracket-array literal in `ORDER BY` is ~4 KB of SQL the parser walks every iteration; brute-force vs HNSW look indistinguishable as a result.
+[SQLR-23](https://github.com/joaoh82/rust_sqlite/pulls?q=SQLR-23) shipped:
 
-A future "prepared statement support" follow-up is the unlock for several rows of this table.
+- `Connection::prepare_cached` — small per-connection LRU of parsed plans (default cap 16, matches rusqlite).
+- `Statement::query_with_params(&[Value])` / `Statement::execute_with_params(&[Value])` — bind `?` placeholders at execute time without re-running sqlparser.
+- `Value::Vector(Vec<f32>)` as a first-class bind type — the 4 KB query vector for W10 is now bound directly instead of being re-lexed every iteration. The HNSW probe optimizer still recognizes the bound shape, so the algorithmic shortcut keeps firing.
+
+The bench harness `Driver::query_one` / `query_all` paths route through `prepare_cached` + the bound API. Every workload's `WorkloadId.version` was bumped `v1 → v2` in lockstep — old JSON envelopes keep the v1 tag and stay readable, but cross-version comparisons require an explicit acknowledgment in the comparison script. The next official pinned-host run will land the post-binding numbers; treat the v1 row above as "before" and watch this section for the "after" once republished.
 
 **Where DuckDB is misleading.** Per-PK-probe single-row OLTP queries (W9) are SQLite's home turf, not DuckDB's. The plan flags this as "apples-to-oranges"; we still publish the number because the directional comparison is informative.
 

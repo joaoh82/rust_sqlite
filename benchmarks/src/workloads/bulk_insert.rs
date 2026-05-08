@@ -37,7 +37,7 @@ use crate::{Driver, Value, WorkloadId};
 pub const W3: WorkloadId = WorkloadId {
     id: "W3",
     name: "bulk-insert",
-    version: "v1",
+    version: "v2",
 };
 
 /// One per-iter dataset is reused across samples — the row contents
