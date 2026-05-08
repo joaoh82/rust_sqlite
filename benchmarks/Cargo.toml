@@ -50,7 +50,7 @@ duckdb = ["dep:duckdb"]
 # The engine. Default features off (no rustyline / clap / `ask`), but
 # `file-locks` is on so the comparison runs the same lock-acquisition
 # path that any real SQLRite consumer pays.
-sqlrite = { package = "sqlrite-engine", path = "..", version = "0.9.0", default-features = false, features = ["file-locks"] }
+sqlrite = { package = "sqlrite-engine", path = "..", version = "0.9.1", default-features = false, features = ["file-locks"] }
 
 # SQLite via rusqlite, with `bundled` so the comparison is against a
 # known SQLite version (not whatever happens to be on the host).
