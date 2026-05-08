@@ -305,7 +305,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [x] **7a — `VECTOR(N)` column type** *(v0.1.10)*: dense f32 vectors with bracket-array literal syntax (`[0.1, 0.2, ...]`); file format bumped to v4
 - [x] **7b — Distance functions** *(v0.1.11)*: `vec_distance_l2/cosine/dot` + `ORDER BY <expr> LIMIT k` so KNN queries work end-to-end
 - [x] **7c — Bounded-heap top-k optimization** *(v0.1.12)*
-- [x] **7d — HNSW ANN index** *(v0.1.13–15)*: `CREATE INDEX … USING hnsw (col)`; recall@10 ≥ 0.95 at default `M=16, ef_construction=200, ef_search=50`; persisted as a `KIND_HNSW` cell tree
+- [x] **7d — HNSW ANN index** *(v0.1.13–15, +SQLR-28)*: `CREATE INDEX … USING hnsw (col) [WITH (metric = '<l2|cosine|dot>')]`; recall@10 ≥ 0.95 at default `M=16, ef_construction=200, ef_search=50`; persisted as a `KIND_HNSW` cell tree, with the metric round-tripping through the synthesized `sqlrite_master` SQL
 - [x] **7e — JSON column type + path queries** *(v0.1.16)*: `JSON` / `JSONB` columns stored as canonical text; `json_extract` / `json_type` / `json_array_length` / `json_object_keys`; `$.key`, `[N]`, chained JSONPath subset
 - [x] **7g.1 — `sqlrite-ask` crate** *(v0.1.18)*: foundational natural-language → SQL via the [Anthropic API](https://docs.anthropic.com/) (Sonnet 4.6 by default), prompt-cached schema dump, sync `ureq` HTTP.
 - [x] **7g.2 — REPL `.ask` + dep-direction flip** *(v0.1.19)*: `.ask <question>` meta-command with `Run? [Y/n]` confirmation. The wiring required dropping the engine dep from `sqlrite-ask` (cargo cycle) — `sqlrite-ask` is now pure over `&str` schemas; the `Connection`/`Database` integration moved to the engine's new `ask` feature. Public surface for callers: `use sqlrite::{Connection, ConnectionAskExt}`.

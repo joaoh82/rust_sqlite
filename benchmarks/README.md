@@ -170,14 +170,20 @@ Even at 10k scale, the gap is large:
 
 ### W10 — vector top-10 (cosine), brute-force vs HNSW
 
-10k 384-dim vectors. Two variants per the plan: brute-force (no index) and HNSW (`CREATE INDEX … USING hnsw`). SQLRite-only — `sqlite-vec` extension wiring is a follow-up (`rusqlite[bundled]` doesn't ship it; loading a pre-compiled `.dylib` at runtime is non-trivial and was out of scope for v1).
+10k 384-dim vectors. Two variants per the plan: brute-force (no index) and HNSW (`CREATE INDEX … USING hnsw (embedding) WITH (metric = 'cosine')`, per SQLR-28). SQLRite-only — `sqlite-vec` extension wiring is a follow-up (`rusqlite[bundled]` doesn't ship it; loading a pre-compiled `.dylib` at runtime is non-trivial and was out of scope for v1).
 
-| Variant | SQLRite median | Throughput |
+The **W10.v1** numbers below were taken before SQLR-23 (parser-bound) and SQLR-28 (HNSW probe was L2-only, so the HNSW variant silently fell through to brute-force on cosine queries) — they are retained for historical context only. **W10.v3** ships with the cosine-built index + cosine-aware optimizer probe; republish under SQLR-25.
+
+| Variant | SQLRite median (v1, retired) | Throughput |
 |---|---|---|
 | brute-force | ~122 ms | ~8 ops/s |
 | hnsw | ~132 ms | ~7 ops/s |
 
-**Read this as:** at 10k vectors × 384 dim, **HNSW barely beats brute-force**. That's not the index's fault — both numbers are dominated by the **per-iter SQL parse cost** (the 384-element bracket-array literal in the `ORDER BY` clause is ~4 KB of SQL the parser walks every iteration; the actual cosine work is ~3.8M FP ops ≈ a few ms). At a much larger corpus (millions of vectors) HNSW would dominate; at 10k the parser cost masks the algorithmic win. A future "prepare-vector-query-once" path or VECTOR-bind binding would surface the real HNSW vs brute-force gap.
+**Read this as (v1, retired):** at 10k vectors × 384 dim, **HNSW barely beats brute-force**. Two reasons compounded:
+1. **Per-iter SQL parse cost** — the 384-element bracket-array literal in the `ORDER BY` clause was ~4 KB of SQL the parser walked every iteration. Fixed in SQLR-23 (`Value::Vector` bind).
+2. **Cosine queries silently brute-forced on the HNSW path** — the optimizer's `try_hnsw_probe` was L2-only; cosine queries never hit the graph. Fixed in SQLR-28 (per-index metric + matching probe).
+
+W10.v3 measures the *actual* HNSW-vs-brute-force gap with both fixes in place.
 
 ### W11 — BM25 top-10
 

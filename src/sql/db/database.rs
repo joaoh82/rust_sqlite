@@ -198,8 +198,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::dialect::SqlriteDialect;
     use crate::sql::parser::create::CreateQuery;
-    use sqlparser::dialect::SQLiteDialect;
     use sqlparser::parser::Parser;
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
             last_name TEXT NOT NULl,
             email TEXT NOT NULL UNIQUE
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
@@ -246,7 +246,7 @@ mod tests {
             last_name TEXT NOT NULl,
             email TEXT NOT NULL UNIQUE
         );";
-        let dialect = SQLiteDialect {};
+        let dialect = SqlriteDialect::new();
         let mut ast = Parser::parse_sql(&dialect, query_statement).unwrap();
         if ast.len() > 1 {
             panic!("Expected a single query statement, but there are more then 1.")
