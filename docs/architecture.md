@@ -104,6 +104,7 @@ The engine never depends on the SDK crates; the SDK crates each depend on the en
 | [`src/sql/hnsw.rs`](../src/sql/hnsw.rs) | Standalone HNSW algorithm — insert / search / layer assignment / beam search. Phase 7d.1. |
 | [`src/sql/fts/`](../src/sql/fts/) | Full-text search — standalone tokenizer, BM25 scorer, and in-memory `PostingList` inverted index. Wired into the executor via the `fts_match` / `bm25_score` scalar functions and the `try_fts_probe` optimizer hook. Phase 8a-8b; persistence in 8c. See [`docs/fts.md`](fts.md). |
 | [`src/sql/json.rs`](../src/sql/json.rs) | JSON column type + path-extraction functions (`json_extract`, `json_type`, `json_array_length`, `json_object_keys`). Phase 7e. |
+| [`src/sql/pragma.rs`](../src/sql/pragma.rs) | `PRAGMA` dispatcher (SQLR-13). `try_parse_pragma` peeks at the SQL token stream before sqlparser sees it and routes any `PRAGMA …` shape to `execute_pragma`. First pragma wired up: `auto_vacuum` (read + set, with `OFF` / `NONE` to disable). Add new pragmas as a single arm in `execute_pragma`. |
 | [`src/sql/pager/`](../src/sql/pager/) | On-disk file format and I/O — see [file-format.md](file-format.md) and [pager.md](pager.md) for details. WAL + checkpointer + shared/exclusive lock modes (Phase 4a-4e) live here. |
 
 ## Flow of a SQL statement

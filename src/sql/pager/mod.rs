@@ -3889,6 +3889,169 @@ mod tests {
         assert_eq!(db.auto_vacuum_threshold(), None);
     }
 
+    // ---------------------------------------------------------------
+    // SQLR-13 — `PRAGMA auto_vacuum` SQL-level coverage. Mirrors the
+    // SQLR-10 setter tests above, but routed through SQL so SDK / FFI
+    // / MCP consumers (which can't reach the Rust setter directly)
+    // get the same guarantees.
+    // ---------------------------------------------------------------
+
+    /// `PRAGMA auto_vacuum = N;` set + `PRAGMA auto_vacuum;` read
+    /// round-trip the threshold, observable via `auto_vacuum_threshold`.
+    #[test]
+    fn pragma_auto_vacuum_set_and_read_via_sql() {
+        let mut db = Database::new("t".to_string());
+
+        let resp = process_command("PRAGMA auto_vacuum = 0.5;", &mut db).expect("set");
+        assert!(
+            resp.contains("PRAGMA"),
+            "set form should produce a PRAGMA status, got: {resp}"
+        );
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.5));
+
+        // Read form — status mentions a returned row.
+        let resp = process_command("PRAGMA auto_vacuum;", &mut db).expect("read");
+        assert!(resp.contains("1 row"), "expected a 1-row read, got: {resp}");
+    }
+
+    /// `PRAGMA auto_vacuum = OFF;` (bare identifier — sqlparser's own
+    /// pragma-value parser would reject this, the SQLR-13 dispatcher
+    /// must accept it) and `= NONE;` both disable the trigger. So does
+    /// the quoted form `'OFF'`.
+    #[test]
+    fn pragma_auto_vacuum_off_disables_trigger() {
+        for raw in ["OFF", "off", "NONE", "none", "'OFF'", "'NONE'"] {
+            let mut db = Database::new("t".to_string());
+            assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+
+            let stmt = format!("PRAGMA auto_vacuum = {raw};");
+            process_command(&stmt, &mut db)
+                .unwrap_or_else(|e| panic!("`{stmt}` should disable: {e}"));
+            assert_eq!(
+                db.auto_vacuum_threshold(),
+                None,
+                "`{stmt}` should clear the threshold"
+            );
+        }
+    }
+
+    /// Out-of-range numeric values surface as a typed error via the
+    /// shared `set_auto_vacuum_threshold` validator — no silent
+    /// saturation. Mirrors the SQLR-10 setter coverage.
+    #[test]
+    fn pragma_auto_vacuum_rejects_out_of_range_via_sql() {
+        let mut db = Database::new("t".to_string());
+        for bad in ["-0.01", "1.01", "1.5"] {
+            let stmt = format!("PRAGMA auto_vacuum = {bad};");
+            let err = process_command(&stmt, &mut db).unwrap_err();
+            assert!(
+                format!("{err}").contains("auto_vacuum_threshold"),
+                "expected range error for `{stmt}`, got: {err}"
+            );
+        }
+        // Default survives all the rejected sets.
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+    }
+
+    /// Junk strings (anything that isn't a number or `OFF`/`NONE`) are
+    /// rejected at parse time with a typed error, not silently treated
+    /// as "disable".
+    #[test]
+    fn pragma_auto_vacuum_rejects_unknown_strings_via_sql() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("PRAGMA auto_vacuum = WAL;", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").contains("OFF/NONE"),
+            "expected OFF/NONE-style error, got: {err}"
+        );
+        // Default unaffected.
+        assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+    }
+
+    /// Pragmas SQLRite doesn't know about return `NotImplemented` —
+    /// not a generic parser error. Future pragmas plug in here.
+    #[test]
+    fn pragma_unknown_returns_not_implemented() {
+        let mut db = Database::new("t".to_string());
+        let err = process_command("PRAGMA journal_mode = WAL;", &mut db).unwrap_err();
+        assert!(
+            matches!(err, SQLRiteError::NotImplemented(_)),
+            "unknown pragma must surface NotImplemented, got: {err:?}"
+        );
+    }
+
+    /// Setting the threshold via SQL must produce identical behavior to
+    /// the Rust setter on the actual auto-VACUUM trigger: `= 0.99`
+    /// suppresses, `= OFF` disables, default fires. Sanity-checks that
+    /// `process_command_with_render`'s pre-parse step doesn't desync
+    /// the in-memory state from the file.
+    #[test]
+    fn pragma_auto_vacuum_drives_real_trigger() {
+        // Sub-case A — `PRAGMA auto_vacuum = OFF;` keeps file at HWM.
+        {
+            let path = tmp_path("av_pragma_off");
+            let mut db = auto_vacuum_setup(&path);
+            process_command("PRAGMA auto_vacuum = OFF;", &mut db).expect("disable via PRAGMA");
+            assert_eq!(db.auto_vacuum_threshold(), None);
+
+            let pages_before = db.pager.as_ref().unwrap().header().page_count;
+            process_command("DROP TABLE bloat;", &mut db).expect("drop");
+            let pages_after = db.pager.as_ref().unwrap().header().page_count;
+            assert_eq!(
+                pages_after, pages_before,
+                "PRAGMA-driven OFF must keep page_count at the HWM"
+            );
+            cleanup(&path);
+        }
+
+        // Sub-case B — high threshold via PRAGMA suppresses the
+        // trigger on a single drop.
+        {
+            let path = tmp_path("av_pragma_high");
+            let mut db = auto_vacuum_setup(&path);
+            process_command("PRAGMA auto_vacuum = 0.99;", &mut db).expect("set high");
+            assert_eq!(db.auto_vacuum_threshold(), Some(0.99));
+
+            let pages_before = db.pager.as_ref().unwrap().header().page_count;
+            process_command("DROP TABLE bloat;", &mut db).expect("drop");
+            let pages_after = db.pager.as_ref().unwrap().header().page_count;
+            assert_eq!(
+                pages_after, pages_before,
+                "high PRAGMA threshold must suppress the trigger"
+            );
+            cleanup(&path);
+        }
+
+        // Sub-case C — re-arm via PRAGMA after disable: the trigger
+        // fires again on the next page-releasing DDL.
+        {
+            let path = tmp_path("av_pragma_rearm");
+            let mut db = auto_vacuum_setup(&path);
+            process_command("PRAGMA auto_vacuum = OFF;", &mut db).unwrap();
+            // Drop with the trigger off — pages land on the freelist
+            // but the file stays at HWM.
+            process_command("DROP TABLE bloat;", &mut db).unwrap();
+            let pages_after_off_drop = db.pager.as_ref().unwrap().header().page_count;
+            assert!(db.pager.as_ref().unwrap().header().freelist_head != 0);
+
+            // Re-arm via PRAGMA, then drop one more thing — the
+            // accumulated freelist still exceeds 25%, so auto-VACUUM
+            // fires.
+            process_command("PRAGMA auto_vacuum = 0.25;", &mut db).expect("re-arm");
+            process_command("CREATE INDEX idx_keep_n ON keep (n);", &mut db).unwrap();
+            process_command("DROP INDEX idx_keep_n;", &mut db).expect("drop index");
+
+            let pages_after_rearm = db.pager.as_ref().unwrap().header().page_count;
+            assert!(
+                pages_after_rearm < pages_after_off_drop,
+                "re-armed PRAGMA must let auto-VACUUM fire: was {pages_after_off_drop}, \
+                 now {pages_after_rearm}"
+            );
+            assert_eq!(db.pager.as_ref().unwrap().header().freelist_head, 0);
+            cleanup(&path);
+        }
+    }
+
     /// VACUUM modifiers (FULL, REINDEX, table targets, …) are rejected
     /// with NotImplemented — only bare `VACUUM;` is supported.
     #[test]

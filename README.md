@@ -167,6 +167,7 @@ sqlrite> DELETE FROM users WHERE age < 30;
 | `UPDATE` | Multi-column `SET`; `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Real transactions, snapshot-based; WAL-backed commit; single-level (no savepoints); auto-rollback if `COMMIT`'s disk write fails |
+| `PRAGMA auto_vacuum` | Read (`PRAGMA auto_vacuum;`) returns the trigger threshold as a single-row result set; set (`PRAGMA auto_vacuum = 0.5;` / `= OFF;` / `= NONE;`) tunes or disables auto-VACUUM at the SQL layer for SDK / FFI / MCP consumers |
 
 Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 
