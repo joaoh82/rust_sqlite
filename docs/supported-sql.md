@@ -589,23 +589,26 @@ A REPL launched with `sqlrite --readonly foo.sqlrite` (or `sqlrite::open_databas
 For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when these land:
 
 ### Joins & composition
-- `INNER` / `LEFT OUTER` / `RIGHT OUTER` / `FULL OUTER JOIN ... ON ...` — **supported** (SQLR-5)
-- `CROSS JOIN`, comma joins, `NATURAL JOIN`, `JOIN ... USING` — not yet
+- `CROSS JOIN`, comma joins, `NATURAL JOIN`, `JOIN ... USING` — explicit `INNER` / `LEFT` / `RIGHT` / `FULL OUTER JOIN ... ON ...` works (SQLR-5); the others don't
+- Aggregates / `GROUP BY` / `DISTINCT` *over* a JOIN — pipe through a subquery once subqueries land
+- `fts_match` / `bm25_score` inside a JOIN expression — single-table-bound today
 - Subqueries (scalar, `IN (SELECT ...)`, correlated)
 - CTEs (`WITH`), recursive CTEs
 - Views (`CREATE VIEW`)
 
 ### Aggregation & grouping
-- `GROUP BY`, `HAVING`
-- Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`)
-- `DISTINCT`
+- `HAVING` — pre-aggregation `WHERE` works; post-aggregation filtering doesn't yet
+- `DISTINCT` on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
+- `GROUP BY` on expressions — bare column names only
+- Other aggregate functions (`GROUP_CONCAT`, `STRING_AGG`, …) — only `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` are wired
 
 ### Predicate & expression
-- `LIKE`, `GLOB`, `REGEXP`
-- `IN (...)`, `NOT IN`, `BETWEEN`
+- `GLOB`, `REGEXP`
+- `BETWEEN`
+- `LIKE … ESCAPE '<char>'` — bare `LIKE` / `NOT LIKE` / `ILIKE` work; the explicit-escape form doesn't
+- `IN (subquery)`, `IN UNNEST(...)` — only literal lists are supported
 - `CASE WHEN ... THEN ... END`
-- Expressions in the `SELECT` projection list
-- Column aliases (`AS`)
+- Expressions in the `SELECT` projection list — aggregate calls are the one allowed expression form (`SELECT age + 1 FROM users` is rejected)
 - Built-in functions (`LENGTH`, `UPPER`, `LOWER`, `COALESCE`, `IFNULL`, date/time, `printf`, …)
 
 ### DDL
@@ -620,13 +623,18 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 ### Transactions
 - Savepoints (`SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`)
 - Isolation-level control (`BEGIN IMMEDIATE`, `BEGIN EXCLUSIVE`)
+- Concurrent writes / MVCC (`BEGIN CONCURRENT`) — proposal sketched in [`docs/concurrent-writes-plan.md`](concurrent-writes-plan.md)
 
 ### Query shape
 - `OFFSET`
-- Multi-column `ORDER BY`
+- Multi-column `ORDER BY`, `NULLS FIRST/LAST`
 - `UNION`, `INTERSECT`, `EXCEPT`
 - `INSERT ... SELECT`
 - `UPDATE ... FROM`, `DELETE ... USING`
+- Window functions (`OVER (...)`, `FILTER (WHERE ...)`, `WITHIN GROUP`)
+
+### Parameter binding
+- Named placeholders (`:foo`, `$1`, `@x`) — only positional `?` is supported (SQLR-23)
 
 ### Session / schema
 - Multiple attached databases (`ATTACH DATABASE`, `DETACH DATABASE`)
