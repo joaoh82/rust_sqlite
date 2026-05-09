@@ -4,15 +4,59 @@ import { Footer } from "@/components/footer";
 import { Nav } from "@/components/nav";
 import { SITE } from "@/lib/site";
 
+const TITLE = "Getting started with SQLRite";
+const DESCRIPTION =
+  "A ten-minute tour from cargo install to a persistent on-disk SQLRite database — REPL, transactions, JOINs, vector search, BM25 full-text, and six language SDKs.";
+
 export const metadata: Metadata = {
-  title: "Getting started · SQLRite docs",
-  description:
-    "A ten-minute tour from cargo install to a persistent on-disk SQLRite database with real transactions, vector search, and full-text search.",
+  title: TITLE,
+  description: DESCRIPTION,
+  alternates: { canonical: "/docs" },
+  openGraph: {
+    type: "article",
+    siteName: "SQLRite",
+    locale: "en_US",
+    url: `${SITE.url}/docs`,
+    title: TITLE,
+    description: DESCRIPTION,
+  },
+  twitter: {
+    card: "summary_large_image",
+    site: SITE.twitterHandle,
+    creator: SITE.twitterHandle,
+    title: TITLE,
+    description: DESCRIPTION,
+  },
+};
+
+const breadcrumbJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  itemListElement: [
+    {
+      "@type": "ListItem",
+      position: 1,
+      name: "Home",
+      item: SITE.url,
+    },
+    {
+      "@type": "ListItem",
+      position: 2,
+      name: "Docs",
+      item: `${SITE.url}/docs`,
+    },
+  ],
 };
 
 export default function DocsPage() {
   return (
     <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify(breadcrumbJsonLd),
+        }}
+      />
       <Nav variant="docs" />
       <div className="docs-shell">
         <aside className="docs-side">
@@ -733,8 +777,8 @@ export default function DocsPage() {
           </div>
         </main>
 
-        <aside className="toc">
-          <h4>On this page</h4>
+        <aside className="toc" aria-label="On this page">
+          <h2 className="toc-title">On this page</h2>
           <a href="#install">Install</a>
           <a href="#first-db">Your first database</a>
           <a href="#repl">Using the REPL</a>

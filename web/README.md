@@ -18,6 +18,41 @@ extracted into its own repository later without rewrites.
 - `/` — landing (hero with animated REPL, features, architecture, roadmap, SDK switcher, SQL surface, desktop showcase, blog series, footer)
 - `/docs` — Getting Started page (sticky sidebar nav + on-page TOC)
 
+## SEO surface
+
+Each public route ships full search/social metadata. The pieces:
+
+- **Per-route `<title>` + `<meta name="description">`** — declared via the
+  Next App-Router `metadata` export on each `page.tsx` (and a site-wide
+  template in [`src/app/layout.tsx`](src/app/layout.tsx)).
+- **Canonical URL** — `alternates.canonical` on every page; prevents the
+  `/docs` tree (and any future hash/query variants) from being treated as
+  duplicates.
+- **OpenGraph + Twitter Card** — full set of `og:*` and `twitter:*` tags per
+  route. Heads-up: Next 15 does **not** deep-merge `openGraph` / `twitter`
+  between layout and page, so site-wide fields (`siteName`, `card`,
+  `site`/`creator`) are restated on each page-level override.
+- **Auto-generated OG images** — every page has a sibling
+  `opengraph-image.tsx` + `twitter-image.tsx` rendered via
+  `next/og`'s `ImageResponse` at the edge. Layout lives in
+  [`src/lib/og.tsx`](src/lib/og.tsx) so each route just supplies a
+  page-specific eyebrow / title / subtitle. The brand mark is inlined as
+  SVG (Satori's dynamic-font fallback 400s on uncommon glyphs).
+- **`/sitemap.xml` + `/robots.txt`** — Next 15 metadata routes
+  ([`src/app/sitemap.ts`](src/app/sitemap.ts),
+  [`src/app/robots.ts`](src/app/robots.ts)). Add a route to the `ROUTES`
+  list when shipping a new page.
+- **JSON-LD structured data** — `SoftwareApplication` schema on the landing
+  page, `BreadcrumbList` on `/docs`. Validate via Google's
+  [Rich Results Test](https://search.google.com/test/rich-results).
+- **Search Console verification** — fill in the placeholder tokens in
+  `metadata.verification` ([`src/app/layout.tsx`](src/app/layout.tsx)) once
+  Google Search Console + Bing Webmaster Tools issue them.
+
+The canonical site URL + Twitter handle live in
+[`src/lib/site.ts`](src/lib/site.ts) (`SITE.url`, `SITE.twitterHandle`) —
+update both there if the domain or handle ever changes.
+
 ## Local development
 
 ```sh

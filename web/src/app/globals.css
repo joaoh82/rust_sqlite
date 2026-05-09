@@ -1234,7 +1234,7 @@ footer {
     grid-template-columns: 1fr 1fr;
   }
 }
-.foot-col h4 {
+.foot-col h3 {
   font-size: 11px;
   font-family: var(--font-mono);
   text-transform: uppercase;
@@ -1332,7 +1332,7 @@ footer {
   overflow-y: auto;
 }
 .docs-side h4,
-.toc h4 {
+.toc .toc-title {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--color-fg-dim);
