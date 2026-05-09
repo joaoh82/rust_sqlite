@@ -16,6 +16,7 @@ SQLRite is a from-scratch SQLite-style embedded database written in Rust. It's p
 - `sqlrite-ffi/` — C ABI cdylib + generated `sqlrite.h` header. Backs the Go SDK and any C consumer.
 - `desktop/` — Tauri 2 + Svelte 5 GUI. Embeds the engine directly (no FFI hop).
 - `benchmarks/` — SQLR-4 / SQLR-16 bench harness. `Driver` trait + SQLRite + SQLite (rusqlite-bundled) drivers + criterion-driven workloads. Excluded from the default CI build/test/clippy/doc commands; run locally with `make bench` (or `make bench-duckdb`). See [docs/benchmarks-plan.md](docs/benchmarks-plan.md).
+- `web/` — marketing + docs site (Next.js 15 + Tailwind v4). Independent of the Cargo workspace; lives in-repo for now but is structured to lift into its own repository later. See [web/README.md](web/README.md).
 
 Architecture deep-dive: [docs/architecture.md](docs/architecture.md). The full doc index is [docs/_index.md](docs/_index.md).
 

@@ -11,6 +11,8 @@ Rust-SQLite (SQLRite)
 > What I cannot create, I do not understand. 
 > — Richard Feynman
 
+📖 **Project website + docs:** the marketing + getting-started site is in [`web/`](web/) (Next.js 15 + Tailwind v4). Run `cd web && npm install && npm run dev` to preview locally; deploys to Vercel out of the box.
+
 
 <table style="width:100%">
 <tr>

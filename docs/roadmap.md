@@ -2,7 +2,7 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
-> **Active frontier (May 2026):** Phase 8 shipped end-to-end (8a–8f). All six sub-phases — standalone algorithms, SQL surface, cell-encoded persistence with on-demand v4→v5 file-format bump, hybrid-retrieval worked example, `bm25_search` MCP tool, and the docs sweep — landed across PRs #78–#83. The next milestone is the **v0.2.0 release** (file-format change + new SQL surface). After v0.2.0 the roadmap loops back to "possible extras" and the 5a.2 cursor refactor.
+> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** The roadmap from here is the smaller "possible extras" list at the bottom of this doc plus the 5a.2 cursor refactor.
 
 ## ✅ Phase 0 — Modernization
 
@@ -517,12 +517,87 @@ Adds the `bm25_search` MCP tool, symmetric with `vector_search` (Phase 7h). Wrap
 
 Final docs pass — canonical [`fts.md`](fts.md) reference (mirrors `ask.md`'s shape); FTS sections added to [`supported-sql.md`](supported-sql.md), [`architecture.md`](architecture.md) (module map + storage section), [`file-format.md`](file-format.md) (`KIND_FTS_POSTING` layout, v4→v5 bump in version history), [`sql-engine.md`](sql-engine.md) (`try_fts_probe` optimizer hook), [`mcp.md`](mcp.md) (`bm25_search` tool entry + count bump 7→8); FTS step added to [`smoke-test.md`](smoke-test.md); [`_index.md`](_index.md) re-organized to give Phase 8 its own top-level section.
 
+## ✅ Phase 9 — SQL surface + DX follow-ups *(0.2.0 → 0.9.1)*
+
+After Phase 8 closed out the v0.1.x cycle and the v0.2.0 file-format bump shipped, the next wave landed the SQL features that had been parked under "possible extras," plus the storage hygiene + DX work that had accumulated alongside them. Each sub-phase shipped as its own minor release, so consumers got each capability the moment it was stable on `main`.
+
+### ✅ Phase 9a — DDL completeness *(v0.3.0)*
+
+`feat(ddl): DEFAULT clause, DROP TABLE/INDEX, ALTER TABLE` (PR #86).
+
+- **`DEFAULT <literal>`** column constraint — accepted on CREATE TABLE and ADD COLUMN; literal-only (function defaults like `CURRENT_TIMESTAMP` rejected at parse time so we don't silently accept misleading SQL).
+- **`DROP TABLE [IF EXISTS]`** + **`DROP INDEX [IF EXISTS]`** — single-target; refuses to drop `sqlrite_autoindex_*` (constraint-bound). All attached indexes (auto, explicit, HNSW, FTS) ride along when a table goes away.
+- **`ALTER TABLE`** — `RENAME TO` / `RENAME COLUMN` / `ADD COLUMN` / `DROP COLUMN`. One operation per statement (SQLite parity). Auto-index names follow renames; index deps cascade through column drops; `ADD COLUMN` with `DEFAULT` backfills existing rows.
+
+### ✅ Phase 9b — Free-list + manual VACUUM *(v0.4.0, SQLR-6)*
+
+Pages released by `DROP TABLE` / `DROP INDEX` / `ALTER TABLE DROP COLUMN` go onto a persisted free-page list rather than being silently leaked. `CREATE TABLE` and INSERT consult the freelist before extending the file. Bare `VACUUM;` rewrites every live B-Tree contiguously from page 1 and clears the freelist; modifiers (`VACUUM FULL`, table targets, etc.) are parsed but rejected at execution. No-op on in-memory databases. Refused inside an open transaction.
+
+### ✅ Phase 9c — Auto-VACUUM *(v0.5.0, SQLR-10)*
+
+Every page-releasing DDL checks the freelist after committing and runs `vacuum_database` automatically when the freelist exceeds **25%** of `page_count` (SQLite parity). Skips databases under 16 pages, skips inside transactions, skips on in-memory and read-only DBs. Threshold tunable per-`Connection` via `set_auto_vacuum_threshold(Option<f64>)`.
+
+### ✅ Phase 9d — `IS NULL` / `IS NOT NULL` + typed `Option<Value>` INSERT pipeline *(v0.5.1, SQLR-7)*
+
+Explicit null tests across `WHERE` / `UPDATE SET` / `DELETE WHERE`. The INSERT pipeline started carrying `Option<Value>` end-to-end so `NULL` and a missing-column DEFAULT can be distinguished without a sentinel.
+
+### ✅ Phase 9e — `GROUP BY`, aggregates, `DISTINCT`, `LIKE`, `IN` *(v0.6.0, SQLR-3)*
+
+The biggest single SQL-surface jump in the project's history.
+
+- **`GROUP BY <col>[, <col>, …]`** — bare column names only. Every non-aggregate projection item must appear in the `GROUP BY` list (parser-checked).
+- **Aggregates** — `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`. Integer `SUM` stays integer until a `REAL` arrives or `i64` overflows (one-time promotion). `AVG` returns `REAL` (or `NULL` on empty groups). `MIN` / `MAX` skip NULLs and use the same total order as `ORDER BY`. Empty-group results are `0` for counts, `NULL` for the rest.
+- **`DISTINCT`** — applies after projection (and after aggregation when both are present); `LIMIT` counts unique rows; `NULL = NULL` for dedupe.
+- **`LIKE` / `NOT LIKE` / `ILIKE`** — `%`, `_`, `\`-escape. ASCII case folding on by default (SQLite parity). `NULL LIKE 'pattern'` evaluates to `NULL` (excluded by `WHERE`).
+- **`IN (literal-list)`** + **`NOT IN (literal-list)`** — three-valued logic per SQL standard.
+
+### ✅ Phase 9f — JOINs *(v0.7.0, SQLR-5)*
+
+`INNER`, `LEFT OUTER`, `RIGHT OUTER`, `FULL OUTER JOIN ... ON …` with explicit `ON`. Why all four when SQLite ships only INNER + LEFT: the per-flavor differences are NULL-padding policies on top of one nested-loop driver — `RIGHT` / `FULL` were free once the executor had a multi-table scope. See [`docs/design-decisions.md`](design-decisions.md) for the rationale.
+
+- Aliases (`FROM customers AS c JOIN orders AS o ON c.id = o.customer_id`); when an alias is supplied the original name leaves scope (SQL standard).
+- Qualified column references (`<table>.<col>` / `<alias>.<col>`); ambiguous bare references error with a "qualify it" hint.
+- Multi-join chains left-fold: `A ⨝ B ⨝ C` evaluates as `(A ⨝ B) ⨝ C`.
+- Self-joins require an alias on at least one side.
+- `WHERE` runs after joins (the standard `LEFT JOIN ... WHERE right.col IS NULL` anti-join idiom works).
+
+Not yet supported: `CROSS JOIN`, comma-separated FROMs, `NATURAL JOIN`, `JOIN ... USING (col)`, aggregates / `GROUP BY` / `DISTINCT` *over* a join, `fts_match` / `bm25_score` inside a join expression. Algorithm: plain nested-loop, O(N×M) per level — hash / merge joins are a future optimization.
+
+### ✅ Phase 9g — Prepared statements + parameter binding *(v0.9.0, SQLR-23)*
+
+Every executable statement accepts `?` placeholders anywhere a value literal is allowed. Public Rust API: `Connection::prepare` / `prepare_cached`, `Statement::execute_with_params(&[Value])` / `query_with_params(&[Value])`. Strict positional binding, strict arity. `Value::Vector(Vec<f32>)` binds where a bracket-array literal would normally appear — including the second arg of `vec_distance_*` inside an HNSW-eligible `ORDER BY`, so the graph shortcut still fires for prepared KNN queries.
+
+`prepare_cached` keeps a per-connection LRU plan cache (default cap 16, tunable via `set_prepared_cache_capacity`) — a hot SQL string parses exactly once across the connection's lifetime. Named placeholders (`:foo`, `$1`) deferred.
+
+### ✅ Phase 9h — HNSW probe widened to cosine + dot *(v0.9.0, SQLR-28)*
+
+`CREATE INDEX … USING hnsw (col) WITH (metric = '<l2|cosine|dot>')` — the metric travels with the index and the optimizer only takes the graph shortcut when the query's `vec_distance_*` function matches the index's metric. Mismatches fall through to brute force rather than returning a wrong answer. Pre-SQLR-28 catalogs round-trip unchanged (no `WITH` is equivalent to `metric = 'l2'`).
+
+### ✅ Phase 9i — `PRAGMA` dispatcher + `auto_vacuum` knob *(v0.9.1, SQLR-13)*
+
+`PRAGMA <name>;` (read) / `PRAGMA <name> = <value>;` (write) is now a real executor arm. The first wired pragma is `auto_vacuum`, which exposes the SQLR-10 threshold to SDK / FFI / MCP consumers that can't call the Rust setter. Out-of-range values, NaN, ±∞, and unknown identifiers are rejected with typed errors — the trigger never silently saturates. Adding a new pragma is a single arm in `execute_pragma`; future ones (`journal_mode`, `synchronous`, `cache_size`, `page_size`, …) will land as they earn their keep.
+
+## ✅ Phase 10 — Benchmarks vs SQLite *(SQLR-4 / SQLR-16)*
+
+End-to-end SQLR-4 / SQLR-16 bench harness with twelve workloads across three groups (read-by-PK, transactional CRUD, analytical slices, vector / FTS retrieval). Pluggable `Driver` trait + bundled SQLite + DuckDB drivers; criterion-based; pinned-host runs published at [`docs/benchmarks.md`](benchmarks.md). Excluded from CI (criterion is too noisy on shared runners; `rusqlite-bundled` is heavy). See [`docs/benchmarks-plan.md`](benchmarks-plan.md) for the design and PRs #102–#114 for the staged rollout.
+
 ## "Possible extras" not pinned to a phase
 
-- Joins (`INNER`, `LEFT OUTER`, `CROSS`)
-- `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, ...), `DISTINCT`, `LIKE`, `IN`
-- Composite and expression indexes
-- Alternate storage engines (LSM/SSTable for write-heavy workloads)
-- Benchmarks against SQLite — design proposal in [`benchmarks-plan.md`](benchmarks-plan.md) (SQLR-4). Confirmed comparison targets: SQLite (mandatory baseline), DuckDB on analytical-slice workloads (optional). libSQL deferred; Cloudflare D1 + rqlite explicitly out-of-scope (network-resident, not embedded).
+The remaining items — actually open, not retroactively rewritten:
 
-These will slot in where they make sense — many are natural side effects of Phase 3 storage work or Phase 5's library API.
+- Subqueries (scalar, `IN (SELECT ...)`, correlated) and CTEs (`WITH`, recursive)
+- `HAVING` (post-aggregation filter)
+- `CASE WHEN … THEN … END`, `BETWEEN`, `GLOB`, `REGEXP`, `LIKE … ESCAPE '<char>'`
+- Aggregates / `GROUP BY` / `DISTINCT` *over* joins (needs a single executor pass that knows about multiple input streams)
+- Multi-column / expression `ORDER BY`, `OFFSET`, `NULLS FIRST/LAST`
+- `UNION` / `INTERSECT` / `EXCEPT`, `INSERT ... SELECT`
+- Composite + expression indexes
+- Concurrent writes via MVCC + `BEGIN CONCURRENT` — design sketch in [`docs/concurrent-writes-plan.md`](concurrent-writes-plan.md)
+- `CREATE VIEW`, `CREATE TRIGGER`, `FOREIGN KEY`, `CHECK`, table-level / composite constraints
+- Savepoints + isolation-level control (`BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`)
+- Built-in scalar functions (`LENGTH`, `UPPER`, `LOWER`, `COALESCE`, `IFNULL`, date/time, `printf`, …)
+- More pragmas (`journal_mode`, `synchronous`, `cache_size`, `page_size`, …)
+- Alternate storage engines (LSM/SSTable for write-heavy workloads)
+- Code signing for desktop installers (Phase 6.1)
+
+These slot in where they make sense — many are natural side effects of the existing executor / pager / parser surfaces.
