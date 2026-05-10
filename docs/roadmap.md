@@ -589,19 +589,25 @@ Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency 
 
 `Connection` is a thin handle backed by `Arc<Mutex<Database>>`. Call [`Connection::connect`] to mint a sibling that shares the same engine state — typically one per worker thread. The headline contract: `Connection` is `Send + Sync`, and the engine no longer requires the caller to wrap the public API in their own `Mutex`. Today every operation still serializes through the per-database mutex (and the pager's existing process-level flock), so the behaviour change is *capability*, not throughput; concurrent throughput arrives with `BEGIN CONCURRENT` in 11.4.
 
-### 🚧 Phase 11.2 — Logical clock + active-tx registry *(in progress, plan-doc "Phase 10.2")*
+### ✅ Phase 11.2 — Logical clock + active-tx registry *(plan-doc "Phase 10.2")*
 
-New [`sqlrite::mvcc`](../src/mvcc/) module:
+[`sqlrite::mvcc`](../src/mvcc/) module:
 
 - `MvccClock` — process-wide monotonic `u64` over `AtomicU64`. `tick()` hands out begin- / commit-timestamps; `now()` reads the high-water without advancing it; `observe(value)` advances the clock to `value` if greater (used at WAL replay).
 - `ActiveTxRegistry` — `Mutex<BTreeMap>` over in-flight transactions. `register(&clock)` allocates a `TxId`, snapshots `begin_ts`, and returns a RAII `TxHandle`; `min_active_begin_ts()` answers Phase 11.6 GC's "what's still possibly visible" question.
 - `TxId` newtype + `TxTimestampOrId` tagged union — defined now so 11.4 can plug in without re-litigating the type shape.
 
-WAL format bumps **v1 → v2**: bytes 24..32 of the WAL header (previously reserved-zero) now carry the persisted `clock_high_water` `u64`. v1 WALs open cleanly — those zero bytes read as "clock never advanced" — and the next checkpoint rewrites the header at v2. No offline upgrade step. `Wal::set_clock_high_water` / `Wal::clock_high_water` accessors expose the field; the setter rejects regressions with a typed error. The clock isn't wired into the executor yet (that's 11.3); the persistence + restore plumbing is in place so 11.3 just reads the high-water at open and seeds the in-memory clock.
+WAL format bumps **v1 → v2**: bytes 24..32 of the WAL header (previously reserved-zero) now carry the persisted `clock_high_water` `u64`. v1 WALs open cleanly — those zero bytes read as "clock never advanced" — and the next checkpoint rewrites the header at v2. No offline upgrade step. `Wal::set_clock_high_water` / `Wal::clock_high_water` accessors expose the field; the setter rejects regressions with a typed error.
 
-### Phase 11.3 — `MvStore` skeleton + snapshot-isolation reads *(planned)*
+### 🚧 Phase 11.3 — `MvStore` skeleton + `PRAGMA journal_mode` opt-in *(in progress, plan-doc "Phase 10.3")*
 
-In-memory version index + `PRAGMA journal_mode = mvcc` opt-in. Lazy-loads versions from the pager on first touch. Writes still go through the legacy path — only reads change.
+Standalone version-index data structure + the per-database journal-mode toggle.
+
+- New [`MvStore`](../src/mvcc/store.rs): `Mutex<HashMap<RowID, Arc<RwLock<Vec<RowVersion>>>>>`. `RowID = (table, rowid)`; each `RowVersion` carries `begin: TxTimestampOrId`, `end: Option<TxTimestampOrId>`, `payload: VersionPayload` (`Present(cols)` or `Tombstone`). `MvStore::read(row, begin_ts)` implements the textbook snapshot-isolation visibility rule (`begin <= T < end`). `push_committed` validates monotonicity + caps the previous latest version's `end`; `push_in_flight` adds a placeholder version that's invisible to other readers until commit rewrites its `begin`.
+- New [`JournalMode`](../src/mvcc/mod.rs) enum (`Wal` default, `Mvcc`); per-database setting on `Database`. `PRAGMA journal_mode = wal | mvcc;` toggles; `PRAGMA journal_mode;` returns the current value as a single-row, single-column result. `Connection::journal_mode()` reads the value through the public API. Switching `Mvcc → Wal` is rejected if the store carries committed versions (would silently strand them); v0 is intentionally strict.
+- `Database` grows `mvcc_clock: Arc<MvccClock>` and `mv_store: MvStore` fields, allocated on every `Database::new` so the toggle to MVCC mode doesn't require a re-init step. Both are shared across every `Connection::connect` sibling.
+
+The executor doesn't consult `MvStore` yet — that wiring lives in 11.4 alongside `BEGIN CONCURRENT` writes (the read-side and write-side are coupled: snapshot reads make sense only once the commit path is mirroring versions into the store). 11.3's contract is *the data structure + the toggle exist and round-trip*; 11.4 will turn the dial.
 
 ### Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(planned, the meat)*
 

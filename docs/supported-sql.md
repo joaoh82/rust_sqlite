@@ -562,6 +562,23 @@ PRAGMA auto_vacuum = OFF;      -- disable; equivalent: NONE, 'OFF', 'NONE'
 
 Out-of-range values (anything outside `0.0..=1.0`, `NaN`, `±∞`) and unknown identifiers like `WAL` / `FULL` are rejected with a typed error — the trigger never silently saturates or falls back to a default. The setting is per-`Connection` runtime state — it's not persisted in the file header, so every reopen starts at the default `Some(0.25)`.
 
+### `PRAGMA journal_mode` (Phase 11.3, SQLR-22)
+
+Selects the per-database concurrency model. `wal` (default) is the legacy WAL-backed pager every pre-Phase-11 build used; `mvcc` opts the database into multi-version concurrency control (Phase 11 — concurrent writes via `BEGIN CONCURRENT`).
+
+```sql
+PRAGMA journal_mode;            -- read; renders a single-row "wal" or "mvcc"
+PRAGMA journal_mode = mvcc;     -- opt into MVCC for this database
+PRAGMA journal_mode = wal;      -- switch back (rejected if the MvStore
+                                --   already carries committed versions)
+```
+
+Case-insensitive on both the pragma name and the value. Quoted values (`'mvcc'`) work; numeric values are rejected (the field is enum-shaped). Unknown modes return a typed error and don't disturb the existing setting.
+
+The setting is **per-database** — every `Connection::connect` sibling sees the same value (the [open-question](concurrent-writes-plan.md) on per-connection vs per-database journal mode resolved to per-database for v0; revisit if a workload requires the per-connection variant). Reachable through the public API as `Connection::journal_mode() -> JournalMode`.
+
+**What 11.3 changes:** the toggle is observable. The data structures backing MVCC (`MvccClock`, `MvStore`, the active-transaction registry) are allocated and round-trip through `PRAGMA`. **What 11.3 does *not* change yet:** the executor's read path. SELECTs still go through the legacy `tables → pager` path regardless of journal mode. End-to-end snapshot-isolation reads + `BEGIN CONCURRENT` writes land together in 11.4 — the read-side and write-side are coupled, and shipping one without the other would surface as wrong rows.
+
 ---
 
 ## Read-only databases
@@ -638,7 +655,7 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 
 ### Session / schema
 - Multiple attached databases (`ATTACH DATABASE`, `DETACH DATABASE`)
-- `PRAGMA` statements other than `auto_vacuum` (SQLR-13). The dispatcher is in place — adding a pragma is a single arm in `execute_pragma`. `journal_mode`, `synchronous`, `cache_size`, etc. are not yet wired up
+- `PRAGMA` statements other than `auto_vacuum` (SQLR-13) and `journal_mode` (SQLR-22 / Phase 11.3). The dispatcher is in place — adding a pragma is a single arm in `execute_pragma`. `synchronous`, `cache_size`, etc. are not yet wired up
 - `REPLACE INTO`, `INSERT OR IGNORE`, `INSERT OR REPLACE` (conflict-resolution clauses)
 
 ---
