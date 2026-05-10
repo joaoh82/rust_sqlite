@@ -190,6 +190,31 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+### 12d. `BEGIN CONCURRENT` reuses the legacy deep-clone snapshot mechanism (Phase 11.4)
+
+**Decision.** A `BEGIN CONCURRENT` transaction allocates a per-`Connection` [`ConcurrentTx`](../src/mvcc/transaction.rs) carrying:
+
+- a `TxHandle` (RAII registry entry from Phase 11.2),
+- `tables: HashMap<String, Table>` — a **deep clone** of `Database::tables` taken at BEGIN, mutated by the executor through every statement of the transaction,
+- `tables_at_begin: HashMap<String, Table>` — an **immutable second deep clone** of the same, untouched for the transaction's lifetime,
+- `schema_at_begin: Vec<String>` — sorted table-name fingerprint at BEGIN.
+
+Each statement inside the transaction runs against the working `tables` clone via a swap-and-restore (`std::mem::swap(db.tables, tx.tables)` → run executor → swap back); the executor itself doesn't know it's running inside an MVCC transaction. At COMMIT, the write-set is derived by diffing `tables_at_begin` against `tables`. Validation walks `MvStore` for the latest committed `begin_ts` per touched row; if any exceeds `tx.begin_ts` we abort with [`SQLRiteError::Busy`](../src/error.rs). On success we tick the clock for `commit_ts`, push each write into `MvStore`, apply the writes per-row to `db.tables`, and persist via the legacy `save_database`.
+
+**Why deep clones rather than a tx-local write-set + read-through-overlay.** The tx-local-overlay model (every executor read consults a tx-local map first, then the live database) is the textbook "right" answer and what 11.5+ will eventually adopt once reads route through `MvStore`. For 11.4 we wanted to ship the four plan-required tests — disjoint inserts both commit, same-row updates collide with `Busy`, aborted writes invisible, retry succeeds — without rewriting the executor. The swap-and-restore approach gets us there because the executor's `&mut Database` signature stays unchanged: from inside the swap, `db.tables` IS the snapshot. Statements inside the transaction therefore see their own writes correctly without any executor-level changes.
+
+**Why the second clone (`tables_at_begin`).** Without it, the COMMIT-time diff would be against the *current* `db.tables`, which might already carry commits from other concurrent transactions that landed between our BEGIN and our COMMIT. Their disjoint writes would surface in our diff as bogus DELETEs, and per-row apply would silently undo someone else's commit. Diffing against the BEGIN-time snapshot keeps our write-set scoped to changes we actually made. The doubled per-transaction memory is the v0 cost of correctness; column-level COW or `Arc<Table>` sharing is an obvious follow-up.
+
+**Why reads via `Statement::query` don't see the swap.** `Statement::query` takes `&self`, not `&mut self`, so it can't perform the swap (the swap mutates state on the `Connection`). Reads via `Connection::execute("SELECT …")` (which takes `&mut self`) work, because they go through `execute_in_concurrent_tx` and the swap. Phase 11.5 routes reads through `MvStore` directly — the data structure already implements the snapshot-isolation visibility rule; only the executor wiring is missing — at which point the swap path can be retired.
+
+**Why per-connection rather than per-database.** Each open `BEGIN CONCURRENT` needs its own snapshot. Putting the snapshot on `Database` would limit us to one open concurrent transaction at a time, defeating the headline concurrency story. Per-`Connection` state means N sibling `Connection::connect()` handles can each hold their own open transaction — and the database mutex still serializes per-statement execution, so the storage layer's invariants don't change.
+
+**Why DDL is rejected inside `BEGIN CONCURRENT`.** Schema mutations interact poorly with the swap-and-diff model: a CREATE TABLE inside the transaction would land on the snapshot clone but not on the live database, and the per-row apply at COMMIT can't merge a new table back. Rather than hold up 11.4 on a clean DDL story, v0 rejects with a typed error — matching the plan's explicit non-goal — and a follow-up extends the merge logic if real workloads need it.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §4.5 (commit protocol), §6 (SQL surface), §8 (non-goals: DDL, AUTOINCREMENT, snapshot-isolation reads outside `BEGIN CONCURRENT`).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

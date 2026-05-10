@@ -50,7 +50,7 @@
 //! (default cap 16) so a hot SQL string is parsed exactly once across
 //! every call, not once per `prepare()`. Matches the rusqlite pattern.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -59,10 +59,11 @@ use sqlparser::ast::Statement as AstStatement;
 use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
-use crate::sql::db::database::Database;
-use crate::sql::db::table::Value;
+use crate::mvcc::{ConcurrentTx, JournalMode, RowID, RowVersion, VersionPayload};
+use crate::sql::db::database::{Database, TxnSnapshot};
+use crate::sql::db::table::{Table, Value};
 use crate::sql::executor::execute_select_rows;
-use crate::sql::pager::{AccessMode, open_database_with_mode, save_database};
+use crate::sql::pager::{self, AccessMode, open_database_with_mode, save_database};
 use crate::sql::params::{rewrite_placeholders, substitute_params};
 use crate::sql::parser::select::SelectQuery;
 use crate::sql::process_ast_with_render;
@@ -119,6 +120,17 @@ pub struct Connection {
     /// boundary.
     prep_cache: VecDeque<(String, Arc<CachedPlan>)>,
     prep_cache_cap: usize,
+    /// Phase 11.4 — per-connection `BEGIN CONCURRENT` state.
+    /// `None` outside a concurrent transaction; `Some` between
+    /// `BEGIN CONCURRENT` and `COMMIT` / `ROLLBACK`. Multiple
+    /// sibling connections can each hold their own — that's the
+    /// headline concurrency story this slice unlocks.
+    ///
+    /// While `Some`, every statement on this connection runs
+    /// against the cloned tables in [`ConcurrentTx::tables`]
+    /// instead of the live `Database::tables`. The live database
+    /// stays untouched until the commit-validation pass succeeds.
+    concurrent_tx: Option<ConcurrentTx>,
 }
 
 impl Connection {
@@ -179,6 +191,7 @@ impl Connection {
             inner: Arc::new(Mutex::new(db)),
             prep_cache: VecDeque::new(),
             prep_cache_cap: DEFAULT_PREP_CACHE_CAP,
+            concurrent_tx: None,
         }
     }
 
@@ -211,6 +224,11 @@ impl Connection {
             inner: Arc::clone(&self.inner),
             prep_cache: VecDeque::new(),
             prep_cache_cap: self.prep_cache_cap,
+            // Phase 11.4: each sibling handle starts outside any
+            // concurrent transaction. Multi-thread `BEGIN CONCURRENT`
+            // is the headline use case — every clone gets its own
+            // independent slot.
+            concurrent_tx: None,
         }
     }
 
@@ -239,16 +257,256 @@ impl Connection {
 
     /// Parses and executes one SQL statement. For DDL (`CREATE TABLE`,
     /// `CREATE INDEX`), DML (`INSERT`, `UPDATE`, `DELETE`) and
-    /// transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`). Returns
-    /// the status message the engine produced (e.g.
-    /// `"INSERT Statement executed."`).
+    /// transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`,
+    /// `BEGIN CONCURRENT`). Returns the status message the engine
+    /// produced (e.g. `"INSERT Statement executed."`).
     ///
     /// For `SELECT`, `execute` works but discards the row data and
     /// just returns the rendered status — use [`Connection::prepare`]
     /// and [`Statement::query`] to iterate typed rows.
+    ///
+    /// Phase 11.4 — intercepts `BEGIN CONCURRENT`, `COMMIT`, and
+    /// `ROLLBACK` before sqlparser sees them so the per-connection
+    /// MVCC transaction state stays in sync. Inside an open
+    /// concurrent transaction, every other statement runs against
+    /// the transaction's private cloned tables; the live database
+    /// stays untouched until commit-validation succeeds.
     pub fn execute(&mut self, sql: &str) -> Result<String> {
+        match concurrent_tx_intent(sql) {
+            ConcurrentTxIntent::Begin => self.begin_concurrent(),
+            ConcurrentTxIntent::Commit if self.concurrent_tx.is_some() => self.commit_concurrent(),
+            ConcurrentTxIntent::Rollback if self.concurrent_tx.is_some() => {
+                self.rollback_concurrent()
+            }
+            ConcurrentTxIntent::None
+            | ConcurrentTxIntent::Commit
+            | ConcurrentTxIntent::Rollback => self.execute_dispatch(sql),
+        }
+    }
+
+    /// Internal — runs `sql` against the engine. If a concurrent
+    /// transaction is open, swaps the transaction's private
+    /// `tables` map in for the duration of the dispatch so writes
+    /// land on the snapshot, not the live database. Otherwise
+    /// falls straight through to the legacy
+    /// [`crate::sql::process_command`] path.
+    fn execute_dispatch(&mut self, sql: &str) -> Result<String> {
+        if self.concurrent_tx.is_some() {
+            self.execute_in_concurrent_tx(sql)
+        } else {
+            let mut db = self.lock();
+            crate::sql::process_command(sql, &mut db)
+        }
+    }
+
+    /// Phase 11.4 — opens a `BEGIN CONCURRENT` transaction on this
+    /// connection. Allocates a new `TxHandle` (which advances the
+    /// MVCC clock by one), deep-clones the live tables into the
+    /// per-connection [`ConcurrentTx`] state, and records the
+    /// schema fingerprint. Returns the status string the REPL
+    /// renders (`"BEGIN"`).
+    ///
+    /// Errors if the database isn't in `journal_mode = mvcc`, or
+    /// if any transaction (concurrent or legacy `BEGIN`) is
+    /// already open on this connection.
+    fn begin_concurrent(&mut self) -> Result<String> {
+        if self.concurrent_tx.is_some() {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN CONCURRENT: a concurrent transaction is already open".to_string(),
+            ));
+        }
+        let db = self.lock();
+        if db.journal_mode() != JournalMode::Mvcc {
+            return Err(SQLRiteError::General(
+                "BEGIN CONCURRENT requires `PRAGMA journal_mode = mvcc;` first".to_string(),
+            ));
+        }
+        if db.in_transaction() {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN CONCURRENT: a non-concurrent transaction is already open".to_string(),
+            ));
+        }
+        if db.is_read_only() {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN CONCURRENT: database is opened read-only".to_string(),
+            ));
+        }
+        let tx = ConcurrentTx::begin(db.mvcc_clock(), db.mv_store().active_registry(), &db.tables);
+        drop(db);
+        self.concurrent_tx = Some(tx);
+        Ok("BEGIN".to_string())
+    }
+
+    /// Phase 11.4 — commits the open concurrent transaction.
+    ///
+    /// Steps (Hekaton-style optimistic validation):
+    ///
+    /// 1. Diff the transaction's private `tables` against the
+    ///    live `Database::tables` to derive the write-set.
+    /// 2. For each row in the write-set, walk the
+    ///    [`MvStore`](crate::mvcc::MvStore) chain. If any
+    ///    committed version's `begin > tx.begin_ts`, abort with
+    ///    [`SQLRiteError::Busy`] — some other transaction
+    ///    superseded the row after our snapshot.
+    /// 3. Allocate a `commit_ts`, push every write into the
+    ///    `MvStore` as a committed version (caps the previous
+    ///    latest's `end` at `commit_ts`), and apply the writes
+    ///    to `Database::tables`.
+    /// 4. Run the legacy `save_database` so the changes durable
+    ///    via the existing WAL.
+    ///
+    /// On `Busy`, the transaction is dropped (rollback semantics)
+    /// and the caller should retry with a fresh `BEGIN
+    /// CONCURRENT`.
+    fn commit_concurrent(&mut self) -> Result<String> {
+        let tx = self
+            .concurrent_tx
+            .take()
+            .expect("commit_concurrent called without active tx (caller should check)");
+
         let mut db = self.lock();
-        crate::sql::process_command(sql, &mut db)
+
+        // Schema drift catches DDL run on the live database under
+        // us. v0 rejects DDL inside the tx; outside is the only
+        // way to land here.
+        if !tx.schema_unchanged(&db.tables) {
+            return Err(SQLRiteError::Busy(
+                "schema changed under BEGIN CONCURRENT (a CREATE/DROP/ALTER ran on \
+                 another connection); transaction rolled back"
+                    .to_string(),
+            ));
+        }
+
+        // Diff against the BEGIN-time clone, NOT against the live
+        // database. Other concurrent transactions may have
+        // committed between our BEGIN and now; their writes show
+        // up in `db.tables` but aren't part of our write-set, and
+        // diffing against live would surface them as bogus DELETEs
+        // (silently undoing someone else's commit).
+        let writes = diff_tables_for_writes(&tx.tables_at_begin, &tx.tables)?;
+
+        // Validation pass: walk the write-set against MvStore.
+        let mv = db.mv_store().clone();
+        let begin_ts = tx.begin_ts();
+        for (row_id, _payload) in &writes {
+            if let Some(latest_begin) = mv.latest_committed_begin(row_id) {
+                if latest_begin > begin_ts {
+                    return Err(SQLRiteError::Busy(format!(
+                        "write-write conflict on {}/{}: another transaction committed \
+                         this row at ts={latest_begin} (after our begin_ts={begin_ts}); \
+                         transaction rolled back, retry with a fresh BEGIN CONCURRENT",
+                        row_id.table, row_id.rowid,
+                    )));
+                }
+            }
+        }
+
+        // Validation passed — allocate commit_ts and apply.
+        let commit_ts = db.mvcc_clock().tick();
+        for (row_id, payload) in &writes {
+            let version = RowVersion::committed(commit_ts, payload.clone());
+            // `push_committed`'s monotonic-begin check is satisfied
+            // because validation above ensured no version has
+            // begin >= commit_ts (commit_ts is freshly ticked).
+            mv.push_committed(row_id.clone(), version)
+                .map_err(|e| SQLRiteError::General(format!("MvStore push failed: {e}")))?;
+        }
+
+        // Apply the diff to Database::tables. Reuses the legacy
+        // INSERT / UPDATE / DELETE shape so post-commit reads on
+        // any handle (concurrent or legacy) see the latest row
+        // values via the existing read path.
+        apply_writes_to_live(&mut db, &tx.tables, &writes)?;
+
+        // Persist via the legacy WAL — the on-disk format is
+        // unchanged in 11.4. A future MVCC-native log-record
+        // frame (Phase 11.5) will subsume this.
+        if let Some(path) = db.source_path.clone() {
+            if let Err(save_err) = pager::save_database(&mut db, &path) {
+                return Err(SQLRiteError::General(format!(
+                    "COMMIT failed during save_database: {save_err}"
+                )));
+            }
+        }
+
+        // tx drops here, releasing the TxHandle (unregisters from
+        // the active-tx registry).
+        drop(tx);
+        Ok("COMMIT".to_string())
+    }
+
+    /// Phase 11.4 — rolls back the open concurrent transaction.
+    /// Drops the per-connection state; the live `Database::tables`
+    /// is unchanged because writes never landed there.
+    fn rollback_concurrent(&mut self) -> Result<String> {
+        // tx drops here; TxHandle unregisters automatically.
+        let _ = self
+            .concurrent_tx
+            .take()
+            .expect("rollback_concurrent called without active tx (caller should check)");
+        Ok("ROLLBACK".to_string())
+    }
+
+    /// Phase 11.4 — runs `sql` against the open concurrent
+    /// transaction's private cloned tables. Implementation: swap
+    /// `db.tables` <-> `tx.tables` for the duration of the
+    /// dispatch, suppress auto-save by parking a dummy
+    /// [`TxnSnapshot`] on `db.txn`, then unwind both.
+    ///
+    /// DDL is rejected before the swap with a typed error —
+    /// schema mutations inside a `BEGIN CONCURRENT` block aren't
+    /// supported in v0 (the plan flags this as an explicit
+    /// non-goal, and the swap-based dispatch can't safely apply
+    /// new tables to the live database without a separate merge
+    /// pass).
+    fn execute_in_concurrent_tx(&mut self, sql: &str) -> Result<String> {
+        let intent = legacy_tx_intent(sql);
+        if matches!(intent, LegacyTxIntent::Begin) {
+            return Err(SQLRiteError::General(
+                "cannot BEGIN: a concurrent transaction is already open".to_string(),
+            ));
+        }
+        // String-prefix DDL check. Rejecting up front means the
+        // tx's snapshot never gets a half-applied schema change —
+        // which would be hard to merge back at commit because the
+        // live database wouldn't agree.
+        if rejects_in_concurrent_tx(sql) {
+            return Err(SQLRiteError::General(
+                "DDL is not supported inside BEGIN CONCURRENT (v0 limitation; the \
+                 transaction stays open, the live schema is unchanged)"
+                    .to_string(),
+            ));
+        }
+
+        let tx = self
+            .concurrent_tx
+            .as_mut()
+            .expect("execute_in_concurrent_tx called without active tx");
+        let mut db = self.inner.lock().unwrap_or_else(|e| {
+            panic!("sqlrite: database mutex poisoned: {e}");
+        });
+
+        // Swap the snapshot in. After this, db.tables IS the tx's
+        // private clone; the executor mutates it freely.
+        std::mem::swap(&mut db.tables, &mut tx.tables);
+
+        // Suppress auto-save with a dummy TxnSnapshot. The
+        // executor's auto-save check looks at `db.in_transaction()`,
+        // which is true while `db.txn` is `Some`. The dummy
+        // snapshot is never restored from — `tx` itself owns the
+        // rollback story for concurrent transactions.
+        let prior_txn = db.txn.take();
+        db.txn = Some(TxnSnapshot {
+            tables: HashMap::new(),
+        });
+
+        let result = crate::sql::process_command(sql, &mut db);
+
+        // Unwind in reverse: take the dummy txn off (don't restore
+        // anything from it), swap the tables back.
+        db.txn = prior_txn;
+        std::mem::swap(&mut db.tables, &mut tx.tables);
+        result
     }
 
     /// Prepares a statement for repeated execution or row iteration.
@@ -393,8 +651,238 @@ impl std::fmt::Debug for Connection {
             .field("tables", &db.tables.len())
             .field("prep_cache_len", &self.prep_cache.len())
             .field("handles", &Arc::strong_count(&self.inner))
+            .field("concurrent_tx", &self.concurrent_tx.is_some())
             .finish()
     }
+}
+
+// =====================================================================
+// Phase 11.4 — concurrent-transaction helpers
+//
+// These live as free functions (rather than methods) so the borrow
+// checker stays out of the way: callers in `Connection::execute*`
+// already juggle mutable borrows of `self.concurrent_tx` and
+// `self.inner.lock()` simultaneously, and threading a third `&mut self`
+// through helpers would force every helper to either take owned
+// arguments or split the borrow at the call site. Free functions take
+// exactly the slices they need.
+
+/// Coarse classifier for tx-control statements. Spotted by string
+/// match before `sqlparser` runs, just like the PRAGMA intercept.
+/// Distinguishing `BEGIN CONCURRENT` from plain `BEGIN` matters
+/// because plain `BEGIN` still routes through the legacy
+/// deep-clone snapshot path; only `BEGIN CONCURRENT` opens an
+/// MVCC transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrentTxIntent {
+    /// `BEGIN CONCURRENT` — opens an MVCC transaction.
+    Begin,
+    /// `COMMIT` (with optional `TRANSACTION` / `WORK` / `;`).
+    Commit,
+    /// `ROLLBACK` (with optional `TRANSACTION` / `WORK` / `;`).
+    Rollback,
+    /// Anything else — falls through to the regular dispatch.
+    None,
+}
+
+/// Coarse classifier for legacy tx-control statements (used to
+/// reject nested `BEGIN` inside an open `BEGIN CONCURRENT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyTxIntent {
+    /// Plain `BEGIN` / `BEGIN TRANSACTION` / `BEGIN DEFERRED` etc.
+    /// — every shape that *isn't* `BEGIN CONCURRENT`.
+    Begin,
+    /// Anything else.
+    None,
+}
+
+fn concurrent_tx_intent(sql: &str) -> ConcurrentTxIntent {
+    let tokens = lowercase_tokens(sql);
+    let head = tokens.as_slice();
+    match head {
+        [first, second, ..] if first == "begin" && second == "concurrent" => {
+            ConcurrentTxIntent::Begin
+        }
+        [first, ..] if first == "commit" => ConcurrentTxIntent::Commit,
+        [first, ..] if first == "end" => ConcurrentTxIntent::Commit,
+        [first, ..] if first == "rollback" => ConcurrentTxIntent::Rollback,
+        _ => ConcurrentTxIntent::None,
+    }
+}
+
+fn legacy_tx_intent(sql: &str) -> LegacyTxIntent {
+    let tokens = lowercase_tokens(sql);
+    let head = tokens.as_slice();
+    match head {
+        // Plain BEGIN — but not BEGIN CONCURRENT, which the
+        // concurrent-tx intent already caught.
+        [first, ..] if first == "begin" => {
+            if matches!(head.get(1).map(String::as_str), Some("concurrent")) {
+                LegacyTxIntent::None
+            } else {
+                LegacyTxIntent::Begin
+            }
+        }
+        [first, ..] if first == "start" => LegacyTxIntent::Begin,
+        _ => LegacyTxIntent::None,
+    }
+}
+
+/// Splits `sql` on whitespace + punctuation that's not part of
+/// keywords, lowercases each piece, and returns the resulting
+/// token list. Coarse enough to spot `BEGIN`, `COMMIT`,
+/// `ROLLBACK`, `CONCURRENT`, `TRANSACTION`, etc.; not a real
+/// tokenizer.
+fn lowercase_tokens(sql: &str) -> Vec<String> {
+    sql.split(|c: char| c.is_whitespace() || c == ';' || c == '(' || c == ')' || c == ',')
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Statement shapes that must be rejected inside a `BEGIN
+/// CONCURRENT` block. v0 covers the canonical DDL — CREATE
+/// TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE,
+/// VACUUM. Cheap string-prefix check; misses contrived
+/// formattings like a leading SQL comment, but the rejection is
+/// best-effort and v0 doesn't promise schema isolation inside
+/// the tx anyway.
+fn rejects_in_concurrent_tx(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("create ")
+        || lower.starts_with("drop ")
+        || lower.starts_with("alter ")
+        || lower.starts_with("vacuum")
+}
+
+/// Phase 11.4 commit-time helper — diff `live` (the original
+/// `Database::tables` map) against `snapshot` (the
+/// transaction's private clone, post-statements) and produce
+/// the write-set: every `(RowID, VersionPayload)` whose value
+/// in the snapshot differs from the live state.
+///
+/// Three cases:
+///
+/// - Row in snapshot but not in live → INSERT, payload =
+///   [`VersionPayload::Present`] of snapshot's column-value
+///   pairs.
+/// - Row in both, with different column values → UPDATE, same
+///   shape.
+/// - Row in live but not in snapshot → DELETE, payload =
+///   [`VersionPayload::Tombstone`].
+///
+/// Errors only if the snapshot's table set drifted from the
+/// live database (DDL was rejected at execute-time so this
+/// shouldn't fire; the typed error guards against bugs).
+fn diff_tables_for_writes(
+    live: &HashMap<String, Table>,
+    snapshot: &HashMap<String, Table>,
+) -> Result<Vec<(RowID, VersionPayload)>> {
+    let mut writes: Vec<(RowID, VersionPayload)> = Vec::new();
+    for (name, snap_table) in snapshot {
+        let live_table = live.get(name).ok_or_else(|| {
+            SQLRiteError::Internal(format!(
+                "concurrent commit: table '{name}' missing from live database"
+            ))
+        })?;
+        let live_rowids: std::collections::HashSet<i64> = live_table.rowids().into_iter().collect();
+        let snap_rowids = snap_table.rowids();
+        for rowid in &snap_rowids {
+            let snap_payload = build_payload(snap_table, *rowid);
+            if live_rowids.contains(rowid) {
+                let live_payload = build_payload(live_table, *rowid);
+                if live_payload != snap_payload {
+                    writes.push((RowID::new(name, *rowid), snap_payload));
+                }
+            } else {
+                writes.push((RowID::new(name, *rowid), snap_payload));
+            }
+        }
+        let snap_set: std::collections::HashSet<i64> = snap_rowids.into_iter().collect();
+        for rowid in live_table.rowids() {
+            if !snap_set.contains(&rowid) {
+                writes.push((RowID::new(name, rowid), VersionPayload::Tombstone));
+            }
+        }
+    }
+    Ok(writes)
+}
+
+/// Builds a [`VersionPayload::Present`] from a row's column-value
+/// pairs. Column order is the table's declaration order; missing
+/// values surface as [`Value::Null`].
+fn build_payload(table: &Table, rowid: i64) -> VersionPayload {
+    let cols = table.column_names();
+    let vals = table.extract_row(rowid);
+    let pairs: Vec<(String, Value)> = cols
+        .into_iter()
+        .zip(vals)
+        .map(|(c, v)| (c, v.unwrap_or(Value::Null)))
+        .collect();
+    VersionPayload::Present(pairs)
+}
+
+/// Applies the commit's write-set onto the live database
+/// row-by-row. Each `(RowID, payload)` translates into a
+/// `delete_row` (always — clears column data and any
+/// secondary-index entries that reference the row) followed
+/// by a `restore_row` if the payload is `Present`.
+///
+/// Per-row apply rather than wholesale table-replace because
+/// other concurrent transactions may have committed onto the
+/// live database between our BEGIN and our COMMIT — replacing
+/// the whole table would silently undo their disjoint writes.
+/// The validation pass already proved we have no row-level
+/// conflict with those commits, so writing only our own rows
+/// preserves theirs.
+///
+/// The `_snapshot` parameter is unused today but kept on the
+/// signature so the FTS / HNSW maintenance pass can grow into
+/// it in a follow-up (the snapshot has the secondary-index
+/// state the executor built during the tx; the live table
+/// will need the same updates if that index is on a touched
+/// column).
+fn apply_writes_to_live(
+    db: &mut Database,
+    _snapshot: &HashMap<String, Table>,
+    writes: &[(RowID, VersionPayload)],
+) -> Result<()> {
+    for (row_id, payload) in writes {
+        let live_table = db.tables.get_mut(&row_id.table).ok_or_else(|| {
+            SQLRiteError::Internal(format!(
+                "concurrent commit: table '{}' missing from live database",
+                row_id.table
+            ))
+        })?;
+        // Always remove the existing row first — this clears the
+        // per-column storage and the secondary-index entries that
+        // reference it. INSERT (no existing row) is a no-op
+        // delete; UPDATE turns into delete-then-insert; DELETE is
+        // just delete.
+        live_table.delete_row(row_id.rowid);
+        if let VersionPayload::Present(cols) = payload {
+            // The payload's column order matches the table's
+            // declaration order (build_payload uses
+            // column_names() and extract_row(), both of which
+            // walk in declaration order). Map back into the
+            // `Vec<Option<Value>>` shape `restore_row` expects.
+            let values: Vec<Option<Value>> = cols
+                .iter()
+                .map(|(_col, value)| match value {
+                    Value::Null => None,
+                    other => Some(other.clone()),
+                })
+                .collect();
+            live_table.restore_row(row_id.rowid, values).map_err(|e| {
+                SQLRiteError::Internal(format!(
+                    "concurrent commit: restore_row({}) on table '{}' failed: {e}",
+                    row_id.rowid, row_id.table,
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// SQLR-23 — the parse-once-execute-many representation. Built by
@@ -1605,6 +2093,291 @@ mod tests {
             .expect_err("numeric mode must error");
         let msg = format!("{err}");
         assert!(msg.contains("numeric"), "unexpected error: {msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.4 — `BEGIN CONCURRENT` end-to-end
+    // -----------------------------------------------------------------
+
+    /// `BEGIN CONCURRENT` requires `PRAGMA journal_mode = mvcc;`
+    /// first. v0 doesn't auto-enable MVCC mode; users opt in
+    /// explicitly so the implications (in-memory MvStore growth,
+    /// `Busy` errors becoming possible) aren't a surprise.
+    #[test]
+    fn begin_concurrent_requires_mvcc_journal_mode() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = conn
+            .execute("BEGIN CONCURRENT;")
+            .expect_err("must require MVCC journal mode");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PRAGMA journal_mode = mvcc"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Round-trip: enable MVCC, BEGIN CONCURRENT, no writes,
+    /// COMMIT. The simplest control-flow check — proves the
+    /// parser-intent + lifecycle hooks all line up.
+    #[test]
+    fn begin_concurrent_then_empty_commit_round_trips() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        let begin_status = conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert_eq!(begin_status, "BEGIN");
+        let commit_status = conn.execute("COMMIT;").unwrap();
+        assert_eq!(commit_status, "COMMIT");
+    }
+
+    /// Plan test #1: two concurrent transactions on **disjoint
+    /// rowids** must both commit. No write-write conflict to
+    /// detect; validation passes for both.
+    #[test]
+    fn two_concurrent_inserts_on_disjoint_rows_both_commit() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
+            .unwrap();
+        let mut b = a.connect();
+
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        a.execute("INSERT INTO accounts (id, balance) VALUES (1, 100);")
+            .unwrap();
+
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("INSERT INTO accounts (id, balance) VALUES (2, 200);")
+            .unwrap();
+
+        // Both commit cleanly — disjoint rowids, no conflict.
+        a.execute("COMMIT;").unwrap();
+        b.execute("COMMIT;").unwrap();
+
+        // Both rows are visible through the legacy read path.
+        let stmt = a.prepare("SELECT id, balance FROM accounts;").unwrap();
+        let mut rows: Vec<(i64, i64)> = stmt
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap()))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(1, 100), (2, 200)]);
+    }
+
+    /// Plan test #2: two concurrent transactions on the **same
+    /// row** — one commits, the other aborts with `Busy`.
+    #[test]
+    fn two_concurrent_updates_same_row_one_aborts_with_busy() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO accounts (id, balance) VALUES (1, 100);")
+            .unwrap();
+        let mut b = a.connect();
+
+        // Both BEGIN before either UPDATE — that's the snapshot
+        // the validation checks against.
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("BEGIN CONCURRENT;").unwrap();
+
+        a.execute("UPDATE accounts SET balance = 200 WHERE id = 1;")
+            .unwrap();
+        b.execute("UPDATE accounts SET balance = 300 WHERE id = 1;")
+            .unwrap();
+
+        // First commit wins.
+        a.execute("COMMIT;").unwrap();
+
+        // Second commit hits the validation pass and aborts.
+        let err = b
+            .execute("COMMIT;")
+            .expect_err("second commit must abort with Busy");
+        assert!(matches!(err, SQLRiteError::Busy(_)));
+        assert!(err.is_retryable(), "Busy must be retryable");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("write-write conflict"),
+            "unexpected error: {msg}"
+        );
+
+        // The winning value is what's persisted.
+        let stmt = a
+            .prepare("SELECT balance FROM accounts WHERE id = 1;")
+            .unwrap();
+        let rows = stmt.query().unwrap().collect_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 200);
+    }
+
+    /// Plan test #3: an aborted transaction's writes must never
+    /// become visible. After ROLLBACK (explicit or implicit on
+    /// Busy), the row keeps its pre-tx value.
+    #[test]
+    fn aborted_transactions_writes_never_become_visible() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (1, 100);")
+            .unwrap();
+
+        // Explicit ROLLBACK.
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("UPDATE t SET v = 999 WHERE id = 1;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let stmt = conn.prepare("SELECT v FROM t WHERE id = 1;").unwrap();
+        let rows = stmt.query().unwrap().collect_all().unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 100);
+
+        // Implicit rollback via Busy: another connection commits a
+        // newer version under us.
+        let mut other = conn.connect();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        other.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("UPDATE t SET v = 7 WHERE id = 1;").unwrap();
+        other.execute("UPDATE t SET v = 13 WHERE id = 1;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        let _ = other.execute("COMMIT;").expect_err("must abort with Busy");
+
+        // The losing writer's value (13) never lands. The winner
+        // (7) is what's visible.
+        let rows = conn
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 7);
+    }
+
+    /// Plan test #4: retry-after-`Busy` succeeds. The caller's
+    /// retry helper opens a fresh `BEGIN CONCURRENT` (with a
+    /// new `begin_ts` past the conflict) and the same UPDATE
+    /// commits cleanly.
+    #[test]
+    fn retry_after_busy_succeeds() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO t (id, v) VALUES (1, 1);").unwrap();
+        let mut b = a.connect();
+
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        a.execute("UPDATE t SET v = 100 WHERE id = 1;").unwrap();
+        b.execute("UPDATE t SET v = 200 WHERE id = 1;").unwrap();
+        a.execute("COMMIT;").unwrap();
+        let err = b.execute("COMMIT;").expect_err("first attempt must Busy");
+        assert!(err.is_retryable());
+
+        // Retry: open a fresh tx, redo the same UPDATE, commit.
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("UPDATE t SET v = 200 WHERE id = 1;").unwrap();
+        b.execute("COMMIT;").expect("retry must succeed");
+
+        let rows = a
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 200);
+    }
+
+    /// Nested `BEGIN CONCURRENT` is rejected with a typed error.
+    /// Same single-tx-per-connection rule the legacy `BEGIN`
+    /// already enforces.
+    #[test]
+    fn nested_begin_concurrent_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let err = conn
+            .execute("BEGIN CONCURRENT;")
+            .expect_err("nested BEGIN CONCURRENT must error");
+        assert!(format!("{err}").contains("already open"));
+    }
+
+    /// Legacy `BEGIN` inside `BEGIN CONCURRENT` is rejected.
+    /// Mixing the two transaction kinds isn't supported in v0;
+    /// the deep-clone snapshot and the MVCC write-set don't
+    /// interleave cleanly.
+    #[test]
+    fn legacy_begin_inside_concurrent_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let err = conn
+            .execute("BEGIN;")
+            .expect_err("legacy BEGIN inside concurrent tx must error");
+        assert!(format!("{err}").contains("concurrent transaction is already open"));
+    }
+
+    /// DDL inside `BEGIN CONCURRENT` is rejected with a typed
+    /// error. Plan §8 calls this out as an explicit non-goal —
+    /// schema mutations interact poorly with the snapshot-
+    /// based commit and the v0 write-set model.
+    #[test]
+    fn ddl_inside_begin_concurrent_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let err = conn
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .expect_err("DDL inside concurrent tx must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("DDL is not supported"), "unexpected: {msg}");
+        // The transaction stays open — caller can ROLLBACK.
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    /// An empty concurrent commit (BEGIN, no writes, COMMIT)
+    /// always succeeds — even when other transactions have
+    /// committed in the meantime, because we have nothing to
+    /// validate.
+    #[test]
+    fn empty_concurrent_commit_never_busies() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO t (id, v) VALUES (1, 1);").unwrap();
+        let mut b = a.connect();
+
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        // Sibling B opens its own concurrent tx and commits a
+        // change to row 1.
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("UPDATE t SET v = 999 WHERE id = 1;").unwrap();
+        b.execute("COMMIT;").unwrap();
+
+        // a never wrote anything — its commit is purely a
+        // tx-state cleanup. Validation has no rows to check.
+        a.execute("COMMIT;")
+            .expect("empty commit must succeed even if siblings committed");
+    }
+
+    /// `is_retryable()` covers both `Busy` and `BusySnapshot`
+    /// without callers having to match each variant. The contract
+    /// SDK retry helpers will rely on.
+    #[test]
+    fn is_retryable_covers_busy_variants() {
+        assert!(SQLRiteError::Busy("x".into()).is_retryable());
+        assert!(SQLRiteError::BusySnapshot("x".into()).is_retryable());
+        assert!(!SQLRiteError::General("x".into()).is_retryable());
     }
 
     #[test]

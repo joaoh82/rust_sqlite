@@ -90,9 +90,45 @@ for h in writers { h.join().unwrap()?; }
 # Ok::<(), sqlrite::SQLRiteError>(())
 ```
 
-Today every commit still serializes through the per-database mutex (and the pager's existing process-level `flock`); the goal of 11.1 is *capability*, not throughput. True multi-writer throughput on disjoint rows arrives with `BEGIN CONCURRENT` in 11.4 — see [`concurrent-writes-plan.md`](concurrent-writes-plan.md).
+Today every commit still serializes through the per-database mutex (and the pager's existing process-level `flock`); the goal of 11.1 is *capability*, not throughput. True multi-writer throughput on disjoint rows arrives with `BEGIN CONCURRENT` in 11.4 — see below + [`concurrent-writes-plan.md`](concurrent-writes-plan.md).
 
 Per-handle state — the prepared-statement cache (LRU populated by `prepare_cached`), the cache capacity setter — stays on each handle, by design (no extra mutex traffic for a per-thread accelerator). The shared state is the `Database` (tables, pager, transaction snapshot, auto-VACUUM threshold).
+
+### Concurrent writes via `BEGIN CONCURRENT` (Phase 11.4)
+
+*Phase 11.4 — see [`supported-sql.md`](supported-sql.md#begin-concurrent-phase-114-sqlr-22) for the full SQL reference.* Multi-writer concurrency is opt-in: `PRAGMA journal_mode = mvcc;` once per database, then each writer wraps its work in `BEGIN CONCURRENT;` … `COMMIT;`. Sibling [`Connection::connect`](#sharing-one-database-across-threads) handles can each hold their own open `BEGIN CONCURRENT`; commits are validated against the [`MvStore`](../src/mvcc/store.rs) version index and abort with `SQLRiteError::Busy` if another writer superseded one of our rows.
+
+```rust
+use sqlrite::{Connection, SQLRiteError};
+
+fn transfer(primary: &mut Connection, src: i64, dst: i64, amount: i64)
+    -> Result<(), SQLRiteError>
+{
+    let mut conn = primary.connect();
+    loop {
+        conn.execute("BEGIN CONCURRENT")?;
+        conn.execute(&format!(
+            "UPDATE accounts SET balance = balance - {amount} WHERE id = {src}"
+        ))?;
+        conn.execute(&format!(
+            "UPDATE accounts SET balance = balance + {amount} WHERE id = {dst}"
+        ))?;
+        match conn.execute("COMMIT") {
+            Ok(_) => return Ok(()),
+            Err(e) if e.is_retryable() => continue, // Busy / BusySnapshot
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+The retryable-error branch is the headline new flow: pick a backoff policy that suits your workload (constant, exponential, jittered) and call the same closure again. `SQLRiteError::is_retryable()` covers both `Busy` and `BusySnapshot` so callers don't have to match each variant individually.
+
+**What 11.4 doesn't yet do:**
+
+- Reads via `Statement::query` inside the transaction don't see the BEGIN-time snapshot — they go through the legacy live-database read path. Reads via `Connection::execute("SELECT …")` *do* see the snapshot, via the swap-based dispatch. Full snapshot-isolated reads land in 11.5.
+- DDL inside `BEGIN CONCURRENT` is rejected with a typed error.
+- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.5 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
 
 ### What's deferred
 

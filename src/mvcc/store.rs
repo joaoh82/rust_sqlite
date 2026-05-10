@@ -279,6 +279,31 @@ impl MvStore {
         }
     }
 
+    /// Returns the begin-timestamp of the latest committed version
+    /// in `row_id`'s chain, or `None` if the row has no committed
+    /// versions (the chain is empty or only carries in-flight
+    /// placeholders).
+    ///
+    /// Phase 11.4 — the commit-validation pass calls this for
+    /// every row in its write-set. If the latest committed begin
+    /// is greater than the validating transaction's `begin_ts`,
+    /// some other transaction superseded the row after our
+    /// snapshot — abort with [`crate::error::SQLRiteError::Busy`].
+    pub fn latest_committed_begin(&self, row_id: &RowID) -> Option<u64> {
+        let chain = {
+            let map = self.lock_map();
+            Arc::clone(map.get(row_id)?)
+        };
+        let chain = chain.read().expect("chain RwLock poisoned");
+        // Walk back-to-front — the latest committed version is
+        // typically the rightmost element. Skip in-flight versions
+        // (`begin = Id(_)`) — they aren't published yet.
+        chain.iter().rev().find_map(|v| match v.begin {
+            TxTimestampOrId::Timestamp(t) => Some(t),
+            TxTimestampOrId::Id(_) => None,
+        })
+    }
+
     /// Pushes a new version onto the chain for `row_id`. Caps the
     /// chain's previous latest version (if any) at `version.begin`
     /// — the canonical write-side bookkeeping the commit path will

@@ -599,7 +599,7 @@ Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency 
 
 WAL format bumps **v1 → v2**: bytes 24..32 of the WAL header (previously reserved-zero) now carry the persisted `clock_high_water` `u64`. v1 WALs open cleanly — those zero bytes read as "clock never advanced" — and the next checkpoint rewrites the header at v2. No offline upgrade step. `Wal::set_clock_high_water` / `Wal::clock_high_water` accessors expose the field; the setter rejects regressions with a typed error.
 
-### 🚧 Phase 11.3 — `MvStore` skeleton + `PRAGMA journal_mode` opt-in *(in progress, plan-doc "Phase 10.3")*
+### ✅ Phase 11.3 — `MvStore` skeleton + `PRAGMA journal_mode` opt-in *(plan-doc "Phase 10.3")*
 
 Standalone version-index data structure + the per-database journal-mode toggle.
 
@@ -607,11 +607,24 @@ Standalone version-index data structure + the per-database journal-mode toggle.
 - New [`JournalMode`](../src/mvcc/mod.rs) enum (`Wal` default, `Mvcc`); per-database setting on `Database`. `PRAGMA journal_mode = wal | mvcc;` toggles; `PRAGMA journal_mode;` returns the current value as a single-row, single-column result. `Connection::journal_mode()` reads the value through the public API. Switching `Mvcc → Wal` is rejected if the store carries committed versions (would silently strand them); v0 is intentionally strict.
 - `Database` grows `mvcc_clock: Arc<MvccClock>` and `mv_store: MvStore` fields, allocated on every `Database::new` so the toggle to MVCC mode doesn't require a re-init step. Both are shared across every `Connection::connect` sibling.
 
-The executor doesn't consult `MvStore` yet — that wiring lives in 11.4 alongside `BEGIN CONCURRENT` writes (the read-side and write-side are coupled: snapshot reads make sense only once the commit path is mirroring versions into the store). 11.3's contract is *the data structure + the toggle exist and round-trip*; 11.4 will turn the dial.
+### 🚧 Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(in progress, plan-doc "Phase 10.4" — the meat)*
 
-### Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(planned, the meat)*
+The headline slice. Multiple sibling `Connection`s can each hold their own open `BEGIN CONCURRENT` transaction; commits validate against `MvStore` and abort with [`SQLRiteError::Busy`](../src/error.rs) on row-level write-write conflict. The four plan-required tests pass: disjoint inserts both commit, same-row updates collide and one wins, aborted writes never become visible, retry-after-`Busy` succeeds.
 
-Parser maps `BEGIN CONCURRENT` to `TxKind::Concurrent`; writes land in the MvStore's write-set; commit walks the write-set checking for newer versions. New `SQLRiteError::Busy` / `BusySnapshot` variants. New WAL log-record frame kind.
+- New [`ConcurrentTx`](../src/mvcc/transaction.rs) — per-`Connection` state holding the [`TxHandle`](../src/mvcc/registry.rs) (RAII registry entry, drops at COMMIT/ROLLBACK), a private deep-clone of `Database::tables` (working state — what each statement's executor mutates), and an immutable second clone (`tables_at_begin` — used at COMMIT to derive the write-set without seeing other transactions' commits). The doubled per-tx memory is the v0 trade for correctness; column-level COW ↔ shared-`Arc` table cloning is the obvious follow-up.
+- `Connection` grows a `concurrent_tx: Option<ConcurrentTx>` field, plus three new methods: `begin_concurrent()`, `commit_concurrent()`, `rollback_concurrent()`. `Connection::execute` intercepts `BEGIN CONCURRENT` / `COMMIT` / `ROLLBACK` before sqlparser runs (sqlparser 0.61 doesn't have a `Concurrent` modifier — same intercept pattern as PRAGMA).
+- Inside an open concurrent transaction, every other statement runs against the transaction's private cloned tables: `Connection::execute_in_concurrent_tx` swaps `db.tables` ↔ `tx.tables` for the duration of the executor call, parks a dummy `TxnSnapshot` on `db.txn` to suppress the auto-save, runs `process_command`, then unwinds in reverse. The executor itself doesn't change.
+- COMMIT shape (Hekaton-style optimistic validation): diff `tx.tables_at_begin` vs `tx.tables` → write-set; for each row, walk `MvStore` for the latest committed version's `begin_ts` (new `MvStore::latest_committed_begin` accessor); abort with `Busy` if any latest exceeds `tx.begin_ts`. On success: tick the clock for `commit_ts`, push every write into `MvStore` as a committed version (auto-caps the previous latest's `end`), apply per-row to `db.tables` (`delete_row` then `restore_row` — preserves secondary B-tree indexes), and run the legacy `save_database` so changes persist via the existing WAL.
+- ROLLBACK is just `self.concurrent_tx.take()` — the cloned tables drop, the `TxHandle` unregisters, the live database was never touched.
+- New `SQLRiteError::Busy(String)` and `SQLRiteError::BusySnapshot(String)` variants. `SQLRiteError::is_retryable()` covers both — the contract SDK retry helpers will rely on.
+- DDL inside `BEGIN CONCURRENT` (CREATE TABLE / CREATE INDEX / DROP TABLE / DROP INDEX / ALTER TABLE / VACUUM) is rejected before the swap with a typed error (plan §8 non-goal).
+
+**Known limitations carried into 11.5+:**
+
+- Reads via `Statement::query` / `Statement::query_with_params` (the prepared-statement path) bypass the swap and read from the live `Database::tables`. Reads via `Connection::execute("SELECT…")` go through the swap and see the snapshot. Full snapshot-isolation reads land when 11.5 routes reads through `MvStore` — the data structure already implements `begin <= T < end` visibility; only the executor wiring is missing.
+- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.5 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror.
+- `AUTOINCREMENT` inside `BEGIN CONCURRENT` isn't explicitly rejected; the v0 deep-clone-snapshot model handles concurrent INSERTs by isolating each tx's `last_rowid` bumps to its private snapshot, so two concurrent INSERTs on an `AUTOINCREMENT` column may collide at COMMIT and surface as `Busy`. Adopting the plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
+- Tables touched by `BEGIN CONCURRENT` writes can't carry FTS or HNSW indexes today — `restore_row` only maintains B-tree secondary indexes. Concurrent-tx tests don't exercise FTS / HNSW, but a runtime guard would surface this with a clear error rather than producing inconsistent indexes.
 
 ### Phase 11.5 — Checkpoint integration + crash recovery *(planned)*
 
