@@ -255,7 +255,9 @@ impl Database {
             }
         };
 
-        let schema = dump_schema_for_database(self.inner.database());
+        let db = self.inner.database();
+        let schema = dump_schema_for_database(&db);
+        drop(db);
         let system_blocks = build_system(&schema, cache_marker);
         let messages = vec![PromptUserMessage {
             role: "user",

@@ -69,6 +69,31 @@ if looks_good {
 
 See [Phase 4f notes in roadmap.md](roadmap.md) for the snapshot semantics and the auto-rollback-on-failed-COMMIT guarantee.
 
+### Sharing one database across threads
+
+*Phase 11.1.* `Connection` is a thin handle over the engine state. Call `Connection::connect()` to mint a sibling handle that shares the same in-memory tables and persistent pager — typically one handle per worker thread. `Connection: Send + Sync`, so the handles can be moved across threads without an outer `Mutex`.
+
+```rust
+use sqlrite::Connection;
+
+let mut primary = Connection::open("foo.sqlrite")?;
+primary.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, who TEXT);")?;
+
+let mut writers = Vec::new();
+for tid in 0..4 {
+    let mut conn = primary.connect();   // sibling handle, same backing DB
+    writers.push(std::thread::spawn(move || {
+        conn.execute(&format!("INSERT INTO log (who) VALUES ('t{tid}');"))
+    }));
+}
+for h in writers { h.join().unwrap()?; }
+# Ok::<(), sqlrite::SQLRiteError>(())
+```
+
+Today every commit still serializes through the per-database mutex (and the pager's existing process-level `flock`); the goal of 11.1 is *capability*, not throughput. True multi-writer throughput on disjoint rows arrives with `BEGIN CONCURRENT` in 11.4 — see [`concurrent-writes-plan.md`](concurrent-writes-plan.md).
+
+Per-handle state — the prepared-statement cache (LRU populated by `prepare_cached`), the cache capacity setter — stays on each handle, by design (no extra mutex traffic for a per-thread accelerator). The shared state is the `Database` (tables, pager, transaction snapshot, auto-VACUUM threshold).
+
 ### What's deferred
 
 - **Parameter binding.** `stmt.query(&[&"alice"])` is the intended shape but the current implementation takes no arguments — use string interpolation for now. Parameter binding lands with the cursor refactor.

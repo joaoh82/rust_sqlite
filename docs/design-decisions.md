@@ -144,6 +144,18 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+### 12a. `Connection` as a thin handle over `Arc<Mutex<Database>>` (Phase 11.1)
+
+**Decision.** `Connection` no longer owns a `Database` by value; it holds `Arc<Mutex<Database>>` plus a per-handle prepared-statement LRU. A new `Connection::connect()` mints a sibling handle that shares the same backing engine state. The mutex is acquired transparently at the entry of every public method (`execute`, `prepare`, `database()`, accessors); statements release it between calls. `Connection: Send + Sync`.
+
+**Why.** Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`) needs more than one connection to address the same in-memory tables and pager from inside the same process. The previous shape (`Connection { db: Database, … }`) made callers wrap the whole connection in their own `Mutex<Connection>`, which works for single-writer workloads but collapses if the public API needs to grow a "this transaction is concurrent" mode that other handles can observe. Lifting the mutex into the engine itself is the minimum change that lets `BEGIN CONCURRENT` and snapshot-isolated reads hook in cleanly later.
+
+**Cost.** Every public-API call now takes one extra atomic CAS (`Mutex::lock`). Negligible against the work each call does (parser pass + executor + optional fsync). The internal `&mut Database` plumbing is unchanged — over a hundred call sites across the executor, parser, and pager keep the same signatures because they run under the lock the public method already acquired. `Connection::database()` now returns a `MutexGuard<'_, Database>` instead of `&Database`; this is `#[doc(hidden)]` and explicitly unstable, but downstream callers (mainly the MCP server tools and SDK shims) had to bind it to a local first, which they were mostly already doing. The prepared-statement cache deliberately stays per-handle so each thread's hot SQL doesn't fight an extra mutex on every `prepare_cached`.
+
+**What this doesn't do (yet).** Phase 11.1 is *capability*, not throughput. Two writers from sibling handles still serialize through the per-database mutex (and the existing pager `flock` between processes). The `BEGIN CONCURRENT` SQL surface, the `MvStore` version index, and snapshot-isolation reads land in 11.3–11.4. See [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the sequenced plan.
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

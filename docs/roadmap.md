@@ -2,7 +2,7 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
-> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** The roadmap from here is the smaller "possible extras" list at the bottom of this doc plus the 5a.2 cursor refactor.
+> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`, SQLR-22) is now in flight — the multi-connection foundation (11.1) is the first slice; see [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the full design.
 
 ## ✅ Phase 0 — Modernization
 
@@ -581,6 +581,46 @@ Every executable statement accepts `?` placeholders anywhere a value literal is 
 
 End-to-end SQLR-4 / SQLR-16 bench harness with twelve workloads across three groups (read-by-PK, transactional CRUD, analytical slices, vector / FTS retrieval). Pluggable `Driver` trait + bundled SQLite + DuckDB drivers; criterion-based; pinned-host runs published at [`docs/benchmarks.md`](benchmarks.md). Excluded from CI (criterion is too noisy on shared runners; `rusqlite-bundled` is heavy). See [`docs/benchmarks-plan.md`](benchmarks-plan.md) for the design and PRs #102–#114 for the staged rollout.
 
+## Phase 11 — Concurrent writes via MVCC + `BEGIN CONCURRENT` *(SQLR-22; in flight — see [`concurrent-writes-plan.md`](concurrent-writes-plan.md))*
+
+Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency control and a `BEGIN CONCURRENT` transaction mode, modelled on Turso's experimental MVCC. The plan doc internally numbers sub-phases as "Phase 10.x" (its working title before the roadmap renumbering); they're listed under Phase 11 here because Phase 10 already shipped.
+
+### 🚧 Phase 11.1 — Multi-connection foundation *(in progress, plan-doc "Phase 10.1")*
+
+`Connection` is now a thin handle backed by `Arc<Mutex<Database>>`. Call [`Connection::connect`] to mint a sibling that shares the same engine state — typically one per worker thread. The headline contract: `Connection` is `Send + Sync`, and the engine no longer requires the caller to wrap the public API in their own `Mutex`. Today every operation still serializes through the per-database mutex (and the pager's existing process-level flock), so the behaviour change is *capability*, not throughput; concurrent throughput arrives with `BEGIN CONCURRENT` in 11.4.
+
+### Phase 11.2 — Logical clock + active-tx registry *(planned)*
+
+`MvccClock` (`AtomicU64`) hands out begin / commit timestamps; `ActiveTxRegistry` exposes `min_active_begin_ts()` for GC. WAL header bumps from v1 → v2 to persist the high-water mark.
+
+### Phase 11.3 — `MvStore` skeleton + snapshot-isolation reads *(planned)*
+
+In-memory version index + `PRAGMA journal_mode = mvcc` opt-in. Lazy-loads versions from the pager on first touch. Writes still go through the legacy path — only reads change.
+
+### Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(planned, the meat)*
+
+Parser maps `BEGIN CONCURRENT` to `TxKind::Concurrent`; writes land in the MvStore's write-set; commit walks the write-set checking for newer versions. New `SQLRiteError::Busy` / `BusySnapshot` variants. New WAL log-record frame kind.
+
+### Phase 11.5 — Checkpoint integration + crash recovery *(planned)*
+
+Drains MVCC log-records into the existing bottom-up B-tree rebuild path. Replay on reopen rebuilds the in-memory index.
+
+### Phase 11.6 — Garbage collection *(planned)*
+
+Per-commit sweep over the write-set's chains, plus a background sweep behind `PRAGMA mvcc_gc_interval_ms`.
+
+### Phase 11.7 — Indexes under MVCC *(deferred-by-design, separate later phase)*
+
+Each secondary-index entry becomes its own `RowVersion`. Turso explicitly punted on this; SQLRite's v0 will reject `CREATE INDEX` while `journal_mode = mvcc`.
+
+### Phase 11.8 — SDK + REPL propagation *(planned)*
+
+Surface `Busy` / `BusySnapshot` through the FFI shim and each language SDK. New REPL `.spawn` meta-command + new "N concurrent writers" benchmark workload.
+
+### Phase 11.9 — Docs *(planned)*
+
+Promote the plan to `docs/concurrent-writes.md` and update the cross-references.
+
 ## "Possible extras" not pinned to a phase
 
 The remaining items — actually open, not retroactively rewritten:
@@ -592,7 +632,6 @@ The remaining items — actually open, not retroactively rewritten:
 - Multi-column / expression `ORDER BY`, `OFFSET`, `NULLS FIRST/LAST`
 - `UNION` / `INTERSECT` / `EXCEPT`, `INSERT ... SELECT`
 - Composite + expression indexes
-- Concurrent writes via MVCC + `BEGIN CONCURRENT` — design sketch in [`docs/concurrent-writes-plan.md`](concurrent-writes-plan.md)
 - `CREATE VIEW`, `CREATE TRIGGER`, `FOREIGN KEY`, `CHECK`, table-level / composite constraints
 - Savepoints + isolation-level control (`BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`)
 - Built-in scalar functions (`LENGTH`, `UPPER`, `LOWER`, `COALESCE`, `IFNULL`, date/time, `printf`, …)

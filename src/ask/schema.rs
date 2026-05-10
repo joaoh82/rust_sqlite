@@ -31,7 +31,8 @@ use crate::sql::db::table::{DataType, Table};
 /// sequence of `CREATE TABLE … (…);` statements, sorted
 /// alphabetically by table name.
 pub fn dump_schema_for_connection(conn: &Connection) -> String {
-    dump_schema_for_database(conn.database())
+    let db = conn.database();
+    dump_schema_for_database(&db)
 }
 
 /// Same as [`dump_schema_for_connection`], but takes a `Database`

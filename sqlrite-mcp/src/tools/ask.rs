@@ -118,9 +118,14 @@ pub fn handle(args: Value, state: &mut ServerState) -> Result<String, ToolError>
         };
     }
 
-    // Run the LLM call.
-    let resp: AskResponse = ask_with_database(state.conn.database(), &args.question, &cfg)
-        .map_err(|e| ToolError::new(format!("ask failed: {e}")))?;
+    // Run the LLM call. Hold the database guard across the call but
+    // drop it before any later `state.conn.execute` / `prepare` —
+    // those re-acquire the same lock.
+    let resp: AskResponse = {
+        let db = state.conn.database();
+        ask_with_database(&db, &args.question, &cfg)
+            .map_err(|e| ToolError::new(format!("ask failed: {e}")))?
+    };
 
     let mut result = json!({
         "sql": resp.sql,

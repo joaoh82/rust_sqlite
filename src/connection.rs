@@ -52,7 +52,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::sql::dialect::SqlriteDialect;
 use sqlparser::ast::Statement as AstStatement;
@@ -87,16 +87,36 @@ const DEFAULT_PREP_CACHE_CAP: usize = 16;
 /// # Ok::<(), sqlrite::SQLRiteError>(())
 /// ```
 ///
-/// `Connection` is `Send` but not `Sync` — clone it (it's currently
-/// unclonable) or share via a `Mutex<Connection>` if you need
-/// multi-threaded access.
+/// ## Multiple connections (Phase 10.1)
+///
+/// `Connection` is a thin handle over an `Arc<Mutex<Database>>`. Call
+/// [`Connection::connect`] to mint a sibling handle that shares the
+/// same backing `Database` — typically one per worker thread. Today
+/// every operation still serializes through the single mutex (and the
+/// pager's exclusive flock between processes), so the headline
+/// behaviour change is that callers can hold and address the same DB
+/// from more than one thread without wrapping the whole `Connection`
+/// in a `Mutex` themselves. `BEGIN CONCURRENT` and snapshot-isolated
+/// reads land in subsequent Phase 10 sub-phases.
+///
+/// `Connection` is `Send + Sync`. The recommended pattern is one
+/// connection per thread (clone via `connect()`); statements still
+/// borrow `&mut Connection`, so a single connection isn't suitable
+/// for true concurrent statement execution.
 pub struct Connection {
-    db: Database,
+    /// Shared engine state. Mints sibling connections via
+    /// [`Connection::connect`] without copying the in-memory tables
+    /// or the long-lived pager.
+    inner: Arc<Mutex<Database>>,
     /// SQLR-23 — small SQL→cached-plan LRU. Keyed by the verbatim SQL
     /// string the caller passed to `prepare_cached`. Stored as a
     /// `VecDeque` rather than a HashMap+linked-list because the
     /// expected capacity is small (default 16) — linear scan is fine
     /// and the implementation stays dependency-free.
+    ///
+    /// Per-connection (not shared with sibling handles) — each thread
+    /// gets its own LRU so cache-mutation never crosses a thread
+    /// boundary.
     prep_cache: VecDeque<(String, Arc<CachedPlan>)>,
     prep_cache_cap: usize,
 }
@@ -156,10 +176,65 @@ impl Connection {
 
     fn wrap(db: Database) -> Self {
         Self {
-            db,
+            inner: Arc::new(Mutex::new(db)),
             prep_cache: VecDeque::new(),
             prep_cache_cap: DEFAULT_PREP_CACHE_CAP,
         }
+    }
+
+    /// Phase 10.1 — mints another `Connection` sharing the same
+    /// backing `Database`. Hand the returned handle to a separate
+    /// thread to address the same in-memory tables and persistent
+    /// pager from there.
+    ///
+    /// The new handle starts with an empty prepared-statement cache
+    /// (caches are per-handle, by design). Inherits the parent's
+    /// `prepare_cached` capacity. Concurrent operations still
+    /// serialize through the engine's internal lock and the pager's
+    /// existing single-writer rule — a true multi-writer story
+    /// arrives with `BEGIN CONCURRENT` in Phase 10.4.
+    ///
+    /// ```no_run
+    /// # use sqlrite::Connection;
+    /// let mut primary = Connection::open("foo.sqlrite")?;
+    /// let secondary = primary.connect();
+    /// std::thread::spawn(move || {
+    ///     let mut conn = secondary;
+    ///     conn.execute("INSERT INTO t (x) VALUES (1)").unwrap();
+    /// })
+    /// .join()
+    /// .unwrap();
+    /// # Ok::<(), sqlrite::SQLRiteError>(())
+    /// ```
+    pub fn connect(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            prep_cache: VecDeque::new(),
+            prep_cache_cap: self.prep_cache_cap,
+        }
+    }
+
+    /// Phase 10.1 — number of `Connection` handles currently sharing
+    /// this database (this handle plus every live `connect()`
+    /// descendant). Useful for diagnostics and tests; no semantic
+    /// guarantee beyond that.
+    pub fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    /// Locks the shared `Database` and returns the guard. Internal
+    /// helper — every public method that needs `&mut Database` calls
+    /// this. The lock is released when the guard drops, so callers
+    /// must keep the guard alive for the duration of the engine call
+    /// (typically by binding it to a local).
+    fn lock(&self) -> MutexGuard<'_, Database> {
+        // `unwrap` propagates a panic from another thread that held
+        // the lock — there's no engine-level recovery story for a
+        // poisoned `Database` (the in-memory tables would be in an
+        // unknown state), so failing fast is the right behaviour.
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| panic!("sqlrite: database mutex poisoned: {e}"))
     }
 
     /// Parses and executes one SQL statement. For DDL (`CREATE TABLE`,
@@ -172,7 +247,8 @@ impl Connection {
     /// just returns the rendered status — use [`Connection::prepare`]
     /// and [`Statement::query`] to iterate typed rows.
     pub fn execute(&mut self, sql: &str) -> Result<String> {
-        crate::sql::process_command(sql, &mut self.db)
+        let mut db = self.lock();
+        crate::sql::process_command(sql, &mut db)
     }
 
     /// Prepares a statement for repeated execution or row iteration.
@@ -238,7 +314,7 @@ impl Connection {
     /// Returns `true` while a `BEGIN … COMMIT/ROLLBACK` block is open
     /// against this connection.
     pub fn in_transaction(&self) -> bool {
-        self.db.in_transaction()
+        self.lock().in_transaction()
     }
 
     /// Returns the current auto-VACUUM threshold (SQLR-10). After a
@@ -248,50 +324,64 @@ impl Connection {
     /// default to `Some(0.25)` (SQLite parity); `None` means the
     /// trigger is disabled. See [`Connection::set_auto_vacuum_threshold`].
     pub fn auto_vacuum_threshold(&self) -> Option<f32> {
-        self.db.auto_vacuum_threshold()
+        self.lock().auto_vacuum_threshold()
     }
 
     /// Sets the auto-VACUUM threshold (SQLR-10). `Some(t)` with `t` in
     /// `0.0..=1.0` arms the trigger; `None` disables it. Values outside
     /// `0.0..=1.0` (or NaN / infinite) return a typed error rather than
-    /// silently saturating. The setting is per-connection runtime
-    /// state — closing the connection drops it; new connections start
-    /// at the default `Some(0.25)`.
+    /// silently saturating. The setting is per-database runtime state —
+    /// closing the last connection to a database drops it; new
+    /// connections start at the default `Some(0.25)`.
     ///
     /// Calling this on an in-memory or read-only database is allowed
     /// (it just won't fire — there's nothing to compact / no writes
     /// will reach the trigger).
     pub fn set_auto_vacuum_threshold(&mut self, threshold: Option<f32>) -> Result<()> {
-        self.db.set_auto_vacuum_threshold(threshold)
+        self.lock().set_auto_vacuum_threshold(threshold)
     }
 
     /// Returns `true` if the connection was opened read-only. Mutating
     /// statements on a read-only connection return a typed error.
     pub fn is_read_only(&self) -> bool {
-        self.db.is_read_only()
+        self.lock().is_read_only()
     }
 
-    /// Escape hatch for advanced callers — the internal `Database`
-    /// backing this connection. Not part of the stable API; will move
-    /// or change as Phase 5's cursor abstraction lands.
+    /// Escape hatch for advanced callers — locks the shared `Database`
+    /// and hands back the guard. Not part of the stable API; will move
+    /// or change as Phase 10's MVCC sub-phases land.
+    ///
+    /// Bind the guard to a local before calling functions that take
+    /// `&Database`:
+    ///
+    /// ```no_run
+    /// # use sqlrite::Connection;
+    /// # fn use_db(_d: &sqlrite::Database) {}
+    /// let conn = Connection::open_in_memory()?;
+    /// let db = conn.database();
+    /// use_db(&db);
+    /// # Ok::<(), sqlrite::SQLRiteError>(())
+    /// ```
     #[doc(hidden)]
-    pub fn database(&self) -> &Database {
-        &self.db
+    pub fn database(&self) -> MutexGuard<'_, Database> {
+        self.lock()
     }
 
     #[doc(hidden)]
-    pub fn database_mut(&mut self) -> &mut Database {
-        &mut self.db
+    pub fn database_mut(&mut self) -> MutexGuard<'_, Database> {
+        self.lock()
     }
 }
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db = self.lock();
         f.debug_struct("Connection")
-            .field("in_transaction", &self.db.in_transaction())
-            .field("read_only", &self.db.is_read_only())
-            .field("tables", &self.db.tables.len())
+            .field("in_transaction", &db.in_transaction())
+            .field("read_only", &db.is_read_only())
+            .field("tables", &db.tables.len())
             .field("prep_cache_len", &self.prep_cache.len())
+            .field("handles", &Arc::strong_count(&self.inner))
             .finish()
     }
 }
@@ -395,7 +485,8 @@ impl<'c> Statement<'c> {
             )));
         }
         let ast = self.plan.ast.clone();
-        process_ast_with_render(ast, &mut self.conn.db).map(|o| o.status)
+        let mut db = self.conn.lock();
+        process_ast_with_render(ast, &mut db).map(|o| o.status)
     }
 
     /// SQLR-23 — executes a prepared non-SELECT statement after binding
@@ -411,7 +502,8 @@ impl<'c> Statement<'c> {
         if !params.is_empty() {
             substitute_params(&mut ast, params)?;
         }
-        process_ast_with_render(ast, &mut self.conn.db).map(|o| o.status)
+        let mut db = self.conn.lock();
+        process_ast_with_render(ast, &mut db).map(|o| o.status)
     }
 
     /// Runs a SELECT and returns a [`Rows`] iterator over typed rows.
@@ -433,7 +525,8 @@ impl<'c> Statement<'c> {
                 "query() only works on SELECT statements; use run() for DDL/DML".to_string(),
             ));
         };
-        let result = execute_select_rows(sq.clone(), &self.conn.db)?;
+        let db = self.conn.lock();
+        let result = execute_select_rows(sq.clone(), &db)?;
         Ok(Rows {
             columns: result.columns,
             rows: result.rows.into_iter(),
@@ -466,7 +559,8 @@ impl<'c> Statement<'c> {
             substitute_params(&mut ast, params)?;
         }
         let sq = SelectQuery::new(&ast)?;
-        let result = execute_select_rows(sq, &self.conn.db)?;
+        let db = self.conn.lock();
+        let result = execute_select_rows(sq, &db)?;
         Ok(Rows {
             columns: result.columns,
             rows: result.rows.into_iter(),
@@ -1265,6 +1359,157 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("doesn't support any options"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 10.1 — multi-connection foundation
+    // -----------------------------------------------------------------
+
+    /// `connect()` mints a sibling handle that shares the backing
+    /// `Database`. Writes through one are visible through the other —
+    /// the headline behavioural change for Phase 10.1.
+    #[test]
+    fn connect_shares_underlying_database() {
+        let mut a = Connection::open_in_memory().unwrap();
+        let mut b = a.connect();
+        assert_eq!(a.handle_count(), 2);
+
+        a.execute("CREATE TABLE shared (id INTEGER PRIMARY KEY, label TEXT);")
+            .unwrap();
+        a.execute("INSERT INTO shared (label) VALUES ('via-a');")
+            .unwrap();
+        b.execute("INSERT INTO shared (label) VALUES ('via-b');")
+            .unwrap();
+
+        let stmt = b.prepare("SELECT label FROM shared;").unwrap();
+        let mut labels: Vec<String> = stmt
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        labels.sort();
+        assert_eq!(labels, vec!["via-a".to_string(), "via-b".to_string()]);
+    }
+
+    /// Dropping a sibling decrements the handle count without
+    /// disturbing the surviving connections.
+    #[test]
+    fn handle_count_reflects_live_handles() {
+        let primary = Connection::open_in_memory().unwrap();
+        assert_eq!(primary.handle_count(), 1);
+        let s1 = primary.connect();
+        let s2 = primary.connect();
+        assert_eq!(primary.handle_count(), 3);
+        drop(s1);
+        assert_eq!(primary.handle_count(), 2);
+        drop(s2);
+        assert_eq!(primary.handle_count(), 1);
+    }
+
+    /// Multi-thread INSERT/COMMIT against the same in-memory DB. Today
+    /// the per-`Database` mutex serializes commits — this test proves
+    /// the locking holds without panics or data loss when N threads
+    /// race for the writer. Phase 10.4's `BEGIN CONCURRENT` will lift
+    /// the serialization for disjoint-row workloads; until then the
+    /// guarantee is "no panic, every commit lands."
+    #[test]
+    fn threaded_writers_serialize_cleanly() {
+        use std::thread;
+
+        let primary = Connection::open_in_memory().unwrap();
+        // Set up the shared schema before spawning so every worker
+        // sees the table.
+        {
+            let mut p = primary.connect();
+            p.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, who TEXT, n INTEGER);")
+                .unwrap();
+        }
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 25;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let mut conn = primary.connect();
+                thread::spawn(move || {
+                    for n in 0..PER_THREAD {
+                        let sql = format!("INSERT INTO log (who, n) VALUES ('t{tid}', {n});");
+                        conn.execute(&sql).expect("insert under contention");
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        // Every write must have landed exactly once — count rows by
+        // probing the table directly so we don't depend on a SELECT
+        // COUNT(*) implementation.
+        let db = primary.database();
+        let table = db.get_table("log".to_string()).unwrap();
+        assert_eq!(
+            table.rowids().len(),
+            THREADS * PER_THREAD,
+            "expected every threaded INSERT to commit",
+        );
+    }
+
+    /// `connect()` over a file-backed database produces sibling
+    /// handles that hit the same on-disk pager. Auto-save through one
+    /// must be visible through the other without a re-open.
+    #[test]
+    fn connect_shares_file_backed_database() {
+        let path = tmp_path("connect_file");
+        let mut primary = Connection::open(&path).unwrap();
+        primary
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+
+        let mut sibling = primary.connect();
+        sibling.execute("INSERT INTO t (v) VALUES ('hi');").unwrap();
+
+        let stmt = primary.prepare("SELECT v FROM t;").unwrap();
+        let rows = stmt.query().unwrap().collect_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String>(0).unwrap(), "hi");
+
+        drop(sibling);
+        drop(primary);
+        cleanup(&path);
+    }
+
+    /// Prepared-statement caches are per-handle, by design — sharing
+    /// a mutable LRU across threads would require an extra lock for
+    /// no real win (each worker prepares its own hot SQL).
+    #[test]
+    fn prep_cache_is_per_handle() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = a.connect();
+
+        let _ = a.prepare_cached("SELECT a FROM t").unwrap();
+        let _ = a.prepare_cached("SELECT a FROM t").unwrap();
+        assert_eq!(a.prepared_cache_len(), 1);
+        // The sibling's cache is untouched.
+        assert_eq!(b.prepared_cache_len(), 0);
+        let _ = b.prepare_cached("SELECT a FROM t").unwrap();
+        assert_eq!(b.prepared_cache_len(), 1);
+    }
+
+    /// Static check: `Connection` is `Send + Sync`. Required so it can
+    /// be moved across threads (or wrapped in `Arc`) without a typestate
+    /// adapter — the headline contract Phase 10.1 puts in place.
+    #[test]
+    fn connection_is_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Connection>();
+        assert_sync::<Connection>();
     }
 
     #[test]

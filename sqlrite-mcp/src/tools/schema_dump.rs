@@ -28,6 +28,7 @@ pub fn metadata() -> Value {
 }
 
 pub fn handle(_args: Value, state: &mut ServerState) -> Result<String, ToolError> {
-    let dump = sqlrite::ask::schema::dump_schema_for_database(state.conn.database());
+    let db = state.conn.database();
+    let dump = sqlrite::ask::schema::dump_schema_for_database(&db);
     Ok(dump)
 }
