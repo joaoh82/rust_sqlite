@@ -1,7 +1,16 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { SITE } from "@/lib/site";
 import "./globals.css";
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  // The site is dark-only; surface that to mobile browsers so address bars
+  // and status bars adopt the page background instead of flashing white.
+  themeColor: "#0b0c0e",
+  colorScheme: "dark",
+};
 
 const inter = Inter({
   subsets: ["latin"],

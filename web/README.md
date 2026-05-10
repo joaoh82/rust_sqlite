@@ -92,6 +92,43 @@ roadmap timeline, etc.) is intentionally hand-rolled — it ports the
 prototype's `styles.css` 1:1 rather than reaching for component-library
 abstractions.
 
+## Responsive design
+
+The site is mobile-first and verified at 375px (iPhone SE), 390px
+(iPhone 14), 768px (iPad), and 1024px+. Key conventions:
+
+- **Breakpoints** live at the bottom of [`src/app/globals.css`](src/app/globals.css):
+  900px (tablet), 760px (mobile nav cutover), 640px (phone), and 380px
+  (very small phones). Section-level grids declare their own breakpoints
+  inline near their styles (features, bench bars, footer, etc.).
+- **Nav** ([`src/components/nav.tsx`](src/components/nav.tsx)) is a
+  client component. Below 760px the inline links collapse into a 44×44
+  hamburger that opens a full-width drawer; Esc closes; the body scroll
+  is locked while open.
+- **Docs** ([`src/app/docs/page.tsx`](src/app/docs/page.tsx)) hides the
+  desktop sidebar and on-page TOC under 1000px and 720px respectively
+  and shows a sticky `<details>`-driven section list in their place.
+- **Tap targets** — primary buttons (`.btn`), the hamburger, install-bar
+  copy, mobile menu links, and the docs section toggle are all ≥ 44px
+  tall on phones. Footer / docs sidebar inline nav links stay at ~36px,
+  which is the common compromise for dense navigation lists.
+- **Horizontal scroll** is guarded globally with `html { overflow-x:
+  clip }`. We use `clip` instead of `hidden` so `position: sticky` keeps
+  working for the nav and the docs sidebar. Long URLs / unbroken tokens
+  in prose use `overflow-wrap: anywhere` so they don't blow out the
+  viewport.
+- **Tables and code blocks** scroll horizontally inside their container
+  (`overflow-x: auto`); the SQL surface table on `/` reflows into
+  stacked cards under 640px since its second column is a long pill list.
+- **Viewport / theme color** — set via the `viewport` export in
+  [`src/app/layout.tsx`](src/app/layout.tsx); the dark `#0b0c0e`
+  `themeColor` keeps mobile browser chrome from flashing white.
+
+When adding new sections, declare the breakpoint logic alongside the
+section's styles rather than at the bottom of the file — it keeps the
+section self-contained and the global breakpoint block reserved for
+typography / spacing baseline tweaks.
+
 ## Updating the version
 
 The displayed version is in [`src/lib/site.ts`](src/lib/site.ts). Update it
