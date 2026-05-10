@@ -172,6 +172,24 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+### 12c. `MvStore` data structure + `JournalMode` toggle land before the read path uses them (Phase 11.3)
+
+**Decision.** [`MvStore`](../src/mvcc/store.rs) (the in-memory version index) and the [`JournalMode`](../src/mvcc/mod.rs) enum (with the `PRAGMA journal_mode = wal | mvcc` SQL surface) ship together in Phase 11.3, but the executor's read path **does not consult `MvStore`** until 11.4. `Database` grows two new fields (`mvcc_clock: Arc<MvccClock>`, `mv_store: MvStore`); both are allocated on every `Database::new`, even when the journal mode is `Wal`.
+
+**Why ship the data structures before the read-side wiring.** The snapshot-isolation contract requires that the read path see versions the write path produced. In v0 our writes happen via the legacy `Database.tables` mutation followed by a per-page WAL commit; those don't push into `MvStore`. So if 11.3 wired reads through `MvStore`, every read would see an empty store and return wrong rows. Routing reads through `MvStore` only makes sense once the *commit path* is mirroring writes into it — and that's a non-trivial change (the commit timestamp must come from `MvccClock`, the cap rule has to fire on the previous version, schema changes must invalidate the store). 11.4 ships both halves together because they're coupled. 11.3 ships the parts that *aren't* coupled (the data structure + the toggle) so the diffs stay reviewable.
+
+**Why allocate `mvcc_clock` + `mv_store` even in `Wal` mode.** Two reasons:
+- `PRAGMA journal_mode = mvcc;` shouldn't have to lazy-construct anything mid-statement. Constructing `MvccClock` is cheap (one `AtomicU64`); `MvStore` is a `Mutex<HashMap>` (zero-allocation when empty).
+- Sibling `Connection::connect` handles can outlive the moment when MVCC was enabled. If the clock were lazy, a sibling connecting before MVCC was first enabled wouldn't observe the same clock as one connecting after — a confusing footgun. Allocating eagerly on `Database::new` means every sibling shares the same `Arc<MvccClock>` from day one.
+
+**Why `Mvcc → Wal` is rejected when the store has committed versions.** The `MvStore` is the only durable record of those versions until 11.5's checkpoint integration drains them into the pager. Switching back to `Wal` mode would either silently strand them (correctness bug) or quietly discard them (data loss). v0 fails the PRAGMA with a typed error and lets the caller decide what to do. When 11.5 lands, "drain to pager then switch" becomes legal.
+
+**Why per-database, not per-connection.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §8 flags this as an open question. Per-connection is more flexible (a maintenance connection can stay in WAL mode while app connections use MVCC); per-database is closer to user expectation and matches SQLite's `PRAGMA journal_mode` semantic. For 11.3 we picked per-database for simplicity — the journal-mode field lives on `Database`, every `Connection::connect` sibling sees the same value. If the per-connection trade-off becomes load-bearing later, the dispatch lives behind `Connection::journal_mode()` already, so callers don't need to change.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §4.2 (version index), §6 (SQL surface), §8 (open questions on per-connection vs per-database journal mode).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

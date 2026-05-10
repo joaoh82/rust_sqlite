@@ -3970,10 +3970,12 @@ mod tests {
 
     /// Pragmas SQLRite doesn't know about return `NotImplemented` —
     /// not a generic parser error. Future pragmas plug in here.
+    /// (Phase 11.3 made `journal_mode` a recognised pragma; this
+    /// test uses a name that's still unsupported.)
     #[test]
     fn pragma_unknown_returns_not_implemented() {
         let mut db = Database::new("t".to_string());
-        let err = process_command("PRAGMA journal_mode = WAL;", &mut db).unwrap_err();
+        let err = process_command("PRAGMA synchronous = NORMAL;", &mut db).unwrap_err();
         assert!(
             matches!(err, SQLRiteError::NotImplemented(_)),
             "unknown pragma must surface NotImplemented, got: {err:?}"

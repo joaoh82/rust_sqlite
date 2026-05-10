@@ -1,8 +1,10 @@
 use crate::error::{Result, SQLRiteError};
+use crate::mvcc::{JournalMode, MvStore, MvccClock};
 use crate::sql::db::table::Table;
 use crate::sql::pager::pager::{AccessMode, Pager};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Snapshot of the mutable in-memory state taken at `BEGIN` time so
 /// `ROLLBACK` can restore it. See `begin_transaction`, `rollback_transaction`.
@@ -51,6 +53,28 @@ pub struct Database {
     /// (SQLite parity at 25%). Per-connection runtime state — not
     /// persisted across reopens.
     pub auto_vacuum_threshold: Option<f32>,
+    /// Phase 11.3 — current journal mode for the database. Default
+    /// is [`JournalMode::Wal`] (every pre-Phase-11 caller). Toggled
+    /// by `PRAGMA journal_mode = mvcc | wal`. The setting is
+    /// per-database (every `Connection` to this `Database` observes
+    /// the same value) — see the open question in
+    /// [`docs/concurrent-writes-plan.md`](../../../docs/concurrent-writes-plan.md)
+    /// §8 for the per-connection vs. per-database trade-off; v0
+    /// picked per-database for simplicity.
+    pub journal_mode: JournalMode,
+    /// Phase 11.3 — process-wide MVCC clock. Shared between every
+    /// `Connection` to this `Database` (and 11.4's `MvStore`).
+    /// Seeded from the WAL header's `clock_high_water` at open
+    /// time so timestamps don't repeat across reopens. Allocated
+    /// here even in `JournalMode::Wal` so `PRAGMA journal_mode =
+    /// mvcc` doesn't require lazy-creating the clock.
+    pub mvcc_clock: Arc<MvccClock>,
+    /// Phase 11.3 — in-memory version index. Allocated on every
+    /// `Database::new` so the toggle to MVCC mode doesn't require
+    /// a re-init step. Empty until 11.4 wires the commit path to
+    /// publish row versions; reads still go through the legacy
+    /// path until then.
+    pub mv_store: MvStore,
 }
 
 impl Database {
@@ -63,6 +87,8 @@ impl Database {
     /// let mut db = Database::new("my_db".to_string());
     /// ```
     pub fn new(db_name: String) -> Self {
+        let mvcc_clock = Arc::new(MvccClock::new(0));
+        let mv_store = MvStore::new(Arc::clone(&mvcc_clock));
         Database {
             db_name,
             tables: HashMap::new(),
@@ -70,7 +96,58 @@ impl Database {
             pager: None,
             txn: None,
             auto_vacuum_threshold: Some(DEFAULT_AUTO_VACUUM_THRESHOLD),
+            journal_mode: JournalMode::default(),
+            mvcc_clock,
+            mv_store,
         }
+    }
+
+    /// Phase 11.3 — current journal mode. Toggled by `PRAGMA
+    /// journal_mode = mvcc | wal`. `Wal` (the default) keeps every
+    /// pre-Phase-11 caller's behaviour; `Mvcc` opts the database
+    /// into MVCC + `BEGIN CONCURRENT` (Phase 11.4 wires this end-to-
+    /// end; today the toggle is observable but the read/write
+    /// paths don't change).
+    pub fn journal_mode(&self) -> JournalMode {
+        self.journal_mode
+    }
+
+    /// Phase 11.3 — switch the database's journal mode. `Wal → Mvcc`
+    /// is unconditional in v0 (no in-flight transactions to drain
+    /// because nothing publishes versions yet). `Mvcc → Wal` is
+    /// rejected if `mv_store` carries any committed versions —
+    /// switching back would silently strand them. v0 keeps this
+    /// strict; the loosening (and the discard-versions path) lands
+    /// when 11.4 starts populating the store.
+    pub fn set_journal_mode(&mut self, mode: JournalMode) -> Result<()> {
+        if self.journal_mode == mode {
+            return Ok(());
+        }
+        if mode == JournalMode::Wal && self.mv_store.total_versions() > 0 {
+            return Err(SQLRiteError::General(
+                "PRAGMA journal_mode: cannot switch back to 'wal' while \
+                 the MVCC store holds committed versions"
+                    .to_string(),
+            ));
+        }
+        self.journal_mode = mode;
+        Ok(())
+    }
+
+    /// Phase 11.3 — the shared MVCC logical clock. Returned by
+    /// reference (not cloned) because callers typically just read
+    /// `now()` / `tick()` against the same `Arc` `Database` already
+    /// holds.
+    pub fn mvcc_clock(&self) -> &Arc<MvccClock> {
+        &self.mvcc_clock
+    }
+
+    /// Phase 11.3 — the in-memory version index. Read-only access
+    /// is enough for 11.3's tests; 11.4 grows the commit-path
+    /// helpers into typed methods on `Database` rather than mutating
+    /// this directly.
+    pub fn mv_store(&self) -> &MvStore {
+        &self.mv_store
     }
 
     /// Returns the current auto-VACUUM threshold, or `None` if disabled.

@@ -22,6 +22,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::error::{Result, SQLRiteError};
+use crate::mvcc::JournalMode;
 use crate::sql::CommandOutput;
 use crate::sql::db::database::Database;
 
@@ -193,10 +194,55 @@ where
 pub fn execute_pragma(stmt: PragmaStatement, db: &mut Database) -> Result<CommandOutput> {
     match stmt.name.to_ascii_lowercase().as_str() {
         "auto_vacuum" => pragma_auto_vacuum(stmt.value, db),
+        "journal_mode" => pragma_journal_mode(stmt.value, db),
         other => Err(SQLRiteError::NotImplemented(format!(
             "PRAGMA '{other}' is not supported"
         ))),
     }
+}
+
+/// `PRAGMA journal_mode;` (read) or `PRAGMA journal_mode = wal | mvcc;`
+/// (write). Phase 11.3 — the toggle is observable but doesn't change
+/// query behaviour yet; 11.4 wires `Mvcc` mode into the read/write
+/// paths. The set form returns the new mode (SQLite parity); the
+/// read form returns the current mode.
+fn pragma_journal_mode(value: Option<PragmaValue>, db: &mut Database) -> Result<CommandOutput> {
+    match value {
+        None => render_journal_mode(db.journal_mode()),
+        Some(v) => {
+            let target = parse_journal_mode_target(&v)?;
+            db.set_journal_mode(target)?;
+            // SQLite renders the post-set mode as a result row;
+            // mirror that so callers can confirm the toggle landed.
+            render_journal_mode(db.journal_mode())
+        }
+    }
+}
+
+fn render_journal_mode(mode: JournalMode) -> Result<CommandOutput> {
+    let mut t = PrintTable::new();
+    t.add_row(PrintRow::new(vec![PrintCell::new("journal_mode")]));
+    t.add_row(PrintRow::new(vec![PrintCell::new(mode.as_str())]));
+    Ok(CommandOutput {
+        status: "PRAGMA journal_mode executed. 1 row returned.".to_string(),
+        rendered: Some(t.to_string()),
+    })
+}
+
+fn parse_journal_mode_target(value: &PragmaValue) -> Result<JournalMode> {
+    let s = match value {
+        PragmaValue::Identifier(s) | PragmaValue::String(s) => s.as_str(),
+        PragmaValue::Number(s) => {
+            return Err(SQLRiteError::General(format!(
+                "PRAGMA journal_mode: expected 'wal' or 'mvcc', got numeric '{s}'"
+            )));
+        }
+    };
+    JournalMode::from_str_lossless(s).ok_or_else(|| {
+        SQLRiteError::General(format!(
+            "PRAGMA journal_mode: unknown mode '{s}' (supported: 'wal', 'mvcc')"
+        ))
+    })
 }
 
 /// `PRAGMA auto_vacuum;` (read) or `PRAGMA auto_vacuum = N | OFF | NONE;`
@@ -417,10 +463,12 @@ mod tests {
 
     #[test]
     fn execute_pragma_unknown_returns_not_implemented() {
+        // `journal_mode` was the canary unknown pragma here before
+        // Phase 11.3 added it. Use a name that's still unsupported.
         let mut db = Database::new("t".to_string());
         let err = execute_pragma(
             PragmaStatement {
-                name: "journal_mode".to_string(),
+                name: "synchronous".to_string(),
                 value: None,
             },
             &mut db,

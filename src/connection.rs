@@ -347,6 +347,17 @@ impl Connection {
         self.lock().is_read_only()
     }
 
+    /// Phase 11.3 — current journal mode. `Wal` (default) keeps every
+    /// pre-Phase-11 caller's behaviour. `Mvcc` is opt-in via
+    /// `PRAGMA journal_mode = mvcc;`. Per-database — every
+    /// [`Connection::connect`] sibling sees the same value.
+    ///
+    /// Today this is observable but doesn't change query behaviour;
+    /// 11.4 wires `Mvcc` mode into the read/write paths.
+    pub fn journal_mode(&self) -> crate::mvcc::JournalMode {
+        self.lock().journal_mode()
+    }
+
     /// Escape hatch for advanced callers — locks the shared `Database`
     /// and hands back the guard. Not part of the stable API; will move
     /// or change as Phase 10's MVCC sub-phases land.
@@ -1510,6 +1521,90 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<Connection>();
         assert_sync::<Connection>();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.3 — `PRAGMA journal_mode` round-trip
+    // -----------------------------------------------------------------
+
+    /// Fresh connections default to `wal` mode. The PRAGMA read form
+    /// renders the current value as a single-row, single-column table
+    /// the REPL can print.
+    #[test]
+    fn journal_mode_defaults_to_wal_and_renders_through_pragma() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert_eq!(conn.journal_mode(), crate::mvcc::JournalMode::Wal);
+
+        // Read form returns "1 row returned." status (matching
+        // `auto_vacuum`'s shape).
+        let status = conn.execute("PRAGMA journal_mode;").unwrap();
+        assert!(
+            status.contains("1 row returned"),
+            "unexpected status: {status}"
+        );
+    }
+
+    /// `PRAGMA journal_mode = mvcc;` flips the per-database mode and
+    /// is observable through every sibling handle. The headline
+    /// per-database contract for Phase 11.3.
+    #[test]
+    fn journal_mode_set_to_mvcc_propagates_to_siblings() {
+        let mut primary = Connection::open_in_memory().unwrap();
+        let sibling = primary.connect();
+        assert_eq!(sibling.journal_mode(), crate::mvcc::JournalMode::Wal);
+
+        primary.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        assert_eq!(primary.journal_mode(), crate::mvcc::JournalMode::Mvcc);
+        // Sibling sees the same value — proves the setting lives on
+        // the shared `Database`, not on the per-handle Connection.
+        assert_eq!(sibling.journal_mode(), crate::mvcc::JournalMode::Mvcc);
+
+        // Switch back is allowed because no MVCC versions exist yet
+        // (11.4 will populate the store).
+        primary.execute("PRAGMA journal_mode = wal;").unwrap();
+        assert_eq!(primary.journal_mode(), crate::mvcc::JournalMode::Wal);
+        assert_eq!(sibling.journal_mode(), crate::mvcc::JournalMode::Wal);
+    }
+
+    /// The set form is case-insensitive on both the pragma name and
+    /// the value (matching SQLite). Quoted values work too.
+    #[test]
+    fn journal_mode_pragma_is_case_insensitive() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA JOURNAL_MODE = MVCC;").unwrap();
+        assert_eq!(conn.journal_mode(), crate::mvcc::JournalMode::Mvcc);
+        conn.execute("pragma journal_mode = 'wal';").unwrap();
+        assert_eq!(conn.journal_mode(), crate::mvcc::JournalMode::Wal);
+    }
+
+    /// Unknown modes return a typed error and don't disturb the
+    /// existing setting.
+    #[test]
+    fn journal_mode_rejects_unknown_value() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = conn
+            .execute("PRAGMA journal_mode = delete;")
+            .expect_err("unknown mode must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown mode 'delete'"),
+            "unexpected error: {msg}"
+        );
+        // Setting wasn't disturbed.
+        assert_eq!(conn.journal_mode(), crate::mvcc::JournalMode::Wal);
+    }
+
+    /// Numeric values are rejected — `journal_mode` is enum-shaped.
+    /// SQLite accepts e.g. `journal_mode = 0` for OFF historically;
+    /// SQLRite stays explicit.
+    #[test]
+    fn journal_mode_rejects_numeric_value() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = conn
+            .execute("PRAGMA journal_mode = 0;")
+            .expect_err("numeric mode must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("numeric"), "unexpected error: {msg}");
     }
 
     #[test]
