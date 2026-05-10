@@ -148,18 +148,27 @@ links open in a new tab via `rel="noreferrer"`.
 
 ### Code block highlighting
 
-Fenced code blocks are tokenized at build time by
-[`rehype-pretty-code`](https://github.com/rehype-pretty/rehype-pretty-code)
-with [Shiki](https://shiki.style/). The plugin is wired up in
-[`src/components/blog-mdx.tsx`](src/components/blog-mdx.tsx) using a
+Code is tokenized at build time by [Shiki](https://shiki.style/). The
+shared theme + helper live in
+[`src/lib/highlight.ts`](src/lib/highlight.ts) and use
 `createCssVariablesTheme()` so Shiki emits inline styles like
-`color: var(--shiki-token-keyword)`. The mapping from
-`--shiki-*` to the blog's color palette (`--color-kw`, `--color-str`,
-`--color-num`, …) lives in the `.blog-article-body pre` rule in
+`color: var(--shiki-token-keyword)`. Each surface that needs
+highlighting then maps the `--shiki-*` variables onto the blog's
+palette tokens (`--color-kw`, `--color-str`, `--color-num`, …) in
 [`src/app/globals.css`](src/app/globals.css) — adjust colors there,
-not in the component. Code fences without a language fall back to
-`plaintext` so unknown / missing language tags don't fail the build.
-Inline `code` keeps its existing chip styling (`bypassInlineCode: true`).
+not in the components. Two consumers:
+
+- **Blog MDX** (`src/components/blog-mdx.tsx`) — uses
+  [`rehype-pretty-code`](https://github.com/rehype-pretty/rehype-pretty-code)
+  inside the `MDXRemote` pipeline. Inline `` `code` `` keeps its chip
+  styling (`bypassInlineCode: true`); fences without a language tag
+  fall back to `plaintext` so a missing language never breaks the
+  build. Mapping lives on `.blog-article-body pre`.
+- **SDK showcase** (`src/components/sdk-showcase.tsx` —
+  server-rendered, paired with a small client wrapper for the tab
+  state) pre-renders each language snippet with `highlightCode()` and
+  embeds the resulting HTML inside `.code-body`. Mapping lives on
+  `.code-body`.
 
 The design tokens (colors, typography, spacing) live in `globals.css`'s
 `@theme` block. The page-level CSS (sections, terminal, feature grid,

@@ -5,7 +5,7 @@ import rehypePrettyCode, {
   type Options as RehypePrettyCodeOptions,
   type Theme as RehypePrettyCodeTheme,
 } from "rehype-pretty-code";
-import { createCssVariablesTheme } from "shiki";
+import { sqlriteShikiTheme } from "@/lib/highlight";
 
 function isInternal(href: string | undefined): boolean {
   if (!href) return false;
@@ -34,16 +34,12 @@ const components = {
 // Shiki emits inline styles like `style="color: var(--shiki-token-keyword)"`.
 // `globals.css` maps those CSS vars onto the blog's existing color tokens, so
 // the highlighter stays a pure data layer and themes stay coherent.
-// `createCssVariablesTheme` returns `ThemeRegistration` (all-optional fields);
-// rehype-pretty-code wants `ThemeRegistrationRaw` (settings required). The
-// shapes are structurally compatible — shiki tolerates the missing `settings`
-// because the rules live in `tokenColors`.
-const shikiTheme = createCssVariablesTheme({
-  name: "sqlrite-css-vars",
-}) as RehypePrettyCodeTheme;
-
 const prettyCodeOptions: RehypePrettyCodeOptions = {
-  theme: shikiTheme,
+  // `createCssVariablesTheme` returns `ThemeRegistration` (all-optional
+  // fields); rehype-pretty-code wants `ThemeRegistrationRaw` (`settings`
+  // required). The shapes are structurally compatible — shiki tolerates the
+  // missing `settings` because the rules live in `tokenColors`.
+  theme: sqlriteShikiTheme as RehypePrettyCodeTheme,
   keepBackground: false,
   // Inline `code` keeps the existing `.blog-article-body code:not(pre code)`
   // chip style — only fenced blocks get tokenized.

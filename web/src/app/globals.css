@@ -854,6 +854,37 @@ section.no-border {
   white-space: pre;
   overflow-x: auto;
   color: var(--color-fg);
+
+  /* Same shiki → palette mapping as `.blog-article-body pre`. The SDK
+     showcase pre-renders snippets via `lib/highlight.ts` and inlines the
+     resulting <pre><code> here. */
+  --shiki-foreground: var(--color-fg);
+  --shiki-background: transparent;
+  --shiki-token-keyword: var(--color-kw);
+  --shiki-token-string: var(--color-str);
+  --shiki-token-string-expression: var(--color-str);
+  --shiki-token-constant: var(--color-num);
+  --shiki-token-comment: var(--color-fg-dim);
+  --shiki-token-function: var(--color-accent);
+  --shiki-token-parameter: var(--color-fg);
+  --shiki-token-punctuation: var(--color-fg-mute);
+  --shiki-token-link: var(--color-accent);
+}
+.code-body > pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+}
+.code-body > pre > code {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+}
+.code-body .line {
+  display: block;
+  min-height: 1lh;
 }
 
 /* SQL ref table */

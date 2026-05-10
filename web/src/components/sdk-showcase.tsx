@@ -1,24 +1,22 @@
-"use client";
-
-import { useState } from "react";
 import { SITE } from "@/lib/site";
-import { InstallBar } from "./install-bar";
+import { highlightCode } from "@/lib/highlight";
+import {
+  SDKShowcaseClient,
+  type SdkEntry,
+} from "./sdk-showcase-client";
 
-type SdkKey = "rust" | "python" | "node" | "go" | "c" | "wasm";
-
-type Sdk = {
-  name: string;
-  install: string;
-  version: string;
-  registry: string;
-  note: string;
-  ext: string;
+type SdkSource = Omit<SdkEntry, "codeHtml"> & {
+  /** Raw snippet — highlighted at build time. */
   code: string;
+  /** Shiki language id. */
+  lang: string;
 };
 
-const SDKS: Record<SdkKey, Sdk> = {
-  rust: {
+const SDKS: SdkSource[] = [
+  {
+    key: "rust",
     name: "Rust",
+    lang: "rust",
     install: `cargo add sqlrite-engine`,
     version: SITE.version,
     registry: "crates.io",
@@ -43,8 +41,10 @@ fn main() -> sqlrite::Result<()> {
     Ok(())
 }`,
   },
-  python: {
+  {
+    key: "python",
     name: "Python",
+    lang: "python",
     install: `pip install sqlrite`,
     version: SITE.version,
     registry: "PyPI",
@@ -64,8 +64,10 @@ with sqlrite.connect("app.sqlrite") as conn:
     for row in cur.fetchall():
         print(row)`,
   },
-  node: {
+  {
+    key: "node",
     name: "Node.js",
+    lang: "javascript",
     install: `npm install @joaoh82/sqlrite`,
     version: SITE.version,
     registry: "npm · scoped",
@@ -86,8 +88,10 @@ insert.run("alice");
 const all = db.prepare("SELECT id, name FROM users").all();
 console.log(all);`,
   },
-  go: {
+  {
+    key: "go",
     name: "Go",
+    lang: "go",
     install: `go get github.com/joaoh82/rust_sqlite/sdk/go`,
     version: `v${SITE.version}`,
     registry: "VCS · proxy.golang.org",
@@ -117,8 +121,10 @@ func main() {
     }
 }`,
   },
-  c: {
+  {
+    key: "c",
     name: "C",
+    lang: "c",
     install: `make -C examples/c run`,
     version: SITE.version,
     registry: "libsqlrite_c · cbindgen header",
@@ -144,8 +150,10 @@ int main(void) {
     return 0;
 }`,
   },
-  wasm: {
+  {
+    key: "wasm",
     name: "WASM",
+    lang: "typescript",
     install: `npm install @joaoh82/sqlrite-wasm`,
     version: SITE.version,
     registry: "npm · ~500 KB gzipped",
@@ -165,75 +173,14 @@ db.exec("INSERT INTO users (name) VALUES ('alice')");
 const rows = db.query("SELECT id, name FROM users");
 console.log(rows);                   // [{ id: 1, name: "alice" }]`,
   },
-};
+];
 
-export function SDKShowcase() {
-  const [tab, setTab] = useState<SdkKey>("rust");
-  const sdk = SDKS[tab];
-
-  return (
-    <section id="sdks">
-      <div className="wrap">
-        <div className="sec-head">
-          <span className="eyebrow tag">05 · embedding</span>
-          <div>
-            <h2>One engine. Six languages.</h2>
-            <p className="sub">
-              The same Rust core — wrapped, never reimplemented. SDKs ship as
-              prebuilt binaries so there&rsquo;s no toolchain to install just to
-              use the database.
-            </p>
-          </div>
-        </div>
-        <div className="sec-body" style={{ paddingTop: 32 }}>
-          <div className="sdk-tabs" role="tablist">
-            {(Object.entries(SDKS) as [SdkKey, Sdk][]).map(([key, s]) => (
-              <button
-                key={key}
-                role="tab"
-                aria-selected={tab === key}
-                className={`sdk-tab ${tab === key ? "active" : ""}`}
-                onClick={() => setTab(key)}
-              >
-                {s.name}
-              </button>
-            ))}
-          </div>
-          <div className="sdk-panel">
-            <div className="sdk-meta">
-              <h3>{sdk.name}</h3>
-              <p
-                className="dim"
-                style={{ marginTop: 6, fontSize: 13.5 }}
-              >
-                {sdk.note}
-              </p>
-              <InstallBar cmd={sdk.install} />
-              <div style={{ marginTop: 18 }}>
-                <div className="meta-row">
-                  <span>version</span>
-                  <span className="v">{sdk.version}</span>
-                </div>
-                <div className="meta-row">
-                  <span>registry</span>
-                  <span className="v">{sdk.registry}</span>
-                </div>
-                <div className="meta-row">
-                  <span>license</span>
-                  <span className="v">MIT</span>
-                </div>
-              </div>
-            </div>
-            <div className="code-block">
-              <div className="code-head">
-                <span>example.{sdk.ext}</span>
-                <span>· copy-pasteable</span>
-              </div>
-              <div className="code-body">{sdk.code}</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
+export async function SDKShowcase() {
+  const entries: SdkEntry[] = await Promise.all(
+    SDKS.map(async ({ code, lang, ...rest }) => ({
+      ...rest,
+      codeHtml: await highlightCode(code, lang),
+    })),
   );
+  return <SDKShowcaseClient sdks={entries} />;
 }
