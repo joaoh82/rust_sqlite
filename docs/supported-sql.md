@@ -616,7 +616,7 @@ loop {
 - Database must be in `journal_mode = mvcc` first. Plain `BEGIN CONCURRENT` against a `Wal`-mode database returns a typed error.
 - DDL (`CREATE TABLE` / `CREATE INDEX` / `DROP TABLE` / `DROP INDEX` / `ALTER TABLE` / `VACUUM`) is rejected inside `BEGIN CONCURRENT` — the typed error keeps the transaction open so the caller can `ROLLBACK`.
 - Nested `BEGIN CONCURRENT` (or plain `BEGIN` inside an open `BEGIN CONCURRENT`) is rejected with a typed error.
-- Reads via `Connection::execute("SELECT …")` inside the transaction see the BEGIN-time snapshot; reads via `Statement::query` (the prepared-statement path) still go through the legacy `tables → pager` path. Full `MvStore`-routed reads land in 11.5.
+- Reads inside the transaction see the BEGIN-time snapshot through every public read path: `Connection::execute("SELECT …")` *and* `Statement::query()` / `Statement::query_with_params()` (the prepared-statement path). Phase 11.5 closed the prepare/query gap by routing the read side through a per-connection `Mutex<Option<ConcurrentTx>>` + `with_snapshot_read` helper.
 - Tables touched by writes inside `BEGIN CONCURRENT` should not carry FTS / HNSW indexes — the per-row commit-apply path only maintains B-tree secondary indexes today. Plain `WHERE col = literal` index probing still works on the post-commit live database.
 - `AUTOINCREMENT`-bearing INSERTs are not specifically guarded; two concurrent INSERTs that each allocate the same rowid surface as a `Busy` at the second commit. The plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
 

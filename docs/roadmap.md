@@ -607,7 +607,7 @@ Standalone version-index data structure + the per-database journal-mode toggle.
 - New [`JournalMode`](../src/mvcc/mod.rs) enum (`Wal` default, `Mvcc`); per-database setting on `Database`. `PRAGMA journal_mode = wal | mvcc;` toggles; `PRAGMA journal_mode;` returns the current value as a single-row, single-column result. `Connection::journal_mode()` reads the value through the public API. Switching `Mvcc → Wal` is rejected if the store carries committed versions (would silently strand them); v0 is intentionally strict.
 - `Database` grows `mvcc_clock: Arc<MvccClock>` and `mv_store: MvStore` fields, allocated on every `Database::new` so the toggle to MVCC mode doesn't require a re-init step. Both are shared across every `Connection::connect` sibling.
 
-### 🚧 Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(in progress, plan-doc "Phase 10.4" — the meat)*
+### ✅ Phase 11.4 — `BEGIN CONCURRENT` writes + commit-time validation *(plan-doc "Phase 10.4" — the meat)*
 
 The headline slice. Multiple sibling `Connection`s can each hold their own open `BEGIN CONCURRENT` transaction; commits validate against `MvStore` and abort with [`SQLRiteError::Busy`](../src/error.rs) on row-level write-write conflict. The four plan-required tests pass: disjoint inserts both commit, same-row updates collide and one wins, aborted writes never become visible, retry-after-`Busy` succeeds.
 
@@ -619,30 +619,38 @@ The headline slice. Multiple sibling `Connection`s can each hold their own open 
 - New `SQLRiteError::Busy(String)` and `SQLRiteError::BusySnapshot(String)` variants. `SQLRiteError::is_retryable()` covers both — the contract SDK retry helpers will rely on.
 - DDL inside `BEGIN CONCURRENT` (CREATE TABLE / CREATE INDEX / DROP TABLE / DROP INDEX / ALTER TABLE / VACUUM) is rejected before the swap with a typed error (plan §8 non-goal).
 
-**Known limitations carried into 11.5+:**
+**Known limitations carried forward (most resolved in 11.5):**
 
-- Reads via `Statement::query` / `Statement::query_with_params` (the prepared-statement path) bypass the swap and read from the live `Database::tables`. Reads via `Connection::execute("SELECT…")` go through the swap and see the snapshot. Full snapshot-isolation reads land when 11.5 routes reads through `MvStore` — the data structure already implements `begin <= T < end` visibility; only the executor wiring is missing.
-- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.5 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror.
+- ~~Reads via `Statement::query` / `Statement::query_with_params` bypass the swap.~~ ✅ Fixed in 11.5 — `Connection.concurrent_tx` is now `Mutex<Option<…>>` and a new `with_snapshot_read` helper threads the swap through `&self`.
+- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.6 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror.
 - `AUTOINCREMENT` inside `BEGIN CONCURRENT` isn't explicitly rejected; the v0 deep-clone-snapshot model handles concurrent INSERTs by isolating each tx's `last_rowid` bumps to its private snapshot, so two concurrent INSERTs on an `AUTOINCREMENT` column may collide at COMMIT and surface as `Busy`. Adopting the plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
 - Tables touched by `BEGIN CONCURRENT` writes can't carry FTS or HNSW indexes today — `restore_row` only maintains B-tree secondary indexes. Concurrent-tx tests don't exercise FTS / HNSW, but a runtime guard would surface this with a clear error rather than producing inconsistent indexes.
 
-### Phase 11.5 — Checkpoint integration + crash recovery *(planned)*
+### 🚧 Phase 11.5 — Snapshot-isolated reads via `Statement::query` *(in progress, slotted ahead of plan-doc 11.5 checkpoint work because the prepare/query gap was the most user-visible 11.4 limitation)*
 
-Drains MVCC log-records into the existing bottom-up B-tree rebuild path. Replay on reopen rebuilds the in-memory index.
+`Connection.concurrent_tx` is now `Mutex<Option<ConcurrentTx>>` (was plain `Option`). A new `with_snapshot_read` helper takes `&self`, locks `concurrent_tx`, then locks the database, and — when a tx is open — swaps the tx's private cloned `tables` in for the duration of the read closure (with a scope-guarded unswap so a panic inside the closure can't strand the database). [`Statement::query`] and [`Statement::query_with_params`] route through this helper so the prepared-statement path now sees the same BEGIN-time snapshot the `execute("SELECT…")` path already saw in 11.4.
 
-### Phase 11.6 — Garbage collection *(planned)*
+Lock order is consistently `concurrent_tx → inner` across every code path; deadlock-free by construction. `Connection` is still `Send + Sync`. The four 11.4 plan-required tests still pass; new tests cover snapshot reads via prepare/query, read-your-writes within a tx, parameter-bound SELECT through the snapshot, and snapshot consistency across concurrent sibling commits.
 
-Per-commit sweep over the write-set's chains, plus a background sweep behind `PRAGMA mvcc_gc_interval_ms`.
+This was renumbered out of plan-doc order: the plan-doc had 11.5 as checkpoint integration, but that's a much larger slice and the prepare/query-bypass-the-swap gap was a real correctness hole for users hitting `BEGIN CONCURRENT`. Plan-doc 11.5 (checkpoint) becomes 11.6 here; plan-doc 11.6 (GC) becomes 11.7; etc.
 
-### Phase 11.7 — Indexes under MVCC *(deferred-by-design, separate later phase)*
+### Phase 11.6 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5")*
+
+MVCC log-record WAL frame format (the deferred 11.4 piece). Commit appends log records pre-`save_database`. Reopen replays log records into `MvStore`. Checkpoint drains `MvStore` versions back into the pager (so `Mvcc → Wal` becomes legal once the store is empty). Crash-recovery test: kill mid-commit between log-record append and version-chain push; reopen; verify the committed transaction is visible and the half-written one is not.
+
+### Phase 11.7 — Garbage collection *(planned, plan-doc "Phase 10.6")*
+
+Per-commit sweep over the write-set's chains, plus a background sweep behind `PRAGMA mvcc_gc_interval_ms`. `min_active_begin_ts` watermark already lives in `ActiveTxRegistry`.
+
+### Phase 11.8 — Indexes under MVCC *(deferred-by-design, plan-doc "Phase 10.7")*
 
 Each secondary-index entry becomes its own `RowVersion`. Turso explicitly punted on this; SQLRite's v0 will reject `CREATE INDEX` while `journal_mode = mvcc`.
 
-### Phase 11.8 — SDK + REPL propagation *(planned)*
+### Phase 11.9 — SDK + REPL propagation *(planned, plan-doc "Phase 10.8")*
 
 Surface `Busy` / `BusySnapshot` through the FFI shim and each language SDK. New REPL `.spawn` meta-command + new "N concurrent writers" benchmark workload.
 
-### Phase 11.9 — Docs *(planned)*
+### Phase 11.10 — Docs *(planned, plan-doc "Phase 10.9")*
 
 Promote the plan to `docs/concurrent-writes.md` and update the cross-references.
 
