@@ -321,7 +321,10 @@ impl Connection {
             .lock()
             .map_err(|_| SQLRiteError::new_err("connection mutex poisoned"))?;
         let resp = py
-            .allow_threads(|| ask_with_database(locked.database(), question, &resolved))
+            .allow_threads(|| {
+                let db = locked.database();
+                ask_with_database(&db, question, &resolved)
+            })
             .map_err(map_err)?;
         Ok(AskResponse::from_rust(resp))
     }

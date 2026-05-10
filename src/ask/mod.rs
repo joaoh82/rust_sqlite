@@ -104,7 +104,8 @@ impl ConnectionAskExt for Connection {
 /// pick whichever shape reads better at the call site.
 #[cfg(feature = "ask")]
 pub fn ask(conn: &Connection, question: &str, config: &AskConfig) -> Result<AskResponse, AskError> {
-    ask_with_database(conn.database(), question, config)
+    let db = conn.database();
+    ask_with_database(&db, question, config)
 }
 
 /// Same as [`ask`], but takes the engine's `&Database` directly.
@@ -131,7 +132,8 @@ pub fn ask_with_provider<P: Provider>(
     config: &AskConfig,
     provider: &P,
 ) -> Result<AskResponse, AskError> {
-    ask_with_database_and_provider(conn.database(), question, config, provider)
+    let db = conn.database();
+    ask_with_database_and_provider(&db, question, config, provider)
 }
 
 /// Lower-level entry taking `&Database` and a provider. Canonical

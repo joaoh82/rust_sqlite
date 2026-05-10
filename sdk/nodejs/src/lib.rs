@@ -261,7 +261,8 @@ impl Database {
         let conn = borrow
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("cannot ask: database is closed"))?;
-        let resp = ask_with_database(conn.database(), &question, &resolved).map_err(map_err)?;
+        let db = conn.database();
+        let resp = ask_with_database(&db, &question, &resolved).map_err(map_err)?;
         Ok(AskResponse {
             sql: resp.sql,
             explanation: resp.explanation,
