@@ -77,7 +77,7 @@ export const metadata: Metadata = {
   // and Bing Webmaster Tools verification is complete (the values are short
   // opaque strings issued by each tool).
   verification: {
-    // google: "<google-site-verification-token>",
+    google: "cp64_cUV17FdoMHKQuAKddZ7RVMcgLpELFIfrxDpCOo",
     // other: { "msvalidate.01": "<bing-verification-token>" },
   },
 };
