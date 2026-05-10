@@ -78,7 +78,7 @@ export const metadata: Metadata = {
   // opaque strings issued by each tool).
   verification: {
     google: "cp64_cUV17FdoMHKQuAKddZ7RVMcgLpELFIfrxDpCOo",
-    // other: { "msvalidate.01": "<bing-verification-token>" },
+    other: { "msvalidate.01": "CCCE26885E00B1C873F188104E8B283D" },
   },
 };
 
