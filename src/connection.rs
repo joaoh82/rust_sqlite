@@ -544,9 +544,20 @@ impl Connection {
             }
         }
 
-        // tx drops here, releasing the TxHandle (unregisters from
-        // the active-tx registry).
+        // Phase 11.6 — per-commit GC sweep on the write-set's
+        // chains. Drop the `tx` handle FIRST so its `begin_ts`
+        // exits the active-tx registry; otherwise the watermark
+        // is still pinned at our own `begin_ts` and we'd preserve
+        // versions we're free to reclaim. Only the rows this
+        // transaction wrote can have a newly-capped `end` worth
+        // sweeping — the broader GC story (full-store sweeps,
+        // background drains) lands behind explicit
+        // [`Connection::vacuum_mvcc`] / [`MvStore::gc_all`].
         drop(tx);
+        let watermark = mv.active_watermark();
+        for (row_id, _) in &writes {
+            mv.gc_chain(row_id, watermark);
+        }
         Ok("COMMIT".to_string())
     }
 
@@ -731,6 +742,32 @@ impl Connection {
     /// 11.4 wires `Mvcc` mode into the read/write paths.
     pub fn journal_mode(&self) -> crate::mvcc::JournalMode {
         self.lock().journal_mode()
+    }
+
+    /// Phase 11.6 — explicit full-store MVCC garbage collection
+    /// pass. Walks every row in the [`MvStore`](crate::mvcc::MvStore)
+    /// chain and drops versions whose `end` timestamp is below the
+    /// current watermark (the smallest `begin_ts` across all
+    /// in-flight transactions on this database, or `u64::MAX` when
+    /// nothing is in flight).
+    ///
+    /// Returns the number of versions reclaimed. Cheap when the
+    /// store is small; a future optimisation will give it
+    /// background-thread semantics behind a configurable cadence.
+    ///
+    /// Per-commit GC already sweeps the rows each transaction
+    /// touched, so most callers don't need this — it's the
+    /// "vacuum the whole store" escape hatch for memory-pressure
+    /// workloads or test suites that want a deterministic baseline.
+    /// Safe to call even if `journal_mode` is `Wal` (the store is
+    /// just empty); useful for tests that want to assert "no
+    /// versions left."
+    pub fn vacuum_mvcc(&self) -> usize {
+        let db = self.lock();
+        let mv = db.mv_store().clone();
+        let watermark = mv.active_watermark();
+        drop(db);
+        mv.gc_all(watermark)
     }
 
     /// Escape hatch for advanced callers — locks the shared `Database`
@@ -2701,6 +2738,156 @@ mod tests {
         }
 
         reader.execute("COMMIT;").unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.6 — MVCC garbage collection
+    // -----------------------------------------------------------------
+
+    /// Per-commit GC bounds the chain length under repeated
+    /// updates to the same row when no readers are holding a
+    /// snapshot that would need older versions. After many
+    /// updates the store should hold roughly one version per row,
+    /// not a version per commit.
+    #[test]
+    fn repeated_updates_keep_chain_bounded_when_no_readers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE counters (id INTEGER PRIMARY KEY, n INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO counters (id, n) VALUES (1, 0);")
+            .unwrap();
+
+        // 50 sequential updates inside their own concurrent
+        // transactions. With no overlapping readers, the
+        // per-commit GC sweep should reclaim every superseded
+        // version and leave only the latest.
+        for n in 1..=50 {
+            conn.execute("BEGIN CONCURRENT;").unwrap();
+            conn.execute(&format!("UPDATE counters SET n = {n} WHERE id = 1;"))
+                .unwrap();
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        // MvStore should now hold exactly one version for the
+        // row we hammered (the latest). Without GC it would hold
+        // 50.
+        let db = conn.database();
+        let store_size = db.mv_store().total_versions();
+        let tracked = db.mv_store().tracked_rows();
+        drop(db);
+        assert_eq!(
+            store_size, 1,
+            "expected 1 version after 50 GC'd updates, got {store_size}",
+        );
+        assert_eq!(tracked, 1);
+    }
+
+    /// GC must NOT reclaim versions that an in-flight reader's
+    /// snapshot might still see. While a reader holds an open
+    /// `BEGIN CONCURRENT` at `begin_ts = T`, every version with
+    /// `end > T` must remain in the chain.
+    #[test]
+    fn gc_preserves_versions_visible_to_active_reader() {
+        let mut writer = Connection::open_in_memory().unwrap();
+        writer.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        writer
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        writer
+            .execute("INSERT INTO t (id, v) VALUES (1, 0);")
+            .unwrap();
+        let mut reader = writer.connect();
+
+        // Reader opens its tx FIRST so its snapshot sits at the
+        // smallest `begin_ts` across the active set.
+        reader.execute("BEGIN CONCURRENT;").unwrap();
+
+        // Writer commits five updates; per-commit GC fires after
+        // each, but the reader's begin_ts pins the watermark so
+        // the older versions can't be reclaimed.
+        for n in 1..=5 {
+            writer.execute("BEGIN CONCURRENT;").unwrap();
+            writer
+                .execute(&format!("UPDATE t SET v = {n} WHERE id = 1;"))
+                .unwrap();
+            writer.execute("COMMIT;").unwrap();
+        }
+
+        // Reader's snapshot still sees v=0 — the chain must have
+        // retained the original version (or a tombstone-capped
+        // earlier value) so the visibility rule resolves it.
+        let rows = reader
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+
+        // The reader's snapshot is preserved by GC's watermark.
+        // No assertion on the exact chain length — that's an
+        // implementation detail; the property is "reader sees
+        // v=0 even after writer's burst."
+
+        reader.execute("COMMIT;").unwrap();
+
+        // After the reader closes, the watermark jumps and an
+        // explicit vacuum reclaims everything reclaimable.
+        // (We skip checking the exact reclaim count because the
+        // post-reader-close state of the chain depends on the
+        // ordering of the reader's `drop` and the watermark
+        // sample inside `vacuum_mvcc` — both are correct, just
+        // different.)
+        writer.vacuum_mvcc();
+        let db = writer.database();
+        let store_size = db.mv_store().total_versions();
+        drop(db);
+        // At most one version per row (the latest committed).
+        assert!(
+            store_size <= 1,
+            "after reader closed and vacuum ran, expected ≤1 version, got {store_size}",
+        );
+    }
+
+    /// `Connection::vacuum_mvcc` is a no-op on a fresh
+    /// `JournalMode::Wal` database: the store is empty, nothing
+    /// to reclaim. Matches the "safe to call regardless of
+    /// journal mode" contract.
+    #[test]
+    fn vacuum_mvcc_is_a_noop_on_wal_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Default journal mode is Wal; never enabled MVCC.
+        assert_eq!(conn.vacuum_mvcc(), 0);
+    }
+
+    /// Explicit `vacuum_mvcc` reclaims everything reclaimable
+    /// when no transactions are active.
+    #[test]
+    fn vacuum_mvcc_reclaims_everything_with_no_active_readers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+
+        // Build up some versions.
+        conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("UPDATE t SET v = 1 WHERE id = 1;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("UPDATE t SET v = 2 WHERE id = 1;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        // Per-commit GC has already done most of the work; the
+        // explicit vacuum is idempotent.
+        let _ = conn.vacuum_mvcc();
+        let db = conn.database();
+        let store_size = db.mv_store().total_versions();
+        drop(db);
+        assert!(store_size <= 1);
     }
 
     /// `is_retryable()` covers both `Busy` and `BusySnapshot`

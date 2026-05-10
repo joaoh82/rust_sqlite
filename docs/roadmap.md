@@ -594,7 +594,7 @@ Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency 
 [`sqlrite::mvcc`](../src/mvcc/) module:
 
 - `MvccClock` — process-wide monotonic `u64` over `AtomicU64`. `tick()` hands out begin- / commit-timestamps; `now()` reads the high-water without advancing it; `observe(value)` advances the clock to `value` if greater (used at WAL replay).
-- `ActiveTxRegistry` — `Mutex<BTreeMap>` over in-flight transactions. `register(&clock)` allocates a `TxId`, snapshots `begin_ts`, and returns a RAII `TxHandle`; `min_active_begin_ts()` answers Phase 11.6 GC's "what's still possibly visible" question.
+- `ActiveTxRegistry` — `Mutex<BTreeMap>` over in-flight transactions. `register(&clock)` allocates a `TxId`, snapshots `begin_ts`, and returns a RAII `TxHandle`; `min_active_begin_ts()` is the GC watermark Phase 11.6 reads on every commit + on `Connection::vacuum_mvcc`.
 - `TxId` newtype + `TxTimestampOrId` tagged union — defined now so 11.4 can plug in without re-litigating the type shape.
 
 WAL format bumps **v1 → v2**: bytes 24..32 of the WAL header (previously reserved-zero) now carry the persisted `clock_high_water` `u64`. v1 WALs open cleanly — those zero bytes read as "clock never advanced" — and the next checkpoint rewrites the header at v2. No offline upgrade step. `Wal::set_clock_high_water` / `Wal::clock_high_water` accessors expose the field; the setter rejects regressions with a typed error.
@@ -622,25 +622,36 @@ The headline slice. Multiple sibling `Connection`s can each hold their own open 
 **Known limitations carried forward (most resolved in 11.5):**
 
 - ~~Reads via `Statement::query` / `Statement::query_with_params` bypass the swap.~~ ✅ Fixed in 11.5 — `Connection.concurrent_tx` is now `Mutex<Option<…>>` and a new `with_snapshot_read` helper threads the swap through `&self`.
-- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.6 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror.
+- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.7 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror. (Durability already works through the legacy mirror in v0; the WAL log-record format is foundation work for cross-process MVCC.)
 - `AUTOINCREMENT` inside `BEGIN CONCURRENT` isn't explicitly rejected; the v0 deep-clone-snapshot model handles concurrent INSERTs by isolating each tx's `last_rowid` bumps to its private snapshot, so two concurrent INSERTs on an `AUTOINCREMENT` column may collide at COMMIT and surface as `Busy`. Adopting the plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
 - Tables touched by `BEGIN CONCURRENT` writes can't carry FTS or HNSW indexes today — `restore_row` only maintains B-tree secondary indexes. Concurrent-tx tests don't exercise FTS / HNSW, but a runtime guard would surface this with a clear error rather than producing inconsistent indexes.
 
-### 🚧 Phase 11.5 — Snapshot-isolated reads via `Statement::query` *(in progress, slotted ahead of plan-doc 11.5 checkpoint work because the prepare/query gap was the most user-visible 11.4 limitation)*
+### ✅ Phase 11.5 — Snapshot-isolated reads via `Statement::query` *(slotted ahead of plan-doc 11.5 checkpoint work because the prepare/query gap was the most user-visible 11.4 limitation)*
 
 `Connection.concurrent_tx` is now `Mutex<Option<ConcurrentTx>>` (was plain `Option`). A new `with_snapshot_read` helper takes `&self`, locks `concurrent_tx`, then locks the database, and — when a tx is open — swaps the tx's private cloned `tables` in for the duration of the read closure (with a scope-guarded unswap so a panic inside the closure can't strand the database). [`Statement::query`] and [`Statement::query_with_params`] route through this helper so the prepared-statement path now sees the same BEGIN-time snapshot the `execute("SELECT…")` path already saw in 11.4.
 
-Lock order is consistently `concurrent_tx → inner` across every code path; deadlock-free by construction. `Connection` is still `Send + Sync`. The four 11.4 plan-required tests still pass; new tests cover snapshot reads via prepare/query, read-your-writes within a tx, parameter-bound SELECT through the snapshot, and snapshot consistency across concurrent sibling commits.
+Lock order is consistently `concurrent_tx → inner` across every code path; deadlock-free by construction. `Connection` is still `Send + Sync`.
 
-This was renumbered out of plan-doc order: the plan-doc had 11.5 as checkpoint integration, but that's a much larger slice and the prepare/query-bypass-the-swap gap was a real correctness hole for users hitting `BEGIN CONCURRENT`. Plan-doc 11.5 (checkpoint) becomes 11.6 here; plan-doc 11.6 (GC) becomes 11.7; etc.
+This was renumbered out of plan-doc order: the plan-doc had 11.5 as checkpoint integration, but that's a much larger slice and the prepare/query-bypass-the-swap gap was a real correctness hole for users hitting `BEGIN CONCURRENT`. Plan-doc 11.5 (checkpoint) → roadmap 11.7; plan-doc 11.6 (GC) → roadmap 11.6 (this one).
 
-### Phase 11.6 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5")*
+### 🚧 Phase 11.6 — Garbage collection *(in progress, plan-doc "Phase 10.6"; promoted ahead of plan-doc 11.5 because unbounded `MvStore` growth was the next concrete user-impact concern after 11.5 closed the snapshot-read gap)*
+
+Bounds in-memory growth of the [`MvStore`](../src/mvcc/store.rs) version chains. Without this, every committed version stays forever in the in-memory chain — a memory leak that grows linearly with commits.
+
+- `MvStore::active_watermark()` returns the GC watermark — the smallest `begin_ts` across the active-tx registry, or `u64::MAX` when nothing is in flight. Versions whose committed `end` timestamp is `<= watermark` are reclaimable: no reader's `begin_ts` can fall in the half-open `[begin, end)` interval that snapshot-isolation visibility requires.
+- `MvStore::gc_chain(row_id, watermark)` reclaims one row's superseded versions (kept: latest version with `end == None`, in-flight versions, and any committed version still possibly visible to a reader). Returns the number of versions dropped. Drops the row from the outer map entirely if its chain becomes empty so long-running sessions don't leak per-row entries.
+- `MvStore::gc_all(watermark)` sweeps every row in one pass; returns total versions reclaimed. Snapshots the row keys upfront so the outer map lock isn't held across per-chain locks.
+- [`Connection::commit_concurrent`](../src/connection.rs) gains a per-commit GC sweep on the write-set's chains. Drops the `tx` `TxHandle` *first* so its `begin_ts` exits the registry — otherwise the watermark is still pinned to our own `begin_ts` and we'd preserve versions we're free to reclaim. Cheap (sweeps only the rows this transaction wrote), and runs on every successful commit.
+- New `Connection::vacuum_mvcc()` method runs a full-store sweep at the current watermark. Returns the version count reclaimed. The "vacuum the whole store" escape hatch for memory-pressure workloads or tests that want a deterministic baseline. Safe to call regardless of `journal_mode` (a no-op `Wal`-mode database returns 0).
+
+**What 11.6 doesn't yet do:**
+
+- No background GC thread or `PRAGMA mvcc_gc_interval_ms`. Per-commit sweep + explicit `vacuum_mvcc()` cover the v0 model; the periodic-sweep variant lands as a follow-up if profiles show it's needed.
+- GC sweeps don't trigger `Mvcc → Wal` journal-mode downgrades. The `set_journal_mode` setter still rejects the transition while the store carries committed versions; promoting that path requires the checkpoint-integration story from 11.7.
+
+### Phase 11.7 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5"; renumbered to follow GC because durability via the legacy `save_database` mirror already works in v0; this slice is foundation work for cross-process MVCC and column-level WAL deltas)*
 
 MVCC log-record WAL frame format (the deferred 11.4 piece). Commit appends log records pre-`save_database`. Reopen replays log records into `MvStore`. Checkpoint drains `MvStore` versions back into the pager (so `Mvcc → Wal` becomes legal once the store is empty). Crash-recovery test: kill mid-commit between log-record append and version-chain push; reopen; verify the committed transaction is visible and the half-written one is not.
-
-### Phase 11.7 — Garbage collection *(planned, plan-doc "Phase 10.6")*
-
-Per-commit sweep over the write-set's chains, plus a background sweep behind `PRAGMA mvcc_gc_interval_ms`. `min_active_begin_ts` watermark already lives in `ActiveTxRegistry`.
 
 ### Phase 11.8 — Indexes under MVCC *(deferred-by-design, plan-doc "Phase 10.7")*
 

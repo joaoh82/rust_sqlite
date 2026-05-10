@@ -229,7 +229,26 @@ Each statement inside the transaction runs against the working `tables` clone vi
 
 **The scope-guard pattern in `with_snapshot_read`.** The swap mutates `db.tables`. If the caller's closure panics mid-read, leaving `db.tables` pointing at the transaction's private clone would catastrophically corrupt every other handle's view of the database. The helper installs a `Drop` guard that unswaps on unwind; on the happy path the guard is disarmed and the unswap runs in the explicit code path so the borrow checker can see the field accesses are disjoint.
 
-**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §3.4 (connection model), §4.4 (read protocol — `MvStore`-backed reads in 11.6+).
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §3.4 (connection model), §4.4 (read protocol — `MvStore`-backed reads in 11.7+).
+
+---
+
+### 12f. `MvStore` GC sweeps per-commit, with `Connection::vacuum_mvcc` for explicit drains (Phase 11.6)
+
+**Decision.** Every successful `BEGIN CONCURRENT` commit ends with a per-commit GC sweep over the rows the transaction wrote. The sweep walks each row's chain and reclaims versions whose `end` timestamp is at or below the [`MvStore::active_watermark`](../src/mvcc/store.rs) (the smallest `begin_ts` across the active-tx registry, or `u64::MAX` when nothing is in flight). The latest version (`end == None`) and any in-flight version are always kept. An explicit [`Connection::vacuum_mvcc`](../src/connection.rs) method runs the same sweep across every row in the store.
+
+**Why per-commit + explicit, not periodic / background.** Three reasons:
+1. The per-commit sweep covers the rows we most care about — the ones we just modified, whose chains just grew. No stale versions accumulate on a hot row under repeated updates.
+2. Background-thread GC adds an extra runtime mode (interval pragma, scheduler hooks, shutdown coordination) for a small win in v0. The per-commit sweep is amortised across the work the engine is already doing, and `vacuum_mvcc` covers the edge cases.
+3. Tests + memory-pressure debug paths want a deterministic "drain to nothing" lever; the explicit method is that lever.
+
+**Why drop the `TxHandle` before the sweep.** The handle holds the transaction's own `begin_ts` in the active-tx registry. Sweeping while the handle is live would pin the watermark to our own `begin_ts` and preserve every version we just wrote (because their `end` timestamps would be at or above our own `begin_ts`). Dropping the handle first lets the watermark advance to the next-oldest active reader (or `u64::MAX` when we were the only one), so the sweep can reclaim aggressively.
+
+**Why drop empty rows from the outer map.** Long-running sessions that delete + reinsert across many distinct rowids would otherwise accumulate empty `Arc<RwLock<Vec<RowVersion>>>` chains. The sweep checks under both locks (outer map + chain) before removing, so it can't race with a `push_committed` about to add a new version.
+
+**Why the watermark uses `u64::MAX` rather than `clock.now()` when no readers are active.** Both work; `u64::MAX` is cheaper (no clock read) and produces the same outcome (every superseded version is reclaimable).
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §4.7 (garbage collection), §8 (memory growth as a known risk).
 
 ---
 
