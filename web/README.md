@@ -146,6 +146,21 @@ backticks or escape (`&lt;`, `\{`). The MDX renderer auto-routes
 internal `[link](/foo)` markdown links through `next/link`; external
 links open in a new tab via `rel="noreferrer"`.
 
+### Code block highlighting
+
+Fenced code blocks are tokenized at build time by
+[`rehype-pretty-code`](https://github.com/rehype-pretty/rehype-pretty-code)
+with [Shiki](https://shiki.style/). The plugin is wired up in
+[`src/components/blog-mdx.tsx`](src/components/blog-mdx.tsx) using a
+`createCssVariablesTheme()` so Shiki emits inline styles like
+`color: var(--shiki-token-keyword)`. The mapping from
+`--shiki-*` to the blog's color palette (`--color-kw`, `--color-str`,
+`--color-num`, …) lives in the `.blog-article-body pre` rule in
+[`src/app/globals.css`](src/app/globals.css) — adjust colors there,
+not in the component. Code fences without a language fall back to
+`plaintext` so unknown / missing language tags don't fail the build.
+Inline `code` keeps its existing chip styling (`bypassInlineCode: true`).
+
 The design tokens (colors, typography, spacing) live in `globals.css`'s
 `@theme` block. The page-level CSS (sections, terminal, feature grid,
 roadmap timeline, etc.) is intentionally hand-rolled — it ports the
