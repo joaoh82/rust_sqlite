@@ -215,6 +215,24 @@ Each statement inside the transaction runs against the working `tables` clone vi
 
 ---
 
+### 12e. `Connection.concurrent_tx` lives behind a `Mutex` so `&self` reads can swap (Phase 11.5)
+
+**Decision.** Phase 11.5 changes `Connection.concurrent_tx` from `Option<ConcurrentTx>` to `Mutex<Option<ConcurrentTx>>`. A new internal helper `with_snapshot_read<F, R>(&self, f: F) -> R` locks both the `concurrent_tx` mutex and the database mutex, then — when a transaction is open — swaps the transaction's private cloned `tables` in for the duration of `f`. [`Statement::query`] and [`Statement::query_with_params`] route through this helper. Lock order is consistently `concurrent_tx → inner` across every code path.
+
+**Why a `Mutex` and not `RefCell`.** `RefCell` is `!Sync`. The Phase 11.1 contract is `Connection: Send + Sync`; downgrading to `!Sync` would force every consumer holding `Arc<Connection>` (or sharing across threads via any other channel) to re-architect, and the shared concurrency story is the whole point of Phase 11. `Mutex` keeps `Send + Sync` while paying the same one-extra-CAS cost per locked operation.
+
+**Why interior mutability instead of changing `Statement::query` to `&mut self`.** `Statement::query(&self)` is part of the public API every SDK / call site already binds against. Changing to `&mut self` would force every existing caller's `let stmt = conn.prepare(...)` to add `mut`, and would also conflict with the rusqlite-shaped pattern callers expect (multiple `query()` calls off the same `Statement`). Interior mutability through a per-`Connection` `Mutex` is invisible to callers.
+
+**Why we don't unify `concurrent_tx` and `inner` under a single `Mutex<DatabaseInner>`.** The two lock targets hold genuinely different state — `concurrent_tx` is per-handle, `inner` is shared across siblings — and merging them would force every read against the live database to take the per-handle lock too. The slight extra round-trip (lock A, lock B inside A) is the standard "fine-grained locking" trade for finer concurrency.
+
+**Why the swap pattern survives 11.5 instead of routing reads through `MvStore` directly.** Routing through `MvStore` would need the executor to consult `MvStore::read(row, begin_ts)` for every row scan — and 11.4 only puts data into `MvStore` at commit time, not as transactions accumulate writes. Reads inside an open transaction need to see the transaction's own staged writes (read-your-writes), which the deep-clone snapshot model already gives us for free via the swap. Once the commit path lands in 11.6 and the `MvStore` becomes the source of truth, reads can switch to consulting `MvStore` directly with the in-flight `TxId` filter; the snapshot-clone path can then be retired.
+
+**The scope-guard pattern in `with_snapshot_read`.** The swap mutates `db.tables`. If the caller's closure panics mid-read, leaving `db.tables` pointing at the transaction's private clone would catastrophically corrupt every other handle's view of the database. The helper installs a `Drop` guard that unswaps on unwind; on the happy path the guard is disarmed and the unswap runs in the explicit code path so the borrow checker can see the field accesses are disjoint.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §3.4 (connection model), §4.4 (read protocol — `MvStore`-backed reads in 11.6+).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

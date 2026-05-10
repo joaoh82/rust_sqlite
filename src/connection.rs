@@ -130,7 +130,18 @@ pub struct Connection {
     /// against the cloned tables in [`ConcurrentTx::tables`]
     /// instead of the live `Database::tables`. The live database
     /// stays untouched until the commit-validation pass succeeds.
-    concurrent_tx: Option<ConcurrentTx>,
+    ///
+    /// **Phase 11.5 — wrapped in a `Mutex`.** [`Statement::query`]
+    /// and [`Statement::query_with_params`] take `&self`, so they
+    /// need interior mutability to swap the snapshot in for the
+    /// read. The lock is uncontended in single-thread use (each
+    /// connection's `concurrent_tx` is per-handle, and the
+    /// Statement-borrows-Connection contract still serializes
+    /// statements on a given handle); the Mutex is the cheapest
+    /// way to satisfy the borrow checker without restructuring
+    /// the Statement API. Lock order is always
+    /// `concurrent_tx` → `inner` to keep deadlock-free.
+    concurrent_tx: Mutex<Option<ConcurrentTx>>,
 }
 
 impl Connection {
@@ -191,7 +202,7 @@ impl Connection {
             inner: Arc::new(Mutex::new(db)),
             prep_cache: VecDeque::new(),
             prep_cache_cap: DEFAULT_PREP_CACHE_CAP,
-            concurrent_tx: None,
+            concurrent_tx: Mutex::new(None),
         }
     }
 
@@ -228,7 +239,7 @@ impl Connection {
             // concurrent transaction. Multi-thread `BEGIN CONCURRENT`
             // is the headline use case — every clone gets its own
             // independent slot.
-            concurrent_tx: None,
+            concurrent_tx: Mutex::new(None),
         }
     }
 
@@ -272,15 +283,110 @@ impl Connection {
     /// the transaction's private cloned tables; the live database
     /// stays untouched until commit-validation succeeds.
     pub fn execute(&mut self, sql: &str) -> Result<String> {
-        match concurrent_tx_intent(sql) {
+        let intent = concurrent_tx_intent(sql);
+        let has_tx = self.concurrent_tx_is_open();
+        match intent {
             ConcurrentTxIntent::Begin => self.begin_concurrent(),
-            ConcurrentTxIntent::Commit if self.concurrent_tx.is_some() => self.commit_concurrent(),
-            ConcurrentTxIntent::Rollback if self.concurrent_tx.is_some() => {
-                self.rollback_concurrent()
-            }
+            ConcurrentTxIntent::Commit if has_tx => self.commit_concurrent(),
+            ConcurrentTxIntent::Rollback if has_tx => self.rollback_concurrent(),
             ConcurrentTxIntent::None
             | ConcurrentTxIntent::Commit
             | ConcurrentTxIntent::Rollback => self.execute_dispatch(sql),
+        }
+    }
+
+    /// Phase 11.5 — cheap probe used by [`Connection::execute`]
+    /// (and [`Statement::query`]) to decide whether to route
+    /// through the concurrent-tx dispatch. Acquires the
+    /// `concurrent_tx` mutex briefly; never blocks for a
+    /// meaningful amount of time because the only other lockers
+    /// are this connection's own writers.
+    fn concurrent_tx_is_open(&self) -> bool {
+        self.lock_concurrent_tx().is_some()
+    }
+
+    /// Phase 11.5 — locks the per-connection
+    /// `Mutex<Option<ConcurrentTx>>`. Wrapping the poison handler
+    /// in one place keeps every caller's lock-order discipline
+    /// visible at the call site (always `concurrent_tx` before
+    /// `inner`).
+    fn lock_concurrent_tx(&self) -> MutexGuard<'_, Option<ConcurrentTx>> {
+        self.concurrent_tx.lock().unwrap_or_else(|e| {
+            panic!("sqlrite: concurrent_tx mutex poisoned: {e}");
+        })
+    }
+
+    /// Phase 11.5 — runs `f` against the read-side `&Database`
+    /// the caller's transaction expects to see.
+    ///
+    /// - **No concurrent transaction open** — `f` runs against the
+    ///   live `Database::tables`. Same path the legacy `query`
+    ///   used.
+    /// - **Concurrent transaction open** — swaps the transaction's
+    ///   private cloned `tables` in for the duration of `f`, so
+    ///   `f` sees the BEGIN-time snapshot plus any writes the
+    ///   transaction has staged. Swaps back before the function
+    ///   returns even on error (the swap-back uses a scope guard
+    ///   pattern so a panic inside `f` doesn't leave `db.tables`
+    ///   pointing at the snapshot clone).
+    ///
+    /// Takes `&self` (rather than `&mut self`) because the
+    /// `Statement::query` API contract is `&self` — that's why the
+    /// `concurrent_tx` field lives behind a `Mutex`. Lock order is
+    /// `concurrent_tx` → `inner`, matching every other tx-aware
+    /// path on this connection.
+    pub(crate) fn with_snapshot_read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Database) -> R,
+    {
+        let mut tx_slot = self.lock_concurrent_tx();
+        let mut db = self.lock();
+        match tx_slot.as_mut() {
+            None => f(&db),
+            Some(tx) => {
+                // Swap the snapshot in. Use a scope guard so the
+                // unswap happens even if `f` unwinds — leaving
+                // `db.tables` pointing at the tx's private clone
+                // would be catastrophic for later sibling-handle
+                // reads.
+                std::mem::swap(&mut db.tables, &mut tx.tables);
+                let prior_txn = db.txn.take();
+                db.txn = Some(TxnSnapshot {
+                    tables: HashMap::new(),
+                });
+
+                struct UnswapGuard<'a> {
+                    db: &'a mut Database,
+                    tx_tables: &'a mut HashMap<String, Table>,
+                    prior_txn: Option<TxnSnapshot>,
+                    armed: bool,
+                }
+                impl Drop for UnswapGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.armed {
+                            self.db.txn = self.prior_txn.take();
+                            std::mem::swap(&mut self.db.tables, self.tx_tables);
+                        }
+                    }
+                }
+                let mut guard = UnswapGuard {
+                    db: &mut db,
+                    tx_tables: &mut tx.tables,
+                    prior_txn,
+                    armed: true,
+                };
+
+                let result = f(guard.db);
+
+                // Disarm the guard explicitly and unwind in the
+                // expected order so the borrow checker can see
+                // both fields are accessed disjointly.
+                guard.armed = false;
+                guard.db.txn = guard.prior_txn.take();
+                std::mem::swap(&mut guard.db.tables, guard.tx_tables);
+
+                result
+            }
         }
     }
 
@@ -291,7 +397,7 @@ impl Connection {
     /// falls straight through to the legacy
     /// [`crate::sql::process_command`] path.
     fn execute_dispatch(&mut self, sql: &str) -> Result<String> {
-        if self.concurrent_tx.is_some() {
+        if self.concurrent_tx_is_open() {
             self.execute_in_concurrent_tx(sql)
         } else {
             let mut db = self.lock();
@@ -310,7 +416,11 @@ impl Connection {
     /// if any transaction (concurrent or legacy `BEGIN`) is
     /// already open on this connection.
     fn begin_concurrent(&mut self) -> Result<String> {
-        if self.concurrent_tx.is_some() {
+        // Lock order: concurrent_tx → inner (db). Keep this order
+        // in every method that touches both — deadlock-free by
+        // construction.
+        let mut tx_slot = self.lock_concurrent_tx();
+        if tx_slot.is_some() {
             return Err(SQLRiteError::General(
                 "cannot BEGIN CONCURRENT: a concurrent transaction is already open".to_string(),
             ));
@@ -333,7 +443,7 @@ impl Connection {
         }
         let tx = ConcurrentTx::begin(db.mvcc_clock(), db.mv_store().active_registry(), &db.tables);
         drop(db);
-        self.concurrent_tx = Some(tx);
+        *tx_slot = Some(tx);
         Ok("BEGIN".to_string())
     }
 
@@ -359,10 +469,15 @@ impl Connection {
     /// and the caller should retry with a fresh `BEGIN
     /// CONCURRENT`.
     fn commit_concurrent(&mut self) -> Result<String> {
-        let tx = self
-            .concurrent_tx
+        let mut tx_slot = self.lock_concurrent_tx();
+        let tx = tx_slot
             .take()
             .expect("commit_concurrent called without active tx (caller should check)");
+        // Drop the slot guard — we already moved the tx out, and
+        // holding it across `self.lock()` would violate the
+        // `concurrent_tx → inner` order if any helper were to
+        // grow a reverse acquire.
+        drop(tx_slot);
 
         let mut db = self.lock();
 
@@ -441,7 +556,7 @@ impl Connection {
     fn rollback_concurrent(&mut self) -> Result<String> {
         // tx drops here; TxHandle unregisters automatically.
         let _ = self
-            .concurrent_tx
+            .lock_concurrent_tx()
             .take()
             .expect("rollback_concurrent called without active tx (caller should check)");
         Ok("ROLLBACK".to_string())
@@ -478,8 +593,10 @@ impl Connection {
             ));
         }
 
-        let tx = self
-            .concurrent_tx
+        // Lock order: concurrent_tx → inner (db). Same shape as
+        // every other tx-aware path on this connection.
+        let mut tx_slot = self.lock_concurrent_tx();
+        let tx = tx_slot
             .as_mut()
             .expect("execute_in_concurrent_tx called without active tx");
         let mut db = self.inner.lock().unwrap_or_else(|e| {
@@ -651,7 +768,7 @@ impl std::fmt::Debug for Connection {
             .field("tables", &db.tables.len())
             .field("prep_cache_len", &self.prep_cache.len())
             .field("handles", &Arc::strong_count(&self.inner))
-            .field("concurrent_tx", &self.concurrent_tx.is_some())
+            .field("concurrent_tx", &self.concurrent_tx_is_open())
             .finish()
     }
 }
@@ -1024,8 +1141,14 @@ impl<'c> Statement<'c> {
                 "query() only works on SELECT statements; use run() for DDL/DML".to_string(),
             ));
         };
-        let db = self.conn.lock();
-        let result = execute_select_rows(sq.clone(), &db)?;
+        // Phase 11.5 — when a `BEGIN CONCURRENT` is open on this
+        // connection, the read sees the transaction's BEGIN-time
+        // snapshot, not the post-commit live database. The
+        // helper handles the swap (and the no-op fallback for
+        // the common case where no concurrent tx is open).
+        let result = self
+            .conn
+            .with_snapshot_read(|db| execute_select_rows(sq.clone(), db))?;
         Ok(Rows {
             columns: result.columns,
             rows: result.rows.into_iter(),
@@ -1058,8 +1181,12 @@ impl<'c> Statement<'c> {
             substitute_params(&mut ast, params)?;
         }
         let sq = SelectQuery::new(&ast)?;
-        let db = self.conn.lock();
-        let result = execute_select_rows(sq, &db)?;
+        // Phase 11.5 — same snapshot-read path as `query()`, just
+        // running on the substituted SelectQuery rather than the
+        // cached one.
+        let result = self
+            .conn
+            .with_snapshot_read(|db| execute_select_rows(sq, db))?;
         Ok(Rows {
             columns: result.columns,
             rows: result.rows.into_iter(),
@@ -2368,6 +2495,212 @@ mod tests {
         // tx-state cleanup. Validation has no rows to check.
         a.execute("COMMIT;")
             .expect("empty commit must succeed even if siblings committed");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.5 — snapshot-isolated reads via Statement::query
+    // -----------------------------------------------------------------
+
+    /// The headline 11.5 contract: a SELECT issued via
+    /// `prepare(...).query()` inside an open `BEGIN CONCURRENT`
+    /// sees the BEGIN-time snapshot, not the post-commit live
+    /// state. Phase 11.4 had this test failing because the
+    /// prepare/query path bypassed the swap; Phase 11.5 routes
+    /// it through `with_snapshot_read`.
+    #[test]
+    fn query_inside_concurrent_tx_sees_begin_time_snapshot() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO t (id, v) VALUES (1, 1);").unwrap();
+        let mut b = a.connect();
+
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        // Sibling B commits a change to row 1 from another tx.
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("UPDATE t SET v = 999 WHERE id = 1;").unwrap();
+        b.execute("COMMIT;").unwrap();
+
+        // Reader inside a's tx, via prepare()+query(), must see
+        // the BEGIN-time value (1), not b's committed value (999).
+        let rows = a
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>(0).unwrap(),
+            1,
+            "Statement::query inside BEGIN CONCURRENT must see the snapshot, not the live db"
+        );
+
+        // After a's empty commit, the same handle's read sees b's
+        // value (999) — the swap is gone, the legacy read path is
+        // back in play.
+        a.execute("COMMIT;").unwrap();
+        let rows = a
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 999);
+    }
+
+    /// Read-your-writes: an UPDATE inside the tx is visible to
+    /// the same tx's subsequent SELECT via `query()`. The swap
+    /// makes the tx's private clone the read target, so writes
+    /// the executor staged on the clone are reflected.
+    #[test]
+    fn query_inside_concurrent_tx_sees_own_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (1, 100);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("UPDATE t SET v = 200 WHERE id = 1;").unwrap();
+        // Inside the tx, query() sees v = 200 (our own write).
+        let rows = conn
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 200);
+
+        // After ROLLBACK, the live db still has 100 (the write
+        // never landed).
+        conn.execute("ROLLBACK;").unwrap();
+        let rows = conn
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 100);
+    }
+
+    /// Reads via `query_with_params` (parameter-bound SELECT)
+    /// also flow through the snapshot. Same path, just with the
+    /// substitution step in front.
+    #[test]
+    fn query_with_params_inside_concurrent_tx_sees_snapshot() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO t (id, v) VALUES (1, 7);").unwrap();
+        let mut b = a.connect();
+
+        a.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("UPDATE t SET v = 42 WHERE id = 1;").unwrap();
+        b.execute("COMMIT;").unwrap();
+
+        let rows = a
+            .prepare("SELECT v FROM t WHERE id = ?")
+            .unwrap()
+            .query_with_params(&[Value::Integer(1)])
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 7);
+
+        a.execute("COMMIT;").unwrap();
+    }
+
+    /// Outside any concurrent tx, `query()` reads the live
+    /// database. Sanity check that 11.5's snapshot routing is
+    /// strictly opt-in via `BEGIN CONCURRENT`.
+    #[test]
+    fn query_outside_concurrent_tx_sees_live_database() {
+        let mut a = Connection::open_in_memory().unwrap();
+        a.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        a.execute("INSERT INTO t (id, v) VALUES (1, 1);").unwrap();
+        let mut b = a.connect();
+
+        // Sibling commits a change. a is NOT in a tx, so its read
+        // should see the post-commit value.
+        b.execute("BEGIN CONCURRENT;").unwrap();
+        b.execute("UPDATE t SET v = 100 WHERE id = 1;").unwrap();
+        b.execute("COMMIT;").unwrap();
+
+        let rows = a
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 100);
+    }
+
+    /// Sibling reader at the moment a writer commits: the
+    /// reader's own `BEGIN CONCURRENT` (and its private snapshot)
+    /// must isolate it from the writer's commit, so the snapshot
+    /// stays internally consistent for the reader's lifetime.
+    /// Repeats the read multiple times across the writer's
+    /// activity to catch any races where the snapshot leaks.
+    #[test]
+    fn snapshot_stays_consistent_across_sibling_commits() {
+        let mut reader = Connection::open_in_memory().unwrap();
+        reader.execute("PRAGMA journal_mode = mvcc;").unwrap();
+        reader
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        reader
+            .execute("INSERT INTO t (id, v) VALUES (1, 1);")
+            .unwrap();
+        let mut writer = reader.connect();
+
+        reader.execute("BEGIN CONCURRENT;").unwrap();
+        // First read inside reader's tx — sees v=1.
+        let read_at_t0 = reader
+            .prepare("SELECT v FROM t WHERE id = 1;")
+            .unwrap()
+            .query()
+            .unwrap()
+            .collect_all()
+            .unwrap();
+        assert_eq!(read_at_t0[0].get::<i64>(0).unwrap(), 1);
+
+        // Writer commits a stream of changes between reader's
+        // reads. Each commit advances the live db and adds a
+        // version to MvStore.
+        for new_value in [10, 20, 30, 40] {
+            writer.execute("BEGIN CONCURRENT;").unwrap();
+            writer
+                .execute(&format!("UPDATE t SET v = {new_value} WHERE id = 1;"))
+                .unwrap();
+            writer.execute("COMMIT;").unwrap();
+
+            // Reader's snapshot must still see v=1.
+            let r = reader
+                .prepare("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .query()
+                .unwrap()
+                .collect_all()
+                .unwrap();
+            assert_eq!(
+                r[0].get::<i64>(0).unwrap(),
+                1,
+                "snapshot regressed after writer committed v={new_value}",
+            );
+        }
+
+        reader.execute("COMMIT;").unwrap();
     }
 
     /// `is_retryable()` covers both `Busy` and `BusySnapshot`

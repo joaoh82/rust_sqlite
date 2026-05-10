@@ -124,11 +124,11 @@ fn transfer(primary: &mut Connection, src: i64, dst: i64, amount: i64)
 
 The retryable-error branch is the headline new flow: pick a backoff policy that suits your workload (constant, exponential, jittered) and call the same closure again. `SQLRiteError::is_retryable()` covers both `Busy` and `BusySnapshot` so callers don't have to match each variant individually.
 
-**What 11.4 doesn't yet do:**
+**What's still ahead** (11.6+):
 
-- Reads via `Statement::query` inside the transaction don't see the BEGIN-time snapshot — they go through the legacy live-database read path. Reads via `Connection::execute("SELECT …")` *do* see the snapshot, via the swap-based dispatch. Full snapshot-isolated reads land in 11.5.
+- Reads inside the transaction now see the BEGIN-time snapshot via both `Connection::execute("SELECT…")` and `Statement::query()` / `query_with_params()` — the prepare/query gap that 11.4 left open closed in 11.5.
 - DDL inside `BEGIN CONCURRENT` is rejected with a typed error.
-- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.5 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
+- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.6 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
 
 ### What's deferred
 
