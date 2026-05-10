@@ -81,6 +81,11 @@ button {
   margin: 0 auto;
   padding: 0 32px;
 }
+@media (max-width: 640px) {
+  .wrap {
+    padding: 0 18px;
+  }
+}
 
 .eyebrow {
   font-family: var(--font-mono);
@@ -192,6 +197,103 @@ p {
 .nav-star {
   color: var(--color-fg-dim);
   font-variant-numeric: tabular-nums;
+}
+
+/* mobile nav toggle (hamburger). hidden on desktop. */
+.nav-toggle {
+  display: none;
+  width: 44px;
+  height: 44px;
+  margin-right: -10px;
+  border: 0;
+  background: transparent;
+  color: var(--color-fg);
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+}
+.nav-toggle:hover {
+  background: var(--color-bg-elev);
+}
+.nav-toggle-bars,
+.nav-toggle-bars::before,
+.nav-toggle-bars::after {
+  display: block;
+  width: 22px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 2px;
+  transition: transform 0.18s ease, opacity 0.18s ease, top 0.18s ease;
+  position: relative;
+}
+.nav-toggle-bars::before,
+.nav-toggle-bars::after {
+  content: "";
+  position: absolute;
+  left: 0;
+}
+.nav-toggle-bars::before {
+  top: -6px;
+}
+.nav-toggle-bars::after {
+  top: 6px;
+}
+.nav-toggle-bars.open {
+  background: transparent;
+}
+.nav-toggle-bars.open::before {
+  top: 0;
+  transform: rotate(45deg);
+}
+.nav-toggle-bars.open::after {
+  top: 0;
+  transform: rotate(-45deg);
+}
+
+.mobile-menu {
+  display: none;
+  border-top: 1px solid var(--color-line-soft);
+  background: color-mix(in oklab, var(--color-bg) 96%, transparent);
+  backdrop-filter: blur(14px);
+}
+.mobile-menu.open {
+  display: block;
+}
+.mobile-menu-inner {
+  padding: 14px 18px 20px;
+  display: grid;
+  gap: 4px;
+  font-size: 15px;
+}
+.mobile-menu-inner a {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 8px 6px;
+  color: var(--color-fg);
+  border-bottom: 1px solid var(--color-line-soft);
+}
+.mobile-menu-inner a:last-of-type {
+  border-bottom: 0;
+}
+.mobile-menu-cta {
+  margin-top: 12px;
+  justify-content: center;
+  border: 1px solid var(--color-line) !important;
+  border-radius: 6px;
+  padding: 12px !important;
+  background: var(--color-bg-elev);
+}
+
+@media (max-width: 760px) {
+  .nav-links {
+    display: none;
+  }
+  .nav-toggle {
+    display: inline-flex;
+  }
 }
 
 section {
@@ -1461,4 +1563,406 @@ footer {
 .toc a {
   font-size: 12.5px;
   padding: 4px 10px;
+}
+
+/* docs mobile menu — sticky button + slide-down drawer on small screens */
+.docs-mobile-menu {
+  display: none;
+  position: sticky;
+  top: 56px;
+  z-index: 40;
+  background: color-mix(in oklab, var(--color-bg) 88%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--color-line-soft);
+}
+.docs-mobile-menu summary {
+  list-style: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-fg);
+  padding: 12px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+}
+.docs-mobile-menu summary::-webkit-details-marker {
+  display: none;
+}
+.docs-mobile-menu summary::after {
+  content: "▾";
+  color: var(--color-fg-dim);
+  font-size: 11px;
+  transition: transform 0.18s ease;
+}
+.docs-mobile-menu[open] summary::after {
+  transform: rotate(180deg);
+}
+.docs-mobile-menu-panel {
+  padding: 8px 18px 18px;
+  max-height: 60vh;
+  overflow-y: auto;
+  font-size: 14px;
+}
+.docs-mobile-menu-panel .section-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-fg-dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 12px 0 4px;
+}
+.docs-mobile-menu-panel a {
+  display: block;
+  padding: 8px 4px;
+  min-height: 36px;
+  color: var(--color-fg-mute);
+  border-bottom: 1px solid var(--color-line-soft);
+}
+.docs-mobile-menu-panel a:last-child {
+  border-bottom: 0;
+}
+.docs-mobile-menu-panel a:hover {
+  color: var(--color-fg);
+}
+
+/* ===========================================================
+   Mobile / tablet adjustments
+   =========================================================== */
+
+/* Tablet ≤ 900px */
+@media (max-width: 900px) {
+  .hero {
+    padding: 72px 0 80px;
+  }
+  .sec-head {
+    padding-top: 72px;
+  }
+  .sec-body {
+    padding: 36px 0 72px;
+  }
+  .arch {
+    padding: 24px;
+  }
+  .arch-row {
+    grid-template-columns: 110px 1fr;
+    gap: 12px;
+  }
+  .docs-cta {
+    gap: 10px;
+  }
+}
+
+/* Phone ≤ 640px */
+@media (max-width: 640px) {
+  body {
+    font-size: 14.5px;
+  }
+  h1 {
+    letter-spacing: -0.025em;
+  }
+  .hero {
+    padding: 48px 0 56px;
+  }
+  .hero-tag {
+    font-size: 16px;
+    margin-top: 20px;
+  }
+  .hero-meta {
+    gap: 8px 14px;
+    margin-top: 24px;
+    font-size: 11.5px;
+  }
+  .cta-row {
+    margin-top: 28px;
+    gap: 10px;
+  }
+  .btn {
+    padding: 12px 16px;
+    font-size: 13px;
+  }
+  .cta-strip {
+    padding: 64px 0;
+  }
+  .cta-strip h2 {
+    font-size: clamp(24px, 7vw, 32px);
+  }
+
+  /* sec-head: collapse the 240px tag column gap */
+  .sec-head {
+    padding-top: 56px;
+    gap: 12px;
+  }
+  .sec-head .sub {
+    font-size: 15px;
+  }
+  .sec-body {
+    padding: 28px 0 56px;
+  }
+
+  /* terminal: shrink padding so it doesn't overflow on phones */
+  .term {
+    font-size: 12px;
+  }
+  .term-body {
+    padding: 14px;
+    min-height: 240px;
+  }
+
+  /* install bar: squeeze padding so the copy button stays visible */
+  .install-prompt {
+    padding-left: 10px;
+  }
+  .install-cmd {
+    font-size: 12.5px;
+    padding: 12px 6px;
+  }
+  .install-copy {
+    padding: 12px 14px;
+    min-height: 44px;
+  }
+
+  /* architecture: stack each row label above the box, drop the pair grid */
+  .arch {
+    padding: 20px 18px;
+  }
+  .arch-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .arch-label {
+    padding-top: 6px;
+    font-size: 10.5px;
+  }
+  .arch-pair {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .arch-box {
+    padding: 12px 14px;
+    font-size: 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  /* roadmap: tighter timeline */
+  .timeline {
+    margin-left: 4px;
+    padding-left: 24px;
+    gap: 24px;
+  }
+  .phase::before {
+    left: -30px;
+  }
+  .phase-title {
+    font-size: 16px;
+  }
+
+  /* SDK tabs: full-width scroll instead of wrap */
+  .sdk-tabs {
+    width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .sdk-tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .sdk-tab {
+    flex: 0 0 auto;
+    min-height: 36px;
+  }
+  .sdk-meta {
+    padding: 18px;
+  }
+  .code-body {
+    padding: 14px 16px;
+    font-size: 12px;
+  }
+
+  /* SQL ref table: stack as cards on phones */
+  .sql-table thead {
+    display: none;
+  }
+  .sql-table,
+  .sql-table tbody,
+  .sql-table tr,
+  .sql-table td {
+    display: block;
+    width: 100%;
+  }
+  .sql-table tr {
+    border-bottom: 1px solid var(--color-line-soft);
+    padding: 14px 0;
+  }
+  .sql-table td {
+    border: 0;
+    padding: 0;
+  }
+  .sql-table td:first-child {
+    width: auto;
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+
+  /* bench: tighter headline stats and groups */
+  .bench-stat {
+    padding: 22px 20px;
+  }
+  .bench-stat-metric {
+    font-size: 30px;
+  }
+  .bench-group {
+    padding: 20px 18px 18px;
+  }
+  .bench-group-head h3 {
+    font-size: 16px;
+  }
+  .bench-bar-track {
+    height: 24px;
+  }
+  .bench-bar-line {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .bench-driver {
+    text-align: left;
+  }
+  .bench-debts {
+    padding: 18px 16px;
+  }
+
+  /* desktop showcase: keep readable on phones */
+  .desktop-shell {
+    border-radius: 10px;
+  }
+  .dt-side {
+    padding: 12px 10px;
+    font-size: 11.5px;
+  }
+  .dt-editor,
+  .dt-results {
+    padding: 12px 14px;
+    font-size: 11.5px;
+  }
+  .dt-results th,
+  .dt-results td {
+    padding: 5px 8px;
+    font-size: 11.5px;
+  }
+
+  /* docs page: enable mobile menu, drop the desktop sidebar gap */
+  .docs-shell {
+    padding: 24px 18px 80px;
+    gap: 24px;
+  }
+  .docs-mobile-menu {
+    display: block;
+    margin: 0 -18px 4px;
+  }
+  .docs-main h1 {
+    font-size: 30px;
+  }
+  .docs-main h2 {
+    margin-top: 40px;
+    font-size: 22px;
+  }
+  .docs-main pre {
+    padding: 12px 14px;
+    font-size: 12px;
+    border-radius: 6px;
+  }
+  .docs-main .lede {
+    font-size: 16px;
+  }
+  .docs-cta {
+    margin-top: 40px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .docs-cta .btn {
+    justify-content: center;
+  }
+
+  /* footer: collapse to single column with breathing room */
+  footer {
+    padding: 40px 0 28px;
+  }
+  .foot-grid {
+    grid-template-columns: 1fr;
+    gap: 28px;
+  }
+  .foot-col a {
+    padding: 8px 0;
+    min-height: 36px;
+  }
+  .social-link {
+    width: 36px;
+    height: 36px;
+  }
+  .foot-bottom {
+    padding-top: 24px;
+    margin-top: 24px;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  /* features: tighter padding so cards aren't huge on small phones */
+  .feat {
+    padding: 24px 20px;
+  }
+
+  /* blog */
+  .blog-item {
+    padding: 22px 20px;
+  }
+
+  /* nav-cta keeps a tap-friendly height on mobile too */
+  .nav-cta {
+    padding: 10px 12px;
+    font-size: 12px;
+  }
+}
+
+/* Very small phones (≤ 380px). Edge cases like iPhone SE 1st-gen at 320px
+   still get a bit more headroom from a final padding cut. */
+@media (max-width: 380px) {
+  .wrap {
+    padding: 0 14px;
+  }
+  .hero h1 {
+    font-size: 36px;
+  }
+  .hero-meta {
+    font-size: 11px;
+  }
+  .docs-shell {
+    padding: 20px 14px 64px;
+  }
+  .docs-mobile-menu {
+    margin: 0 -14px 4px;
+  }
+}
+
+/* Make sure no images overflow regardless of viewport. */
+img,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Universal long-string wrap guards — long URLs / unbroken tokens shouldn't
+   force a horizontal page scroll on narrow phones. `overflow-x: clip` is the
+   modern equivalent of `hidden` that doesn't break `position: sticky`
+   (used by the nav and the docs sidebar). */
+html {
+  overflow-x: clip;
+}
+.docs-main p,
+.docs-main li,
+.callout {
+  overflow-wrap: anywhere;
 }

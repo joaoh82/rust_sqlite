@@ -58,6 +58,39 @@ export default function DocsPage() {
         }}
       />
       <Nav variant="docs" />
+      <details className="docs-mobile-menu">
+        <summary>
+          <span>On this page</span>
+        </summary>
+        <div className="docs-mobile-menu-panel">
+          <div className="section-label">Getting started</div>
+          <a href="#install">Install</a>
+          <a href="#first-db">Your first database</a>
+          <a href="#repl">Using the REPL</a>
+          <a href="#persistence">Persistence &amp; the WAL</a>
+          <a href="#transactions">Transactions</a>
+          <a href="#joins">JOINs</a>
+          <a href="#aggregates">GROUP BY &amp; aggregates</a>
+          <a href="#alter-drop">ALTER / DROP / VACUUM</a>
+          <a href="#prepared">Prepared statements</a>
+          <a href="#pragma">PRAGMA</a>
+          <a href="#vector">Vector search</a>
+          <a href="#fts">Full-text search</a>
+          <a href="#desktop">Desktop app</a>
+          <a href="#mcp">MCP server</a>
+          <div className="section-label">Embedding</div>
+          <a href="#sdk-rust">Rust crate</a>
+          <a href="#sdk-python">Python</a>
+          <a href="#sdk-node">Node.js</a>
+          <a href="#sdk-go">Go</a>
+          <a href="#sdk-c">C FFI</a>
+          <a href="#sdk-wasm">WASM</a>
+          <div className="section-label">Reference</div>
+          <a href="#supported">Supported SQL</a>
+          <a href="#errors">Errors &amp; limits</a>
+          <a href="#contributing">Contributing</a>
+        </div>
+      </details>
       <div className="docs-shell">
         <aside className="docs-side">
           <div className="section-label">Getting started</div>
