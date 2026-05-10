@@ -106,8 +106,14 @@ mod tests {
 
     #[test]
     fn journal_mode_round_trips_through_str() {
-        assert_eq!(JournalMode::from_str_lossless("wal"), Some(JournalMode::Wal));
-        assert_eq!(JournalMode::from_str_lossless("WAL"), Some(JournalMode::Wal));
+        assert_eq!(
+            JournalMode::from_str_lossless("wal"),
+            Some(JournalMode::Wal)
+        );
+        assert_eq!(
+            JournalMode::from_str_lossless("WAL"),
+            Some(JournalMode::Wal)
+        );
         assert_eq!(
             JournalMode::from_str_lossless("Mvcc"),
             Some(JournalMode::Mvcc)

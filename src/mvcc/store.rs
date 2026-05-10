@@ -292,11 +292,7 @@ impl MvStore {
     /// Errors if the new `begin` is `<= the previous latest's
     /// begin` (violates monotonicity — the commit path must always
     /// hand out increasing timestamps via the `MvccClock`).
-    pub fn push_committed(
-        &self,
-        row_id: RowID,
-        version: RowVersion,
-    ) -> Result<(), MvStoreError> {
+    pub fn push_committed(&self, row_id: RowID, version: RowVersion) -> Result<(), MvStoreError> {
         let begin_ts = match version.begin {
             TxTimestampOrId::Timestamp(t) => t,
             TxTimestampOrId::Id(_) => return Err(MvStoreError::NotCommitted),
