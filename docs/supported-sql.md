@@ -577,7 +577,48 @@ Case-insensitive on both the pragma name and the value. Quoted values (`'mvcc'`)
 
 The setting is **per-database** — every `Connection::connect` sibling sees the same value (the [open-question](concurrent-writes-plan.md) on per-connection vs per-database journal mode resolved to per-database for v0; revisit if a workload requires the per-connection variant). Reachable through the public API as `Connection::journal_mode() -> JournalMode`.
 
-**What 11.3 changes:** the toggle is observable. The data structures backing MVCC (`MvccClock`, `MvStore`, the active-transaction registry) are allocated and round-trip through `PRAGMA`. **What 11.3 does *not* change yet:** the executor's read path. SELECTs still go through the legacy `tables → pager` path regardless of journal mode. End-to-end snapshot-isolation reads + `BEGIN CONCURRENT` writes land together in 11.4 — the read-side and write-side are coupled, and shipping one without the other would surface as wrong rows.
+**What 11.3 changes:** the toggle is observable. The data structures backing MVCC (`MvccClock`, `MvStore`, the active-transaction registry) are allocated and round-trip through `PRAGMA`. **What 11.4 adds (this slice):** `BEGIN CONCURRENT` writes go through commit-time validation against `MvStore`; same-row conflicts surface as `SQLRiteError::Busy`. See `BEGIN CONCURRENT` below.
+
+---
+
+## `BEGIN CONCURRENT` (Phase 11.4, SQLR-22)
+
+Opens a transaction that doesn't acquire the engine's single-writer lock — multiple `BEGIN CONCURRENT` transactions can coexist, on the same `Connection` or across sibling [`Connection::connect`](embedding.md#sharing-one-database-across-threads) handles. Writes accumulate against a per-transaction snapshot; at `COMMIT`, the engine validates the write-set against any versions that committed after the transaction's `begin_ts` and aborts with [`SQLRiteError::Busy`](../src/error.rs) if some other transaction superseded a row.
+
+```sql
+PRAGMA journal_mode = mvcc;     -- opt the database into MVCC
+
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;                         -- may return Busy → caller retries
+```
+
+**Retry shape (Rust):**
+
+```rust
+loop {
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("UPDATE accounts SET balance = balance - 50 WHERE id = 1")?;
+    conn.execute("UPDATE accounts SET balance = balance + 50 WHERE id = 2")?;
+    match conn.execute("COMMIT") {
+        Ok(_) => break,
+        Err(e) if e.is_retryable() => continue,
+        Err(e) => return Err(e),
+    }
+}
+```
+
+**`SQLRiteError::is_retryable()`** covers both `Busy` and `BusySnapshot`. Use it in retry helpers rather than matching the variants individually so adding a third retryable variant later doesn't break callers.
+
+**Requirements + restrictions (v0):**
+
+- Database must be in `journal_mode = mvcc` first. Plain `BEGIN CONCURRENT` against a `Wal`-mode database returns a typed error.
+- DDL (`CREATE TABLE` / `CREATE INDEX` / `DROP TABLE` / `DROP INDEX` / `ALTER TABLE` / `VACUUM`) is rejected inside `BEGIN CONCURRENT` — the typed error keeps the transaction open so the caller can `ROLLBACK`.
+- Nested `BEGIN CONCURRENT` (or plain `BEGIN` inside an open `BEGIN CONCURRENT`) is rejected with a typed error.
+- Reads via `Connection::execute("SELECT …")` inside the transaction see the BEGIN-time snapshot; reads via `Statement::query` (the prepared-statement path) still go through the legacy `tables → pager` path. Full `MvStore`-routed reads land in 11.5.
+- Tables touched by writes inside `BEGIN CONCURRENT` should not carry FTS / HNSW indexes — the per-row commit-apply path only maintains B-tree secondary indexes today. Plain `WHERE col = literal` index probing still works on the post-commit live database.
+- `AUTOINCREMENT`-bearing INSERTs are not specifically guarded; two concurrent INSERTs that each allocate the same rowid surface as a `Busy` at the second commit. The plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
 
 ---
 

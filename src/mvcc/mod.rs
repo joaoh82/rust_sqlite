@@ -30,10 +30,12 @@
 pub mod clock;
 pub mod registry;
 pub mod store;
+pub mod transaction;
 
 pub use clock::MvccClock;
 pub use registry::{ActiveTxRegistry, TxHandle, TxId, TxTimestampOrId};
 pub use store::{MvStore, MvStoreError, RowID, RowVersion, RowVersionChain, VersionPayload};
+pub use transaction::ConcurrentTx;
 
 /// Selects the durability + concurrency story a database operates
 /// under. Toggled by `PRAGMA journal_mode = …` (see

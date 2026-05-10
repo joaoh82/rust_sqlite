@@ -24,6 +24,25 @@ pub enum SQLRiteError {
     SqlError(#[from] ParserError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Phase 11.4 — `BEGIN CONCURRENT` commit hit a write-write
+    /// conflict. Some other transaction committed a newer version
+    /// of a row in this transaction's write-set after this
+    /// transaction's `begin_ts`. Caller should `ROLLBACK` (already
+    /// implicitly performed) and retry the transaction with a
+    /// fresh `begin_ts`.
+    #[error("Busy: {0}")]
+    Busy(String),
+    /// Phase 11.4 — same shape as [`SQLRiteError::Busy`] but
+    /// surfaces the snapshot-isolation specific case: a row in
+    /// the read-set changed under us. Distinguished from `Busy`
+    /// so SDKs can map it to a per-language exception that the
+    /// caller's retry helper recognizes (mirrors Turso /
+    /// libSQL's `BUSY` vs `BUSY_SNAPSHOT` split). v0 only emits
+    /// `Busy` from the write-write validation loop; the
+    /// read-anomaly variant is reserved for the snapshot-read
+    /// integration that follows.
+    #[error("BusySnapshot: {0}")]
+    BusySnapshot(String),
 }
 
 // `std::io::Error` has no `PartialEq`, so we implement one by value-of-message.
@@ -38,8 +57,20 @@ impl PartialEq for SQLRiteError {
             (UnknownCommand(a), UnknownCommand(b)) => a == b,
             (SqlError(a), SqlError(b)) => format!("{a:?}") == format!("{b:?}"),
             (Io(a), Io(b)) => a.kind() == b.kind() && a.to_string() == b.to_string(),
+            (Busy(a), Busy(b)) => a == b,
+            (BusySnapshot(a), BusySnapshot(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+impl SQLRiteError {
+    /// Phase 11.4 — true for `Busy` and `BusySnapshot`. SDK retry
+    /// helpers branch on this rather than matching the variants
+    /// individually so adding a third "retryable" variant later
+    /// doesn't break callers.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, SQLRiteError::Busy(_) | SQLRiteError::BusySnapshot(_))
     }
 }
 
