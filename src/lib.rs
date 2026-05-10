@@ -61,6 +61,12 @@ extern crate prettytable;
 pub mod ask;
 pub mod connection;
 pub mod error;
+// Phase 11.2 — multi-version concurrency control primitives. The
+// module is public because Phase 11.3 / 11.4 grow externally-visible
+// types (timestamps, busy errors) on top of these foundations; today
+// it just exposes the standalone clock + active-tx registry. See
+// `docs/concurrent-writes-plan.md`.
+pub mod mvcc;
 pub mod sql;
 
 // Phase 5a public API.

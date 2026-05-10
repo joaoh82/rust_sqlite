@@ -14,12 +14,20 @@
 //! ```text
 //!   byte 0..32   WAL header
 //!                   0..8    magic "SQLRWAL\0"
-//!                   8..12   format version (u32 LE) = 1
+//!                   8..12   format version (u32 LE)
+//!                            v1: pre-Phase-11
+//!                            v2: Phase 11.2 — adds clock_high_water
+//!                                              in bytes 24..32
 //!                  12..16   page size     (u32 LE) = 4096
 //!                  16..20   salt          (u32 LE) — random on create,
 //!                                                    re-rolled per checkpoint
 //!                  20..24   checkpoint seq (u32 LE) — bumps per checkpoint
-//!                  24..32   reserved / zero
+//!                  24..32   v2: clock_high_water (u64 LE) — last
+//!                            persisted MVCC logical clock value;
+//!                            `crate::mvcc::MvccClock::observe`'d on
+//!                            reopen so timestamps don't reuse values
+//!                            across restarts.
+//!                            v1: reserved / zero (read as 0).
 //!
 //!   byte 32..    sequence of frames, each `FRAME_SIZE` bytes:
 //!                   0..4    page number           (u32 LE)
@@ -33,6 +41,14 @@
 //!                                                    [0..12] + the payload
 //!                  16..16+PAGE_SIZE  page bytes
 //! ```
+//!
+//! **Format version compatibility.** v1 WALs (written by pre-Phase-11
+//! builds) open cleanly: their reserved bytes are zero, which we
+//! interpret as `clock_high_water = 0` — exactly what a fresh-from-
+//! checkpoint clock would carry. The next time the WAL is rewritten
+//! (any checkpoint, including the auto-checkpoint that fires past the
+//! frame threshold) it lands on disk as v2. There's no "you must
+//! upgrade your files" step.
 //!
 //! **Checksum.** A rolling `rotate_left(1) + byte` sum over the
 //! concatenation of the frame's first 12 header bytes (page_num,
@@ -60,7 +76,15 @@ use crate::sql::pager::pager::{AccessMode, acquire_lock};
 
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_MAGIC: &[u8; 8] = b"SQLRWAL\0";
-pub const WAL_FORMAT_VERSION: u32 = 1;
+/// The version the engine writes today. Phase 11.2 bumped 1 → 2 to
+/// introduce [`WalHeader::clock_high_water`] in bytes 24..32 of the
+/// WAL header. `read_header` still accepts v1 files (treating those
+/// bytes as zero); the next `truncate` rewrites them as v2.
+pub const WAL_FORMAT_VERSION: u32 = 2;
+/// Lowest format version we know how to open. v1 had the bytes that
+/// now hold `clock_high_water` reserved-as-zero, which is identical
+/// to "clock has never been persisted" and round-trips cleanly.
+pub const WAL_FORMAT_VERSION_MIN_SUPPORTED: u32 = 1;
 pub const FRAME_HEADER_SIZE: usize = 16;
 pub const FRAME_SIZE: usize = FRAME_HEADER_SIZE + PAGE_SIZE;
 
@@ -71,6 +95,13 @@ pub const FRAME_SIZE: usize = FRAME_HEADER_SIZE + PAGE_SIZE;
 pub struct WalHeader {
     pub salt: u32,
     pub checkpoint_seq: u32,
+    /// Phase 11.2 — the last MVCC logical-clock value persisted to
+    /// this WAL. Rewritten by `truncate` (= every checkpoint) so a
+    /// reopen-then-tick can never reuse a timestamp the previous run
+    /// already handed out. Always 0 for v1 WALs (the bytes were
+    /// reserved-zero before the bump); read back as 0 on any v1 file
+    /// that pre-existed this build.
+    pub clock_high_water: u64,
 }
 
 /// Parsed per-frame header (everything but the page body).
@@ -131,6 +162,7 @@ impl Wal {
         let header = WalHeader {
             salt,
             checkpoint_seq: 0,
+            clock_high_water: 0,
         };
         let mut wal = Self {
             file,
@@ -191,6 +223,33 @@ impl Wal {
 
     pub fn last_commit_page_count(&self) -> Option<u32> {
         self.last_commit_page_count
+    }
+
+    /// Phase 11.2 — the MVCC logical-clock high-water mark persisted
+    /// in this WAL's header. Returns 0 for fresh-from-create WALs and
+    /// for v1 WALs (where the bytes were reserved-zero). The Pager
+    /// (Phase 11.3) seeds the in-memory `MvccClock` from this on open.
+    pub fn clock_high_water(&self) -> u64 {
+        self.header.clock_high_water
+    }
+
+    /// Phase 11.2 — overrides the in-memory clock high-water value.
+    /// `truncate` writes whatever value the WAL is carrying when it
+    /// runs, so callers update this just before checkpoint to persist
+    /// the latest in-memory clock value. The setter rejects a
+    /// non-monotonic update (a value below the existing high-water
+    /// mark) — that would either be a bug in the caller or evidence
+    /// of a corrupted in-memory clock. Same value is a no-op.
+    pub fn set_clock_high_water(&mut self, value: u64) -> Result<()> {
+        if value < self.header.clock_high_water {
+            return Err(SQLRiteError::General(format!(
+                "WAL clock_high_water cannot move backwards: \
+                 attempted {value}, current {}",
+                self.header.clock_high_water
+            )));
+        }
+        self.header.clock_high_water = value;
+        Ok(())
     }
 
     /// Bulk-loads every committed page from the WAL into `dest`. Used by
@@ -298,7 +357,12 @@ impl Wal {
         buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
         buf[16..20].copy_from_slice(&self.header.salt.to_le_bytes());
         buf[20..24].copy_from_slice(&self.header.checkpoint_seq.to_le_bytes());
-        // 24..32 zero
+        // Phase 11.2: bytes 24..32 carry the MVCC clock high-water
+        // mark (u64 LE). v1 WALs left this as zeros, which v2 reads
+        // as "no timestamps have been issued" — the same value a
+        // newly-created v2 WAL starts at. That's how the v1 → v2
+        // upgrade stays seamless.
+        buf[24..32].copy_from_slice(&self.header.clock_high_water.to_le_bytes());
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&buf)?;
         Ok(())
@@ -416,9 +480,14 @@ fn read_header(file: &mut File) -> Result<WalHeader> {
         ));
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-    if version != WAL_FORMAT_VERSION {
+    // Phase 11.2 — accept v1 (clock bytes are reserved-zero) and v2
+    // (clock bytes carry the high-water mark). Anything else is
+    // either a corrupt header or a forward-version we don't
+    // understand; reject with a clean error.
+    if !(WAL_FORMAT_VERSION_MIN_SUPPORTED..=WAL_FORMAT_VERSION).contains(&version) {
         return Err(SQLRiteError::General(format!(
-            "unsupported WAL format version {version}; this build understands {WAL_FORMAT_VERSION}"
+            "unsupported WAL format version {version}; this build reads \
+             v{WAL_FORMAT_VERSION_MIN_SUPPORTED}..=v{WAL_FORMAT_VERSION}"
         )));
     }
     let page_size = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
@@ -429,9 +498,14 @@ fn read_header(file: &mut File) -> Result<WalHeader> {
     }
     let salt = u32::from_le_bytes(buf[16..20].try_into().unwrap());
     let checkpoint_seq = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+    // v1 wrote zeros into bytes 24..32; v2 puts the clock high-water
+    // there. Either way, decoding as `u64::from_le_bytes` produces
+    // the right value — 0 for v1, the persisted clock for v2.
+    let clock_high_water = u64::from_le_bytes(buf[24..32].try_into().unwrap());
     Ok(WalHeader {
         salt,
         checkpoint_seq,
+        clock_high_water,
     })
 }
 
@@ -650,6 +724,131 @@ mod tests {
         assert_eq!(w2.read_page(2).unwrap(), None);
         assert_eq!(w2.frame_count(), 1);
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.2 — clock_high_water in the WAL header
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fresh_wal_starts_clock_at_zero() {
+        let p = tmp_wal("clock_fresh");
+        let w = Wal::create(&p).unwrap();
+        assert_eq!(w.clock_high_water(), 0);
+        drop(w);
+        let w2 = Wal::open(&p).unwrap();
+        assert_eq!(w2.clock_high_water(), 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Round-trip: setting the clock and triggering `truncate`
+    /// (= every checkpoint) must persist the high-water mark across a
+    /// reopen. This is the property Phase 11.6 GC relies on — without
+    /// it, two transactions on either side of a reopen could share a
+    /// timestamp and corrupt visibility.
+    #[test]
+    fn clock_high_water_round_trips_through_truncate() {
+        let p = tmp_wal("clock_truncate");
+        let mut w = Wal::create(&p).unwrap();
+        // Append a frame so truncate has something to drop. Doesn't
+        // matter what the body is — we're testing the header path.
+        w.append_frame(1, &page(0xaa), Some(1)).unwrap();
+        w.set_clock_high_water(12_345).unwrap();
+        w.truncate().unwrap();
+        assert_eq!(w.clock_high_water(), 12_345);
+        drop(w);
+
+        let w2 = Wal::open(&p).unwrap();
+        assert_eq!(w2.clock_high_water(), 12_345);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `truncate` rewrites the header. Bump-then-truncate-twice must
+    /// keep advancing the on-disk value as the in-memory clock moves.
+    #[test]
+    fn clock_high_water_is_monotonically_persisted_across_truncates() {
+        let p = tmp_wal("clock_monotonic_persist");
+        let mut w = Wal::create(&p).unwrap();
+        w.set_clock_high_water(100).unwrap();
+        w.truncate().unwrap();
+        w.set_clock_high_water(200).unwrap();
+        w.truncate().unwrap();
+        drop(w);
+
+        let w2 = Wal::open(&p).unwrap();
+        assert_eq!(w2.clock_high_water(), 200);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Setter rejects a value below the current high-water mark with
+    /// a typed error. Same value is accepted as a no-op (test below).
+    /// Same-or-greater is the contract every consumer relies on; a
+    /// silent saturate-to-current would mask a real bug in the caller.
+    #[test]
+    fn set_clock_high_water_rejects_regressions() {
+        let p = tmp_wal("clock_no_regress");
+        let mut w = Wal::create(&p).unwrap();
+        w.set_clock_high_water(500).unwrap();
+        let err = w.set_clock_high_water(499).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("backwards") && msg.contains("499") && msg.contains("500"),
+            "expected typed regression error, got: {msg}"
+        );
+        // Idempotent same-value update is fine.
+        w.set_clock_high_water(500).unwrap();
+        assert_eq!(w.clock_high_water(), 500);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Synthetic v1 WAL — exact byte layout the previous engine
+    /// version wrote. Opening it must succeed and report
+    /// `clock_high_water == 0` (the bytes were reserved-zero in v1).
+    /// This is the "graceful upgrade" contract.
+    #[test]
+    fn v1_wal_opens_with_zero_clock() {
+        let p = tmp_wal("v1_compat");
+        // Hand-build a v1 WAL header. Frame body is intentionally
+        // omitted — we're testing header parsing, not frame replay.
+        let mut buf = vec![0u8; WAL_HEADER_SIZE];
+        buf[0..8].copy_from_slice(WAL_MAGIC);
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        buf[16..20].copy_from_slice(&0xdead_beef_u32.to_le_bytes()); // salt
+        buf[20..24].copy_from_slice(&7u32.to_le_bytes()); // checkpoint_seq
+        // bytes 24..32 left as zero — v1's reserved bytes.
+        std::fs::write(&p, &buf).unwrap();
+
+        let w = Wal::open(&p).unwrap();
+        assert_eq!(w.header().salt, 0xdead_beef);
+        assert_eq!(w.header().checkpoint_seq, 7);
+        assert_eq!(
+            w.clock_high_water(),
+            0,
+            "v1 reserved bytes must read as clock=0"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Forward-versions we don't understand must error cleanly rather
+    /// than silently misinterpreting bytes. Picks a version far above
+    /// our `WAL_FORMAT_VERSION` so the test stays valid even after
+    /// future bumps.
+    #[test]
+    fn unknown_future_version_is_rejected() {
+        let p = tmp_wal("unknown_version");
+        let mut buf = vec![0u8; WAL_HEADER_SIZE];
+        buf[0..8].copy_from_slice(WAL_MAGIC);
+        buf[8..12].copy_from_slice(&999u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+        let err = Wal::open(&p).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported WAL format version") && msg.contains("999"),
+            "unexpected error shape: {msg}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

@@ -326,13 +326,26 @@ A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page
 │ offset │ length │ content                                         │
 ├────────┼────────┼─────────────────────────────────────────────────┤
 │     0  │    8   │ magic:  "SQLRWAL\0"                             │
-│     8  │    4   │ format version (u32 LE) = 1                     │
+│     8  │    4   │ format version (u32 LE)                         │
+│        │        │   1 = pre-Phase-11                              │
+│        │        │   2 = Phase 11.2 — adds clock_high_water        │
 │    12  │    4   │ page size      (u32 LE) = 4096                  │
 │    16  │    4   │ salt (u32 LE) — rolled each checkpoint          │
 │    20  │    4   │ checkpoint seq (u32 LE) — increments per ckpt   │
-│    24  │    8   │ reserved / zero                                 │
+│    24  │    8   │ clock_high_water (u64 LE) — Phase 11.2 MVCC     │
+│        │        │   logical-clock high-water mark; rewritten on   │
+│        │        │   each checkpoint. v1 left these bytes as zero  │
+│        │        │   (read identically as "no timestamps issued"). │
 └────────┴────────┴─────────────────────────────────────────────────┘
 ```
+
+**v1 → v2 compatibility.** The bytes that now hold `clock_high_water`
+were reserved-zero in v1, so a pre-Phase-11 WAL opens cleanly: the
+parser interprets the zeros as `clock_high_water = 0`, which is
+indistinguishable from "fresh checkpoint, clock has never advanced."
+The next checkpoint rewrites the header at v2 — there's no offline
+upgrade step. Forward versions we don't recognize (e.g. v3) error
+out with a clean diagnostic rather than misinterpreting the bytes.
 
 ### Frames
 
