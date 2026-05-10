@@ -854,6 +854,37 @@ section.no-border {
   white-space: pre;
   overflow-x: auto;
   color: var(--color-fg);
+
+  /* Same shiki → palette mapping as `.blog-article-body pre`. The SDK
+     showcase pre-renders snippets via `lib/highlight.ts` and inlines the
+     resulting <pre><code> here. */
+  --shiki-foreground: var(--color-fg);
+  --shiki-background: transparent;
+  --shiki-token-keyword: var(--color-kw);
+  --shiki-token-string: var(--color-str);
+  --shiki-token-string-expression: var(--color-str);
+  --shiki-token-constant: var(--color-num);
+  --shiki-token-comment: var(--color-fg-dim);
+  --shiki-token-function: var(--color-accent);
+  --shiki-token-parameter: var(--color-fg);
+  --shiki-token-punctuation: var(--color-fg-mute);
+  --shiki-token-link: var(--color-accent);
+}
+.code-body > pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+}
+.code-body > pre > code {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+}
+.code-body .line {
+  display: block;
+  min-height: 1lh;
 }
 
 /* SQL ref table */
@@ -2202,6 +2233,24 @@ html {
   line-height: 1.65;
   overflow-x: auto;
   color: var(--color-fg);
+
+  /* Shiki (rehype-pretty-code) emits inline styles like
+     `color: var(--shiki-token-keyword)`. Map those onto the blog's
+     existing token palette so the highlighter is theme-coherent. */
+  --shiki-foreground: var(--color-fg);
+  --shiki-background: transparent;
+  --shiki-token-keyword: var(--color-kw);
+  --shiki-token-string: var(--color-str);
+  --shiki-token-string-expression: var(--color-str);
+  --shiki-token-constant: var(--color-num);
+  --shiki-token-comment: var(--color-fg-dim);
+  --shiki-token-function: var(--color-accent);
+  --shiki-token-parameter: var(--color-fg);
+  --shiki-token-punctuation: var(--color-fg-mute);
+  --shiki-token-link: var(--color-accent);
+  --shiki-token-inserted: var(--color-good);
+  --shiki-token-deleted: oklch(0.72 0.16 25);
+  --shiki-token-changed: var(--color-warn);
 }
 .blog-article-body pre code {
   font: inherit;
@@ -2209,6 +2258,17 @@ html {
   padding: 0;
   border: 0;
   color: inherit;
+  display: block;
+}
+.blog-article-body pre [data-line] {
+  display: block;
+  min-height: 1lh;
+}
+/* rehype-pretty-code wraps each fenced block in a <figure>. Strip the
+   browser default figure margins so the block sits flush against the
+   surrounding paragraph rhythm. */
+.blog-article-body figure[data-rehype-pretty-code-figure] {
+  margin: 0;
 }
 .blog-article-body blockquote {
   margin: 0;
