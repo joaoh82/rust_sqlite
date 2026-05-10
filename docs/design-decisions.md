@@ -156,6 +156,22 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+### 12b. MVCC logical clock persisted in the WAL header (Phase 11.2)
+
+**Decision.** A new `sqlrite::mvcc` module ships [`MvccClock`](../src/mvcc/clock.rs) (an `AtomicU64`-backed process-wide counter) and [`ActiveTxRegistry`](../src/mvcc/registry.rs) (a `Mutex<BTreeMap>`-backed set of in-flight `TxId → begin_ts` mappings). The clock's high-water mark is persisted in the WAL header — bytes 24..32, previously reserved-zero — and the WAL format version bumps from 1 to 2.
+
+**Why.** MVCC visibility (`begin_ts <= ts < end_ts`) requires that timestamps never repeat — including across reopens. Restarting the engine and resuming the clock from zero would silently break that invariant the moment two transactions on either side of a restart picked the same value. Persisting the high-water mark on each checkpoint means reopen seeds the in-memory clock past the last value the previous run handed out. Putting it in the WAL header (rather than the main file) is right because the WAL is the durability boundary already; commits already fsync the WAL, and the existing checkpoint code rewrites the WAL header on truncate.
+
+**Cost.** A WAL format bump is real but is mitigated by the v1 layout: bytes 24..32 were reserved-zero, so a v1 WAL parses cleanly under v2 rules with `clock_high_water = 0` — exactly what a never-ticked clock would carry. The next checkpoint rewrites the header at v2; no offline upgrade step. The reader still rejects forward versions (e.g. v3) with a typed error rather than silently misinterpreting bytes.
+
+**Why an `AtomicU64`, not a plain `u64` behind a `Mutex`.** Each transaction calls the clock twice (begin + commit). Under contention, a `Mutex` would funnel every BEGIN through one critical section. Atomic CAS is wait-free and cheaper. The `observe()` helper (used at WAL replay to bring the clock up to a persisted value) is a CAS loop rather than a `store` so two racing observers can't move the clock backwards.
+
+**Why `Mutex<BTreeMap>` for the active-tx registry rather than a sharded skip list.** The registry is touched twice per transaction (begin + commit/rollback). Phase 11.6's GC reads `min_active_begin_ts` once per sweep. That's roughly 2N + 1 mutex calls per N transactions — well below contention thresholds for any realistic workload. When the GC profile actually shows the registry on the hot path, a sharded structure is the obvious upgrade; until then, simple wins.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §4.1 (clock) and §4.2 (version index — the registry is an extracted slice of MvStore that's standalone in 11.2). Phase 11.3 is the first in-tree consumer.
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses
