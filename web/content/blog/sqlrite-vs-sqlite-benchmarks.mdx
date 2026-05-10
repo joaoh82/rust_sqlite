@@ -1,0 +1,248 @@
+---
+title: "SQLRite vs SQLite, side by side: a benchmark and a fair-fight setup"
+description: "How SQLRite's benchmark harness compares an in-development Rust embedded database against rusqlite-bundled SQLite — the workloads, what's already close, and where the gap is wide."
+publishedAt: "2026-04-29"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "benchmarks", "sqlite", "rust", "performance"]
+primaryKeyword: "Rust embedded database benchmarks vs SQLite"
+---
+
+Comparing a one-year-old database against SQLite is, on paper, a
+silly thing to do. SQLite has 25 years of micro-optimization, an
+army of contributors, and a test suite the size of some small
+operating systems. Whatever the result, "we're slower than SQLite"
+is the boring one and "we're faster than SQLite" is almost certainly
+the result of measuring the wrong thing.
+
+I built a benchmark harness for [SQLRite](https://github.com/joaoh82/rust_sqlite)
+anyway, because I needed to know two things you cannot guess:
+
+1. **Where exactly is SQLRite slow today?** Slow on what shapes of
+   query? Slow because of which subsystem? Slow because we picked the
+   wrong algorithm or because we haven't optimized the right path?
+2. **Which corners of the engine are *already* competitive?** Not
+   because we won, but because the gap is small enough that further
+   work is throwing rocks at boulders.
+
+The harness — `benchmarks/` in the repo — is what those answers
+come from. This post walks through how it's built, what a "fair
+fight" actually means here, and what the numbers look like today.
+
+## Why a separate harness
+
+Criterion has a great Rust benchmark API, but for a comparison
+between databases I wanted three things that a plain Criterion bench
+makes hard:
+
+- **A `Driver` trait** so that adding "SQLite via rusqlite" or
+  "DuckDB via duckdb-rs" or, eventually, "Postgres via libpq" is one
+  file with no special-cased code.
+- **Workloads that look like real embedded usage**, not just
+  microbenchmarks. Insert a thousand rows in a transaction. Run a
+  prepared `SELECT` ten thousand times with different bind values.
+  Re-open a 100k-row database from disk and run the first query.
+- **Group A / Group B separation.** Group A is "anything any
+  embedded SQL engine should handle" — single-row inserts, predicate
+  scans, simple aggregates. Group B is "things SQLRite supports that
+  classic embedded SQL doesn't" — vector k-NN, hybrid retrieval. The
+  separation matters because including a DuckDB driver in Group A is
+  an honest comparison; including DuckDB in Group B is testing
+  something else entirely.
+
+The harness lives outside the default cargo test/build commands.
+Criterion's stable noise floor on a shared CI runner is too high to
+be useful, and the `rusqlite` build with `bundled` enabled is heavy
+enough to slow CI for a benchmark that nobody runs in CI anyway. You
+run it locally with `make bench` (or `make bench-duckdb` to add
+the DuckDB driver to Group A).
+
+## The drivers
+
+`Driver` is a small Rust trait. The interesting part of the contract:
+
+```rust
+pub trait Driver {
+    fn name(&self) -> &'static str;
+    fn open(path: &Path) -> Result<Self> where Self: Sized;
+    fn execute(&mut self, sql: &str) -> Result<u64>;
+    fn execute_with_params(&mut self, sql: &str, params: &[Param]) -> Result<u64>;
+    fn query_count(&mut self, sql: &str) -> Result<u64>;
+    // ... and a couple more for SELECT iteration and prepared statements
+}
+```
+
+There are three implementations:
+
+- **`SqliteDriver`** — wraps `rusqlite` with `bundled` so we
+  control the SQLite version under test (currently 3.45.x).
+- **`SqlriteDriver`** — wraps the SQLRite engine directly, with the
+  default features.
+- **`DuckdbDriver`** — wraps `duckdb-rs`, opt-in via a feature
+  flag, used only for Group A reads.
+
+Every workload is parameterized by row count and accepts any
+`Driver`. The harness times each combination with Criterion and
+emits a JSON-shaped summary that the website turns into bar charts
+on the [benchmarks section of the landing page](/#benchmarks).
+
+The SQLite driver is the relevant baseline. SQLite is the
+*incumbent embedded SQL database*. If we are doing the work right,
+the gap between SQLRite and rusqlite-bundled SQLite is the gap that
+matters; no synthetic baseline gets to substitute for that.
+
+## What "fair fight" actually means
+
+A benchmark is only as honest as its setup. Three rules I've held
+to:
+
+### 1. Same on-disk state
+
+For workloads that touch disk — and basically all of them do —
+SQLRite and SQLite each open a fresh database file in a fresh
+tmpdir before the run starts. No warm OS cache from a previous
+iteration. The harness `fsync`s the parent directory after creation
+so we're not measuring a delayed dirent.
+
+### 2. Same durability guarantees
+
+SQLite has knobs that change durability:
+`PRAGMA synchronous = OFF` is famously fast and famously
+*will eat your data on a power loss*. By default, the harness runs
+SQLite in `synchronous = NORMAL` and `journal_mode = WAL`, the same
+durability stance SQLRite uses. There's a separate variant that
+unlocks `synchronous = OFF` for both engines, but the headline
+numbers are the matched-durability ones.
+
+### 3. Same workload shape
+
+If a workload is "insert 1000 rows in one transaction," both
+drivers run that as one transaction. If the SQLite driver wraps it
+in `BEGIN; … COMMIT;` automatically because of how rusqlite handles
+implicit transactions, the SQLRite driver does the same. The
+harness assertion at the end is "both drivers got to the same
+SELECT result" — not just "both finished without erroring."
+
+What this rules out is the classic benchmark trick where the
+"contender" runs in some unsafe-but-fast mode and the
+"baseline" runs in safe mode. Easy way to win a benchmark; not a
+useful number.
+
+## What the numbers look like
+
+The numbers move with every release; the charts on the landing page
+are pulled from the most recent run. As of the harness's first
+public commit (Phase 7d → Phase 8 transition), the rough story is:
+
+- **Single-row INSERT, no transaction.** SQLRite is in the
+  ballpark of SQLite. The diff-based pager helps here — most
+  inserts are one dirty page and one WAL frame in both engines.
+- **Bulk INSERT in one transaction.** SQLite is meaningfully
+  faster. SQLite has had decades of tuning around the bulk-insert
+  fast path; the SQLRite cost is dominated by the bottom-up B-tree
+  rebuild, which is O(N) and we will eventually replace.
+- **Indexed point lookup (`SELECT WHERE id = ?` on PK).** Close
+  enough that the noise dominates.
+- **Range scan with predicate.** SQLite is faster, mainly because
+  its predicate evaluator is cleverer than ours. This is also where
+  the prepared-statement plan cache gives back the most ground.
+- **Prepared statement vs. parsed-each-time.** Both engines win
+  big from preparation. SQLRite's per-connection LRU plan cache
+  defaults to 16 slots; tuning it up helps a lot for hot loops.
+- **Vector k-NN with HNSW (Group B).** SQLite-vec or DuckDB
+  flat-scan in Group A is the wrong comparison; for the right
+  comparison (HNSW vs. brute force on the same data) the win is
+  large at small `k`, as expected.
+
+I am being deliberately vague about *exact* numbers in a blog post.
+The right place for those is the live charts, which update every
+release. What I'd like you to take away is the **shape**: SQLRite
+is not catastrophically slow on the workloads I care about, it is
+clearly slower on a couple of paths, and the slow paths have
+identifiable causes.
+
+## What the slow paths tell us
+
+The benchmark harness is, in effect, a roadmap generator. Every
+workload that lags has a one-line cause:
+
+- **Bulk insert** → bottom-up B-tree rebuild. Replace with an
+  in-place split path eventually.
+- **Range scan with complex predicate** → naive predicate
+  evaluator. The fix is a small interpreter loop, not a full
+  rewrite.
+- **Reopen-then-first-query** → HNSW rebuild on open. Persisting
+  the graph removes this entirely.
+- **Multi-join queries** → nested-loop driver. Hash and merge join
+  are both Phase-9 candidates.
+
+The thing that's nice about a written-down benchmark is that you
+can argue with it. "Why is the bulk-insert workload 1000 rows
+instead of 100,000?" is a real question with a real answer (because
+nobody on the embedded side actually does single-transaction bulk
+loads of 100k rows in their hot path; if they do, they should). I
+got several good roadmap suggestions from people complaining about
+the harness. That's a feature, not a bug.
+
+## What we're *not* benchmarking
+
+Worth being explicit:
+
+- **Latency under crash recovery.** This is a real metric — how
+  long does it take to reopen a database with a 50 MB unflushed WAL
+  — but it requires fault injection to measure properly. On the
+  list.
+- **Memory.** Embedded databases live or die on memory footprint.
+  The harness doesn't track RSS yet; it should.
+- **Multi-connection contention.** SQLite is *the* gold standard
+  for read-mostly multi-connection workloads. SQLRite is single
+  writer + many readers via advisory locks; the harness measures
+  this for both engines but I haven't yet written a workload that
+  stresses it.
+- **The non-SQL surfaces.** Python via PyO3, Node via napi-rs, Go
+  via cgo, WASM. These all add an FFI hop on top of the engine, and
+  some of them are slower than the Rust path by a measurable
+  amount. The harness has the hooks but no published numbers yet.
+
+## The point of the exercise
+
+If you take only one thing from this post, take this: **a database
+without a benchmark harness is a database that is silently lying to
+you about which features are slow.** SQLRite was probably lying
+about three or four things until the harness landed; some of them I
+was wrong about, and one of them ("we should be roughly competitive
+on point lookups") I was right about and didn't realize. Either
+outcome is useful.
+
+For the broader context behind this engine's design — why we have
+HNSW and a diff-based pager in the same file format — see the
+[origin-story post](/blog/why-im-building-sqlrite) and
+[the storage deep-dive](/blog/how-sqlrite-stores-rows-on-disk). The
+SQL surface that everything in this post exercises is documented in
+[the getting-started docs](/docs).
+
+If you want to run the harness yourself:
+
+```sh
+git clone https://github.com/joaoh82/rust_sqlite
+cd rust_sqlite
+make bench           # SQLRite + SQLite
+make bench-duckdb    # add the DuckDB driver to Group A
+```
+
+The full plan, including which workloads we want to add next, is in
+[`docs/benchmarks-plan.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/benchmarks-plan.md).
+And if you build a workload SQLRite handles surprisingly well or
+surprisingly badly, please file an
+[issue](https://github.com/joaoh82/rust_sqlite/issues) — that's the
+cheapest contribution you can make to a database project, and it's
+the one with the best leverage.
+
+The next post in the series is the distribution one:
+[shipping SQLRite as a desktop app, an MCP server, and Python /
+Node / Go SDKs](/blog/shipping-sqlrite-tauri-mcp-sdks). One engine,
+six surfaces, a story about packaging that took longer than the
+file format did.
+
+If SQLRite is useful to you, ⭐ the
+[repo](https://github.com/joaoh82/rust_sqlite) — visibility
+matters more than I'd like to admit.

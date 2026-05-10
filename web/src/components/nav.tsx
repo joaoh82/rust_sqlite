@@ -48,6 +48,7 @@ export function Nav({ variant = "landing" }: NavProps) {
               <a href="#sdks">SDKs</a>
               <a href="#benchmarks">Benchmarks</a>
               <Link href="/docs">Docs</Link>
+              <Link href="/blog">Blog</Link>
             </>
           ) : (
             <>
@@ -56,6 +57,8 @@ export function Nav({ variant = "landing" }: NavProps) {
               <Link href="/#roadmap">Roadmap</Link>
               <Link href="/#sdks">SDKs</Link>
               <Link href="/#benchmarks">Benchmarks</Link>
+              <Link href="/docs">Docs</Link>
+              <Link href="/blog">Blog</Link>
             </>
           )}
           <a
@@ -112,6 +115,9 @@ export function Nav({ variant = "landing" }: NavProps) {
               <Link href="/docs" onClick={close}>
                 Docs
               </Link>
+              <Link href="/blog" onClick={close}>
+                Blog
+              </Link>
             </>
           ) : (
             <>
@@ -129,6 +135,12 @@ export function Nav({ variant = "landing" }: NavProps) {
               </Link>
               <Link href="/#benchmarks" onClick={close}>
                 Benchmarks
+              </Link>
+              <Link href="/docs" onClick={close}>
+                Docs
+              </Link>
+              <Link href="/blog" onClick={close}>
+                Blog
               </Link>
               <Link href="/" onClick={close}>
                 Home

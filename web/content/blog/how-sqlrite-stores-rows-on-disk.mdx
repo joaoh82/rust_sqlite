@@ -1,0 +1,275 @@
+---
+title: "How SQLRite stores rows on disk: pages, B-trees, and a diff-based pager"
+description: "A walkthrough of SQLRite's on-disk format — 4 KiB pages, cell-encoded B-trees per table and index, and a write-ahead log that only persists the pages that actually changed."
+publishedAt: "2026-04-15"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "rust", "databases", "storage", "b-tree", "wal"]
+primaryKeyword: "embedded database B-tree storage in Rust"
+---
+
+The first time you write a database from scratch, the part you don't
+expect to spend the most time on is the file. Not the parser, not the
+optimizer, not joins — the *file*. The shape of the bytes on disk
+constrains every other decision you make for the rest of the
+project's life. Get it wrong early and every later feature is a tax.
+
+This post is a walkthrough of how
+[SQLRite](https://github.com/joaoh82/rust_sqlite) currently stores
+rows on disk. It covers the four things that, together, are the whole
+storage subsystem:
+
+1. The **page** — a fixed-size unit on disk.
+2. The **cell** — how a single row is encoded into a page.
+3. The **B-tree** — how cells across many pages are organized.
+4. The **pager and the WAL** — how changes get from RAM to disk
+   without corrupting anything when the lights go out.
+
+If you are coming from "I read about B-trees once" and you want to
+see what the implementation actually looks like in a working embedded
+database, this is the post for you. The user-level surface — the SQL
+this engine accepts, the SDKs that wrap it — lives over in the
+[docs](/docs); we'll only refer to it where it matters.
+
+## Pages
+
+A SQLRite database is a single file. The file is divided into
+contiguous **4 KiB pages**, numbered starting at 1. Page 0 is a
+header and Page 1 is the schema page; everything else is allocated
+on demand to tables and indexes.
+
+Why 4 KiB?
+
+- It matches the page size of every common filesystem (ext4, APFS,
+  NTFS), so a single page write is almost always a single physical
+  write.
+- It matches what `pread`/`pwrite` syscalls cost least to issue.
+- It matches the sweet spot for memory-mapped page caches.
+- It is exactly the size SQLite uses by default, which means
+  comparing performance numbers later is easier.
+
+A page in SQLRite has a header (page type, free byte count, slot
+directory size, and parent/right-sibling pointers if it's a B-tree
+node) and a body. The body grows from the bottom of the page upward
+as cells; a slot directory at the top of the body grows downward.
+This is the classic
+[**slotted page**](https://en.wikipedia.org/wiki/Slotted_page) layout
+that most disk-resident databases settle on, for the same reason
+everyone settles on it: it makes variable-length rows easy to insert,
+delete, and reorder without rewriting the whole page.
+
+## Cells
+
+A "cell" is what SQLRite calls one row encoded into bytes. The
+encoding is very simple by design:
+
+- A small per-cell header carrying the row's encoded payload size and
+  a key (the integer primary key for tables, or the indexed value for
+  index pages).
+- A sequence of typed values: `INTEGER`, `TEXT`, `REAL`, `BOOLEAN`,
+  `NULL`, `VECTOR(N)`, `JSON`. Each is length-prefixed when it
+  needs to be.
+
+What we deliberately do *not* do (yet) is the SQLite varint trick
+where each integer is encoded with the smallest number of bytes that
+will hold it. SQLite gets a real space win out of that — most
+integers in a real database are small. SQLRite uses fixed-width
+encoding for now because the win is modest at our scale and the
+debugging cost of a malformed varint is not modest. We will likely
+add it once the page format hits v5.
+
+A row that's larger than will fit in a page — for example, a long
+`TEXT` blob or a 1024-dimensional `VECTOR` — spills into an
+**overflow chain**. The first part stays on the page, with a pointer
+to a continuation page. Continuations chain until the value ends.
+This is also the SQLite playbook; it is roughly the only known good
+way to keep a fixed page size while supporting arbitrarily large
+values.
+
+## B-trees
+
+Every SQLRite table is a B-tree keyed on its `INTEGER PRIMARY KEY`
+(or an implicit row ID if the schema doesn't declare one). Every
+SQLRite index is a B-tree keyed on the indexed columns. The B-trees
+share the same on-disk node layout — leaf vs. internal — so the
+pager doesn't need to know whether it's looking at a table page or
+an index page. That's a small implementation win that pays off every
+time you go to write a new feature.
+
+Two implementation decisions are worth calling out, because they are
+not the obvious ones:
+
+### Bottom-up rebuild on commit
+
+Most database tutorials describe B-tree mutations as in-place edits:
+insert a key, find the right leaf, split the leaf if it overflows,
+propagate the split up the parent chain. SQLRite does this in
+*memory* during a transaction, against a snapshot of the
+in-memory state — but at commit time, instead of writing back the
+edited tree page-by-page, **the entire B-tree is rebuilt
+bottom-up**.
+
+That sounds expensive. It mostly isn't. The leaf pages already exist
+in memory; rebuilding is a serialization pass and a couple of slot
+directory tweaks. The reason to do it this way is that **bottom-up
+rebuild is correct by construction.** Every page that gets persisted
+is a fresh, valid page, with no "did we update the parent before the
+crash?" failure mode. It also gives us a much simpler diffing pass
+for the WAL (more on that next).
+
+The cost we are paying for this simplicity is O(N) rather than
+O(log N) per commit on a hot table. That ceiling will eventually need
+to come down — probably with an in-place split path — but it is a
+ceiling I'd rather raise after I have the rest of the system, not
+before.
+
+### Slot directory, not a sorted array
+
+A leaf page's cells are *not* stored in key order in the page body.
+They're stored in arrival order. A separate **slot directory** lists
+cell offsets in key order. This means an insert never has to memmove
+the page body — only update the slot directory. It also means lookups
+are still O(log n_cells) on the slot directory.
+
+Index pages use the same trick. Same wins.
+
+## The pager
+
+The pager is the thing in the middle: it sits between the in-memory
+B-trees and the file. Its job is to:
+
+- Read pages from disk on demand into a small in-memory page cache.
+- Track which pages are dirty (changed since the last commit).
+- On commit, write only the dirty pages, in a way that survives a
+  crash.
+
+That last clause is what the WAL is for.
+
+### The diff is the trick
+
+A naïve pager writes every page that changed during the transaction,
+in order, and then `fsync`s. That works. It is also a *lot* of
+writes. SQLRite's pager only writes pages whose **bytes actually
+changed.** During a write transaction, the pager hashes each
+candidate dirty page against its on-disk copy. If the hash matches,
+the page isn't dirty after all — somebody touched the in-memory copy
+but didn't change anything that affects the persisted bytes.
+
+This is the diff-based pager. In practice, on workloads with
+read-modify-write cycles or `UPDATE … WHERE` queries that match
+nothing, it cuts disk writes dramatically. On a clean
+`CREATE TABLE` + `INSERT` path, it's a no-op — every page is
+genuinely new.
+
+## The WAL
+
+The write-ahead log is a sidecar file:
+`<db>.sqlrite-wal`. It exists only while writes are in flight; it is
+truncated on a clean checkpoint.
+
+Each commit appends one **frame** per dirty page. A frame is the
+page's full 4 KiB body, plus a small header carrying the page number
+and a per-frame checksum. The very last frame in a commit carries the
+new page-0 contents — the database header — and is marked as a
+**commit frame.**
+
+On crash recovery, the rules are:
+
+- Walk the WAL forward.
+- Validate each frame's checksum.
+- If a frame is torn (incomplete trailing bytes), or if its checksum
+  doesn't match, **truncate the WAL at the last good frame and stop.**
+- For every commit frame found, replay all frames up through the
+  commit into the page cache.
+- Treat the most recent commit's page-0 as the live database header,
+  even if the main file's page 0 is older.
+
+The contract is: a commit either landed in the WAL completely, or it
+didn't. There is no half-committed transaction.
+
+### Auto-checkpointing
+
+A WAL that grows forever is a problem. SQLRite **auto-checkpoints**
+once the WAL crosses 100 frames. A checkpoint is straightforward:
+
+1. Acquire the writer lock (shared with the rest of the engine via
+   [`fs2`](https://github.com/danburkert/fs2-rs) advisory locks).
+2. For each dirty page in the WAL, in WAL order, write it to its
+   home offset in the main file.
+3. `fsync` the main file.
+4. Truncate the WAL to zero bytes.
+5. Drop the lock.
+
+Readers using shared locks can keep reading from the WAL while the
+checkpoint runs; they'll see the WAL's view of any pages that haven't
+been pushed to the main file yet.
+
+### Crash safety, in three sentences
+
+Every page write is preceded by a WAL frame. Every commit terminates
+with a special frame that validates the entire batch. On reopen, the
+WAL is the source of truth until checkpointed.
+
+That's it. That's the whole crash-safety story.
+
+## Putting it together
+
+Here is what the path looks like when you do a single `INSERT`:
+
+1. Parse the SQL into an AST. Bind it to a typed `InsertQuery`.
+2. The executor takes the in-memory snapshot of the table (a
+   `BTree`), inserts the row into a leaf, splits if needed, walks
+   parents up.
+3. On `COMMIT` (or auto-commit, for a bare `INSERT`):
+   - The pager finds the dirty pages of the rebuilt B-tree.
+   - It diffs each one against its on-disk copy and discards
+     no-op writes.
+   - It encodes the survivors as WAL frames, computing checksums.
+   - It writes all frames, then a final commit frame carrying the
+     new page-0.
+   - It `fsync`s the WAL.
+4. The auto-checkpointer fires later if the WAL is long enough.
+
+The contract that sits over all of this: **a `COMMIT` returns
+success only after the commit frame is durably on disk.** That's the
+hard part.
+
+## What I'd do differently
+
+A few decisions I'd revisit:
+
+- **Fixed-width integer encoding.** The space win from varints is
+  real on most workloads. Worth doing in v5.
+- **No per-table page chains.** Tables and indexes share a page
+  pool but don't pre-allocate contiguous runs. This makes seek
+  patterns slightly worse than they need to be on rotational media,
+  which doesn't matter today and might matter later.
+- **The B-tree rebuild ceiling.** Eventually this needs an in-place
+  split path. The bottom-up rebuild is great until your hot table is
+  several gigabytes.
+
+But I'd keep the file format. The shape of bytes on disk is the
+hardest thing to change later, and the shape SQLRite settled on is
+boring in all the right ways.
+
+If you want to read the actual code, the page and B-tree types live
+in [`src/sql/pager/`](https://github.com/joaoh82/rust_sqlite/tree/main/src/sql/pager)
+and the executor's commit path lives in
+[`src/sql/db/database.rs`](https://github.com/joaoh82/rust_sqlite/blob/main/src/sql/db/database.rs).
+The full file format spec is at
+[`docs/file-format.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/file-format.md).
+
+The next post in the series is the most fun one to write so far:
+[adding vector search to a SQLite-style database with HNSW](/blog/adding-vector-search-with-hnsw).
+That's where embedded SQL stops looking like 1992 and starts looking
+like the next decade.
+
+More on the philosophy behind these choices in the
+[origin-story post](/blog/why-im-building-sqlrite); a head-to-head
+against rusqlite-bundled SQLite on storage-heavy workloads is in
+[the benchmarks post](/blog/sqlrite-vs-sqlite-benchmarks). The
+[transactions and persistence section of the docs](/docs#persistence)
+covers the same ground from the user side.
+
+If SQLRite has been useful to you, ⭐ the
+[repo](https://github.com/joaoh82/rust_sqlite) — visibility is the
+bottleneck.

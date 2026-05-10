@@ -1,0 +1,351 @@
+---
+title: "From SQL to Tauri: shipping SQLRite as a desktop app, MCP server, and Python/Node/Go SDKs"
+description: "The distribution story behind SQLRite — one engine, six surfaces. How a Rust crate becomes a Svelte/Tauri desktop app, a Model Context Protocol stdio server, and language SDKs for Python, Node, Go, C, and the browser."
+publishedAt: "2026-05-06"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "tauri", "mcp", "ffi", "wasm", "rust", "distribution"]
+primaryKeyword: "Rust embedded database SDK packaging Tauri MCP"
+---
+
+The least glamorous part of shipping a database is the part that
+matters most for whether anyone uses it. The engine is a Rust crate.
+Beautiful. Now you need a CLI binary, a desktop app, an MCP server
+for AI clients, a Python package, a Node module, a Go module that
+plays nicely with `database/sql`, a C header, a WASM bundle, and —
+crucially — a release process that builds all of those for every
+target on every push without involving a human.
+
+I underestimated this project. I'd guess a third of the engineering
+time on
+[SQLRite](https://github.com/joaoh82/rust_sqlite) so far has been
+distribution. Half of that was figuring it out the first time;
+half was the honest cost of *keeping six surfaces in sync.*
+
+This post is a tour of those six surfaces, what each one wraps, and
+which problems showed up only at the distribution boundary. If
+you're building a Rust library and considering "should I make this
+embeddable from Python / Node / a browser tab," the short answer is
+yes. The longer answer is what's below.
+
+## The engine, then everything else
+
+Everything starts at one file:
+[`src/connection.rs`](https://github.com/joaoh82/rust_sqlite/blob/main/src/connection.rs).
+That's the public Rust API. `Connection`, `Statement`, `Rows`,
+`Row`, `Value`. Five types. Every other surface — every SDK, every
+binary, every server — binds against those five types. There is
+no second API.
+
+That sounds obvious. It is the single most useful decision in this
+project. The temptation when you ship to multiple ecosystems is to
+let each ecosystem add its own ergonomic shortcut to the engine —
+a Python-flavored `executemany`, a Node `prepare().all()`, a Go
+`Rows.Scan` — and to do that by exposing some private API "just for
+the binding." Each shortcut is fine in isolation; together they
+turn into six engines pretending to be one.
+
+SQLRite's rule is **the binding can wrap, but it cannot reach
+inside.** If a binding wants `executemany`, it loops `execute` and
+catches errors. If it wants `Rows.Scan`, it calls `Row::get`. If
+that's awkward — and it is sometimes — the fix goes into the
+*Rust* API, where every other surface gets it for free.
+
+For the user-facing reference of every API mentioned below — the
+SQL accepted, the meta commands, the SDK call shapes — head to
+[the getting-started docs](/docs).
+
+## The CLI
+
+The simplest surface and probably the most-used one. `sqlrite` is a
+[`[[bin]]`](https://github.com/joaoh82/rust_sqlite/blob/main/Cargo.toml)
+target in the engine crate, gated on the `cli` and `ask` features.
+It runs a [`rustyline`](https://github.com/kkawakam/rustyline)-driven
+prompt with history, syntax highlighting, bracket matching, and a
+small set of meta commands (`.open`, `.tables`, `.ask`, `.help`,
+`.exit`).
+
+The thing that surprised me here: the REPL is the **best testing
+surface for the engine.** Every weird SQL the parser doesn't
+handle, every error message that's confusing, every long-running
+query that should be interruptible — all of those show up first in
+the REPL, before any binding sees them. Treating the REPL as a
+"first-class diagnostic tool, not just a demo" was a mid-Phase-2
+attitude shift that's paid for itself a hundred times over.
+
+## The Tauri desktop app
+
+[Tauri 2](https://tauri.app/) plus [Svelte 5](https://svelte.dev/).
+A three-pane layout: file pickers in the header, tables and schema
+in the sidebar, a query editor with line numbers and a
+selection-aware Run. Prebuilt installers for macOS (`.dmg`),
+Windows (`.msi`), and Linux (`.AppImage` / `.deb` / `.rpm`) ship
+with every release. The `desktop/` workspace member is its own
+Cargo crate plus its own `package.json`; both speak to the same
+engine.
+
+Two things were genuinely hard:
+
+### Embedding, not FFI
+
+The first version of the desktop app talked to the engine through
+the C FFI. That worked, and it was fast, and it was wrong. The C
+FFI exists for non-Rust callers; using it from a Rust app inside a
+Tauri shell is a layer of unnecessary translation. The Tauri
+backend is itself Rust. It can `use sqlrite::Connection;` and
+that's the end of the integration. We deleted ~400 lines of FFI
+glue and got rid of the threading surprise that came with it.
+
+### Filesystem access without panic
+
+A desktop database app does things a server-side library can
+ignore: open a database from a file picker, save under a different
+name, refuse to open a file the user can't write to, recover
+gracefully from "the user opened a JPEG instead of a database."
+SQLRite's typed errors made this dramatically simpler than I
+expected — every "this isn't a database" path returns a
+`SQLRiteError::Io(_)` or `Format(_)`, and the GUI lights up the
+right toast.
+
+The biggest single-day improvement was the day I stopped making the
+GUI thread call into the engine directly and put a small
+`Arc<Mutex<Connection>>` between them. SQLRite is single-writer,
+many-reader; the GUI uses one writer (the editor) and many readers
+(the table list, the schema panel). Three lines of code; a category
+of races gone.
+
+## The MCP server
+
+This one I almost didn't build. I'd seen
+[Model Context Protocol](https://modelcontextprotocol.io/) demos
+and assumed the integration would be cute but shallow. Then a
+collaborator mentioned that they'd been pasting SQL into Claude
+Code by hand for an hour to debug a schema problem, and I thought:
+of course this is the integration. The whole point of an embedded
+database is that it doesn't need a server. An MCP stdio server
+*is* the AI-native interface to that.
+
+`sqlrite-mcp` is a separate crate that links the engine and exposes
+eight tools:
+
+- `list_tables`
+- `describe_table`
+- `query` (read-only)
+- `execute` (DDL/DML — hidden in `--read-only` mode)
+- `schema_dump`
+- `vector_search`
+- `bm25_search`
+- `ask` (LLM-powered natural-language → SQL)
+
+Stdio transport, JSON-RPC frames. The whole thing is a few hundred
+lines because the engine already does the work; the server is a
+shim. `--read-only` opens with a shared lock and hides `execute`,
+which is the right default for "let the LLM look at my database
+without nuking it."
+
+The thing I want to emphasize: **the MCP server is the engine.**
+There is no caching layer, no protocol-specific adapter, no
+re-implementation of `SELECT`. A query received over stdio takes
+exactly the same path as a query from the REPL.
+
+## The C FFI
+
+`sqlrite-ffi` is a C ABI cdylib plus a
+[`cbindgen`](https://github.com/mozilla/cbindgen)-generated
+`sqlrite.h`. Opaque pointer types, thread-local last-error,
+split `sqlrite_execute` (DDL/DML) vs.
+`sqlrite_query` / `sqlrite_step` (SELECT iteration).
+
+The C FFI exists to back two callers:
+
+- The Go SDK (cgo).
+- "Some C consumer we haven't met yet."
+
+We considered exposing the FFI surface to Python and Node too. We
+didn't, for one reason: PyO3 and napi-rs are *much* better Rust
+bindings than they are C bindings. Every minute spent generating
+ctypes wrappers is a minute not spent making the Python API feel
+like Python.
+
+## The Python and Node SDKs
+
+[PyO3](https://pyo3.rs/) for Python, [napi-rs](https://napi.rs/)
+for Node. Both build cdylibs that wrap the engine, both ship as
+`pip install sqlrite` and `npm install @joaoh82/sqlrite`, both
+expose APIs that look native to their host ecosystem.
+
+The Python API is `sqlite3`-flavored on purpose:
+
+```python
+import sqlrite
+
+with sqlrite.connect("app.sqlrite") as conn:
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+    cur.execute("INSERT INTO notes (body) VALUES (?)", ("first",))
+    rows = cur.execute("SELECT id, body FROM notes").fetchall()
+```
+
+Anyone who has ever used `sqlite3` in Python can read this. That
+familiarity is the entire point. We are not selling a new mental
+model; we are selling the same mental model with a different
+storage engine.
+
+The Node API is `better-sqlite3`-flavored for the same reason:
+
+```js
+import { Database } from "@joaoh82/sqlrite";
+
+const db = new Database("app.sqlrite");
+db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+db.prepare("INSERT INTO notes (body) VALUES (?)").run("first");
+console.log(db.prepare("SELECT id, body FROM notes").all());
+```
+
+Two things you don't see but that took real work:
+
+- **Cross-platform prebuilt wheels / binaries.** Both crates
+  publish prebuilds for every common platform so users don't need a
+  Rust toolchain. The CI matrix for this is large and the linker
+  options are platform-specific. `napi-rs` and `maturin` both
+  earn their keep here; rolling this from scratch would be weeks of
+  work per ecosystem.
+- **`Value::Vector` round-tripping.** A Python `list[float]` becomes
+  a `Value::Vector(Vec<f32>)` becomes a JS `Float32Array` becomes a
+  Go `[]float32`. The conversion code is small but the test matrix
+  isn't. Every binding has a "round-trip a vector through every
+  type" test; one of those tests fired about a month into Phase 7d
+  and saved a real bug.
+
+## The Go SDK
+
+Go is a different shape than Python or Node. The expected API is
+`database/sql`. The expected import looks like:
+
+```go
+import (
+    "database/sql"
+    _ "github.com/joaoh82/rust_sqlite/sdk/go"
+)
+
+db, _ := sql.Open("sqlrite", "app.sqlrite")
+```
+
+Implementing a `database/sql` driver is straightforward but
+opinionated; the things that matter are types (Go's
+`sql.NullString` and friends map cleanly to SQLRite's typed
+values), prepared statements (the trait-level prepared-statement
+support already exists; the driver just exposes it), and **cgo
+boundaries.**
+
+Cgo is the cost of admission. The Go SDK is *not* part of the
+Cargo workspace, by design — a workspace member targeting cgo
+spreads its build constraints across the whole workspace, and that
+hurts cargo's incremental builds. A separate workspace member, a
+separate Makefile target, a release process that knows about both.
+
+If you're starting a multi-language SDK story today, my advice
+would be: **commit to a workspace shape early.** Decide which
+crates are workspace members and which are siblings, and be
+prepared to defend the choice. Refactoring this halfway through is
+miserable.
+
+## The WASM bundle
+
+`@joaoh82/sqlrite-wasm` is the engine compiled to WebAssembly via
+[`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/). The
+output is roughly 1.8 MB raw, ~500 KB gzipped, with three
+`wasm-pack` targets (`web`, `bundler`, `nodejs`).
+
+The whole database can live in a browser tab. That sentence feels
+absurd to type, but it's a flavor of "embedded" SQLite never
+quite delivered for browsers — sql.js is a Emscripten port of the
+C engine and it's wonderful, but it's also enormous and the build
+toolchain is a different planet from the rest of the SQLRite
+binaries. Building once, in Rust, and emitting a WASM target alongside
+every other surface is a meaningfully better story.
+
+The WASM target is also where the engine's feature gates earn their
+keep. WASM builds with `default-features = false` to drop the
+`cli`, `ask`, and `file-locks` features (rustyline and `fs2` don't
+make sense in a browser). The conditional compilation has been
+fiddly to maintain — every new feature has to declare which
+surfaces it belongs to — but it's also forced a useful discipline:
+the engine has a clear "always-on" core and a clear "shell-y" outer
+ring, and that mental model has paid off when reasoning about what
+goes into a security review.
+
+## The release process
+
+`scripts/bump-version.sh 0.10.0` updates the version across 11
+manifests in one shot. That number used to be lower; every binding
+adds a manifest. The cost of keeping them in sync is real, and the
+script paid for itself the first time I forgot one of them.
+
+Releases are GitHub-Actions-driven matrix builds. Every push to a
+release tag produces:
+
+- `crates.io` publish for `sqlrite-engine`, `sqlrite-mcp`,
+  `sqlrite-ffi`, `sqlrite-ask`.
+- Python wheels via `maturin` for macOS / Linux / Windows ×
+  CPython 3.10–3.13.
+- Node prebuilds via `napi-rs` for the same platform matrix.
+- Go module is a tag — Go pulls source.
+- WASM target published to npm separately as
+  `@joaoh82/sqlrite-wasm`.
+- Tauri installers as GitHub release assets.
+
+This is, for what it's worth, the most fragile part of the project.
+A new binding adds rows to the matrix; a platform regression in any
+of the upstream toolchains breaks a column. The release pipeline is
+where I spend the most time reading other people's CI logs.
+
+## What I'd tell a smaller version of this project
+
+Three things I'd do the same and one I'd do differently.
+
+**Same.** One Rust API. The discipline of making every surface
+wrap-not-extend has saved more time than it's cost.
+
+**Same.** Tauri instead of Electron. The bundle size, the security
+posture, and the fact that the backend is *Rust* mean the desktop
+app doesn't have to learn a new mental model.
+
+**Same.** Build the MCP server early. I didn't, and the people who
+got the most value out of SQLRite first were the ones with
+AI-flavored use cases.
+
+**Differently.** Pin the cdylib's symbol surface from day one.
+Both PyO3 and napi-rs let you regenerate ABIs every release, and
+they will, and you will spend a Saturday afternoon figuring out why
+your Python wheel for macOS arm64 doesn't load. A `crate-type`
+discipline plus a pinned `cdylib-link-lines` is the prevention.
+
+If you want to read the actual code for any of these surfaces:
+
+- Engine: [`src/`](https://github.com/joaoh82/rust_sqlite/tree/main/src)
+- Desktop: [`desktop/`](https://github.com/joaoh82/rust_sqlite/tree/main/desktop)
+- MCP server: [`sqlrite-mcp/`](https://github.com/joaoh82/rust_sqlite/tree/main/sqlrite-mcp)
+- C FFI: [`sqlrite-ffi/`](https://github.com/joaoh82/rust_sqlite/tree/main/sqlrite-ffi)
+- Python / Node / WASM / Go: [`sdk/`](https://github.com/joaoh82/rust_sqlite/tree/main/sdk)
+
+The point of the whole exercise is one thing: a user picks the
+language they already know, and `pip install sqlrite` (or
+`npm install`, or `cargo add`, or `go get`) is the only command
+they have to learn. One database, six surfaces, no thought
+required.
+
+If you want to dig in further, the
+[origin-story post](/blog/why-im-building-sqlrite) covers the
+"why," [the storage deep-dive](/blog/how-sqlrite-stores-rows-on-disk)
+covers the file format that every surface above shares, and
+[the benchmarks post](/blog/sqlrite-vs-sqlite-benchmarks) covers how
+we actually measure whether any of this is fast enough yet. The
+[/docs page](/docs) is the user-facing reference for the whole
+surface.
+
+The next milestone is full-text search and hybrid retrieval — and
+then we start moving the benchmarks. If SQLRite has been useful to
+you, ⭐ the
+[repo](https://github.com/joaoh82/rust_sqlite) — visibility
+matters, especially for a project that wants to live in six
+ecosystems at once.

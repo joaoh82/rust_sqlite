@@ -1,0 +1,235 @@
+---
+title: "Adding vector search to a SQLite-style database with HNSW"
+description: "How SQLRite added a VECTOR(N) column type and an HNSW index to an embedded SQL engine — distance functions, the executor shortcut, and the design tradeoffs of putting an ANN graph next to a B-tree."
+publishedAt: "2026-04-22"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "vector-search", "hnsw", "rust", "rag", "ai"]
+primaryKeyword: "embedded vector search HNSW Rust"
+---
+
+Vector search inside an embedded SQL engine sounds like it should be
+weird, and it sort of is. SQL was built for sets and predicates. ANN
+search is geometry. The two languages don't quite agree on what a
+"row" is, what an "index" does, or what `ORDER BY` should mean when
+the order is "closer to this 384-dimensional point."
+
+But for the AI-shaped year we're in, this is the integration users
+actually want. RAG over local notes. Agent memory. Hybrid retrieval
+that combines a BM25 score with a cosine distance. Today those use
+cases get stitched together with `sqlite-vec` plus FTS5 plus glue
+code; it works, but it's "you, the integrator, are responsible." For
+[SQLRite](https://github.com/joaoh82/rust_sqlite) Phase 7d, I wanted
+the integration to be the engine's job. (For the philosophy behind
+that decision, see [the origin-story post](/blog/why-im-building-sqlrite).
+For how rows actually get to disk underneath all this, see
+[the storage deep-dive](/blog/how-sqlrite-stores-rows-on-disk).)
+
+This post is a retrospective on how that landed: what the API looks
+like, what the index does under the hood, and which tradeoffs were
+not obvious until I'd shipped the wrong version of them.
+
+## The user-facing API
+
+Here is the whole thing:
+
+```sql
+CREATE TABLE docs (
+  id        INTEGER PRIMARY KEY,
+  body      TEXT,
+  embedding VECTOR(384)
+);
+
+CREATE INDEX docs_emb ON docs(embedding) USING HNSW;
+
+INSERT INTO docs (body, embedding) VALUES
+  ('rust embedded database', [0.13, -0.02, ...]);
+
+SELECT id, vec_distance_cosine(embedding, ?) AS dist
+FROM docs
+ORDER BY dist ASC
+LIMIT 10;
+```
+
+`VECTOR(N)` is a column type. The dimension is fixed per column; rows
+that don't conform get rejected with a typed error. Three distance
+functions ship: `vec_distance_cosine`, `vec_distance_dot`,
+`vec_distance_l2`. There's a single `USING HNSW` index type. That's
+the surface.
+
+Bracket array literals are first-class — `[0.13, -0.02, ...]` is a
+vector value, not a string. From Rust:
+
+```rust
+use sqlrite::{Connection, Value};
+
+let mut conn = Connection::open("memory.sqlrite")?;
+let mut stmt = conn.prepare_cached(
+    "SELECT id FROM docs ORDER BY vec_distance_cosine(embedding, ?) ASC LIMIT 10",
+)?;
+let rows = stmt.query_with_params(&[Value::Vector(query_vec)])?.collect_all()?;
+```
+
+A `Value::Vector(Vec<f32>)` binds where a literal would otherwise go,
+which means *prepared* k-NN queries still take the index shortcut.
+That last bit was its own little design problem; more on it below.
+
+## The HNSW index
+
+[HNSW](https://arxiv.org/abs/1603.09320) (Hierarchical Navigable
+Small World) is the standard graph-based ANN index. The summary, in
+two sentences: every vector is a node in a multi-layer graph where
+higher layers are sparser; you start a query at the top, greedily
+hop toward the query, and descend layers as you get closer. It's not
+the only ANN index in the world — IVF-PQ, ScaNN, DiskANN, and
+FAISS-style flat-with-quantization all have their use cases — but
+HNSW has two properties that matter for embedded:
+
+- **Sub-linear search time** without giving up much recall.
+- **No training step.** You insert, you search. There is no "first
+  fit a centroid model on a representative batch." For an embedded
+  database that doesn't know what the workload looks like before the
+  user installs it, this is exactly the right tradeoff.
+
+The downside is build cost. Inserting a vector into HNSW does a
+short-radius search to find its neighbors, then wires them together.
+That's a O(log n) walk per insert with a fan-out of `M` (the
+neighbor cap, default 16). On a million-row dataset, that adds up.
+SQLRite's first version of insert was naïve and bench-bound; the
+fixed version batches insertions and reuses search state.
+
+## Where the graph lives
+
+Two options: in the SQLite-style file format, or in memory rebuilt
+on open.
+
+I tried both. The persistent option is, eventually, the right answer —
+but it's a much bigger change than it sounds. HNSW graphs aren't
+B-trees; their access pattern is "follow many small pointers across
+the graph," which is what virtual memory and `mmap` are good at and
+what 4 KiB pages are not. Persisting the graph in 4 KiB pages either
+spreads neighbors across many pages (fine for spinning disks, awful
+for cache locality) or packs neighbors next to nodes (which means
+node insertions can reshape the layout, which means the diff-based
+pager writes a lot more pages per commit, which is exactly what we
+spent the last phase removing).
+
+So Phase 7d ships **HNSW in memory, rebuilt on open**. The vectors
+themselves still live in the table's B-tree — they're just typed
+column values — so durability and crash safety are unchanged. On
+`Connection::open`, the engine walks the table once and re-inserts
+each vector into a fresh HNSW. For a million 384-dimensional rows,
+this takes a few seconds. For the embedded use cases I care about
+right now (notes, chat history, codebases at human scale), that's
+fine. For bigger tables, it isn't, and persistence is a Phase 9
+problem.
+
+The thing I want to defend here: **the wrong persistence is worse
+than no persistence.** A reader who opens a million-vector database,
+waits 800 ms for the graph rebuild, and runs a query that returns in
+1.5 ms is having a fine time. A reader who opens the same database,
+loads a 200 MB graph file from disk that doesn't quite match the
+table any more, and gets a stale answer is *not*. Embedded
+databases live or die on the user's trust that what they query is
+what they wrote.
+
+## Wiring it into the executor
+
+This is where SQL stops being convenient. The query
+
+```sql
+SELECT id, vec_distance_cosine(embedding, ?) AS dist
+FROM docs
+ORDER BY dist ASC
+LIMIT 10;
+```
+
+…parses as a normal scan-then-sort plan. A naïve executor would
+compute `vec_distance_cosine` for every row in `docs`, sort, and
+take the top 10. That's O(n) per query. We have an HNSW index sitting
+right there.
+
+The executor recognizes a specific shape — `ORDER BY` a
+`vec_distance_*` over the indexed column, `LIMIT k`, no other
+side effects — and rewrites it into an HNSW probe with a bounded
+top-k heap. If the shape doesn't match (because of a `WHERE` clause
+that filters on a non-vector column, say), the query falls back to a
+full scan and the optimizer flags it. We also keep the `WHERE`
+predicate path correct under the rewrite — the heap accepts a row
+only if it satisfies the surviving predicates. This is the
+"post-filter" pattern; it's the same shape Pinecone and pgvector
+use.
+
+There's a third path the executor takes: when `LIMIT k` is large
+enough relative to `n`, the rewrite isn't worth it (HNSW with
+`ef_search` tuned to recall everything stops being sub-linear), and
+we just do the full scan. The threshold is currently a constant; it
+should eventually live in a per-index PRAGMA.
+
+## The thing nobody tells you about prepared statements
+
+A prepared statement looks like a tiny optimization — parse the SQL
+once, run the plan many times. For vector search, it is also a
+correctness requirement: if `?` binds to a different vector each
+time, the plan must still take the HNSW shortcut.
+
+The naïve implementation parses the placeholder as "an opaque
+parameter," and the optimizer can't tell at plan time whether the
+parameter is a vector or a string or an integer. So it can't safely
+rewrite the plan. So you fall back to the full scan, every time.
+
+The fix is small but not obvious: the **prepared cache stores plans
+keyed by the AST shape with parameter slots typed.** When the AST is
+of the form `ORDER BY vec_distance_*(col, ?) LIMIT k` and `col` has
+an HNSW index, we install the rewritten plan and remember that the
+parameter must bind to a `Value::Vector(_)`. At bind time we
+type-check; if the user binds a `Value::Text(_)` instead, we error.
+This is the same trick a real query optimizer uses for parameter
+sniffing, dressed up in 30 lines of code.
+
+`prepare_cached` keeps a per-connection LRU plan cache (default cap
+16). On a hot RAG path, the cache hit means the SQL never parses
+twice and the plan never gets rewritten twice. The cost is exactly
+the lookup.
+
+## A short list of things that surprised me
+
+- **Distance choice matters.** Cosine, dot product, and L2 are not
+  interchangeable, and embeddings shipped by different model families
+  expect different ones. We support all three, but the README needed
+  a paragraph telling users to pick the one their model recommends.
+- **Vectors are huge.** A `VECTOR(1024)` is 4 KiB by itself, which
+  means it always overflows. That's fine, but it changes the cost
+  curve of inserts in a table that has *only* vector columns versus
+  one that mixes vectors with small typed columns.
+- **`LIMIT 1` is the canary.** ANN indexes shine when `k` is small.
+  If your benchmarks all use `LIMIT 100`, you'll think HNSW is
+  modestly faster than scan. If your benchmarks use `LIMIT 10`,
+  HNSW dunks on it. RAG retrieval is in the second regime.
+- **Recall is a knob, not a constant.** HNSW has an `ef_search`
+  parameter that trades recall for latency. Phase 7d picked a
+  conservative default; an upcoming PRAGMA exposes it.
+
+## Where this leaves us
+
+Vector search as a first-class feature of the embedded SQL engine,
+with prepared statements that take the shortcut, with a graph that
+rebuilds on open and otherwise feels invisible, with three distance
+functions and one index type. It is the integration I wanted the
+engine to provide, and it's the bedrock for the next phase: BM25
+full-text search and **hybrid retrieval**, where `bm25_score` and
+`vec_distance_cosine` get to compose in the same query. That's
+[Phase 8](https://github.com/joaoh82/rust_sqlite/blob/main/docs/roadmap.md),
+in flight now.
+
+If you want to play with it, there's a runnable example in
+[`examples/vector-search/`](https://github.com/joaoh82/rust_sqlite/tree/main/examples)
+of the repo, and the [docs page](/docs) covers the
+[query patterns](/docs#vector). The MCP server's `vector_search`
+tool exposes the same API to AI clients with two lines of config —
+the smallest "agent memory" demo I've seen, with no extra moving
+parts.
+
+If SQLRite is useful to you, ⭐ the
+[GitHub repo](https://github.com/joaoh82/rust_sqlite) — visibility
+is the bottleneck for projects like this, and a single star helps
+more than you'd think.
