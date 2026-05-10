@@ -64,21 +64,21 @@ export function Footer() {
             </div>
           </div>
           <div className="foot-col">
-            <h4>Project</h4>
+            <h3>Project</h3>
             <a href={SITE.repo}>GitHub</a>
             <Link href="/docs">Documentation</Link>
             <a href={SITE.docsRs}>Rust API docs</a>
             <a href={SITE.releases}>Releases</a>
           </div>
           <div className="foot-col">
-            <h4>Community</h4>
+            <h3>Community</h3>
             <a href={SITE.discord}>Discord</a>
             <a href={`${SITE.repo}/discussions`}>Discussions</a>
             <a href={`${SITE.repo}/issues`}>Issues</a>
             <a href="https://github.com/sponsors/joaoh82">Sponsor</a>
           </div>
           <div className="foot-col">
-            <h4>Reading</h4>
+            <h3>Reading</h3>
             <a href={SITE.medium}>Series on Medium</a>
             <a href="https://cstack.github.io/db_tutorial/">
               DB tutorial (inspiration)
