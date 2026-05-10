@@ -1,0 +1,222 @@
+---
+title: "Why I'm building SQLRite — an embedded SQL and vector database in Rust"
+description: "An origin story for SQLRite: the design tenets behind a SQLite-style engine rebuilt from scratch in Rust, what's shipped, and what comes next."
+publishedAt: "2026-04-08"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "rust", "databases", "design"]
+primaryKeyword: "embedded SQL database in Rust"
+---
+
+There is a particular kind of software that you can use for a decade
+without ever really seeing. SQLite is one of those. It is everywhere —
+on your phone, in your browser, inside Photoshop, behind your favorite
+editor — and yet most of the people who depend on it have never opened
+the file format spec, never read the page cache, never traced what
+actually happens between `INSERT` and the green light on your SSD.
+
+I started [SQLRite](https://github.com/joaoh82/rust_sqlite) because I
+wanted to *see* it. Not just use it: own it. Build the thing, type the
+B-tree split, watch the WAL frames roll past. SQLRite is what you get
+when you take the constraints that made SQLite great — single file,
+embedded, zero configuration, ACID — and try to rediscover them from
+first principles, in Rust, with one set of eyes on the AI-shaped
+present.
+
+This post is the manifesto. The why before the what.
+
+## What SQLRite is
+
+SQLRite is a from-scratch SQLite-style embedded database written in
+Rust. It ships as a Rust crate
+([`sqlrite-engine`](https://crates.io/crates/sqlrite-engine)), a REPL
+binary, a Tauri desktop app, an MCP stdio server, a C ABI shim, and
+SDKs for Python, Node, Go, and the browser via WASM. One engine, one
+file format, six surfaces.
+
+The core is small enough to read in a weekend:
+
+- A 4 KiB-page on-disk format with cell-encoded rows.
+- A B-tree per table and per index, rebuilt bottom-up on commit.
+- A write-ahead log with crash-safe checkpointing.
+- A SQL surface — `CREATE` / `INSERT` / `SELECT` with predicates,
+  `JOIN`s in all four flavors, aggregates and `GROUP BY`, prepared
+  statements, transactions, `ALTER` / `DROP` / `VACUUM`, `PRAGMA`.
+- A vector type with HNSW indexing for sub-linear k-NN.
+- A BM25 full-text index that composes with the vector path for
+  hybrid retrieval.
+
+Here is what one session looks like:
+
+```sh
+$ cargo install sqlrite-engine
+$ sqlrite app.sqlrite
+sqlrite> CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+sqlrite> INSERT INTO notes (body) VALUES ('the only embedded sql in rust');
+sqlrite> SELECT * FROM notes;
++----+-------------------------------+
+| id | body                          |
++----+-------------------------------+
+|  1 | the only embedded sql in rust |
++----+-------------------------------+
+```
+
+The same engine runs underneath every other surface. You can open the
+same `.sqlrite` file from the REPL, from Python, from Node, from a
+desktop GUI, or from an MCP server — and the bytes on disk don't care.
+
+## Why rebuild SQLite
+
+The honest answer is: to learn the things that you cannot learn by
+reading. There is a whole class of database concepts — page splits,
+WAL replay, free lists, write amplification, cache eviction
+heuristics — that read like trivia until you've shipped a buggy
+version of them. Once you have, you don't forget.
+
+But there is a more interesting answer too, and it has to do with
+*now*.
+
+Embedded databases have a moment again. The reasons are different
+from the ones SQLite was born into. The wave this time is local,
+private, model-shaped: agents that need a working memory; desktop
+apps that ship a vector store and a knowledge graph by default; mobile
+RAG; offline-first sync; LLM tools that want to run a SQL query
+against your project without phoning a server. The classic SQLite
+recipe — single file, embedded, zero config — fits all of that
+beautifully. What does *not* fit is "wait for an extension."
+
+SQLite supports vectors today only through extensions
+([`sqlite-vss`](https://github.com/asg017/sqlite-vss),
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec)) — fine when you
+control the binary, awkward when you ship to users. Full-text search
+is FTS5, an opt-in module. Both are excellent in their domain, but
+the integration story for embedded apps that want both, plus
+hybrid retrieval, plus a desktop installer, plus six SDKs, plus an
+MCP server, is "good luck."
+
+SQLRite's bet is that those things should be in the engine. Vectors
+are a column type. FTS is `CREATE INDEX … USING FTS`. The desktop
+GUI, the MCP server, and the SDKs all link the same Rust crate.
+There's no "extension story" because there's no extension.
+
+## Design tenets
+
+A few principles fall out of that bet, and they have shaped almost
+every implementation choice so far:
+
+1. **One file, end of story.** A SQLRite database is one
+   `.sqlrite` file plus a sidecar WAL during writes. No directories,
+   no config, no daemon. You can `cp` it to back it up and `rsync` it
+   to a peer.
+2. **Crash safety is a feature, not an afterthought.** Every
+   release has a torn-write test, a partial-WAL test, and a header
+   mismatch test. The pager refuses to commit unless the WAL frame
+   landed.
+3. **The lib is the engine.** No `unsafe` you can avoid. Single
+   `Connection` API. Tauri can embed it directly. WASM gets the same
+   surface stripped of POSIX locks.
+4. **Phase-by-phase, public.** SQLRite is built in numbered phases,
+   each with a written plan in `docs/phase-*.md`. The roadmap is open;
+   the design discussions are open; this blog is open. You can read
+   exactly why a decision was made.
+5. **Don't reinvent the parser.** SQLRite uses
+   [`sqlparser`](https://github.com/sqlparser-rs/sqlparser-rs) (SQLite
+   dialect) and only narrows the AST. Inventing grammar is rarely the
+   useful part of building a database.
+
+There is also a tenet that's mostly aesthetic but I think matters:
+**every error returns a typed `SQLRiteError`, no panics ever**. It is
+shocking how much effort that takes, and how much trust it buys.
+
+## What's shipped
+
+As of mid-2026, SQLRite is in version `0.9.x`. The roadmap is broken
+into phases; phases 1–7 are shipped, phase 8 is in flight. The short
+version:
+
+- **Phase 1** — REPL + parser scaffolding.
+- **Phase 2** — typed errors, meta commands.
+- **Phase 3** — B-tree storage.
+- **Phase 4** — pager, WAL, transactions, persistence.
+- **Phase 5** — JOINs (all four flavors), aggregates, `GROUP BY`,
+  prepared statements, `ALTER` / `DROP` / `VACUUM`, `PRAGMA`,
+  free-list reuse with auto-VACUUM.
+- **Phase 6** — desktop GUI (Svelte 5 + Tauri 2), prebuilt
+  installers for macOS / Windows / Linux.
+- **Phase 7** — multi-language story: C FFI, Python (PyO3), Node
+  (napi-rs), Go (cgo), WASM (wasm-bindgen). Plus the **vector
+  column type and HNSW index** in 7d.
+- **Phase 8** — full-text search (FTS5-style inverted index with
+  BM25) and hybrid retrieval. In progress.
+
+The thing I'm proudest of is not any one feature. It's that all six
+surfaces exist at once. You can talk to the same database from a Rust
+unit test, a Python notebook, a `node` REPL, a Go binary, a browser
+tab, and a Claude Code session — and they all see the same B-tree.
+
+## What's coming next
+
+The roadmap continues past Phase 8:
+
+- **Subqueries, then `HAVING`, then CTEs.** The executor is
+  ready for them; the AST narrowing isn't.
+- **Hash and merge joins** for equi-join shapes. The current driver
+  is a plain nested-loop. Adequate for small embedded workloads;
+  silly for any join above a few thousand rows on each side.
+- **Better persistence for HNSW.** The graph is rebuilt on open
+  today. It needs to live in the file format alongside everything
+  else.
+- **More pragmas.** `journal_mode`, `synchronous`, `cache_size`,
+  `page_size` should all be reachable.
+- **Online migrations.** `ALTER` is single-op per statement; the
+  long-running case (rewrite a column under load) deserves better.
+
+Beyond features, the bigger goal is **performance.** SQLRite's
+benchmark suite (which I'll write about
+[in a later post](/blog/sqlrite-vs-sqlite-benchmarks)) compares
+against rusqlite-backed SQLite head to head. The point isn't to beat
+SQLite; SQLite has 25 years of micro-optimization behind it. The
+point is to know exactly where SQLRite is slow, so the curve bends in
+the right direction over time.
+
+## Why open-source it
+
+There is a version of this project that lives on my laptop and never
+ships. I would have learned roughly the same things from it. But that
+version doesn't have a roadmap, doesn't have to defend a feature
+gate, doesn't have to write down why the B-tree commits bottom-up
+instead of in place. I am writing SQLRite in public partly because it
+is more useful to me that way: the act of explaining a decision is
+the act of testing it.
+
+It is also, frankly, more fun. The most rewarding bug reports I have
+ever read came in on a database side project. The internet has a
+small but excellent population of people who care about WAL frames at
+3 a.m., and I would like to keep finding them.
+
+## How to follow along
+
+If you want to play with what's there:
+
+```sh
+cargo install sqlrite-engine          # CLI / REPL
+cargo add sqlrite-engine              # Rust crate
+pip install sqlrite                   # Python
+npm install @joaoh82/sqlrite          # Node
+```
+
+The desktop installer, MCP server, and the
+[docs](/docs) all live at [sqlritedb.com](/). The next post in this
+series digs into how SQLRite actually stores rows on disk —
+[pages, B-trees, and the diff-based pager](/blog/how-sqlrite-stores-rows-on-disk).
+
+If you build something on it, even something small, I would love to
+hear about it. The repo is at
+[github.com/joaoh82/rust_sqlite](https://github.com/joaoh82/rust_sqlite),
+and if SQLRite is useful to you, the most helpful thing you can do is
+⭐ it — visibility is the bottleneck for almost every dev tool.
+
+The whole project is the result of a simple bet: that the embedded
+database deserves a fresh take, that Rust is a good language to make
+that take in, and that the AI-shaped era we're entering will value
+"local, private, single-file, vectors and FTS in the box" more, not
+less. We will see. Either way, the journey is worth writing about.

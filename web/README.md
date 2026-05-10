@@ -17,6 +17,10 @@ extracted into its own repository later without rewrites.
 
 - `/` — landing (hero with animated REPL, features, architecture, roadmap, SDK switcher, SQL surface, desktop showcase, blog series, footer)
 - `/docs` — Getting Started page (sticky sidebar nav + on-page TOC)
+- `/blog` — index of long-form posts pulled from `content/blog/*.mdx`
+- `/blog/[slug]` — per-post detail page (MDX rendered server-side, `Article` JSON-LD, breadcrumb JSON-LD, dynamic OG image, prev/next navigation)
+- `/blog/tags/[tag]` — tag pages (one per unique frontmatter tag)
+- `/blog/rss.xml` — RSS 2.0 feed
 
 ## SEO surface
 
@@ -43,8 +47,9 @@ Each public route ships full search/social metadata. The pieces:
   [`src/app/robots.ts`](src/app/robots.ts)). Add a route to the `ROUTES`
   list when shipping a new page.
 - **JSON-LD structured data** — `SoftwareApplication` schema on the landing
-  page, `BreadcrumbList` on `/docs`. Validate via Google's
-  [Rich Results Test](https://search.google.com/test/rich-results).
+  page, `BreadcrumbList` on `/docs`, `Blog` on `/blog`, and
+  `BlogPosting` + `BreadcrumbList` on each `/blog/<slug>`. Validate via
+  Google's [Rich Results Test](https://search.google.com/test/rich-results).
 - **Search Console verification** — fill in the placeholder tokens in
   `metadata.verification` ([`src/app/layout.tsx`](src/app/layout.tsx)) once
   Google Search Console + Bing Webmaster Tools issue them.
@@ -73,18 +78,73 @@ npm run lint       # next lint (ESLint)
 
 ```
 web/
+├── content/
+│   └── blog/                # MDX posts (one .mdx file per post; frontmatter at top)
 ├── src/
 │   ├── app/
 │   │   ├── globals.css      # design tokens + utility CSS (ports the original design's styles.css)
 │   │   ├── layout.tsx       # root layout, fonts (Inter + JetBrains Mono via next/font)
 │   │   ├── page.tsx         # landing
-│   │   └── docs/page.tsx    # /docs
+│   │   ├── docs/page.tsx    # /docs
+│   │   ├── blog/            # /blog index, [slug] detail, tags/[tag], rss.xml
+│   │   ├── sitemap.ts       # /sitemap.xml — enumerates static + per-post + per-tag URLs
+│   │   └── robots.ts        # /robots.txt
 │   ├── components/          # one .tsx per landing section (hero, features, roadmap, …)
 │   └── lib/
+│       ├── blog.ts          # MDX loader: frontmatter parsing, post enumeration, tag helpers
+│       ├── og.tsx           # shared OpenGraph frame
 │       ├── site.ts          # SITE constants (version, repo URL, social links)
 │       └── utils.ts         # shadcn cn() helper
 └── components.json          # shadcn/ui config
 ```
+
+## Blog
+
+The blog is content-driven. Posts live as `.mdx` files in
+[`content/blog/`](content/blog) and are rendered server-side via
+[`next-mdx-remote`](https://github.com/hashicorp/next-mdx-remote).
+Frontmatter is parsed by `gray-matter`.
+
+### Adding a post
+
+Create `content/blog/<slug>.mdx`:
+
+```mdx
+---
+title: "Your post title"
+description: "One-sentence description used in <meta>, OG, RSS."
+publishedAt: "2026-05-10"          # ISO date, sorts the index
+updatedAt: "2026-05-12"            # optional
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "rust"]          # also drives /blog/tags/[tag]
+primaryKeyword: "rust sql engine"  # optional, for SEO bookkeeping
+---
+
+Body text in Markdown / MDX.
+```
+
+Then:
+
+- The post is automatically picked up by `/blog`, `/blog/<slug>`,
+  every relevant `/blog/tags/<tag>`, the RSS feed, and the sitemap.
+- An OG image is generated dynamically from the title +
+  description at `/blog/<slug>/opengraph-image`.
+- `BlogPosting` JSON-LD and `BreadcrumbList` JSON-LD are injected
+  on the detail page.
+
+### Required frontmatter validity
+
+`src/lib/blog.ts` validates frontmatter at load time and throws if
+`title`, `description`, `publishedAt`, `author`, or `tags` is
+missing / wrong-typed. The build will fail fast in CI rather than
+shipping a half-broken post.
+
+### MDX caveats
+
+`<` and `{` in prose can confuse the MDX parser. Wrap them in
+backticks or escape (`&lt;`, `\{`). The MDX renderer auto-routes
+internal `[link](/foo)` markdown links through `next/link`; external
+links open in a new tab via `rel="noreferrer"`.
 
 The design tokens (colors, typography, spacing) live in `globals.css`'s
 `@theme` block. The page-level CSS (sections, terminal, feature grid,

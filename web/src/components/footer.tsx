@@ -67,6 +67,7 @@ export function Footer() {
             <h3>Project</h3>
             <a href={SITE.repo}>GitHub</a>
             <Link href="/docs">Documentation</Link>
+            <Link href="/blog">Blog</Link>
             <a href={SITE.docsRs}>Rust API docs</a>
             <a href={SITE.releases}>Releases</a>
           </div>
@@ -79,10 +80,9 @@ export function Footer() {
           </div>
           <div className="foot-col">
             <h3>Reading</h3>
+            <Link href="/blog">Blog</Link>
+            <Link href="/blog/rss.xml">RSS feed</Link>
             <a href={SITE.medium}>Series on Medium</a>
-            <a href="https://cstack.github.io/db_tutorial/">
-              DB tutorial (inspiration)
-            </a>
             <a href={SITE.archDoc}>Architecture</a>
             <a href={SITE.roadmapDoc}>Roadmap</a>
           </div>
