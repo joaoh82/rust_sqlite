@@ -77,13 +77,22 @@ use crate::sql::pager::pager::{AccessMode, acquire_lock};
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_MAGIC: &[u8; 8] = b"SQLRWAL\0";
 /// The version the engine writes today. Phase 11.2 bumped 1 → 2 to
-/// introduce [`WalHeader::clock_high_water`] in bytes 24..32 of the
-/// WAL header. `read_header` still accepts v1 files (treating those
-/// bytes as zero); the next `truncate` rewrites them as v2.
-pub const WAL_FORMAT_VERSION: u32 = 2;
+/// Bumped 2 → 3 in Phase 11.9 to mark "may contain MVCC log-record
+/// frames" — frames whose `page_num` field carries
+/// [`crate::mvcc::MVCC_FRAME_MARKER`] (`u32::MAX`) instead of a
+/// real page number. v1 and v2 readers had no special-case for that
+/// marker and a pre-Phase-11.9 checkpoint would try to flush it to
+/// the main file at offset `u32::MAX * PAGE_SIZE` (way past EOF),
+/// which is why the bump is needed.
+pub const WAL_FORMAT_VERSION: u32 = 3;
 /// Lowest format version we know how to open. v1 had the bytes that
 /// now hold `clock_high_water` reserved-as-zero, which is identical
-/// to "clock has never been persisted" and round-trips cleanly.
+/// to "clock has never been persisted" and round-trips cleanly. v2
+/// adds the clock_high_water field but no MVCC frames. v3 adds MVCC
+/// frames; downgrading a v3 WAL into a v2 reader would mis-handle
+/// the MVCC marker page number — but a fresh `truncate` (every
+/// checkpoint) rewrites the header at the engine's current version,
+/// so the cross-version exposure is bounded.
 pub const WAL_FORMAT_VERSION_MIN_SUPPORTED: u32 = 1;
 pub const FRAME_HEADER_SIZE: usize = 16;
 pub const FRAME_SIZE: usize = FRAME_HEADER_SIZE + PAGE_SIZE;
@@ -142,6 +151,13 @@ pub struct Wal {
     /// Total valid frames (up to and including `last_commit_offset`).
     /// Used by the checkpointer in Phase 4d to decide whether to run.
     frame_count: usize,
+    /// Phase 11.9 — MVCC commit batches recovered from the WAL on
+    /// open, in the order they were committed (oldest first).
+    /// Populated by `replay_frames` from frames carrying
+    /// `page_num = MVCC_FRAME_MARKER`. `Pager::open` exposes the
+    /// vector so the engine can replay them into `MvStore` on
+    /// reopen.
+    recovered_mvcc: Vec<crate::mvcc::MvccCommitBatch>,
 }
 
 impl Wal {
@@ -172,6 +188,7 @@ impl Wal {
             last_commit_offset: WAL_HEADER_SIZE as u64,
             last_commit_page_count: None,
             frame_count: 0,
+            recovered_mvcc: Vec::new(),
         };
         wal.write_header()?;
         wal.file.flush()?;
@@ -208,6 +225,7 @@ impl Wal {
             last_commit_offset: WAL_HEADER_SIZE as u64,
             last_commit_page_count: None,
             frame_count: 0,
+            recovered_mvcc: Vec::new(),
         };
         wal.replay_frames()?;
         Ok(wal)
@@ -345,6 +363,15 @@ impl Wal {
         self.last_commit_offset = WAL_HEADER_SIZE as u64;
         self.last_commit_page_count = None;
         self.frame_count = 0;
+        // Phase 11.9 — the recovered MVCC batches were a snapshot
+        // taken at WAL replay time and represent commits the
+        // current process has now seen. Clearing them on truncate
+        // matches the legacy `latest_frame.clear()` policy: the
+        // WAL is now empty on disk, so the in-memory mirror is
+        // empty too. (The engine still holds the *applied* state
+        // in `MvStore`; this vector is only the rebuildable-from-
+        // WAL portion.)
+        self.recovered_mvcc.clear();
         Ok(())
     }
 
@@ -420,20 +447,41 @@ impl Wal {
     /// would shadow the previous committed frame for page N, erasing it
     /// from visibility.
     fn replay_frames(&mut self) -> Result<()> {
+        use crate::mvcc::{MVCC_FRAME_MARKER, MvccCommitBatch};
+
         let file_len = self.file.seek(SeekFrom::End(0))?;
         let mut offset = WAL_HEADER_SIZE as u64;
         let mut pending: HashMap<u32, u64> = HashMap::new();
+        // Phase 11.9 — MVCC batches waiting for the next commit
+        // barrier. They share the legacy page-commit barrier's
+        // fsync, so we promote them at the same `is_commit` point
+        // page frames are promoted.
+        let mut pending_mvcc: Vec<MvccCommitBatch> = Vec::new();
         while offset + FRAME_SIZE as u64 <= file_len {
             match self.read_frame_at(offset) {
-                Ok((header, _body)) => {
+                Ok((header, body)) => {
                     self.frame_count += 1;
-                    pending.insert(header.page_num, offset);
+                    if header.page_num == MVCC_FRAME_MARKER {
+                        // MVCC log-record frame. Decode body now —
+                        // if it's corrupt the whole frame falls
+                        // out of the log (treated the same as a
+                        // bad checksum).
+                        match MvccCommitBatch::decode(body.as_ref()) {
+                            Ok(batch) => pending_mvcc.push(batch),
+                            Err(_) => break,
+                        }
+                    } else {
+                        pending.insert(header.page_num, offset);
+                    }
                     if header.is_commit() {
-                        // Seal: promote all pending frames (including
-                        // this commit frame itself) into latest_frame.
+                        // Seal: promote all pending page frames
+                        // (including this commit frame itself)
+                        // into latest_frame, plus all pending
+                        // MVCC batches into recovered_mvcc.
                         for (p, o) in pending.drain() {
                             self.latest_frame.insert(p, o);
                         }
+                        self.recovered_mvcc.extend(pending_mvcc.drain(..));
                         self.last_commit_offset = offset + FRAME_SIZE as u64;
                         self.last_commit_page_count = Some(header.commit_page_count);
                     }
@@ -444,9 +492,40 @@ impl Wal {
                 Err(_) => break,
             }
         }
-        // Anything still in `pending` belongs to a transaction that never
-        // committed (crash, or a writer that died mid-append). Drop it.
+        // Anything still in `pending` or `pending_mvcc` belongs to
+        // a transaction that never committed (crash, or a writer
+        // that died mid-append). Drop it — the legacy and the
+        // MVCC writes both fail together, matching the atomicity
+        // contract.
         Ok(())
+    }
+
+    /// Phase 11.9 — appends an MVCC commit batch as a single WAL
+    /// frame whose `page_num` is set to
+    /// [`MVCC_FRAME_MARKER`](crate::mvcc::MVCC_FRAME_MARKER).
+    ///
+    /// Writes the frame as a "dirty" frame
+    /// (`commit_page_count = None`) so it doesn't seal a
+    /// transaction by itself — it piggybacks on the next legacy
+    /// page-commit frame's fsync. This is the durability boundary
+    /// for `BEGIN CONCURRENT`: the MVCC batch and the legacy page
+    /// updates of the same transaction land in the WAL together
+    /// and either both survive the next fsync or both fall away
+    /// at the torn-write boundary on reopen.
+    ///
+    /// `Connection::commit_concurrent` calls this right before
+    /// `save_database`, so the same fsync covers both.
+    pub fn append_mvcc_batch(&mut self, batch: &crate::mvcc::MvccCommitBatch) -> Result<()> {
+        let body = batch.encode()?;
+        self.append_frame(crate::mvcc::MVCC_FRAME_MARKER, body.as_ref(), None)
+    }
+
+    /// Phase 11.9 — returns the MVCC commit batches recovered from
+    /// the WAL on open, in commit order. Empty if no MVCC frames
+    /// were present (a brand-new WAL, a pre-11.9 v1/v2 WAL, or one
+    /// where the last commit barrier dropped MVCC frames).
+    pub fn recovered_mvcc_commits(&self) -> &[crate::mvcc::MvccCommitBatch] {
+        &self.recovered_mvcc
     }
 }
 

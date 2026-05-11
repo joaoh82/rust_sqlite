@@ -329,6 +329,7 @@ A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page
 │     8  │    4   │ format version (u32 LE)                         │
 │        │        │   1 = pre-Phase-11                              │
 │        │        │   2 = Phase 11.2 — adds clock_high_water        │
+│        │        │   3 = Phase 11.9 — adds MVCC log-record frames  │
 │    12  │    4   │ page size      (u32 LE) = 4096                  │
 │    16  │    4   │ salt (u32 LE) — rolled each checkpoint          │
 │    20  │    4   │ checkpoint seq (u32 LE) — increments per ckpt   │
@@ -343,9 +344,21 @@ A second file alongside the `.sqlrite`, named `<stem>.sqlrite-wal`, records page
 were reserved-zero in v1, so a pre-Phase-11 WAL opens cleanly: the
 parser interprets the zeros as `clock_high_water = 0`, which is
 indistinguishable from "fresh checkpoint, clock has never advanced."
-The next checkpoint rewrites the header at v2 — there's no offline
-upgrade step. Forward versions we don't recognize (e.g. v3) error
-out with a clean diagnostic rather than misinterpreting the bytes.
+The next checkpoint rewrites the header at the current version —
+there's no offline upgrade step. Forward versions we don't recognise
+error out with a clean diagnostic rather than misinterpreting the
+bytes.
+
+**v2 → v3 compatibility.** v3 doesn't change the header layout at
+all — only the set of frame kinds the body stream can carry. A v2
+reader on a v3 file would still parse every frame correctly *except*
+that it would not recognise the MVCC-marker frames and would skip
+them silently as if they were unknown page numbers (the page-number
+field reads `u32::MAX`). We bump the header anyway so v2 readers
+emit the usual "unsupported WAL format version" diagnostic on a v3
+WAL, surfacing the mismatch instead of silently losing MVCC
+durability. The current build accepts v1..=v3 on open and writes v3
+on every new WAL.
 
 ### Frames
 
@@ -366,6 +379,67 @@ Each frame is `FRAME_HEADER_SIZE + PAGE_SIZE` = **4112 bytes**:
 │    16  │ 4096   │ page body                                       │
 └────────┴────────┴─────────────────────────────────────────────────┘
 ```
+
+### MVCC log-record frames (Phase 11.9)
+
+When the database is in `journal_mode = mvcc`, a successful `BEGIN
+CONCURRENT` commit appends a second frame on top of the legacy page
+frames: an MVCC log record that captures the resolved write-set.
+The frame uses the same 4112-byte envelope but is distinguished by
+the page-number field carrying the sentinel `u32::MAX`
+(`MVCC_FRAME_MARKER`). Real page numbers are bounded by file size,
+so the sentinel can never collide with a legitimate page frame.
+
+The body carries:
+
+```
+┌────────┬────────┬─────────────────────────────────────────────────┐
+│ offset │ length │ content                                         │
+├────────┼────────┼─────────────────────────────────────────────────┤
+│     0  │    8   │ magic: "MVCC0001" (ASCII, no NUL)               │
+│     8  │    8   │ commit_ts (u64 LE)                              │
+│    16  │    2   │ record count (u16 LE)                           │
+│    18  │ var.   │ records — for each:                             │
+│        │        │   1 byte  op tag (0 = Tombstone, 1 = Present)   │
+│        │        │   2 + N   table name (length-prefixed)          │
+│        │        │   8       rowid (i64 LE)                        │
+│        │        │   if op = 1: column count (u16 LE) + per-column │
+│        │        │     (name, type tag, value) tuples              │
+│   ...  │   ...  │ zero-padded to PAGE_SIZE                        │
+└────────┴────────┴─────────────────────────────────────────────────┘
+```
+
+Value type tags inside a record:
+
+```
+0  Null
+1  Int   — 8 bytes i64 LE
+2  Real  — 8 bytes f64 LE
+3  Text  — 4 + N bytes (u32 LE length, then UTF-8 bytes)
+4  Bool  — 1 byte (0 / 1)
+5  Vector — 4 + 4*N bytes (u32 LE length, then f32 LE elements)
+```
+
+A batch must fit in the 4096-byte body; encoder rejects oversize
+batches with a typed error. Multi-frame batches (for very large
+transactions) are a deferred follow-up.
+
+The MVCC frame is appended with `commit_page_count = None` (dirty)
+so its own `fsync` is skipped. The very next legacy commit frame
+that the same `save_database` writes will `fsync` the whole buffer
+— covering both the MVCC frame and the legacy page updates in one
+boundary. A crash between the two append calls drops both, which
+is the right rollback semantics.
+
+On reopen, the replay loop branches on `page_num`:
+`MVCC_FRAME_MARKER` frames are decoded into `MvccCommitBatch` and
+held in a pending list that promotes onto the recovered list each
+time the next legacy commit frame seals the transaction. The
+`Pager` exposes the recovered batches as
+`Pager::recovered_mvcc_commits()`; `pager::open_database` drains
+them into `Database::mv_store` via `MvStore::push_committed` and
+seeds `Database::mvcc_clock` past the highest replayed
+`commit_ts`.
 
 ### Torn-write recovery
 

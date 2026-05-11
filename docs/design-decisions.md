@@ -252,6 +252,63 @@ Each statement inside the transaction runs against the working `tables` clone vi
 
 ---
 
+### 12g. MVCC commits piggyback on the legacy save's fsync (Phase 11.9)
+
+**Decision.** `BEGIN CONCURRENT` commits now leave a typed
+[`MvccCommitBatch`](../src/mvcc/log.rs) frame in the WAL *before*
+the legacy `save_database` runs. The MVCC frame uses
+`page_num = MVCC_FRAME_MARKER (u32::MAX)` and `commit_page_count =
+None`, so it is **not** fsync'd on its own. The legacy save then
+appends its page commits and ends with the existing page-0 commit
+frame (which *is* fsync'd). That single fsync flushes everything
+buffered behind it, covering the MVCC frame and the page commits
+in one durability boundary.
+
+**Why piggyback rather than fsync per MVCC frame.** Each fsync is
+the dominant cost of a small commit (often >90% of wall time on
+SSDs). Dual fsyncs would double the cost of a `BEGIN CONCURRENT`
+commit relative to a legacy commit for no correctness gain — the
+two writes already need to be atomic with each other (a crash that
+keeps one but loses the other would either resurrect uncommitted
+state in `MvStore` or hide a durable legacy update from the
+in-memory MVCC index). Sharing the boundary makes the atomicity
+free: torn-write recovery already drops dirty frames past the last
+commit barrier, and that recovery treats the MVCC frame as just
+another dirty frame waiting for its commit-barrier.
+
+**Why the marker is `u32::MAX`.** Page numbers are bounded by the
+file's `page_count`, which sits well below `u32::MAX` for any
+realistic database (the maximum page-addressable file size at
+4 KiB pages is 16 TiB). Choosing the sentinel from outside the
+legal range keeps the discriminator a single integer comparison
+on the existing frame-header layout — no new flag field, no
+binary-incompatible header.
+
+**Why the clock is seeded from `max(header.clock_high_water,
+max(commit_ts in WAL))`.** The WAL header's `clock_high_water`
+field is only persisted on checkpoint (which fsync's the
+truncated WAL). Between checkpoints, the in-memory header is
+ahead of the on-disk header — and an unclean process exit drops
+that in-memory lead. The MVCC frames themselves are durable, and
+each carries its `commit_ts`, so the replay walks the recovered
+batches and takes the higher of the two seeds. Without this
+maxing step a crash between commits and checkpoint could let a
+post-reopen transaction hand out a `begin_ts` *below* an
+already-committed version's `end` — an immediate snapshot-isolation
+violation.
+
+**What 11.9 deferred.** The checkpoint half of plan-doc Phase
+10.5: draining `MvStore` versions back into the pager so a
+WAL truncate doesn't lose them, and re-enabling the `Mvcc → Wal`
+journal-mode downgrade. The legacy save mirror still covers
+durability of the visible row state on the read path, so this
+gap is foundation work — not a correctness regression — and
+the existing per-commit GC bounds in-memory chain growth.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §3.3 (durability model), §4.6 (WAL log records), §10.5 (checkpoint integration — partially shipped, see note in plan doc).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

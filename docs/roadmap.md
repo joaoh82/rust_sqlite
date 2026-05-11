@@ -657,7 +657,7 @@ Bounds in-memory growth of the [`MvStore`](../src/mvcc/store.rs) version chains.
 - **Go SDK**: two new sentinel error values `sqlrite.ErrBusy` / `sqlrite.ErrBusySnapshot`, plus an `IsRetryable(err error) bool` helper. `wrapErr` recognises the new FFI status codes and wraps the engine message with `fmt.Errorf("…: %w", ErrBusy)`.
 - **WASM SDK** — deliberately untouched (browser is single-threaded; multi-handle shape not yet exposed).
 
-### 🚧 Phase 11.8 — Multi-handle SDK shape *(in progress, was plan-doc 11.8's other half; promoted ahead of plan-doc 11.5 again because the 11.7 retry-error machinery can't be exercised end-to-end through any SDK until siblings are reachable)*
+### ✅ Phase 11.8 — Multi-handle SDK shape *(in progress, was plan-doc 11.8's other half; promoted ahead of plan-doc 11.5 again because the 11.7 retry-error machinery can't be exercised end-to-end through any SDK until siblings are reachable)*
 
 Each pre-11.8 SDK `connect()` / `new Database()` built an *isolated* backing DB; the 11.7 `BusyError` / `errorKind` / `ErrBusy` plumbing was reachable but not actually triggerable from user code. This slice exposes the engine's `Connection::connect()` through every reachable language so apps can mint sibling handles that share state, and finally exercise the 11.7 retry idioms with real cross-handle conflicts.
 
@@ -669,9 +669,17 @@ Each pre-11.8 SDK `connect()` / `new Database()` built an *isolated* backing DB;
 
 Each SDK gets end-to-end tests that exercise `BEGIN CONCURRENT` cross-handle conflicts: two sibling handles, two concurrent transactions on the same row, the second commit hits the SDK's typed retryable error, retry succeeds.
 
-### Phase 11.9 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5"; renumbered to follow SDK propagation because durability via the legacy `save_database` mirror already works in v0; this slice is foundation work for cross-process MVCC and column-level WAL deltas)*
+### ✅ Phase 11.9 — WAL log-record durability + crash recovery *(plan-doc "Phase 10.5"; renumbered to follow SDK propagation because durability via the legacy `save_database` mirror already worked in v0)*
 
-MVCC log-record WAL frame format (the deferred 11.4 piece). Commit appends log records pre-`save_database`. Reopen replays log records into `MvStore`. Checkpoint drains `MvStore` versions back into the pager (so `Mvcc → Wal` becomes legal once the store is empty). Crash-recovery test: kill mid-commit between log-record append and version-chain push; reopen; verify the committed transaction is visible and the half-written one is not.
+MVCC commits now leave a typed log-record frame in the WAL on top of the existing page-level commit. The MVCC frame is appended before the legacy save's commit-frame fsync, so a single fsync covers both: a crash either keeps both or loses both. On reopen, the WAL replay decodes every MVCC frame and re-pushes the row versions into `MvStore`; the in-memory MVCC clock is seeded past the highest replayed `commit_ts` so post-restart transactions can never hand out a regressed `begin_ts`.
+
+- **WAL format version bumped to v3.** v1 / v2 are still readable (replay just sees zero MVCC frames); v3 adds the MVCC frame marker (`page_num = u32::MAX`) and the body codec.
+- **Frame body codec** ([`src/mvcc/log.rs`](../src/mvcc/log.rs)): `MvccCommitBatch { commit_ts, records }` encoded with magic `MVCC0001`, then `commit_ts` (u64 LE), record count (u16 LE), then per-record `(op tag, table name, rowid, optional column-value pairs)`. Everything fits in the 4 KiB frame body; the encoder surfaces a typed error if a single commit overflows (multi-frame batches are a deferred slice).
+- **Append path** ([`src/connection.rs`](../src/connection.rs) `commit_concurrent`): after validation passes, the resolved write-set is encoded into a batch, appended to the WAL (no fsync), and then `save_database` runs and seals the transaction with its own fsync. The clock high-water in the WAL header is also bumped so a future checkpoint persists it.
+- **Replay path** ([`src/sql/pager/mod.rs`](../src/sql/pager/mod.rs) `replay_mvcc_into_db`): drains `Pager::recovered_mvcc_commits` into `MvStore` and observes the clock past `max(header.clock_high_water, max(commit_ts))`. Replay is unconditional — `JournalMode::Wal`-mode databases simply see zero frames.
+- **Tests** ([`src/connection.rs`](../src/connection.rs)): six new cases cover round-trip persistence, multi-row batches, ROLLBACK-leaves-no-frame, legacy-commit-leaves-no-frame, multi-commit replay after an unclean close, and clock-seeding past the last `commit_ts`.
+
+**Out of scope for 11.9** (parked for a follow-up): checkpoint draining the `MvStore` versions back into the pager (which would let `set_journal_mode(Mvcc → Wal)` succeed); a real OS-level kill-mid-commit test (the existing test uses a clean drop, which exercises the same crash-recovery codepath because the WAL is the durable record).
 
 ### Phase 11.10 — Indexes under MVCC *(deferred-by-design, plan-doc "Phase 10.7")*
 

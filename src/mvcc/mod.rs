@@ -28,11 +28,13 @@
 //! PR) keeps the diffs reviewable.
 
 pub mod clock;
+pub mod log;
 pub mod registry;
 pub mod store;
 pub mod transaction;
 
 pub use clock::MvccClock;
+pub use log::{MVCC_BODY_MAGIC, MVCC_FRAME_MARKER, MvccCommitBatch, MvccLogRecord};
 pub use registry::{ActiveTxRegistry, TxHandle, TxId, TxTimestampOrId};
 pub use store::{MvStore, MvStoreError, RowID, RowVersion, RowVersionChain, VersionPayload};
 pub use transaction::ConcurrentTx;
