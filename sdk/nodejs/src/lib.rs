@@ -54,6 +54,118 @@ fn map_err<E: std::fmt::Display>(e: E) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Phase 11.7 — error-kind helper for JS retry loops
+//
+// The engine's `thiserror` Display impl prefixes retryable errors with
+// `"Busy: "` and `"BusySnapshot: "`. That prefix flows through
+// `from_reason(e.to_string())` into `err.message` on the JS side, so
+// JavaScript callers can already discriminate via regex. We expose a
+// typed helper from the SDK so the retry idiom is one named function
+// call instead of a string match — same UX SDK consumers expect from
+// `process.errno` / `err.code` patterns in core Node modules.
+
+/// Distinguishes the three error kinds JS callers care about.
+/// Returned by [`error_kind`]; mirrors the engine's
+/// [`sqlrite::SQLRiteError::is_retryable`] split.
+#[napi(string_enum)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Generic engine error or any non-retryable failure. JS
+    /// callers should propagate this — retrying won't help.
+    Other,
+    /// `BEGIN CONCURRENT` commit hit a row-level write-write
+    /// conflict. The transaction has already been rolled back; the
+    /// retry helper should call the user's closure again with a
+    /// fresh `BEGIN CONCURRENT`.
+    Busy,
+    /// Snapshot-isolation read anomaly. Same retry semantics as
+    /// `Busy`; SDK retry helpers branch on either kind.
+    BusySnapshot,
+}
+
+/// Classifies a thrown error's `.message` into a retryable kind.
+/// Pass `err.message` (a JS string) and the helper returns the
+/// matching [`ErrorKind`]. Use it inside a `catch` block to
+/// decide whether to retry:
+///
+/// ```js
+/// const { Database, errorKind, ErrorKind } = require('@joaoh82/sqlrite');
+/// // ... open db, set journal_mode = mvcc ...
+/// while (true) {
+///   try {
+///     db.exec('BEGIN CONCURRENT');
+///     db.exec("UPDATE t SET v = v + 1 WHERE id = 1");
+///     db.exec('COMMIT');
+///     break;
+///   } catch (err) {
+///     const kind = errorKind(err.message);
+///     if (kind === ErrorKind.Busy || kind === ErrorKind.BusySnapshot) {
+///       continue; // retryable
+///     }
+///     throw err;
+///   }
+/// }
+/// ```
+#[napi]
+pub fn error_kind(message: String) -> ErrorKind {
+    classify_error_message(&message)
+}
+
+/// Pure Rust classifier — split out so the unit tests don't need
+/// to spin up napi. Returns the kind based on the engine's
+/// `thiserror` prefix conventions: `"Busy: "` / `"BusySnapshot: "`.
+fn classify_error_message(message: &str) -> ErrorKind {
+    // Note the ordering: `BusySnapshot` is checked first because
+    // it's a prefix of itself but `Busy: ` is also a prefix of
+    // `BusySnapshot: `. Matching the long form first avoids
+    // mis-classifying snapshot errors as plain Busy.
+    if message.starts_with("BusySnapshot: ") {
+        ErrorKind::BusySnapshot
+    } else if message.starts_with("Busy: ") {
+        ErrorKind::Busy
+    } else {
+        ErrorKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_recognises_busy_prefix() {
+        assert_eq!(
+            classify_error_message("Busy: write-write conflict on accounts/1"),
+            ErrorKind::Busy
+        );
+    }
+
+    #[test]
+    fn classify_recognises_busy_snapshot_prefix() {
+        assert_eq!(
+            classify_error_message("BusySnapshot: row 5 changed under us"),
+            ErrorKind::BusySnapshot
+        );
+    }
+
+    #[test]
+    fn classify_returns_other_for_generic_errors() {
+        assert_eq!(
+            classify_error_message("General error: bad SQL syntax"),
+            ErrorKind::Other
+        );
+        assert_eq!(classify_error_message(""), ErrorKind::Other);
+        // A regular SELECT result shouldn't accidentally match
+        // — explicitly check a message that contains "Busy" but
+        // not as the prefix.
+        assert_eq!(
+            classify_error_message("The host is Busy: ..."),
+            ErrorKind::Other
+        );
+    }
+}
+
 /// Converts a `sqlrite::Value` into a napi-compatible JS value using the
 /// env to allocate. Used both for row values and for error contexts.
 fn value_to_js(env: &Env, v: &Value) -> Result<JsUnknown> {

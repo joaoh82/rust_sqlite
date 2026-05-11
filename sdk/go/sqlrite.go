@@ -127,12 +127,65 @@ const (
 	statusOk              Status = 0
 	statusError           Status = 1
 	statusInvalidArgument Status = 2
-	statusDone            Status = 101
-	statusRow             Status = 102
+	// Phase 11.7 — retryable-error codes the C FFI surfaces from
+	// `BEGIN CONCURRENT` commit conflicts. See `ErrBusy` /
+	// `ErrBusySnapshot` below for the Go-side sentinels callers
+	// match against.
+	statusBusy         Status = 5
+	statusBusySnapshot Status = 6
+	statusDone         Status = 101
+	statusRow          Status = 102
 )
+
+// Phase 11.7 — retryable error sentinels exposed to Go callers.
+// Match against them with `errors.Is(err, sqlrite.ErrBusy)` /
+// `errors.Is(err, sqlrite.ErrBusySnapshot)` to drive a retry
+// loop:
+//
+//	for {
+//	    tx, err := db.Begin()
+//	    if err != nil { return err }
+//	    // ... do work, then:
+//	    err = tx.Commit()
+//	    if err == nil { break }
+//	    if errors.Is(err, sqlrite.ErrBusy) ||
+//	        errors.Is(err, sqlrite.ErrBusySnapshot) {
+//	        // tx was already rolled back by the engine
+//	        continue
+//	    }
+//	    return err
+//	}
+//
+// Use [IsRetryable] for a kind-agnostic check.
+var (
+	// ErrBusy is returned when a `BEGIN CONCURRENT` commit hits a
+	// row-level write-write conflict. The transaction has already
+	// been rolled back; the caller should retry the whole
+	// transaction with a fresh `BEGIN CONCURRENT`.
+	ErrBusy = errors.New("sqlrite: busy (write-write conflict; transaction rolled back, retry)")
+
+	// ErrBusySnapshot is returned when a `BEGIN CONCURRENT` read
+	// sees a row that has been superseded after the transaction's
+	// snapshot was taken. Same retry semantics as `ErrBusy`.
+	ErrBusySnapshot = errors.New("sqlrite: busy snapshot (snapshot stale; transaction rolled back, retry)")
+)
+
+// IsRetryable reports whether `err` chains an `ErrBusy` or
+// `ErrBusySnapshot` and should therefore be retried by the
+// caller. Use it instead of comparing against individual
+// sentinels so a future retryable variant (e.g. lock-wait
+// timeout) doesn't force a caller-side change.
+func IsRetryable(err error) bool {
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrBusySnapshot)
+}
 
 // wrapErr returns a Go error when the status code is nonzero. Use
 // after any `sqlrite_*` call that can fail.
+//
+// Phase 11.7 — retryable statuses surface as errors that wrap the
+// matching sentinel (`ErrBusy` / `ErrBusySnapshot`) so callers can
+// use `errors.Is` to branch their retry loops without parsing the
+// message.
 func wrapErr(status Status, op string) error {
 	if status == statusOk {
 		return nil
@@ -141,7 +194,14 @@ func wrapErr(status Status, op string) error {
 	if msg == "" {
 		msg = fmt.Sprintf("SQLRite status %d", uint32(status))
 	}
-	return fmt.Errorf("sqlrite: %s: %s", op, msg)
+	switch status {
+	case statusBusy:
+		return fmt.Errorf("sqlrite: %s: %s: %w", op, msg, ErrBusy)
+	case statusBusySnapshot:
+		return fmt.Errorf("sqlrite: %s: %s: %w", op, msg, ErrBusySnapshot)
+	default:
+		return fmt.Errorf("sqlrite: %s: %s", op, msg)
+	}
 }
 
 // cString converts a Go string into a C-allocated NUL-terminated

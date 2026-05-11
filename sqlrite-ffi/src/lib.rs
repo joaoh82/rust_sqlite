@@ -71,10 +71,38 @@ pub enum SqlriteStatus {
     /// A required pointer argument was null, or an input string was
     /// invalid UTF-8 / not NUL-terminated.
     InvalidArgument = 2,
+    /// Phase 11.7 — a `BEGIN CONCURRENT` commit hit a row-level
+    /// write-write conflict. The transaction has already been
+    /// rolled back; the caller should retry the whole
+    /// transaction with a fresh `BEGIN CONCURRENT`. SDK retry
+    /// helpers branch on this code (or its `BusySnapshot`
+    /// sibling) and call their user-provided closure again.
+    Busy = 5,
+    /// Phase 11.7 — same retry semantics as [`Self::Busy`], but
+    /// surfaces the snapshot-isolation specific case (a row in
+    /// the transaction's read-set changed under us). Reserved
+    /// for the read-anomaly path Phase 11.5+ wires through
+    /// `MvStore`; today the engine emits it from the same
+    /// `BEGIN CONCURRENT` commit path. Distinguished from
+    /// `Busy` so SDKs can map each to its own
+    /// per-language exception class without forking on the
+    /// message string.
+    BusySnapshot = 6,
     /// A SELECT query returned no more rows (returned from `step`).
     Done = 101,
     /// A SELECT query produced a row (returned from `step`).
     Row = 102,
+}
+
+impl SqlriteStatus {
+    /// Phase 11.7 — true for [`Self::Busy`] and
+    /// [`Self::BusySnapshot`]. Mirrors `SQLRiteError::is_retryable`
+    /// on the Rust side; SDK retry helpers should branch on this
+    /// rather than matching specific codes so a future retryable
+    /// code (e.g. lock-wait timeout) doesn't break callers.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy | Self::BusySnapshot)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +181,11 @@ struct StmtHandle {
 
 /// Turns a `Result<_, E>` into a status code + last-error side effect.
 /// Callers capture the `Ok` value via an out-parameter before calling this.
+///
+/// The generic version maps every error to [`SqlriteStatus::Error`].
+/// For results carrying an engine-typed `SQLRiteError`, use
+/// [`status_of_sqlrite`] instead so retryable variants surface as
+/// [`SqlriteStatus::Busy`] / [`SqlriteStatus::BusySnapshot`].
 fn status_of<T, E: std::fmt::Display>(r: Result<T, E>) -> (SqlriteStatus, Option<T>) {
     match r {
         Ok(v) => {
@@ -162,6 +195,31 @@ fn status_of<T, E: std::fmt::Display>(r: Result<T, E>) -> (SqlriteStatus, Option
         Err(e) => {
             set_last_error(e.to_string());
             (SqlriteStatus::Error, None)
+        }
+    }
+}
+
+/// Phase 11.7 — specialised [`status_of`] for engine results.
+/// Maps [`sqlrite::SQLRiteError::Busy`] /
+/// [`sqlrite::SQLRiteError::BusySnapshot`] to the distinct status
+/// codes that SDK retry helpers (Python / Node / Go / WASM)
+/// branch on. Every other variant collapses to
+/// [`SqlriteStatus::Error`] with the message in
+/// [`sqlrite_last_error`].
+fn status_of_sqlrite<T>(r: Result<T, sqlrite::SQLRiteError>) -> (SqlriteStatus, Option<T>) {
+    match r {
+        Ok(v) => {
+            clear_last_error();
+            (SqlriteStatus::Ok, Some(v))
+        }
+        Err(e) => {
+            let status = match e {
+                sqlrite::SQLRiteError::Busy(_) => SqlriteStatus::Busy,
+                sqlrite::SQLRiteError::BusySnapshot(_) => SqlriteStatus::BusySnapshot,
+                _ => SqlriteStatus::Error,
+            };
+            set_last_error(e.to_string());
+            (status, None)
         }
     }
 }
@@ -317,7 +375,10 @@ pub unsafe extern "C" fn sqlrite_execute(
     };
     // Safety: caller guarantees `conn` is a valid handle.
     let handle = unsafe { &mut *(conn as *mut ConnHandle) };
-    let (status, _) = status_of(handle.conn.execute(sql_str));
+    // Use the SQLRiteError-aware mapper so `BEGIN CONCURRENT`
+    // commit conflicts surface as `Busy` / `BusySnapshot` rather
+    // than the generic `Error`. SDK retry helpers branch on these.
+    let (status, _) = status_of_sqlrite(handle.conn.execute(sql_str));
     status
 }
 
@@ -1092,6 +1153,104 @@ mod tests {
             sqlrite_close(ptr::null_mut());
             sqlrite_finalize(ptr::null_mut());
             sqlrite_free_string(ptr::null_mut());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.7 — BEGIN CONCURRENT / Busy status surfacing
+    // -----------------------------------------------------------------
+
+    /// Static check: `SqlriteStatus::is_retryable` covers both
+    /// `Busy` and `BusySnapshot`. SDK retry helpers branch on
+    /// this rather than matching specific variants so adding a
+    /// third retryable code later doesn't force a recompile.
+    #[test]
+    fn is_retryable_covers_busy_variants() {
+        assert!(SqlriteStatus::Busy.is_retryable());
+        assert!(SqlriteStatus::BusySnapshot.is_retryable());
+        assert!(!SqlriteStatus::Ok.is_retryable());
+        assert!(!SqlriteStatus::Error.is_retryable());
+        assert!(!SqlriteStatus::InvalidArgument.is_retryable());
+        assert!(!SqlriteStatus::Done.is_retryable());
+        assert!(!SqlriteStatus::Row.is_retryable());
+    }
+
+    /// Two `BEGIN CONCURRENT` transactions on the same row from
+    /// two FFI connections: the second commit must surface as
+    /// `SqlriteStatus::Busy` (not the generic `Error`), and the
+    /// retry on a fresh `BEGIN CONCURRENT` must succeed.
+    ///
+    /// This is the headline SDK contract: every binding layered
+    /// on the FFI can branch on the status code to drive
+    /// language-idiomatic retry helpers.
+    #[test]
+    fn begin_concurrent_busy_status_round_trip() {
+        unsafe {
+            // Two FFI handles sharing the same in-memory DB.
+            let mut a: *mut SqlriteConnection = ptr::null_mut();
+            assert_eq!(sqlrite_open_in_memory(&mut a), SqlriteStatus::Ok);
+            // For Busy to fire we need two `Connection`s that
+            // share the same backing `Database`. The FFI's
+            // `sqlrite_open_in_memory` builds a fresh DB per
+            // call, so we reach into the inner `ConnHandle` and
+            // mint a sibling via `Connection::connect`.
+            let handle_a = &mut *(a as *mut ConnHandle);
+            let conn_b = handle_a.conn.connect();
+            let b: *mut SqlriteConnection =
+                Box::into_raw(Box::new(ConnHandle { conn: conn_b })) as _;
+
+            let (_c, p) = cstr("PRAGMA journal_mode = mvcc;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+
+            let (_c, p) = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("INSERT INTO t (id, v) VALUES (1, 100);");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+
+            // Both transactions open before either writes.
+            let (_c, p) = cstr("BEGIN CONCURRENT;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("BEGIN CONCURRENT;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+
+            let (_c, p) = cstr("UPDATE t SET v = 200 WHERE id = 1;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("UPDATE t SET v = 300 WHERE id = 1;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+
+            // First commit wins.
+            let (_c, p) = cstr("COMMIT;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+
+            // Second commit aborts with Busy — the dedicated
+            // status code SDKs hang their retry helpers off.
+            let (_c, p) = cstr("COMMIT;");
+            let status = sqlrite_execute(b, p);
+            assert_eq!(
+                status,
+                SqlriteStatus::Busy,
+                "expected Busy, got {status:?}; last_err={:?}",
+                last_err()
+            );
+            assert!(status.is_retryable());
+            assert!(
+                last_err()
+                    .map(|e| e.contains("write-write conflict"))
+                    .unwrap_or(false),
+                "Busy status should still set last_error, got {:?}",
+                last_err()
+            );
+
+            // Retry on a fresh BEGIN CONCURRENT succeeds.
+            let (_c, p) = cstr("BEGIN CONCURRENT;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("UPDATE t SET v = 300 WHERE id = 1;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("COMMIT;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+
+            sqlrite_close(b);
+            sqlrite_close(a);
         }
     }
 
