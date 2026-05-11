@@ -16,6 +16,7 @@
 
 pub mod aggregate;
 pub mod bulk_insert;
+pub mod concurrent_writers;
 pub mod fts;
 pub mod group_by;
 pub mod hybrid;

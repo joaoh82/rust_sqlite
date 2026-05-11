@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 
 use crate::{Driver, Value};
 
+#[derive(Clone, Copy)]
 pub struct SQLiteDriver;
 
 impl Driver for SQLiteDriver {
@@ -49,6 +50,14 @@ impl Driver for SQLiteDriver {
             .context("PRAGMA temp_store=MEMORY")?;
         conn.pragma_update(None, "cache_size", -65536i64)
             .context("PRAGMA cache_size=-65536")?;
+        // Phase 11.11b — `busy_timeout = 5s` so the W13 multi-writer
+        // workload's concurrent COMMITs wait for the writer lock
+        // rather than immediately returning SQLITE_BUSY. Without
+        // this, the bench measures lock-collision rate, not
+        // throughput. Single-writer workloads (W1..W12) never hit
+        // contention so the pragma is a no-op for them.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("busy_timeout=5s")?;
         Ok(conn)
     }
 
@@ -128,6 +137,32 @@ impl Driver for SQLiteDriver {
             out.push(buf);
         }
         Ok(out)
+    }
+
+    fn concurrent_begin_sql(&self) -> &'static str {
+        // SQLite's recommended multi-writer shape: acquire the
+        // write lock at BEGIN so two writers don't race into
+        // SQLITE_BUSY at COMMIT. The `busy_timeout` set at open
+        // makes the BEGIN wait for the lock rather than failing
+        // immediately.
+        "BEGIN IMMEDIATE"
+    }
+
+    fn is_retryable_busy(&self, err: &anyhow::Error) -> bool {
+        // SQLite returns SQLITE_BUSY / SQLITE_BUSY_RETRY /
+        // SQLITE_LOCKED on contention. With `busy_timeout` we
+        // mostly *don't* see these — the call blocks instead —
+        // but if the timeout elapses (very rare with our 5s
+        // setting on the W13 workload sizes) we should retry.
+        err.chain()
+            .filter_map(|e| e.downcast_ref::<rusqlite::Error>())
+            .any(|e| {
+                use rusqlite::ErrorCode::*;
+                matches!(
+                    e.sqlite_error_code(),
+                    Some(DatabaseBusy) | Some(DatabaseLocked)
+                )
+            })
     }
 }
 

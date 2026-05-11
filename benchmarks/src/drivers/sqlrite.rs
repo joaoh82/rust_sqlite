@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 
 use crate::{Driver, Value};
 
+#[derive(Clone, Copy)]
 pub struct SQLRiteDriver;
 
 impl Driver for SQLRiteDriver {
@@ -43,8 +44,15 @@ impl Driver for SQLRiteDriver {
     }
 
     fn execute(&self, conn: &mut Self::Conn, sql: &str) -> Result<()> {
+        // Preserve the typed `SQLRiteError` as the anyhow source so
+        // [`is_retryable_busy`] can downcast — the W13 retry loop
+        // needs to distinguish `Busy` / `BusySnapshot` from other
+        // failures. Adding context via `.with_context` keeps the
+        // human-readable wrapper while threading the typed source
+        // underneath.
         conn.execute(sql)
-            .map_err(|e| anyhow::anyhow!("sqlrite execute: {e}\n  sql: {sql}"))?;
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("sqlrite execute: {sql}"))?;
         Ok(())
     }
 
@@ -57,9 +65,11 @@ impl Driver for SQLRiteDriver {
         let bound = to_engine_values(params);
         let mut stmt = conn
             .prepare_cached(sql)
-            .map_err(|e| anyhow::anyhow!("sqlrite prepare_cached: {e}\n  sql: {sql}"))?;
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("sqlrite prepare_cached: {sql}"))?;
         stmt.execute_with_params(&bound)
-            .map_err(|e| anyhow::anyhow!("sqlrite execute_with_params: {e}\n  sql: {sql}"))?;
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("sqlrite execute_with_params: {sql}"))?;
         Ok(())
     }
 
@@ -118,6 +128,44 @@ impl Driver for SQLRiteDriver {
             out.push(buf);
         }
         Ok(out)
+    }
+
+    /// Mint a sibling Connection that shares the primary's
+    /// `Arc<Mutex<Database>>`. A fresh `Connection::open(path)`
+    /// would fail here because the primary already holds an
+    /// exclusive `flock(LOCK_EX)` on the WAL sidecar.
+    fn connect_sibling(&self, primary: &Self::Conn, _path: &Path) -> Result<Self::Conn> {
+        Ok(primary.connect())
+    }
+
+    fn enable_concurrent_mode(&self, conn: &mut Self::Conn) -> Result<()> {
+        // `BEGIN CONCURRENT` requires `journal_mode = mvcc;`
+        // otherwise the engine surfaces a typed error. The PRAGMA
+        // is per-database (not per-connection), so toggling once
+        // on the primary suffices for every sibling.
+        conn.execute("PRAGMA journal_mode = mvcc")
+            .map_err(anyhow::Error::new)
+            .context("PRAGMA journal_mode = mvcc")?;
+        Ok(())
+    }
+
+    fn concurrent_begin_sql(&self) -> &'static str {
+        "BEGIN CONCURRENT"
+    }
+
+    /// SQLRite signals both `Busy` (write-write conflict at commit)
+    /// and `BusySnapshot` (snapshot GC'd under a long-lived reader)
+    /// via `SQLRiteError::is_retryable()`. The bench harness wraps
+    /// engine errors in `anyhow::Error`, so we peel back to the
+    /// typed source and consult the predicate.
+    fn is_retryable_busy(&self, err: &anyhow::Error) -> bool {
+        err.downcast_ref::<sqlrite::SQLRiteError>()
+            .map(|e| e.is_retryable())
+            .unwrap_or(false)
+            || err
+                .chain()
+                .filter_map(|e| e.downcast_ref::<sqlrite::SQLRiteError>())
+                .any(|e| e.is_retryable())
     }
 }
 
