@@ -11,6 +11,7 @@
 package sqlrite_test
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -395,7 +396,7 @@ func TestBeginConcurrentAcrossSqlOpenInstances(t *testing.T) {
 	// COMMIT sequence stays on the same underlying handle for the
 	// whole transaction. `database/sql` would otherwise be free to
 	// round-robin successive Exec calls across pool slots.
-	ctx := t.Context()
+	ctx := context.Background()
 	connA, err := db1.Conn(ctx)
 	if err != nil {
 		t.Fatalf("db1.Conn: %v", err)
@@ -472,11 +473,11 @@ func TestRegistryRefcountDropsToZeroOnLastClose(t *testing.T) {
 		t.Fatalf("sql.Open db2: %v", err)
 	}
 	// Pin a conn from each pool so refcount > 1.
-	c1, err := db1.Conn(t.Context())
+	c1, err := db1.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("db1.Conn: %v", err)
 	}
-	c2, err := db2.Conn(t.Context())
+	c2, err := db2.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("db2.Conn: %v", err)
 	}
