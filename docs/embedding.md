@@ -124,11 +124,13 @@ fn transfer(primary: &mut Connection, src: i64, dst: i64, amount: i64)
 
 The retryable-error branch is the headline new flow: pick a backoff policy that suits your workload (constant, exponential, jittered) and call the same closure again. `SQLRiteError::is_retryable()` covers both `Busy` and `BusySnapshot` so callers don't have to match each variant individually.
 
-**What's still ahead** (11.6+):
+**Memory bounding.** Every successful commit triggers a per-row GC sweep over the write-set's chains, reclaiming versions no in-flight reader can possibly see anymore. For workloads where you want a deterministic full drain (memory-pressure testing, debug snapshots), call `conn.vacuum_mvcc()` — returns the count of versions reclaimed across the whole store. Both paths are correct against in-flight readers: a reader holding `BEGIN CONCURRENT; SELECT …` keeps every version its `begin_ts` snapshot needs.
 
-- Reads inside the transaction now see the BEGIN-time snapshot via both `Connection::execute("SELECT…")` and `Statement::query()` / `query_with_params()` — the prepare/query gap that 11.4 left open closed in 11.5.
+**What's still ahead** (11.7+):
+
+- Reads inside the transaction see the BEGIN-time snapshot via both `Connection::execute("SELECT…")` and `Statement::query()` / `query_with_params()` — the prepare/query gap that 11.4 left open closed in 11.5.
 - DDL inside `BEGIN CONCURRENT` is rejected with a typed error.
-- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.6 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
+- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.7 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
 
 ### What's deferred
 

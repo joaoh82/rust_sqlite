@@ -385,6 +385,93 @@ impl MvStore {
         chain.push(version);
     }
 
+    // -----------------------------------------------------------------
+    // Phase 11.6 — garbage collection
+    // -----------------------------------------------------------------
+
+    /// Returns the GC watermark — the timestamp below which any
+    /// committed-and-superseded version is reclaimable.
+    ///
+    /// - If there's at least one in-flight transaction, the
+    ///   watermark is its `begin_ts` (the smallest one across the
+    ///   active set). Versions whose `end` timestamp is `> watermark`
+    ///   may still be visible to that reader and must be kept.
+    /// - With no in-flight transactions the watermark is `u64::MAX`,
+    ///   meaning every superseded version can go (the latest version
+    ///   per row stays — its `end` is `None`).
+    ///
+    /// The `+1` shift versus the strict snapshot-isolation
+    /// reclamation rule keeps the math simple: `gc_chain` retains
+    /// versions whose end-timestamp is strictly greater than the
+    /// watermark, so `watermark = u64::MAX` reclaims every version
+    /// with `end = Some(_)` cleanly.
+    pub fn active_watermark(&self) -> u64 {
+        self.inner.active.min_active_begin_ts().unwrap_or(u64::MAX)
+    }
+
+    /// Garbage-collects `row_id`'s version chain against
+    /// `watermark`. A committed version is reclaimable when its
+    /// `end` timestamp is `<= watermark` — at that point no
+    /// reader's `begin_ts` falls in the half-open `[begin, end)`
+    /// interval that the snapshot-isolation rule requires for
+    /// visibility. In-flight versions and the latest committed
+    /// version (`end == None`) are always kept.
+    ///
+    /// Returns the number of versions reclaimed. Drops the chain
+    /// from the outer map entirely if it ends up empty (no
+    /// versions left after the sweep), so the per-row entry
+    /// doesn't leak memory.
+    pub fn gc_chain(&self, row_id: &RowID, watermark: u64) -> usize {
+        let chain_arc = match self.lock_map().get(row_id) {
+            Some(arc) => Arc::clone(arc),
+            None => return 0,
+        };
+        let reclaimed = {
+            let mut chain = chain_arc.write().expect("chain RwLock poisoned");
+            let before = chain.len();
+            chain.retain(|v| match v.end {
+                // Committed-end timestamp at or below the watermark
+                // is reclaimable; anything strictly above it is
+                // still possibly visible to a reader.
+                Some(TxTimestampOrId::Timestamp(t)) => t > watermark,
+                // None (latest version) and in-flight `Id(_)` caps
+                // are always kept.
+                _ => true,
+            });
+            before - chain.len()
+        };
+        // Drop the row's outer-map entry if its chain is now
+        // empty. Cheap and avoids accumulating empty rows over
+        // long-running sessions. Re-checks `is_empty` under both
+        // locks so we don't race with a `push_committed` that's
+        // about to add a new version.
+        if reclaimed > 0 {
+            let chain_locked = chain_arc.read().expect("chain RwLock poisoned");
+            if chain_locked.is_empty() {
+                drop(chain_locked);
+                self.lock_map().remove(row_id);
+            }
+        }
+        reclaimed
+    }
+
+    /// Sweeps every row in the store against `watermark`. Returns
+    /// the total number of versions reclaimed. Used by
+    /// [`crate::Connection::vacuum_mvcc`] for an explicit full
+    /// drain; per-commit callers should prefer
+    /// [`MvStore::gc_chain`] over the rows they actually touched.
+    pub fn gc_all(&self, watermark: u64) -> usize {
+        // Snapshot the row keys upfront so we don't hold the outer
+        // map lock across the per-chain locks (avoids a long
+        // critical section that would block concurrent
+        // `push_committed` / `read` calls).
+        let row_ids: Vec<RowID> = self.lock_map().keys().cloned().collect();
+        row_ids
+            .iter()
+            .map(|rid| self.gc_chain(rid, watermark))
+            .sum()
+    }
+
     fn get_or_create_chain(&self, row_id: RowID) -> Arc<RwLock<RowVersionChain>> {
         let mut map = self.lock_map();
         Arc::clone(
@@ -702,5 +789,196 @@ mod tests {
         assert_eq!(store.clock().now(), 42);
         clock.tick(); // clock.tick now == 43
         assert_eq!(store.clock().now(), 43);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11.6 — garbage collection
+    // -----------------------------------------------------------------
+
+    /// With no active readers, the watermark is `u64::MAX` —
+    /// every committed-and-superseded version is reclaimable.
+    /// Latest version (end = None) and in-flight versions stay.
+    #[test]
+    fn active_watermark_is_max_with_no_readers() {
+        let (store, _clock) = MvStore::fresh();
+        assert_eq!(store.active_watermark(), u64::MAX);
+    }
+
+    /// With at least one in-flight transaction, the watermark
+    /// drops to that tx's `begin_ts` (the smallest one across
+    /// the active set).
+    #[test]
+    fn active_watermark_tracks_oldest_in_flight_tx() {
+        let (store, clock) = MvStore::fresh();
+        let h1 = store.active_registry().register(&clock); // begin_ts = 1
+        assert_eq!(store.active_watermark(), 1);
+        let h2 = store.active_registry().register(&clock); // begin_ts = 2
+        assert_eq!(store.active_watermark(), 1);
+        drop(h1);
+        assert_eq!(store.active_watermark(), 2);
+        drop(h2);
+        assert_eq!(store.active_watermark(), u64::MAX);
+    }
+
+    /// `gc_chain` reclaims versions whose `end` timestamp is at or
+    /// below the watermark. The latest (end = None) stays, by
+    /// definition.
+    #[test]
+    fn gc_chain_reclaims_versions_below_watermark() {
+        let (store, _clock) = MvStore::fresh();
+        let row = RowID::new("t", 1);
+        // Build a chain of three committed versions.
+        store
+            .push_committed(row.clone(), RowVersion::committed(1, payload(1)))
+            .unwrap();
+        store
+            .push_committed(row.clone(), RowVersion::committed(5, payload(2)))
+            .unwrap();
+        store
+            .push_committed(row.clone(), RowVersion::committed(9, payload(3)))
+            .unwrap();
+        // After the third push, chain is:
+        //   v1 begin=1 end=5
+        //   v2 begin=5 end=9
+        //   v3 begin=9 end=None
+        assert_eq!(store.total_versions(), 3);
+
+        // Watermark = 5 reclaims v1 (end=5 <= 5). v2 (end=9) is
+        // still possibly visible. v3 (end=None) always stays.
+        let reclaimed = store.gc_chain(&row, 5);
+        assert_eq!(reclaimed, 1);
+        assert_eq!(store.total_versions(), 2);
+
+        // Watermark = MAX reclaims everything that's been
+        // superseded; v3 (end=None) stays.
+        let reclaimed = store.gc_chain(&row, u64::MAX);
+        assert_eq!(reclaimed, 1);
+        assert_eq!(store.total_versions(), 1);
+    }
+
+    /// `gc_chain` drops the row's outer-map entry entirely when
+    /// the chain becomes empty. Cheap and prevents long-running
+    /// sessions from accumulating empty rows.
+    #[test]
+    fn gc_chain_drops_empty_chain_from_map() {
+        let (store, _clock) = MvStore::fresh();
+        let row = RowID::new("t", 1);
+        // Push two versions where the latest one will *also* be
+        // reclaimable: a tombstone capped (artificially) by a
+        // committed end so the whole chain becomes reclaimable.
+        // We can't actually reach this state through the public
+        // API in v0 (the latest version always has end=None), but
+        // the test exercises the empty-chain cleanup branch
+        // explicitly.
+        store
+            .push_committed(row.clone(), RowVersion::committed(1, payload(1)))
+            .unwrap();
+        store
+            .push_committed(
+                row.clone(),
+                RowVersion::committed(5, VersionPayload::Tombstone),
+            )
+            .unwrap();
+        // Forcibly cap the tombstone's end so the whole chain is
+        // reclaimable. (Reaches into the internals — fine for a
+        // unit test, the production path goes through `push_committed`
+        // which always leaves the latest end=None.)
+        {
+            let map = store.inner.versions.lock().unwrap();
+            let chain_arc = map.get(&row).unwrap().clone();
+            drop(map);
+            let mut chain = chain_arc.write().unwrap();
+            if let Some(last) = chain.last_mut() {
+                last.end = Some(TxTimestampOrId::Timestamp(10));
+            }
+        }
+        assert_eq!(store.tracked_rows(), 1);
+
+        let reclaimed = store.gc_chain(&row, u64::MAX);
+        assert_eq!(reclaimed, 2);
+        // Empty chain → row removed from outer map.
+        assert_eq!(store.tracked_rows(), 0);
+    }
+
+    /// `gc_all` sweeps every row's chain in one pass. Returns
+    /// the total versions reclaimed across the store.
+    #[test]
+    fn gc_all_sweeps_every_row() {
+        let (store, _clock) = MvStore::fresh();
+        for rid in 0..4 {
+            let row = RowID::new("t", rid);
+            store
+                .push_committed(row.clone(), RowVersion::committed(1, payload(rid)))
+                .unwrap();
+            store
+                .push_committed(row.clone(), RowVersion::committed(2, payload(rid * 10)))
+                .unwrap();
+        }
+        // Each row has 2 versions: one with end=2 (reclaimable
+        // at high watermark), one with end=None (kept).
+        assert_eq!(store.total_versions(), 8);
+
+        let reclaimed = store.gc_all(u64::MAX);
+        assert_eq!(reclaimed, 4);
+        assert_eq!(store.total_versions(), 4);
+        assert_eq!(store.tracked_rows(), 4);
+    }
+
+    /// GC must not reclaim versions visible to an active reader.
+    /// A reader with `begin_ts = 5` can see versions where
+    /// `begin <= 5 < end`, so versions with `end > 5` must be
+    /// kept.
+    #[test]
+    fn gc_preserves_versions_visible_to_active_readers() {
+        let (store, clock) = MvStore::fresh();
+        let row = RowID::new("t", 1);
+        store
+            .push_committed(row.clone(), RowVersion::committed(1, payload(1)))
+            .unwrap();
+        store
+            .push_committed(row.clone(), RowVersion::committed(10, payload(2)))
+            .unwrap();
+        // Open a reader at begin_ts = 5. (The clock is at 1 right
+        // now from the registers above; bump it past 5 then take
+        // a snapshot via observe.)
+        clock.observe(4);
+        let reader = store.active_registry().register(&clock); // begin_ts = 5
+        assert_eq!(reader.begin_ts(), 5);
+        assert_eq!(store.active_watermark(), 5);
+
+        // The version with end = 10 is still visible to the
+        // reader — must NOT be reclaimed.
+        let reclaimed = store.gc_chain(&row, store.active_watermark());
+        assert_eq!(reclaimed, 0);
+
+        // Reader at begin_ts = 5 sees v1 (begin=1, end=10
+        // satisfies 1 <= 5 < 10).
+        assert_eq!(store.read(&row, 5), Some(payload(1)));
+
+        // Once the reader closes, the watermark jumps to MAX and
+        // v1 becomes reclaimable.
+        drop(reader);
+        let reclaimed = store.gc_chain(&row, store.active_watermark());
+        assert_eq!(reclaimed, 1);
+    }
+
+    /// Many sequential commits to the same row with no active
+    /// reader: chain length stays bounded under per-row GC.
+    /// (`bounded` here = "1 latest version" — every prior version
+    /// is reclaimable because nobody can see them.)
+    #[test]
+    fn gc_keeps_chain_bounded_under_repeated_updates() {
+        let (store, _clock) = MvStore::fresh();
+        let row = RowID::new("t", 1);
+        for ts in 1..=100u64 {
+            store
+                .push_committed(row.clone(), RowVersion::committed(ts, payload(ts as i64)))
+                .unwrap();
+            // Per-update GC sweep at the current watermark
+            // (u64::MAX since no readers).
+            store.gc_chain(&row, store.active_watermark());
+        }
+        // Only the latest version (end = None) survives.
+        assert_eq!(store.total_versions(), 1);
     }
 }
