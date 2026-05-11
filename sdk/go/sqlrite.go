@@ -63,6 +63,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sync"
 	"unsafe"
 )
 
@@ -284,3 +286,159 @@ func rejectNamedParamsForNow(args []driver.NamedValue) error {
 
 // freeCString is a typed alias so call sites read cleanly.
 func freeCString(p *C.char) { C.free(unsafe.Pointer(p)) }
+
+// ---------------------------------------------------------------------------
+// Phase 11.11c — process-level path registry for file-backed siblings.
+//
+// The engine's `Connection::open` takes `flock(LOCK_EX)` on the WAL
+// sidecar, so the *second* `sqlrite_open` for the same path in the
+// same process would deadlock with itself. `database/sql` makes this
+// easy to hit: a single `sql.DB`'s pool spins up additional `Conn`s
+// on demand by calling `driver.Open` again, and applications routinely
+// hold more than one `*sql.DB` against the same file.
+//
+// We thread every file-backed read-write `newConn` call through a
+// process-level registry keyed by canonical absolute path. The first
+// caller pays for a real `sqlrite_open` and the resulting handle is
+// stashed as a hidden "primary" in the registry. Subsequent callers
+// (within the same `sql.DB` pool or across instances) mint a sibling
+// off that primary via `sqlrite_connect_sibling` — sharing the
+// `Arc<Mutex<Database>>` underneath, so they all see the same tables
+// and can each hold their own `BEGIN CONCURRENT`. The registry holds
+// a refcount of outstanding siblings; when the last one closes, the
+// registry closes the primary and drops the entry.
+//
+// **Scope (v0).** Read-only opens and `:memory:` opens skip the
+// registry: a read-only open takes a shared lock that can coexist
+// with other readers but conflicts with any writer in the same
+// process, and `:memory:` databases are isolated by design.
+// Cross-pool sharing for read-only handles is a future follow-up if
+// anyone hits the use case.
+//
+// **Lock order.** Two locks are in play: each `*conn`'s `c.mu`, and
+// the registry's `registryMu`. Acquisition order is always
+// `c.mu` → `registryMu`, never the reverse. `newConn` only holds
+// `registryMu`; `conn.Close` takes `c.mu` first, then `registryMu`.
+
+type sharedEntry struct {
+	// Hidden primary handle owned by the registry. Never exposed
+	// to a `*conn`; every `*conn` gets a sibling minted off it.
+	primary *C.SqlriteConnection
+	// Number of outstanding siblings minted off this primary.
+	// When this hits zero we close the primary and remove the
+	// entry.
+	refcount int32
+}
+
+var (
+	registryMu sync.Mutex
+	// canonical absolute path → entry.
+	pathRegistry = map[string]*sharedEntry{}
+)
+
+// canonicalPath returns the absolute, lexically-cleaned form of
+// `name`. We use this as the registry key so two `sql.Open` calls
+// with different relative paths but the same target resolve to the
+// same entry. Symlinks are *not* resolved — `filepath.Abs` is
+// path-syntactic only. Callers who want symlink-equality should
+// pass an `os.EvalSymlinks`-ed path; for v0 that's their problem,
+// not ours.
+func canonicalPath(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", fmt.Errorf("sqlrite: canonicalize %q: %w", name, err)
+	}
+	return filepath.Clean(abs), nil
+}
+
+// acquireSiblingHandle is the entry point newConn calls for
+// file-backed read-write opens. Returns the sibling handle the
+// caller should own + the canonical path the caller stashes on
+// the `*conn` so Close can find the right entry.
+func acquireSiblingHandle(name string) (*C.SqlriteConnection, string, error) {
+	canonical, err := canonicalPath(name)
+	if err != nil {
+		return nil, "", err
+	}
+
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	entry, ok := pathRegistry[canonical]
+	if !ok {
+		// First open for this path. Create the primary as the
+		// registry's hidden owner. If this `sqlrite_open` fails
+		// (file doesn't exist + we can't create it, locked by
+		// another process, …), surface the error and leave the
+		// registry untouched.
+		cName := cString(canonical)
+		defer freeCString(cName)
+		var primary *C.SqlriteConnection
+		status := Status(C.sqlrite_open(cName, &primary))
+		if err := wrapErr(status, "open"); err != nil {
+			return nil, "", err
+		}
+		entry = &sharedEntry{primary: primary, refcount: 0}
+		pathRegistry[canonical] = entry
+	}
+
+	// Mint a sibling for this caller off the primary.
+	var sibling *C.SqlriteConnection
+	status := Status(C.sqlrite_connect_sibling(entry.primary, &sibling))
+	if err := wrapErr(status, "connect_sibling"); err != nil {
+		// Sibling creation failed. If this entry has no other
+		// outstanding siblings, the primary is dead weight —
+		// close it and drop the entry so a future `newConn`
+		// doesn't try to mint a sibling off a stale handle.
+		if entry.refcount == 0 {
+			C.sqlrite_close(entry.primary)
+			delete(pathRegistry, canonical)
+		}
+		return nil, "", err
+	}
+
+	entry.refcount++
+	return sibling, canonical, nil
+}
+
+// releaseSiblingHandle is called from `conn.Close` for registered
+// conns. Drops the refcount; when it hits zero, closes the hidden
+// primary and removes the entry.
+func releaseSiblingHandle(canonical string) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	entry, ok := pathRegistry[canonical]
+	if !ok {
+		// Defensive: the entry should always exist here.
+		// If it doesn't, we're either double-closing (in
+		// which case there's nothing to do) or the registry
+		// is corrupted (in which case the FFI's own asserts
+		// would catch it on the next sibling open). Drop
+		// silently.
+		return
+	}
+	entry.refcount--
+	if entry.refcount <= 0 {
+		C.sqlrite_close(entry.primary)
+		delete(pathRegistry, canonical)
+	}
+}
+
+// registryHandleCount returns the number of outstanding siblings
+// for `path` (canonicalized internally). Returns 0 for unknown
+// paths. Used by the tests; not part of the public API.
+//
+//nolint:deadcode // exported via go:linkname-style for test access
+func registryHandleCount(path string) int32 {
+	canonical, err := canonicalPath(path)
+	if err != nil {
+		return 0
+	}
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if entry, ok := pathRegistry[canonical]; ok {
+		return entry.refcount
+	}
+	return 0
+}

@@ -366,6 +366,32 @@ dispatch tree, every REPL line goes through it.
 
 ---
 
+### 12i. Go SDK uses a process-level path registry to mint siblings (Phase 11.11c)
+
+**Decision.** The Go SDK at [`sdk/go/`](../sdk/go/) keeps a process-level `map[string]*sharedEntry` keyed by canonical absolute path. Every file-backed read-write `sql.Open("sqlrite", path)` resolves the path through `filepath.Abs` + `filepath.Clean`, then either creates a registry entry (paying for a real `sqlrite_open`) or mints a **sibling handle** off the existing entry's primary via the FFI's `sqlrite_connect_sibling`. The registry holds a refcount of outstanding siblings; the last close fires `sqlrite_close` on the primary and removes the entry.
+
+**Why.** `database/sql`'s pool model expects `driver.Open` to be cheap and idempotent: a single `*sql.DB` will call it whenever it needs another pool slot, and applications routinely hold multiple `*sql.DB` instances against the same file (one for the API server, one for a background worker, …). SQLRite's engine takes `flock(LOCK_EX)` on the WAL sidecar at the first `Connection::open`, so the second `sqlrite_open` for the same path would deadlock against the first one in the *same* process — a real defect that surfaced as "the existing TestFileBackedPersistsAcrossConnections only works because each `db.Close()` releases the lock before the next `sql.Open`."
+
+The registry is the smallest thing that makes the SDK match the Phase 11.7 / 11.8 contract: sibling handles share `Arc<Mutex<Database>>` and each can hold its own `BEGIN CONCURRENT`. The Python / Node / C SDKs already had this story since 11.8 because they expose sibling creation directly (`Connection.connect()` / `db.connect()` / `sqlrite_connect_sibling`). Go's quirk is `database/sql`'s pool — it asks the driver for connections on its own schedule — so the work happens transparently inside `newConn`.
+
+**Why a process-level (not `*sql.DB`-level) registry.** Cross-`*sql.DB` sharing was the original 11.8 gap. Keying the registry on path rather than on a pool instance is what closes that gap; two `sql.Open` calls in the same process for the same file converge on the same backing engine, same as the FFI / Python / Node story.
+
+**Why a hidden "primary" + refcount, not just the first opener's handle.** The first opener could close *before* the second opener finishes its work. If the registry held only "the first opener's handle" the close would either:
+- close the underlying engine (leaving the second opener with a dead handle), or
+- need to transfer ownership somewhere, complicating the close path
+
+A hidden primary that the registry itself owns sidesteps both problems: every `*conn` gets its own sibling, closes are independent, and the registry tears the primary down only when the refcount reaches zero.
+
+**Why `:memory:` and read-only opens bypass the registry.** `:memory:` databases are isolated by design — each `sql.Open(":memory:")` is its own DB, matching SQLite. Read-only opens take a shared `flock(LOCK_SH)` that already coexists with other readers; routing them through the registry would give every read-only opener a read-write sibling (since `connect_sibling` doesn't downgrade access mode), which is the wrong abstraction. Cross-pool read-only sharing is a clean follow-up if anyone surfaces the use case.
+
+**Why no symlink resolution.** `filepath.Abs` + `filepath.Clean` is lexical only — two `sql.Open` calls via different symlinks pointing at the same file end up as separate registry entries and the second one fails to acquire the flock. Resolving symlinks via `os.EvalSymlinks` would close that gap but breaks if intermediate path components are themselves symlinks that change between the resolution and the file open. v0 keeps the simple key and documents the symlink caveat in [`sdk/go/README.md`](../sdk/go/README.md); callers who care can pass an `EvalSymlinks`-canonicalized path.
+
+**Lock order.** Two locks are in play: each `*conn`'s `c.mu`, and the registry's `registryMu`. Acquisition order is always `c.mu → registryMu`, never the reverse. `newConn` only holds `registryMu` (the `*conn` doesn't exist yet); `conn.Close` takes `c.mu` first, then `registryMu`. Other operations only hold `c.mu`.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §10.8 (multi-handle SDK shape, Go follow-up).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

@@ -2,7 +2,7 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
-> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** **Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`, SQLR-22) is shipped end-to-end through 11.12** — the multi-connection foundation, logical clock, `MvStore`, `BEGIN CONCURRENT` writes + commit-time validation, snapshot-isolated reads, garbage collection, SDK propagation across C / Python / Node / Go, multi-handle SDK shape, WAL log-record durability + crash recovery, REPL `.spawn` for interactive demos, and the canonical user-facing reference all landed. A small set of follow-ups (checkpoint-drain to enable `Mvcc → Wal` downgrade, indexes under MVCC, the "N concurrent writers" benchmark workload) remain explicitly parked. See [`concurrent-writes.md`](concurrent-writes.md) for the user-facing reference; [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the design rationale.
+> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** **Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`, SQLR-22) is shipped end-to-end through 11.12 + 11.11b + 11.11c** — the multi-connection foundation, logical clock, `MvStore`, `BEGIN CONCURRENT` writes + commit-time validation, snapshot-isolated reads, garbage collection, SDK propagation across C / Python / Node / Go (cross-pool sibling shape on Go via the path registry), multi-handle SDK shape, WAL log-record durability + crash recovery, REPL `.spawn` for interactive demos, the `W13` concurrent-writers bench workload, and the canonical user-facing reference all landed. The only remaining items are deferred-by-design or foundation work: indexes under MVCC (11.10, Turso punted on the same problem), and the checkpoint-drain follow-up (parked half of 11.9, enables `set_journal_mode(Mvcc → Wal)` once `MvStore` is drainable). See [`concurrent-writes.md`](concurrent-writes.md) for the user-facing reference; [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the design rationale.
 
 ## ✅ Phase 0 — Modernization
 
@@ -708,9 +708,18 @@ New `W13` workload in [`benchmarks/`](../benchmarks/) pits SQLRite-MVCC against 
 
 Headline numbers will land with the first pinned-host re-publication; v1 ships the workload + correctness gate so any future numbers stand on a verified base.
 
-### Phase 11.11c — Go SDK cross-pool sibling shape *(planned)*
+### ✅ Phase 11.11c — Go SDK cross-pool sibling shape
 
-Each `sql.Open("sqlrite", path)` today builds an independent backing DB; sharing engine state across `sql.DB` pools needs a process-level registry keyed by path. Bundled into Phase 11.11 originally; split out because it touches the Go binding architecture (cgo + the `database/sql` driver model) rather than the bench harness or the engine. See [`sdk/go/README.md`](../sdk/go/README.md) for the current single-pool sibling story.
+The Go SDK ([`sdk/go/`](../sdk/go/)) used to take one engine-level `Connection::open` per `sql.Open("sqlrite", path)`. A second `sql.Open` (or a single pool that grew past one connection) collided with the first opener's `flock(LOCK_EX)` and deadlocked — `database/sql`'s pool model + SQLRite's exclusive-writer lock disagreed.
+
+This slice adds a **process-level path registry** (in [`sdk/go/sqlrite.go`](../sdk/go/sqlrite.go)) keyed by canonical absolute path. File-backed read-write opens now route through it: the first opener pays for a real `sqlrite_open` and the resulting handle is stashed as a hidden "primary" in the registry; subsequent openers mint a **sibling** off that primary via the C FFI's [`sqlrite_connect_sibling`](../sqlrite-ffi/include/sqlrite.h) (shipped in 11.8), sharing the engine's `Arc<Mutex<Database>>` underneath. A refcount tracks outstanding siblings; the registry closes the primary when it hits zero.
+
+- `:memory:` opens stay isolated by design (matches SQLite); each `sql.Open(":memory:")` is its own DB.
+- Read-only opens (`sqlrite.OpenReadOnly`) bypass the registry — they take a shared `flock(LOCK_SH)` that can coexist with other readers but conflicts with any writer in the same process.
+- Symlinks are **not** resolved; the registry key is `filepath.Abs` + `filepath.Clean`. Symlink-equality is the caller's job (use `os.EvalSymlinks`-ed paths).
+- New tests cover cross-`*sql.DB` state sharing, BEGIN CONCURRENT across separate pools with a real Busy + retry, and the refcount dropping to zero on the last close.
+
+End result: every shipped SDK — C FFI / Python / Node / Go — now mints sibling handles that share backing state. The 11.7 retryable-error machinery (`sqlrite.ErrBusy`, `sqlrite.ErrBusySnapshot`, `sqlrite.IsRetryable`) is finally exerciseable cross-pool from Go.
 
 ### ✅ Phase 11.12 — Docs sweep *(plan-doc "Phase 10.9")*
 
