@@ -319,6 +319,196 @@ func TestJournalModeMvccReachesGoDriver(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 11.11c — cross-pool sibling sharing via the path registry
+
+// TestTwoSqlOpenOnSameFileShareState verifies that two independent
+// `*sql.DB` instances pointing at the same path share the same
+// backing engine state — a row written through db1 is immediately
+// visible through db2, WITHOUT closing db1 first. Pre-11.11c the
+// second `sql.Open` for an already-open file would deadlock on
+// `flock(LOCK_EX)`.
+func TestTwoSqlOpenOnSameFileShareState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared.sqlrite")
+
+	db1, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db1: %v", err)
+	}
+	defer db1.Close()
+	// Force db1 to actually acquire a connection so the registry
+	// entry is live before db2 opens.
+	mustExec(t, db1, "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)")
+	mustExec(t, db1, "INSERT INTO items (label) VALUES ('via-db1')")
+
+	db2, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db2: %v", err)
+	}
+	defer db2.Close()
+
+	// db2 should see the row db1 wrote — they share `Arc<Mutex<Database>>`.
+	labels := collectStrings(t, db2, "SELECT label FROM items")
+	if len(labels) != 1 || labels[0] != "via-db1" {
+		t.Fatalf("db2 sees %v, want [via-db1]", labels)
+	}
+
+	// And a write via db2 surfaces through db1 — bidirectional.
+	mustExec(t, db2, "INSERT INTO items (label) VALUES ('via-db2')")
+	labels1 := collectStrings(t, db1, "SELECT label FROM items ORDER BY id")
+	if len(labels1) != 2 || labels1[0] != "via-db1" || labels1[1] != "via-db2" {
+		t.Errorf("db1 sees %v, want [via-db1, via-db2]", labels1)
+	}
+}
+
+// TestBeginConcurrentAcrossSqlOpenInstances exercises the headline
+// 11.11c use case: two `*sql.DB` instances over the same path each
+// hold their own `BEGIN CONCURRENT`, the first commit wins, the
+// second hits `ErrBusy` and a retry succeeds.
+//
+// Without the path registry this test would deadlock at db2's
+// open (flock conflict) before any tx machinery ran. With it,
+// both pools mint sibling handles off a shared primary, so each
+// pool's pinned `*sql.Conn` carries its own per-connection
+// `ConcurrentTx` slot.
+func TestBeginConcurrentAcrossSqlOpenInstances(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "concurrent.sqlrite")
+
+	db1, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db1: %v", err)
+	}
+	defer db1.Close()
+	mustExec(t, db1, "PRAGMA journal_mode = mvcc")
+	mustExec(t, db1, "CREATE TABLE counters (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+	mustExec(t, db1, "INSERT INTO counters (id, n) VALUES (1, 0)")
+
+	db2, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db2: %v", err)
+	}
+	defer db2.Close()
+
+	// Pin one driver-level conn out of each pool so the BEGIN /
+	// COMMIT sequence stays on the same underlying handle for the
+	// whole transaction. `database/sql` would otherwise be free to
+	// round-robin successive Exec calls across pool slots.
+	ctx := t.Context()
+	connA, err := db1.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db1.Conn: %v", err)
+	}
+	defer connA.Close()
+	connB, err := db2.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db2.Conn: %v", err)
+	}
+	defer connB.Close()
+
+	mustExecConn := func(c *sql.Conn, q string) {
+		t.Helper()
+		if _, err := c.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+
+	// Interleave BEGINs so connA.begin_ts < connB.begin_ts and
+	// both see the same pre-update value.
+	mustExecConn(connA, "BEGIN CONCURRENT")
+	mustExecConn(connB, "BEGIN CONCURRENT")
+	mustExecConn(connA, "UPDATE counters SET n = n + 1 WHERE id = 1")
+	mustExecConn(connB, "UPDATE counters SET n = n + 100 WHERE id = 1")
+
+	// connA commits first → succeeds (no version newer than A.begin_ts yet).
+	mustExecConn(connA, "COMMIT")
+	// connB's commit now collides with connA's commit. Expect ErrBusy.
+	if _, err := connB.ExecContext(ctx, "COMMIT"); err == nil {
+		t.Fatal("connB COMMIT should have hit a write-write conflict, got nil")
+	} else if !errors.Is(err, sqlrite.ErrBusy) {
+		t.Fatalf("connB COMMIT: want ErrBusy, got %v", err)
+	}
+
+	// Retry on connB picks up connA's committed value and lands.
+	mustExecConn(connB, "BEGIN CONCURRENT")
+	mustExecConn(connB, "UPDATE counters SET n = n + 100 WHERE id = 1")
+	mustExecConn(connB, "COMMIT")
+
+	// Final value should be 0 + 1 (from A) + 100 (from B's retry).
+	rows, err := db1.QueryContext(ctx, "SELECT n FROM counters WHERE id = 1")
+	if err != nil {
+		t.Fatalf("final SELECT: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("expected one row")
+	}
+	var n int
+	if err := rows.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 101 {
+		t.Errorf("final counter = %d, want 101", n)
+	}
+}
+
+// TestRegistryRefcountDropsToZeroOnLastClose verifies the
+// registry's bookkeeping: after the last sibling closes the
+// entry is removed (so the next `sql.Open` for the same path
+// pays for a fresh `sqlrite_open` rather than minting a sibling
+// off a stale primary).
+func TestRegistryRefcountDropsToZeroOnLastClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "refcount.sqlrite")
+
+	db1, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db1: %v", err)
+	}
+	mustExec(t, db1, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	db2, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open db2: %v", err)
+	}
+	// Pin a conn from each pool so refcount > 1.
+	c1, err := db1.Conn(t.Context())
+	if err != nil {
+		t.Fatalf("db1.Conn: %v", err)
+	}
+	c2, err := db2.Conn(t.Context())
+	if err != nil {
+		t.Fatalf("db2.Conn: %v", err)
+	}
+
+	// Now we have 2 outstanding siblings.
+	if c1.Close() != nil {
+		t.Fatal("c1.Close")
+	}
+	if c2.Close() != nil {
+		t.Fatal("c2.Close")
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("db1.Close: %v", err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("db2.Close: %v", err)
+	}
+
+	// After everything closes, a new sql.Open on the same path
+	// must succeed (the registry entry has been removed and the
+	// flock released). Pre-11.11c this is what the existing
+	// `TestFileBackedPersistsAcrossConnections` already
+	// verified; here we re-prove it AFTER siblings have been in
+	// play.
+	db3, err := sql.Open(sqlrite.DriverName, path)
+	if err != nil {
+		t.Fatalf("post-close re-open: %v", err)
+	}
+	defer db3.Close()
+	mustExec(t, db3, "INSERT INTO t (id) VALUES (1)")
+}
+
 func TestNonEmptyParametersRejected(t *testing.T) {
 	db := openMem(t)
 	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")

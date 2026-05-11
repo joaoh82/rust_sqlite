@@ -193,10 +193,10 @@ Sibling propagation across each SDK (Phase 11.7 + 11.8):
 | C FFI | `sqlrite_connect_sibling(existing, out)` | `SqlriteStatus::Busy` / `BusySnapshot`; `sqlrite_status_is_retryable` |
 | Python | `conn.connect()` | `sqlrite.BusyError` / `sqlrite.BusySnapshotError` (both subclass `SQLRiteError`) |
 | Node.js | `db.connect()` | `errorKind(message)` returns `'Busy'` / `'BusySnapshot'` / `'Other'` |
-| Go | `(via database/sql pool — see notes below)` | `errors.Is(err, sqlrite.ErrBusy)` / `ErrBusySnapshot`; `sqlrite.IsRetryable(err)` |
+| Go | `database/sql` pool + cross-pool path registry (Phase 11.11c) | `errors.Is(err, sqlrite.ErrBusy)` / `ErrBusySnapshot`; `sqlrite.IsRetryable(err)` |
 | WASM | *(deferred — single-threaded runtime)* | *(deferred)* |
 
-For Go, each `sql.Open("sqlrite", path)` still constructs its own backing DB; siblings within a single `sql.DB` pool share state automatically. Cross-pool sharing is a separate follow-up (Phase 11.11b).
+For Go, every `sql.Open("sqlrite", path)` against a file-backed read-write DB routes through a process-level path registry (Phase 11.11c) — multiple `sql.Open` calls for the same canonical path mint sibling handles off a shared primary, so each `*sql.DB`'s pool can issue its own `BEGIN CONCURRENT` against the same backing engine. `:memory:` opens stay isolated by design; read-only opens (via `sqlrite.OpenReadOnly`) take a shared lock and bypass the registry. See [`sdk/go/README.md`](../sdk/go/README.md#multi-handle-reads--writes-phase-1111c) for the runnable cross-pool example.
 
 ### The retry loop
 

@@ -19,29 +19,62 @@ import (
 // into a single conn from a goroutine that grabbed it via Acquire —
 // the Rust engine is single-writer per file-locked open anyway, so
 // there's no contention loss.
+//
+// Phase 11.11c — `registryPath` is non-empty for file-backed
+// read-write conns whose handle is a sibling minted via the
+// process-level path registry (see `sharedRegistry` in sqlrite.go).
+// Close consults the registry to drop the refcount; when it hits
+// zero, the registry closes the hidden primary handle. Read-only
+// opens and `:memory:` opens carry an empty `registryPath` and
+// skip the registry path entirely.
 type conn struct {
-	mu     sync.Mutex
-	handle *C.SqlriteConnection
-	closed bool
+	mu           sync.Mutex
+	handle       *C.SqlriteConnection
+	closed       bool
+	registryPath string
 }
 
 func newConn(name string, readOnly bool) (*conn, error) {
-	cName := cString(name)
-	defer freeCString(cName)
-
-	var handle *C.SqlriteConnection
-	var status Status
-	if readOnly {
-		status = Status(C.sqlrite_open_read_only(cName, &handle))
-	} else if name == ":memory:" {
-		status = Status(C.sqlrite_open_in_memory(&handle))
-	} else {
-		status = Status(C.sqlrite_open(cName, &handle))
+	// `:memory:` and read-only opens stay isolated — every
+	// `sql.Open(":memory:")` is a distinct in-memory DB by
+	// design (matches SQLite), and the read-only open path
+	// takes a shared `flock(LOCK_SH)` that can coexist with
+	// other read-only openers but conflicts with any writer
+	// in the same process. Both bypass the path registry.
+	if name == ":memory:" {
+		var handle *C.SqlriteConnection
+		cName := cString(name)
+		defer freeCString(cName)
+		status := Status(C.sqlrite_open_in_memory(&handle))
+		if err := wrapErr(status, "open"); err != nil {
+			return nil, err
+		}
+		return &conn{handle: handle}, nil
 	}
-	if err := wrapErr(status, "open"); err != nil {
+	if readOnly {
+		var handle *C.SqlriteConnection
+		cName := cString(name)
+		defer freeCString(cName)
+		status := Status(C.sqlrite_open_read_only(cName, &handle))
+		if err := wrapErr(status, "open"); err != nil {
+			return nil, err
+		}
+		return &conn{handle: handle}, nil
+	}
+
+	// Phase 11.11c — read-write file open. Route through the
+	// process-level path registry so multiple `sql.Open` calls
+	// (and a single `sql.DB`'s pool, when it asks for more than
+	// one connection) all share the same backing engine state.
+	// The engine's `Connection::open` takes `flock(LOCK_EX)`,
+	// so a naive "open again" would deadlock with itself in
+	// the same process; siblings via `sqlrite_connect_sibling`
+	// share the lock alongside the `Arc<Mutex<Database>>`.
+	handle, canonical, err := acquireSiblingHandle(name)
+	if err != nil {
 		return nil, err
 	}
-	return &conn{handle: handle}, nil
+	return &conn{handle: handle, registryPath: canonical}, nil
 }
 
 // Ensure we satisfy the extended driver interfaces `database/sql`
@@ -73,6 +106,12 @@ func (c *conn) PrepareContext(_ context.Context, query string) (driver.Stmt, err
 
 // Close releases the underlying `SqlriteConnection*`. Safe to call
 // multiple times.
+//
+// Phase 11.11c — for conns minted via the path registry (file-
+// backed read-write), Close also drops the registry refcount. When
+// it hits zero, the registry closes the hidden primary handle —
+// the last sibling out turns off the lights. Lock order is
+// `c.mu` → `sharedRegistry` (always), never the reverse.
 func (c *conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -82,6 +121,9 @@ func (c *conn) Close() error {
 	C.sqlrite_close(c.handle)
 	c.handle = nil
 	c.closed = true
+	if c.registryPath != "" {
+		releaseSiblingHandle(c.registryPath)
+	}
 	return nil
 }
 

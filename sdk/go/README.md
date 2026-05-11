@@ -82,6 +82,59 @@ defer ro.Close()
 // Reads work; any Exec throws with "read-only" in the message.
 ```
 
+### Multi-handle reads + writes (Phase 11.11c)
+
+Two `sql.Open` calls against the same file in the same process — across *separate* `*sql.DB` instances or within a single pool that's grown past one connection — used to deadlock on the engine's exclusive `flock`. Phase 11.11c introduces a process-level path registry: the first opener pays for a real engine connection; subsequent openers mint **sibling handles** off it via the FFI's `sqlrite_connect_sibling`, sharing the same backing `Arc<Mutex<Database>>`. The last opener to close releases the lock.
+
+```go
+db1, _ := sql.Open("sqlrite", "shared.sqlrite")
+db2, _ := sql.Open("sqlrite", "shared.sqlrite") // sibling, shares state with db1
+
+db1.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+db1.Exec("INSERT INTO t (id) VALUES (1)")
+
+// db2 sees the row immediately — same backing engine.
+rows, _ := db2.Query("SELECT id FROM t")
+```
+
+Combined with `BEGIN CONCURRENT` (see below), this is the canonical shape for driving multi-writer workloads from Go.
+
+#### `BEGIN CONCURRENT` across `database/sql` pools
+
+The retryable-error sentinels (`sqlrite.ErrBusy`, `sqlrite.ErrBusySnapshot`) plus the `sqlrite.IsRetryable` classifier ship since Phase 11.7. Phase 11.11c makes them exercisable across separate `*sql.DB` pools:
+
+```go
+db1, _ := sql.Open("sqlrite", "accounts.sqlrite")
+db2, _ := sql.Open("sqlrite", "accounts.sqlrite")
+
+// One-time setup on either pool — the PRAGMA is per-database, so siblings
+// observe the same value.
+db1.Exec("PRAGMA journal_mode = mvcc")
+
+// Pin one driver-level conn out of each pool. Two BEGIN CONCURRENT
+// transactions can now coexist; the second commit hits ErrBusy and the
+// caller retries with a fresh BEGIN CONCURRENT.
+ctx := context.Background()
+a, _ := db1.Conn(ctx)
+b, _ := db2.Conn(ctx)
+defer a.Close(); defer b.Close()
+
+for {
+    _, _ = b.ExecContext(ctx, "BEGIN CONCURRENT")
+    _, _ = b.ExecContext(ctx, "UPDATE accounts SET balance = balance + 50 WHERE id = 1")
+    err := commit(ctx, b)
+    if err == nil { break }
+    if sqlrite.IsRetryable(err) { continue }
+    log.Fatal(err)
+}
+```
+
+See [`docs/concurrent-writes.md`](../../docs/concurrent-writes.md) for the conceptual walkthrough.
+
+**Caveats:**
+- The registry only kicks in for **file-backed read-write** opens. `:memory:` databases stay isolated per `sql.Open` (matches SQLite's classical `:memory:` semantics), and read-only opens (`sqlrite.OpenReadOnly`) take a shared lock rather than minting a sibling.
+- The registry key is the path's absolute, lexically-cleaned form — `filepath.Abs` + `filepath.Clean`. Symlinks are **not** resolved; two `sql.Open` calls via different symlinks pointing at the same file will collide. Pass an `os.EvalSymlinks`-canonicalized path if your application needs symlink-equality.
+
 ### Vector columns + KNN (Phase 7a–7d)
 
 `VECTOR(N)` storage class plus `vec_distance_l2` / `vec_distance_cosine` / `vec_distance_dot` distance functions. Vector literals are JSON-style bracket arrays `[0.1, 0.2, ...]`. Today the Go side bridges them as text — `database/sql` doesn't yet have a typed accessor for vectors:
