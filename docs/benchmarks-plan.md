@@ -111,6 +111,16 @@ For W10/W11, the goal isn't to beat the comparators — they're battle-hardened 
 
 For W12, no off-the-shelf comparator exists in a single embedded engine; the number stands on its own.
 
+### Group D — Concurrent writes (Phase 11.11b, the Phase-11 MVCC differentiator)
+
+| ID | Name | Shape | Comparator |
+|----|------|-------|------------|
+| W13 | Concurrent writers | 4 worker threads × 50 BEGIN/UPDATE/COMMIT cycles each, random rowid in `1..=1000` (≈ 0.4% collision per op), `UPDATE counters SET n = n + 1 WHERE id = ?` | SQLite (`BEGIN IMMEDIATE` + `busy_timeout = 5s` per-connection) |
+
+The headline workload Phase 11's MVCC machinery was designed for. SQLRite drives `BEGIN CONCURRENT` across sibling [`Connection::connect`](../docs/concurrent-writes.md) handles minted from the same process; SQLite drives `BEGIN IMMEDIATE` across separate `rusqlite::Connection` handles serializing through the WAL write lock. Both engines run the same retry-on-busy outer loop ([`is_retryable_busy`](../benchmarks/src/lib.rs) is engine-dispatched); only SQLRite actually exercises the retry path under this workload's shape — the contrast *is* the measurement.
+
+Workload parameters live in [`benchmarks/src/workloads/concurrent_writers.rs`](../benchmarks/src/workloads/concurrent_writers.rs) as named constants (`W13_PRELOAD_ROWS`, `W13_N_WORKERS`, `W13_TXS_PER_WORKER`). Bumping any of them is a workload-version bump under Q8.
+
 ---
 
 ## Metrics
@@ -127,8 +137,9 @@ Keep tight. The task brief lists many candidates; the suite measures these:
 Explicitly **not** measured in v1:
 
 - **CPU%.** Noisy on a shared machine, redundant with wall-clock for single-threaded workloads.
-- **Concurrency curves.** Engine is single-writer by design (Phase 4e). No concurrent-writer workload is meaningful until that changes.
 - **Network I/O.** All targets are in-process.
+
+**Updated post-Phase 11.11b:** Group D's `W13` (concurrent writers) lifts the single-writer caveat — SQLRite now has a real multi-writer story via `BEGIN CONCURRENT`, and W13 measures it directly against SQLite's single-writer baseline. Full concurrency-curve sweeps (varying `N` workers and collision rate) are a clean follow-up; v1 reports a single representative point.
 
 ---
 
@@ -190,7 +201,8 @@ benchmarks/
 │       ├── join.rs        — W9
 │       ├── vector.rs      — W10
 │       ├── fts.rs         — W11
-│       └── hybrid.rs      — W12
+│       ├── hybrid.rs      — W12
+│       └── concurrent_writers.rs — W13 (Phase 11.11b)
 ├── benches/
 │   └── suite.rs           — single criterion entry point that fans out
 ├── scripts/
@@ -264,11 +276,18 @@ Add the `duckdb-rs` driver under a `--features duckdb` flag. Wire only into Grou
 
 **Exit criterion:** `docs/benchmarks.md` exists, the README has a "Benchmarks" section pointing at it, the first dated results JSON is committed.
 
-### Post-9.6 ideas (parked)
+### 9.7 — Group D concurrent writers (Phase 11.11b, shipped)
+
+Adds `W13` (concurrent writers, mostly-disjoint rows) under a new Group D. The `Driver` trait grows three optional methods (`connect_sibling`, `concurrent_begin_sql`, `is_retryable_busy`) with defaults that make sense for engines without an MVCC story; SQLRite overrides all three. SQLite gains a `busy_timeout = 5s` pragma at open so its `BEGIN IMMEDIATE` blocks rather than fails on contention. The workload lives in [`benchmarks/src/workloads/concurrent_writers.rs`](../benchmarks/src/workloads/concurrent_writers.rs).
+
+**Exit criterion:** W13 runs under both drivers, correctness gate passes (`SUM(n) == n_workers * txs_per_worker` after a sample), and the JSON envelope picks up `W13.v1` rows for both drivers.
+
+### Post-9.7 ideas (parked)
 
 - **libSQL driver** if/when we want a non-extension vector competitor for W10.
 - **Per-PR regression detector.** A GitHub Action that runs the bench on a self-hosted runner and posts a comment if any workload regresses >20% from the last `main` baseline.
-- **Concurrency workloads** if/when SQLRite gains true multi-writer support.
+- **Concurrency curves for W13.** Sweep `N` workers (1, 2, 4, 8, 16) and `K` rows (10, 100, 1k, 10k) to chart SQLRite-MVCC's scaling envelope vs SQLite's serial baseline. v1 reports a single representative point; the sweep is a clean follow-up.
+- **W13b hot-row contention.** Same workload, `K = 10` rows instead of 1000 — collision probability climbs to ~40% per op, exercising the retry loop hard. Useful for stressing the GC + retry path under adversarial contention.
 - **Larger datasets (10M, 100M).** v1 is sized for fast iteration on a laptop. A "release-blocker run" config could 100× the row counts.
 
 ### Total scope estimate

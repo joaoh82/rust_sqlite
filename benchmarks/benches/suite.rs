@@ -24,6 +24,7 @@ use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sqlrite_benchmarks::Driver;
 #[cfg(feature = "duckdb")]
@@ -31,8 +32,8 @@ use sqlrite_benchmarks::drivers::duckdb::DuckDBDriver;
 use sqlrite_benchmarks::drivers::sqlite::SQLiteDriver;
 use sqlrite_benchmarks::drivers::sqlrite::SQLRiteDriver;
 use sqlrite_benchmarks::workloads::{
-    aggregate as w7, bulk_insert as w3, fts as w11, group_by as w8, hybrid as w12,
-    index_lookup as w6, join as w9, kv as w1, mixed_oltp as w5, range_scan as w2,
+    aggregate as w7, bulk_insert as w3, concurrent_writers as w13, fts as w11, group_by as w8,
+    hybrid as w12, index_lookup as w6, join as w9, kv as w1, mixed_oltp as w5, range_scan as w2,
     single_insert as w4, vector as w10,
 };
 
@@ -478,6 +479,67 @@ fn register_w12<D: Driver>(c: &mut Criterion, driver: D) {
 }
 
 // ---------------------------------------------------------------------------
+// W13 — concurrent writers, mostly-disjoint rows (Phase 11.11b)
+// ---------------------------------------------------------------------------
+
+fn register_w13<D>(c: &mut Criterion, driver: D)
+where
+    D: Driver + Clone + 'static,
+    D::Conn: Send + 'static,
+{
+    let driver = Arc::new(driver);
+    let tmp = tempdir_for("w13", driver.name());
+    let path = db_path(tmp.path(), driver.name(), "w13");
+
+    // Correctness gate FIRST — runs a single 4×10 burst against a
+    // fresh DB and verifies the sum matches commits.
+    w13::correctness_check(Arc::clone(&driver), &path).expect("W13 correctness check");
+
+    // Re-setup so the bench starts from a known preload state.
+    // `correctness_check` left the DB with 40 increments in it;
+    // that doesn't matter for throughput but we want a clean
+    // baseline.
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file({
+        let mut p = path.as_os_str().to_owned();
+        p.push("-wal");
+        PathBuf::from(p)
+    });
+    {
+        let _ = w13::setup(&*driver, &path).expect("W13 setup");
+    }
+
+    let mut group = c.benchmark_group(w13::W13.full());
+    // 4 workers × 50 txs × N samples can run long; criterion's
+    // default sample size (100) would push a single driver past
+    // 30s of wall clock. Cap at 20 — still plenty of statistical
+    // confidence for a throughput comparison; override at the CLI
+    // for a sharper estimate.
+    group.sample_size(20);
+
+    let bench_id = format!(
+        "{}/n={}/m={}",
+        driver.name(),
+        w13::W13_N_WORKERS,
+        w13::W13_TXS_PER_WORKER
+    );
+    group.bench_function(&bench_id, |b| {
+        b.iter(|| {
+            let committed = w13::run_concurrent(
+                Arc::clone(&driver),
+                &path,
+                w13::W13_N_WORKERS,
+                w13::W13_TXS_PER_WORKER,
+            )
+            .expect("W13 run");
+            black_box(committed)
+        });
+    });
+    group.finish();
+    drop(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -512,6 +574,8 @@ fn benches(c: &mut Criterion) {
     register_w11(c, SQLiteDriver);
     register_w12(c, SQLRiteDriver);
     register_w12(c, SQLiteDriver); // skipped via driver_supports
+    register_w13(c, SQLRiteDriver);
+    register_w13(c, SQLiteDriver);
 }
 
 criterion_group!(suite, benches);

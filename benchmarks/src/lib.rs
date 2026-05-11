@@ -116,6 +116,68 @@ pub trait Driver: Send + Sync {
         sql: &str,
         params: &[Value],
     ) -> anyhow::Result<Vec<Vec<Value>>>;
+
+    /// Phase 11.11b — mint a sibling connection sharing the same
+    /// backing state as `primary`. Used by W13 (concurrent writers)
+    /// to drive `N` worker threads against the same database from
+    /// a single process.
+    ///
+    /// The default implementation opens a fresh connection at `path`
+    /// — appropriate for engines (SQLite, DuckDB) whose per-process
+    /// concurrency is mediated by file-level locking + `busy_timeout`.
+    /// Engines whose primary opener takes an exclusive lock (SQLRite,
+    /// where `Connection::open` calls `flock(LOCK_EX)`) override this
+    /// to mint an in-process sibling that shares the lock + the
+    /// backing `Arc<Mutex<Database>>`.
+    #[allow(dead_code)]
+    fn connect_sibling(&self, primary: &Self::Conn, path: &Path) -> anyhow::Result<Self::Conn> {
+        let _ = primary;
+        self.open(path)
+    }
+
+    /// Phase 11.11b — opt the connection into the engine's
+    /// concurrent-write mode before W13 issues its first `BEGIN
+    /// CONCURRENT` (or equivalent). For SQLRite this runs
+    /// `PRAGMA journal_mode = mvcc;`; for SQLite the default is a
+    /// no-op (its WAL + busy_timeout setup happens at `open` time).
+    ///
+    /// Called once per primary connection at workload setup; the
+    /// per-database setting then propagates to every sibling
+    /// minted via [`Driver::connect_sibling`].
+    #[allow(dead_code)]
+    fn enable_concurrent_mode(&self, conn: &mut Self::Conn) -> anyhow::Result<()> {
+        let _ = conn;
+        Ok(())
+    }
+
+    /// Phase 11.11b — engine-idiomatic `BEGIN` flavour for the
+    /// concurrent-writers workload (W13).
+    ///
+    /// - SQLRite returns `"BEGIN CONCURRENT"` (MVCC + commit-time validation).
+    /// - SQLite returns `"BEGIN IMMEDIATE"` (acquire the write lock at BEGIN
+    ///   so two writers don't race into `SQLITE_BUSY` at COMMIT — same shape
+    ///   the SQLite docs recommend for multi-writer apps).
+    /// - DuckDB / future engines return their idiomatic form.
+    ///
+    /// Default is plain `"BEGIN"` for engines that don't yet have a
+    /// W13 story.
+    #[allow(dead_code)]
+    fn concurrent_begin_sql(&self) -> &'static str {
+        "BEGIN"
+    }
+
+    /// Phase 11.11b — does `err` indicate a retryable busy / conflict
+    /// from this engine's concurrent path? W13's per-worker loop
+    /// retries on `true` and bubbles on `false`.
+    ///
+    /// Default: no error is retryable. Drivers that override
+    /// [`Driver::concurrent_begin_sql`] should override this too so
+    /// the workload's retry loop knows when to spin.
+    #[allow(dead_code)]
+    fn is_retryable_busy(&self, err: &anyhow::Error) -> bool {
+        let _ = err;
+        false
+    }
 }
 
 /// Workload-version tag. Mirrors Q8 in `benchmarks-plan.md`: every

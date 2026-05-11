@@ -697,9 +697,20 @@ Lift the REPL from a single `Database` to a `Vec<Connection>` so users can mint 
 
 The downstream "N concurrent writers" benchmark workload (originally bundled into 11.11) is its own follow-up: it touches the `benchmarks/` harness, links SQLite + DuckDB drivers, and is much heavier than this slice.
 
-### Phase 11.11b — `N concurrent writers` benchmark workload *(planned)*
+### ✅ Phase 11.11b — `W13 — concurrent writers` benchmark workload
 
-New benchmark in [`benchmarks/`](../benchmarks/) that pits SQLRite-MVCC against SQLite + DuckDB on a disjoint-row "N writers, mostly disjoint rows" scenario. Slots into the existing SQLR-16 harness as a Group D differentiator workload. Also includes Go SDK multi-handle work (cross-pool sibling shape) — see the 11.8 note for why that's a separate slice.
+New `W13` workload in [`benchmarks/`](../benchmarks/) pits SQLRite-MVCC against SQLite on a "N writers, mostly disjoint rows" scenario — the headline shape Phase 11's MVCC machinery was designed for. Lives under a new **Group D** in the [`docs/benchmarks-plan.md`](benchmarks-plan.md#group-d--concurrent-writes-phase-1111b-the-phase-11-mvcc-differentiator) taxonomy.
+
+- **Workload** ([`benchmarks/src/workloads/concurrent_writers.rs`](../benchmarks/src/workloads/concurrent_writers.rs)): 4 worker threads × 50 BEGIN/UPDATE/COMMIT cycles each, random rowid in `1..=1000` (~ 0.4% collision per op). Each engine uses its idiomatic BEGIN flavour: SQLRite `BEGIN CONCURRENT`, SQLite `BEGIN IMMEDIATE` with `busy_timeout = 5s`. Both run the same retry-on-busy outer loop.
+- **Driver trait extension** ([`benchmarks/src/lib.rs`](../benchmarks/src/lib.rs)): three new methods with sensible defaults — `connect_sibling` (SQLRite overrides to call `Connection::connect`; default opens a fresh connection), `concurrent_begin_sql` (default `"BEGIN"`), `is_retryable_busy` (default false). The SQLite driver gains a `busy_timeout = 5s` pragma at open so concurrent commits block instead of immediately erroring.
+- **Correctness gate**: after a 4×10 burst, `SUM(n)` over the counters table must equal `n_workers × txs_per_worker`. Catches lost commits, double-counted retries, and any mis-handling of the Busy boundary.
+- **Sub-phase**: registered as **9.7** in [`docs/benchmarks-plan.md`](benchmarks-plan.md). The original 11.11b also flagged Go SDK cross-pool sibling shape — that's a separate slice (Phase 11.11c) because it touches the Go binding architecture rather than the bench harness.
+
+Headline numbers will land with the first pinned-host re-publication; v1 ships the workload + correctness gate so any future numbers stand on a verified base.
+
+### Phase 11.11c — Go SDK cross-pool sibling shape *(planned)*
+
+Each `sql.Open("sqlrite", path)` today builds an independent backing DB; sharing engine state across `sql.DB` pools needs a process-level registry keyed by path. Bundled into Phase 11.11 originally; split out because it touches the Go binding architecture (cgo + the `database/sql` driver model) rather than the bench harness or the engine. See [`sdk/go/README.md`](../sdk/go/README.md) for the current single-pool sibling story.
 
 ### ✅ Phase 11.12 — Docs sweep *(plan-doc "Phase 10.9")*
 

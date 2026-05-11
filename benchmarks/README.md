@@ -29,6 +29,7 @@ Three groups (full descriptions in [`docs/benchmarks-plan.md`](../docs/benchmark
 - **Group A — OLTP baseline.** W1 read-by-PK, W2 range scan, W3 bulk insert, W4 single-row insert, W5 mixed OLTP, W6 index lookup. ✅ shipped (9.1 + 9.2).
 - **Group B — SQL-feature scaling.** W7 aggregate, W8 GROUP BY, W9 INNER JOIN. ✅ shipped (9.3).
 - **Group C — Differentiators.** W10 vector top-10, W11 BM25 top-10, W12 hybrid retrieval. ✅ shipped (9.4).
+- **Group D — Concurrent writes.** W13 concurrent writers, mostly-disjoint rows. ✅ shipped (9.7, Phase 11.11b).
 
 For headline numbers + reading-the-numbers methodology + the engineering debts the suite surfaced, see the canonical [**`docs/benchmarks.md`**](../docs/benchmarks.md).
 
@@ -222,6 +223,21 @@ Both engines use an inverted index + BM25 ranker; the SQL shapes differ because 
 
 **Read this as:** absolute number for the headline RAG pitch. ~650 µs/query for "filter by FTS, rank by 50/50 BM25 + cosine over 384-dim embeddings" on a 1000-doc corpus is solid — competitive with what a Python+sklearn user would pay round-tripping to a separate vector DB + BM25 engine. The number scales with corpus size; bumping the cap (post Phase 8.1) is what unlocks larger-scale headlines.
 
+### W13 — concurrent writers, mostly-disjoint rows (Phase 11.11b)
+
+**1000-row `counters` table, 4 worker threads × 50 BEGIN/UPDATE/COMMIT cycles each.** Each transaction picks a random rowid in `1..=1000` (~0.4% collision probability per op) and runs `UPDATE counters SET n = n + 1 WHERE id = ?`. Retries on `Busy` / `BusySnapshot` (SQLRite) or `SQLITE_BUSY` / `SQLITE_LOCKED` (SQLite). Total committed updates per sample: `4 × 50 = 200`.
+
+| Engine | BEGIN flavour | Connection model |
+|---|---|---|
+| SQLRite | `BEGIN CONCURRENT` (Phase 11.4) | One primary `Connection::open` + 3 siblings via `Connection::connect`; all share `Arc<Mutex<Database>>` |
+| SQLite | `BEGIN IMMEDIATE` + `busy_timeout = 5s` | Four separate `rusqlite::Connection::open` instances; WAL writer lock serializes commits |
+
+Both engines run the same retry-on-busy outer loop (the [`Driver::is_retryable_busy`](src/lib.rs) classifier is engine-dispatched). Only SQLRite actually exercises the retry path under this workload's collision rate; SQLite's `busy_timeout` makes its BEGIN block rather than fail, so the workers serialize behind the writer lock without surfacing busy errors.
+
+The workload's parameters live in [`src/workloads/concurrent_writers.rs`](src/workloads/concurrent_writers.rs) — bumping `W13_PRELOAD_ROWS`, `W13_N_WORKERS`, or `W13_TXS_PER_WORKER` is a workload-version bump under Q8 (current: `W13.v1`).
+
+**Read this as:** the Phase-11 differentiator. SQLRite's `BEGIN CONCURRENT` enables disjoint-row writers to commit in parallel; SQLite's single-writer model serializes them. Headline numbers and the scaling envelope (varying `N` and `K`) will land with the first pinned-host re-publication; the workload's correctness gate (`SUM(n) == n_workers * txs_per_worker` after a 4×10 burst) is what 9.7 ships and what any future numbers stand on. See [`docs/concurrent-writes.md`](../docs/concurrent-writes.md) for the Phase-11 design walkthrough.
+
 ## Adding a workload
 
 Per the [`docs/benchmarks-plan.md`](../docs/benchmarks-plan.md#sub-phases) sequencing:
@@ -269,7 +285,8 @@ benchmarks/
 │   │   ├── join.rs          — W9 INNER JOIN, customer ↔ order
 │   │   ├── vector.rs        — W10 vector top-10 (brute-force + HNSW)
 │   │   ├── fts.rs           — W11 BM25 top-10 (vs SQLite FTS5)
-│   │   └── hybrid.rs        — W12 hybrid BM25 + cosine fusion
+│   │   ├── hybrid.rs        — W12 hybrid BM25 + cosine fusion
+│   │   └── concurrent_writers.rs — W13 concurrent writers (Phase 11.11b)
 │   └── bin/
 │       └── aggregate.rs   — walks target/criterion/ → results/*.json
 ├── benches/
