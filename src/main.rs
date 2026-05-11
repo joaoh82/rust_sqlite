@@ -9,8 +9,8 @@ mod repl;
 use std::path::PathBuf;
 
 use meta_command::handle_meta_command;
-use repl::{CommandType, REPLHelper, get_command_type, get_config};
-use sqlrite::{Database, process_command_with_render};
+use repl::{CommandType, REPLHelper, ReplState, get_command_type, get_config};
+use sqlrite::Connection;
 
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
@@ -39,6 +39,9 @@ Once in the REPL, meta commands start with a dot:
   .save <FILENAME>       Write the current DB to FILENAME (rarely needed —
                          once .open is in play, every write auto-saves)
   .tables                List tables in the current database
+  .spawn                 Mint a sibling connection sharing this database
+  .use <NAME>            Switch the active handle (A, B, ...) — see .conns
+  .conns                 List every handle, marking the active one
   .exit                  Quit
 
 Supported SQL: CREATE TABLE / CREATE [UNIQUE] INDEX / INSERT / SELECT /
@@ -104,17 +107,25 @@ fn main() -> rustyline::Result<()> {
         std::process::exit(1);
     }
 
-    let (mut db, opened_path): (Database, Option<&std::path::PathBuf>) = match &initial_db_path {
-        Some(path) => match open_or_create(path, read_only) {
-            Ok(db) => (db, Some(path)),
-            Err(err) => {
-                eprintln!("Could not open '{}': {err}", path.display());
-                eprintln!("Falling back to a transient in-memory database.");
-                (Database::new("tempdb".to_string()), None)
-            }
-        },
-        None => (Database::new("tempdb".to_string()), None),
-    };
+    let (initial_conn, opened_path): (Connection, Option<&std::path::PathBuf>) =
+        match &initial_db_path {
+            Some(path) => match open_or_create(path, read_only) {
+                Ok(conn) => (conn, Some(path)),
+                Err(err) => {
+                    eprintln!("Could not open '{}': {err}", path.display());
+                    eprintln!("Falling back to a transient in-memory database.");
+                    (
+                        Connection::open_in_memory().expect("in-memory open never fails"),
+                        None,
+                    )
+                }
+            },
+            None => (
+                Connection::open_in_memory().expect("in-memory open never fails"),
+                None,
+            ),
+        };
+    let mut state = ReplState::new(initial_conn);
 
     // Friendly intro message for the user
     let connection_line = match opened_path {
@@ -129,30 +140,35 @@ fn main() -> rustyline::Result<()> {
         connection_line,
     );
 
-    let prompt = "sqlrite> ";
-
     loop {
+        // Prompt shows the active handle so multi-handle demos
+        // (`.spawn` / `.use`) make it obvious which connection is
+        // about to execute the next statement.
+        let prompt = format!("sqlrite[{}]> ", state.active_name());
         repl.helper_mut().expect("No helper found").colored_prompt =
             format!("\x1b[1;32m{prompt}\x1b[0m");
         // Source for ANSI Color information: http://www.perpetualpc.net/6429_colors.html#color_list
         // http://bixense.com/clicolors/
 
-        let readline = repl.readline(prompt);
+        let readline = repl.readline(&prompt);
         match readline {
             Ok(command) => {
                 let _ = repl.add_history_entry(command.as_str());
                 // Parsing user's input and returning and enum of repl::CommandType
                 match get_command_type(command.trim()) {
                     CommandType::SQLCommand(_cmd) => {
-                        // `process_command_with_render` returns a CommandOutput
-                        // carrying both the status line and (for SELECT) the
-                        // pre-rendered prettytable. Print rendered first if
-                        // present so the user sees the rows above the
-                        // confirmation. Prior to the engine-stdout-pollution
-                        // cleanup the engine printed the table itself, which
-                        // corrupted any non-REPL stdout channel — now the REPL
-                        // owns the printing.
-                        match process_command_with_render(&command, &mut db) {
+                        // Route through `Connection::execute_with_render`
+                        // so `BEGIN CONCURRENT` / `COMMIT` / `ROLLBACK`
+                        // hit the per-connection MVCC state, and reads
+                        // inside an open concurrent transaction see the
+                        // BEGIN-time snapshot. SELECTs come back with
+                        // the pre-rendered prettytable; we print that
+                        // first so the user sees the rows above the
+                        // confirmation. Prior to the engine-stdout-
+                        // pollution cleanup the engine printed the table
+                        // itself, which corrupted any non-REPL stdout
+                        // channel — the REPL owns the printing now.
+                        match state.active_conn_mut().execute_with_render(&command) {
                             Ok(output) => {
                                 if let Some(rendered) = output.rendered.as_deref() {
                                     print!("{rendered}");
@@ -165,7 +181,7 @@ fn main() -> rustyline::Result<()> {
                     CommandType::MetaCommand(cmd) => {
                         // handle_meta_command parses and executes the MetaCommand
                         // and returns a Result<String, SQLRiteError>
-                        match handle_meta_command(cmd, &mut repl, &mut db) {
+                        match handle_meta_command(cmd, &mut repl, &mut state) {
                             Ok(response) => println!("{response}"),
                             Err(err) => eprintln!("An error occured: {err}"),
                         }
@@ -190,18 +206,14 @@ fn main() -> rustyline::Result<()> {
 }
 
 /// Equivalent to typing `.open FILE` at the REPL: load if present,
-/// materialize an empty DB on disk if missing. Attaches the long-lived
-/// Pager either way so subsequent writes auto-save.
+/// materialize an empty DB on disk if missing. Returns a fresh
+/// `Connection` whose backing `Arc<Mutex<Database>>` carries the
+/// long-lived pager so subsequent writes auto-save.
 ///
 /// When `read_only` is set we take a shared advisory lock and never
 /// materialize a missing file — read-only mode must fail cleanly if
 /// the target doesn't exist rather than silently creating one.
-fn open_or_create(path: &std::path::Path, read_only: bool) -> sqlrite::Result<Database> {
-    let db_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("db")
-        .to_string();
+fn open_or_create(path: &std::path::Path, read_only: bool) -> sqlrite::Result<Connection> {
     if read_only {
         if !path.exists() {
             return Err(sqlrite::SQLRiteError::General(format!(
@@ -209,13 +221,11 @@ fn open_or_create(path: &std::path::Path, read_only: bool) -> sqlrite::Result<Da
                 path.display()
             )));
         }
-        sqlrite::open_database_read_only(path, db_name)
-    } else if path.exists() {
-        sqlrite::open_database(path, db_name)
+        Connection::open_read_only(path)
     } else {
-        let mut fresh = Database::new(db_name);
-        fresh.source_path = Some(path.to_path_buf());
-        sqlrite::save_database(&mut fresh, path)?;
-        Ok(fresh)
+        // `Connection::open` already does the create-on-missing
+        // dance (materialize a fresh DB + save_database) and
+        // returns the attached pager either way.
+        Connection::open(path)
     }
 }

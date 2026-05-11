@@ -685,9 +685,21 @@ MVCC commits now leave a typed log-record frame in the WAL on top of the existin
 
 Each secondary-index entry becomes its own `RowVersion`. Turso explicitly punted on this; SQLRite's v0 will reject `CREATE INDEX` while `journal_mode = mvcc`.
 
-### Phase 11.11 — REPL `.spawn` + bench workload *(planned)*
+### ✅ Phase 11.11a — REPL `.spawn` for interactive `BEGIN CONCURRENT` demos
 
-REPL `.spawn` meta-command for interactive `BEGIN CONCURRENT` demos. New "N concurrent writers" benchmark workload pitting SQLRite-MVCC against SQLite + DuckDB on disjoint-row write throughput. Plus Go SDK multi-handle work (cross-pool sibling shape).
+Lift the REPL from a single `Database` to a `Vec<Connection>` so users can mint sibling handles in-session and step through cross-handle MVCC scenarios. The prompt now shows the active handle (`sqlrite[A]> ` / `sqlrite[B]> `) so it's always obvious which connection is about to execute the next line.
+
+- **`.spawn`** mints a sibling off the active handle (via `Connection::connect`) and switches to it. Each handle gets a stable letter name (`A`, `B`, `C`, …, `Z`, then `AA`, `AB`).
+- **`.use <NAME>`** switches the active handle (case-insensitive); errors with the list of valid names if the target is unknown.
+- **`.conns`** lists every handle, marks the active one with `*`, and tags any handle that holds an open `BEGIN CONCURRENT` so demos can show the conflict-detection state at a glance.
+- **`.open`** collapses every sibling back to a single handle named `A` so the new database doesn't strand siblings pointing at the old one.
+- New [`Connection::execute_with_render`](../src/connection.rs) returns a `CommandOutput` instead of a bare status string, so the REPL's SQL dispatch routes through `Connection` (catching `BEGIN CONCURRENT` / `COMMIT` / `ROLLBACK` and the in-flight tx swap) while still printing the prettytable for `SELECT`. The old non-render `execute` stays for callers that don't need it.
+
+The downstream "N concurrent writers" benchmark workload (originally bundled into 11.11) is its own follow-up: it touches the `benchmarks/` harness, links SQLite + DuckDB drivers, and is much heavier than this slice.
+
+### Phase 11.11b — `N concurrent writers` benchmark workload *(planned)*
+
+New benchmark in [`benchmarks/`](../benchmarks/) that pits SQLRite-MVCC against SQLite + DuckDB on a disjoint-row "N writers, mostly disjoint rows" scenario. Slots into the existing SQLR-16 harness as a Group D differentiator workload. Also includes Go SDK multi-handle work (cross-pool sibling shape) — see the 11.8 note for why that's a separate slice.
 
 ### Phase 11.12 — Docs *(planned, plan-doc "Phase 10.9")*
 

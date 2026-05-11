@@ -23,6 +23,10 @@ Meta commands start with a dot and don't need a trailing semicolon.
 | `.open FILENAME` | Open (or create) a `.sqlrite` file. From this point on, every committing SQL statement auto-saves. |
 | `.save FILENAME` | Force-flush the current DB to `FILENAME`. Rarely needed — auto-save makes this redundant when it's the active file. Useful for "save as" to a different path. |
 | `.tables` | List tables in the current database, sorted alphabetically |
+| `.ask QUESTION` | Natural-language → SQL via the configured LLM. Requires `SQLRITE_LLM_API_KEY`. |
+| `.spawn` | Mint a sibling connection sharing the same backing database. Switches to it. (Phase 11.11a) |
+| `.use NAME` | Switch the active handle (case-insensitive). (Phase 11.11a) |
+| `.conns` | List every active handle; marks the current one with `*` and flags handles in an open `BEGIN CONCURRENT`. (Phase 11.11a) |
 | `.read` / `.ast` | Not yet implemented |
 
 ### `.open` semantics
@@ -31,7 +35,33 @@ Meta commands start with a dot and don't need a trailing semicolon.
 - If `FILENAME` doesn't exist: create an empty database at that path (auto-save enabled immediately).
 - If `FILENAME` exists but is not a valid SQLRite database: reject with a `bad magic bytes` error — the REPL stays in its previous state.
 
-Only one database is active at a time. A subsequent `.open` replaces the in-memory state.
+Only one database is active at a time. A subsequent `.open` replaces the in-memory state and **collapses every sibling handle minted via `.spawn` back to a single one** (named `A`) — siblings pointing at the previous database would be stranded otherwise.
+
+### Multi-handle mode (Phase 11.11a)
+
+The REPL holds a vector of `Connection`s; the prompt always shows which one is active: `sqlrite[A]> `, `sqlrite[B]> `, etc.
+
+- `.spawn` mints a new sibling off the active handle and switches to it. Each new handle gets the next letter in sequence (`A`, `B`, `C`, …, `Z`, `AA`, `AB`).
+- `.use NAME` switches the active handle. The next SQL line runs on that connection.
+- `.conns` shows the current roster, with `*` next to the active handle and `(BEGIN CONCURRENT)` next to any handle holding an open concurrent transaction.
+
+A worked demo (assumes `PRAGMA journal_mode = mvcc;`):
+
+```text
+sqlrite[A]> CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+sqlrite[A]> INSERT INTO t (id, v) VALUES (1, 0);
+sqlrite[A]> .spawn
+Spawned sibling handle 'B' and switched to it. 2 handles open.
+sqlrite[B]> .use A
+sqlrite[A]> BEGIN CONCURRENT;
+sqlrite[A]> UPDATE t SET v = 100 WHERE id = 1;
+sqlrite[A]> .use B
+sqlrite[B]> BEGIN CONCURRENT;
+sqlrite[B]> UPDATE t SET v = 200 WHERE id = 1;
+sqlrite[B]> COMMIT;
+sqlrite[B]> .use A
+sqlrite[A]> COMMIT;            -- Busy: write-write conflict on t/1
+```
 
 ## Supported SQL
 
