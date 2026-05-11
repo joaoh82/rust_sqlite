@@ -241,6 +241,47 @@ impl Connection {
         })
     }
 
+    /// Phase 11.8 — mints a sibling `Connection` that shares the
+    /// same underlying database state (the in-memory tables, the
+    /// MVCC store, the pager). Wraps the engine's
+    /// `Connection::connect`.
+    ///
+    /// Use this to drive `BEGIN CONCURRENT` from multiple Python
+    /// handles in the same process: each sibling can hold its
+    /// own concurrent transaction, and commits validate against
+    /// the shared MvStore.
+    ///
+    /// ```python
+    /// import sqlrite
+    /// conn = sqlrite.connect(":memory:")
+    /// conn.execute("PRAGMA journal_mode = mvcc")
+    /// conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+    /// conn.execute("INSERT INTO t (id, v) VALUES (1, 0)")
+    ///
+    /// sibling = conn.connect()
+    /// # `sibling` shares the same backing DB — its writes and
+    /// # `BEGIN CONCURRENT` transactions land on the same tables.
+    /// ```
+    ///
+    /// The sibling carries its own per-handle prepared-statement
+    /// cache and concurrent-transaction slot. Closing one
+    /// handle (`conn.close()`) doesn't affect siblings; the
+    /// underlying database lives as long as any handle holds it.
+    fn connect(&self) -> PyResult<Connection> {
+        let guard = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| SQLRiteError::new_err("cannot connect: connection is closed"))?;
+        let locked = guard
+            .lock()
+            .map_err(|_| SQLRiteError::new_err("connection mutex poisoned"))?;
+        let sibling = locked.connect();
+        Ok(Connection {
+            inner: Some(Mutex::new(sibling)),
+            ask_config: self.ask_config.clone(),
+        })
+    }
+
     /// Closes the connection and releases the OS file lock. Safe to
     /// call multiple times; a closed connection raises `SQLRiteError`
     /// on any subsequent operation.

@@ -285,6 +285,86 @@ def test_journal_mode_pragma_reaches_python(conn):
         conn.execute("PRAGMA journal_mode = nonsense")
 
 
+# ---------------------------------------------------------------------------
+# Phase 11.8 — multi-handle (Connection.connect()) end-to-end
+
+
+def test_sibling_connection_shares_underlying_database(conn):
+    """A sibling minted via `conn.connect()` sees writes the parent
+    made — the headline 11.8 contract.
+    """
+    sibling = conn.connect()
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'alice')")
+
+    # Sibling reads the parent's write.
+    cur = sibling.execute("SELECT name FROM t WHERE id = 1")
+    assert cur.fetchone() == ("alice",)
+
+    # Sibling's writes are visible to the parent.
+    sibling.execute("INSERT INTO t (id, name) VALUES (2, 'bob')")
+    cur = conn.execute("SELECT name FROM t WHERE id = 2")
+    assert cur.fetchone() == ("bob",)
+
+
+def test_sibling_after_close_still_works(conn):
+    """Closing the parent doesn't tear down the sibling. The
+    underlying database is `Arc`-shared across handles."""
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+    conn.execute("INSERT INTO t (id, v) VALUES (1, 100)")
+    sibling = conn.connect()
+    conn.close()
+
+    cur = sibling.execute("SELECT v FROM t WHERE id = 1")
+    assert cur.fetchone() == (100,)
+
+
+def test_sibling_on_closed_connection_raises(conn):
+    """Calling `connect()` on a closed connection should raise
+    SQLRiteError, not segfault."""
+    conn.close()
+    with pytest.raises(sqlrite.SQLRiteError):
+        conn.connect()
+
+
+def test_begin_concurrent_busy_round_trips_through_python_siblings(conn):
+    """Two sibling handles, two `BEGIN CONCURRENT` transactions on
+    the same row: second commit must raise `sqlrite.BusyError`.
+
+    This is the end-to-end test that wasn't possible before 11.8
+    — the previous Python `sqlrite.connect()` model built isolated
+    databases. With `Connection.connect()` exposed, the 11.7 retry
+    idiom can finally be exercised from Python.
+    """
+    conn.execute("PRAGMA journal_mode = mvcc")
+    conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+    conn.execute("INSERT INTO accounts (id, balance) VALUES (1, 100)")
+
+    sibling = conn.connect()
+
+    conn.execute("BEGIN CONCURRENT")
+    sibling.execute("BEGIN CONCURRENT")
+
+    conn.execute("UPDATE accounts SET balance = 200 WHERE id = 1")
+    sibling.execute("UPDATE accounts SET balance = 300 WHERE id = 1")
+
+    # First commit wins.
+    conn.execute("COMMIT")
+
+    # Second commit aborts with the dedicated subclass.
+    with pytest.raises(sqlrite.BusyError) as exc_info:
+        sibling.execute("COMMIT")
+    # Still a SQLRiteError too (subclass relationship).
+    assert isinstance(exc_info.value, sqlrite.SQLRiteError)
+    # Retry succeeds.
+    sibling.execute("BEGIN CONCURRENT")
+    sibling.execute("UPDATE accounts SET balance = 300 WHERE id = 1")
+    sibling.execute("COMMIT")
+
+    cur = conn.execute("SELECT balance FROM accounts WHERE id = 1")
+    assert cur.fetchone() == (300,)
+
+
 def test_executescript_runs_batched_statements(conn):
     cur = conn.cursor()
     cur.executescript(

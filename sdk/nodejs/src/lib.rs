@@ -299,6 +299,40 @@ impl Database {
         })
     }
 
+    /// Phase 11.8 — mints a sibling `Database` that shares the
+    /// same underlying state (the in-memory tables, the MVCC
+    /// store, the pager). Wraps the engine's `Connection::connect`.
+    ///
+    /// Use this to drive `BEGIN CONCURRENT` from multiple Node
+    /// handles in the same process: each sibling can hold its own
+    /// concurrent transaction, and commits validate against the
+    /// shared MvStore.
+    ///
+    /// ```js
+    /// const db = new Database(':memory:');
+    /// db.exec('PRAGMA journal_mode = mvcc');
+    /// db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+    /// const sibling = db.connect();
+    /// // sibling.exec(...) lands on the same backing tables.
+    /// ```
+    ///
+    /// The sibling carries its own per-handle prepared-statement
+    /// cache and concurrent-transaction slot. Closing one handle
+    /// (`db.close()`) doesn't affect siblings; the underlying
+    /// database lives as long as any handle holds it.
+    #[napi]
+    pub fn connect(&self) -> Result<Database> {
+        let borrow = self.inner.borrow();
+        let parent = borrow
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("cannot connect: database is closed"))?;
+        let sibling = parent.connect();
+        Ok(Database {
+            inner: RefCell::new(Some(sibling)),
+            ask_config: RefCell::new(self.ask_config.borrow().clone()),
+        })
+    }
+
     /// Closes the connection and releases the OS file lock. Safe to
     /// call multiple times.
     #[napi]
