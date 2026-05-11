@@ -255,69 +255,67 @@ func TestBadSQLBubblesUpAsError(t *testing.T) {
 // Phase 11.7 — BEGIN CONCURRENT / Busy sentinel errors
 
 func TestBusySentinelsAreDistinctErrors(t *testing.T) {
-	if ErrBusy == nil {
-		t.Fatal("ErrBusy is nil")
+	if sqlrite.ErrBusy == nil {
+		t.Fatal("sqlrite.ErrBusy is nil")
 	}
-	if ErrBusySnapshot == nil {
-		t.Fatal("ErrBusySnapshot is nil")
+	if sqlrite.ErrBusySnapshot == nil {
+		t.Fatal("sqlrite.ErrBusySnapshot is nil")
 	}
 	// Sanity: the two sentinels are independent values.
-	if errors.Is(ErrBusy, ErrBusySnapshot) {
-		t.Error("ErrBusy must not match ErrBusySnapshot via errors.Is")
+	if errors.Is(sqlrite.ErrBusy, sqlrite.ErrBusySnapshot) {
+		t.Error("sqlrite.ErrBusy must not match sqlrite.ErrBusySnapshot via errors.Is")
 	}
-	if errors.Is(ErrBusySnapshot, ErrBusy) {
-		t.Error("ErrBusySnapshot must not match ErrBusy via errors.Is")
+	if errors.Is(sqlrite.ErrBusySnapshot, sqlrite.ErrBusy) {
+		t.Error("sqlrite.ErrBusySnapshot must not match sqlrite.ErrBusy via errors.Is")
 	}
 }
 
 func TestIsRetryableCoversBothSentinels(t *testing.T) {
-	if !IsRetryable(ErrBusy) {
-		t.Error("IsRetryable(ErrBusy) should be true")
+	if !sqlrite.IsRetryable(sqlrite.ErrBusy) {
+		t.Error("sqlrite.IsRetryable(sqlrite.ErrBusy) should be true")
 	}
-	if !IsRetryable(ErrBusySnapshot) {
-		t.Error("IsRetryable(ErrBusySnapshot) should be true")
+	if !sqlrite.IsRetryable(sqlrite.ErrBusySnapshot) {
+		t.Error("sqlrite.IsRetryable(sqlrite.ErrBusySnapshot) should be true")
 	}
-	if IsRetryable(errors.New("not a busy error")) {
-		t.Error("IsRetryable on a generic error should be false")
+	if sqlrite.IsRetryable(errors.New("not a busy error")) {
+		t.Error("sqlrite.IsRetryable on a generic error should be false")
 	}
-	if IsRetryable(nil) {
-		t.Error("IsRetryable(nil) should be false")
+	if sqlrite.IsRetryable(nil) {
+		t.Error("sqlrite.IsRetryable(nil) should be false")
 	}
 	// Wrapped errors flow through errors.Is — retry loops use
-	// `fmt.Errorf("... %w", ErrBusy)` shape, so we verify the
+	// `fmt.Errorf("... %w", sqlrite.ErrBusy)` shape, so we verify the
 	// helper recognises wrapped variants too.
-	wrapped := fmt.Errorf("commit failed: %w", ErrBusy)
-	if !IsRetryable(wrapped) {
-		t.Error("IsRetryable should unwrap %w to find ErrBusy")
+	wrapped := fmt.Errorf("commit failed: %w", sqlrite.ErrBusy)
+	if !sqlrite.IsRetryable(wrapped) {
+		t.Error("sqlrite.IsRetryable should unwrap %w to find sqlrite.ErrBusy")
 	}
 }
 
-func TestJournalModeMvccRoundTripsThroughGoDriver(t *testing.T) {
-	// Sanity that the journal_mode PRAGMA reaches the engine
+func TestJournalModeMvccReachesGoDriver(t *testing.T) {
+	// Sanity that `PRAGMA journal_mode = mvcc` reaches the engine
 	// through cgo. BEGIN CONCURRENT itself isn't usefully
 	// exercisable through `database/sql` today (the driver
 	// doesn't expose sibling Connection handles per the Phase
-	// 11.1 multi-connection contract), but the PRAGMA path
-	// proves the cgo plumbing is right.
+	// 11.1 multi-connection contract), but PRAGMA accepts and the
+	// `BEGIN CONCURRENT` gate flips, which proves the cgo
+	// plumbing is right.
+	//
+	// Note: PRAGMA renders a single-row result in the engine's
+	// `CommandOutput.rendered`, but the Go driver routes non-SELECT
+	// statements through `sqlrite_execute` (no rows), so we don't
+	// try to read the value back through `db.Query`.
 	db := openMem(t)
 	mustExec(t, db, "PRAGMA journal_mode = mvcc")
-
-	// Read back via Query — the PRAGMA renders a single-row
-	// single-column result.
-	rows, err := db.Query("PRAGMA journal_mode")
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		t.Fatal("expected one row from PRAGMA journal_mode")
-	}
-	var mode string
-	if err := rows.Scan(&mode); err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	if mode != "mvcc" {
-		t.Errorf("expected mode 'mvcc', got %q", mode)
+	// BEGIN CONCURRENT only succeeds once journal_mode is mvcc;
+	// the gate proves the toggle landed.
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	mustExec(t, db, "BEGIN CONCURRENT")
+	mustExec(t, db, "ROLLBACK")
+	// Unknown values still error cleanly (regression guard for
+	// the PRAGMA dispatcher).
+	if _, err := db.Exec("PRAGMA journal_mode = nonsense"); err == nil {
+		t.Fatal("expected unknown journal_mode to error")
 	}
 }
 

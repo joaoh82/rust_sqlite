@@ -253,19 +253,36 @@ def test_busy_error_class_exists_and_inherits_from_sqlrite_error():
     assert issubclass(sqlrite.BusySnapshotError, sqlrite.SQLRiteError)
 
 
-def test_journal_mode_pragma_round_trips_through_python(conn):
-    """Sanity check that the journal_mode toggle reaches Python.
+def test_journal_mode_pragma_reaches_python(conn):
+    """Sanity check that `PRAGMA journal_mode = mvcc` reaches the
+    engine through the Python SDK.
+
     BEGIN CONCURRENT is unusable from Python today without a
     multi-handle API (each `sqlrite.connect()` builds an isolated
     DB; siblings via `Connection::connect()` aren't yet exposed —
-    follow-up for 11.8+), but the PRAGMA path proves the FFI
-    plumbing is right end-to-end.
+    follow-up for 11.10), but PRAGMA accepts/rejects cleanly proves
+    the FFI plumbing is right.
+
+    Note: PRAGMA goes through the cursor's non-query path (the
+    `is_query` heuristic only flags SELECT), so `fetchone()` after
+    PRAGMA returns None — the rendered single-row result lives in
+    the engine's `CommandOutput.rendered` field, which the Python
+    cursor doesn't surface today. The contract we're testing here
+    is "the PRAGMA executes without erroring", not "the read-form
+    rendering reaches Python".
     """
+    # Set the mode — must not error.
     conn.execute("PRAGMA journal_mode = mvcc")
-    # The PRAGMA read form renders a single-row result.
-    cur = conn.execute("PRAGMA journal_mode")
-    row = cur.fetchone()
-    assert row == ("mvcc",), f"expected ('mvcc',), got {row!r}"
+    # Verify BEGIN CONCURRENT now succeeds (it would error with
+    # "requires PRAGMA journal_mode = mvcc" if the toggle didn't
+    # take). Roll back immediately; we're just probing the gate.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    conn.execute("BEGIN CONCURRENT")
+    conn.execute("ROLLBACK")
+    # An unknown PRAGMA value still surfaces as an error class
+    # callers can catch (regression guard).
+    with pytest.raises(sqlrite.SQLRiteError):
+        conn.execute("PRAGMA journal_mode = nonsense")
 
 
 def test_executescript_runs_batched_statements(conn):
