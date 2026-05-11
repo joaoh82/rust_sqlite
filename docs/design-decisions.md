@@ -144,6 +144,8 @@ Decisions are grouped by the engine layer they concern: parser, storage, concurr
 
 ---
 
+> **Phase 11 (§12a–§12h) — concurrent writes via MVCC + `BEGIN CONCURRENT`.** These notes capture the per-slice design decisions made as Phase 11 shipped. For the **user-facing reference** (SQL surface, embedding API, SDK error mapping, REPL meta-commands, durability story, limitations) go to [`docs/concurrent-writes.md`](concurrent-writes.md). The plan-doc references below point to the original [`concurrent-writes-plan.md`](concurrent-writes-plan.md) which stays as the historical design record.
+
 ### 12a. `Connection` as a thin handle over `Arc<Mutex<Database>>` (Phase 11.1)
 
 **Decision.** `Connection` no longer owns a `Database` by value; it holds `Arc<Mutex<Database>>` plus a per-handle prepared-statement LRU. A new `Connection::connect()` mints a sibling handle that shares the same backing engine state. The mutex is acquired transparently at the entry of every public method (`execute`, `prepare`, `database()`, accessors); statements release it between calls. `Connection: Send + Sync`.
