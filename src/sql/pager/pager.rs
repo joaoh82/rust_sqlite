@@ -387,6 +387,70 @@ impl Pager {
         self.staged.clear();
     }
 
+    /// Phase 11.9 — appends an MVCC commit-batch frame to the WAL
+    /// without fsync. The next legacy page-commit's fsync covers it,
+    /// so callers should follow this with `Pager::commit` (or
+    /// `pager::save_database`, which calls into it) to seal the
+    /// transaction. See [`crate::sql::pager::wal::Wal::append_mvcc_batch`]
+    /// for the durability story.
+    ///
+    /// `Connection::commit_concurrent` is the only caller today; it
+    /// invokes this after validation passes but before the legacy
+    /// save so a single fsync covers both the MVCC log record and
+    /// the page-level updates.
+    pub fn append_mvcc_batch(&mut self, batch: &crate::mvcc::MvccCommitBatch) -> Result<()> {
+        self.require_writable("append_mvcc_batch")?;
+        let wal = self
+            .wal
+            .as_mut()
+            .expect("read-write Pager must carry a WAL handle");
+        wal.append_mvcc_batch(batch)
+    }
+
+    /// Phase 11.9 — MVCC commit batches recovered from the WAL at
+    /// open time, in commit order. Empty for fresh databases, for
+    /// pre-11.9 (v1 / v2) WALs that carry no MVCC frames, and for
+    /// read-only opens that didn't replay (those still get the
+    /// batches if the WAL had any — replay is unconditional in
+    /// `Wal::open_with_mode`).
+    ///
+    /// The caller (`pager::open_database`) drains this into
+    /// `Database::mv_store` so the conflict-detection window
+    /// survives a process restart.
+    pub fn recovered_mvcc_commits(&self) -> &[crate::mvcc::MvccCommitBatch] {
+        match self.wal.as_ref() {
+            Some(wal) => wal.recovered_mvcc_commits(),
+            None => &[],
+        }
+    }
+
+    /// Phase 11.9 — returns the persisted MVCC clock high-water
+    /// from the WAL header, or 0 for in-memory / no-WAL opens. The
+    /// open path uses this to seed [`crate::mvcc::MvccClock`] so
+    /// post-reopen transactions don't hand out timestamps below
+    /// `max(committed_ts)`.
+    pub fn clock_high_water(&self) -> u64 {
+        self.wal.as_ref().map(|w| w.clock_high_water()).unwrap_or(0)
+    }
+
+    /// Phase 11.9 — promotes the WAL header's `clock_high_water` to
+    /// `value` if it would advance. No-op if `value` is at or below
+    /// the current high-water mark. Persists the new value into
+    /// the WAL header (which an fsync at checkpoint will flush).
+    ///
+    /// Called by `Connection::commit_concurrent` after each MVCC
+    /// commit so a crash between commits and the next checkpoint
+    /// leaves enough of the clock persisted that replay seeds
+    /// `MvccClock` correctly.
+    pub fn observe_clock_high_water(&mut self, value: u64) -> Result<()> {
+        if let Some(wal) = self.wal.as_mut() {
+            if value > wal.clock_high_water() {
+                wal.set_clock_high_water(value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Commits all staged pages into the WAL. Only pages whose bytes differ
     /// from the effective committed state (wal_cache layered on on_disk)
     /// produce frames. A final commit frame carries the new page 0 (encoded

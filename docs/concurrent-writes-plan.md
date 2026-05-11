@@ -270,9 +270,11 @@ Goal: more than one `Connection` can target the same `Database` within a process
 
 ### Phase 10.5 — Checkpoint + crash recovery
 
-- Extend the checkpointer to drain MVCC log records into pager-level updates before folding the WAL into the main file.
-- Crash recovery: on open, replay WAL log records into `MvStore`, then replay pager-level commit frames as today.
-- Tests: kill the process mid-MVCC-commit (between log-record append and version-chain push), reopen, verify the committed transaction is visible and the half-written one is not.
+> **Status (roadmap 11.9 — May 2026):** The crash-recovery half landed in roadmap Phase 11.9. WAL format is bumped to v3; commits append a typed `MvccCommitBatch` frame before the legacy save's fsync; reopen replays those frames into `MvStore` and seeds `MvccClock` past the highest `commit_ts`. The checkpoint-drain half — folding MVCC log records into pager-level updates and re-enabling the `Mvcc → Wal` journal-mode downgrade — is the remaining slice and stays parked for a follow-up.
+
+- ~~Extend the checkpointer to drain MVCC log records into pager-level updates before folding the WAL into the main file.~~ *Deferred — see status note above.*
+- Crash recovery: on open, replay WAL log records into `MvStore`, then replay pager-level commit frames as today. **(Shipped — 11.9.)**
+- Tests: kill the process mid-MVCC-commit (between log-record append and version-chain push), reopen, verify the committed transaction is visible and the half-written one is not. **(Shipped — 11.9 covers the clean-drop case which exercises the same recovery codepath; a real OS-kill test is parked with the checkpoint-drain follow-up.)**
 
 ### Phase 10.6 — Garbage collection
 

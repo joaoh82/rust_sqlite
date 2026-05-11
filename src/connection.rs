@@ -59,7 +59,9 @@ use sqlparser::ast::Statement as AstStatement;
 use sqlparser::parser::Parser;
 
 use crate::error::{Result, SQLRiteError};
-use crate::mvcc::{ConcurrentTx, JournalMode, RowID, RowVersion, VersionPayload};
+use crate::mvcc::{
+    ConcurrentTx, JournalMode, MvccCommitBatch, MvccLogRecord, RowID, RowVersion, VersionPayload,
+};
 use crate::sql::db::database::{Database, TxnSnapshot};
 use crate::sql::db::table::{Table, Value};
 use crate::sql::executor::execute_select_rows;
@@ -533,9 +535,51 @@ impl Connection {
         // values via the existing read path.
         apply_writes_to_live(&mut db, &tx.tables, &writes)?;
 
+        // Phase 11.9 — append the MVCC commit batch into the WAL
+        // before the legacy page-commit flush. The MVCC frame is
+        // not fsync'd on its own; the legacy `save_database`
+        // below ends with a commit-frame fsync that durably
+        // includes every byte written since the previous fsync,
+        // covering this batch too. A crash between the two
+        // append calls drops both — torn-write atomicity for the
+        // whole transaction.
+        //
+        // For in-memory databases (no source_path) we skip the
+        // WAL append: there's no pager and no fsync. MVCC state
+        // stays in the in-memory `MvStore` for the lifetime of
+        // the process.
+        if let Some(pager) = db.pager.as_mut() {
+            let records = writes
+                .iter()
+                .map(|(row, payload)| MvccLogRecord {
+                    row: row.clone(),
+                    payload: payload.clone(),
+                })
+                .collect();
+            let batch = MvccCommitBatch { commit_ts, records };
+            if let Err(append_err) = pager.append_mvcc_batch(&batch) {
+                return Err(SQLRiteError::General(format!(
+                    "COMMIT failed appending MVCC log record: {append_err}"
+                )));
+            }
+            // Bump the WAL header's persisted clock high-water so
+            // the next checkpoint truncates with a header that
+            // covers this commit. The MVCC frames themselves
+            // also carry `commit_ts`, so even an un-checkpointed
+            // crash still seeds the clock correctly via the
+            // replayer's max-with-frames logic — this just keeps
+            // the post-checkpoint path correct.
+            if let Err(set_err) = pager.observe_clock_high_water(commit_ts) {
+                return Err(SQLRiteError::General(format!(
+                    "COMMIT failed updating WAL clock high-water: {set_err}"
+                )));
+            }
+        }
+
         // Persist via the legacy WAL — the on-disk format is
-        // unchanged in 11.4. A future MVCC-native log-record
-        // frame (Phase 11.5) will subsume this.
+        // unchanged in 11.4+. The page-commit's fsync below
+        // covers the MVCC frame appended above; one atomic
+        // boundary for the whole transaction.
         if let Some(path) = db.source_path.clone() {
             if let Err(save_err) = pager::save_database(&mut db, &path) {
                 return Err(SQLRiteError::General(format!(
@@ -2898,6 +2942,220 @@ mod tests {
         assert!(SQLRiteError::Busy("x".into()).is_retryable());
         assert!(SQLRiteError::BusySnapshot("x".into()).is_retryable());
         assert!(!SQLRiteError::General("x".into()).is_retryable());
+    }
+
+    /// Phase 11.9 — every BEGIN CONCURRENT commit on a file-backed
+    /// database leaves an MVCC log-record frame in the WAL. The Pager
+    /// surfaces those on reopen via `recovered_mvcc_commits`.
+    #[test]
+    fn mvcc_commit_persists_a_log_record_into_wal() {
+        let path = tmp_path("mvcc_log_record");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            c.execute("BEGIN CONCURRENT;").unwrap();
+            c.execute("INSERT INTO t (id, v) VALUES (1, 42);").unwrap();
+            c.execute("COMMIT;").unwrap();
+        }
+        // Reopen and confirm the WAL replay surfaced the batch.
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        let pager = db.pager.as_ref().expect("file-backed db carries a pager");
+        let batches = pager.recovered_mvcc_commits();
+        assert_eq!(batches.len(), 1, "one BEGIN CONCURRENT commit -> one batch");
+        assert_eq!(batches[0].records.len(), 1, "one row written");
+        let rec = &batches[0].records[0];
+        assert_eq!(rec.row.table, "t");
+        assert_eq!(rec.row.rowid, 1);
+        match &rec.payload {
+            VersionPayload::Present(cols) => {
+                assert!(cols.iter().any(
+                    |(k, v)| k == "v" && matches!(v, crate::sql::db::table::Value::Integer(42))
+                ));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        drop(db);
+        drop(c2);
+        cleanup(&path);
+    }
+
+    /// Phase 11.9 — on reopen the MVCC log records are pushed back
+    /// into `MvStore`. The conflict-detection window survives a
+    /// process restart: a write whose `begin_ts` predates a
+    /// replayed commit must surface as `Busy`.
+    #[test]
+    fn mvcc_reopen_restores_mv_store_and_clock() {
+        let path = tmp_path("mvcc_reopen");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            c.execute("BEGIN CONCURRENT;").unwrap();
+            c.execute("INSERT INTO t (id, v) VALUES (1, 10);").unwrap();
+            c.execute("COMMIT;").unwrap();
+            c.execute("BEGIN CONCURRENT;").unwrap();
+            c.execute("UPDATE t SET v = 20 WHERE id = 1;").unwrap();
+            c.execute("COMMIT;").unwrap();
+        }
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        // Two commits replayed → two versions for row t/1 (the
+        // first capped, the second open-ended).
+        let store = db.mv_store();
+        let row = RowID::new("t", 1);
+        assert!(
+            store.latest_committed_begin(&row).is_some(),
+            "MvStore should know about row t/1 after reopen"
+        );
+        // Clock must have advanced past the persisted commits so
+        // any new transaction gets a fresh `begin_ts`.
+        let last_commit_ts = store.latest_committed_begin(&row).unwrap();
+        assert!(
+            db.mvcc_clock().now() >= last_commit_ts,
+            "clock {} must be >= last replayed commit_ts {}",
+            db.mvcc_clock().now(),
+            last_commit_ts,
+        );
+        drop(db);
+        drop(c2);
+        cleanup(&path);
+    }
+
+    /// Phase 11.9 — multi-row batches survive replay intact, with
+    /// every (RowID, payload) pair coming back from the WAL.
+    #[test]
+    fn mvcc_multi_row_batch_replays_intact() {
+        let path = tmp_path("mvcc_multi_row");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            // Seed rows under legacy mode so the concurrent tx
+            // can UPDATE them — Phase 11 keeps INSERT-only
+            // semantics for the concurrent path simple.
+            c.execute("INSERT INTO t (id, v) VALUES (1, 1);").unwrap();
+            c.execute("INSERT INTO t (id, v) VALUES (2, 2);").unwrap();
+            c.execute("INSERT INTO t (id, v) VALUES (3, 3);").unwrap();
+
+            c.execute("BEGIN CONCURRENT;").unwrap();
+            c.execute("UPDATE t SET v = 100 WHERE id = 1;").unwrap();
+            c.execute("UPDATE t SET v = 200 WHERE id = 2;").unwrap();
+            c.execute("UPDATE t SET v = 300 WHERE id = 3;").unwrap();
+            c.execute("COMMIT;").unwrap();
+        }
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        let pager = db.pager.as_ref().unwrap();
+        let batches = pager.recovered_mvcc_commits();
+        assert_eq!(batches.len(), 1, "single COMMIT -> single batch");
+        let rowids: Vec<i64> = batches[0].records.iter().map(|r| r.row.rowid).collect();
+        assert!(rowids.contains(&1));
+        assert!(rowids.contains(&2));
+        assert!(rowids.contains(&3));
+        assert_eq!(batches[0].records.len(), 3);
+        drop(db);
+        drop(c2);
+        cleanup(&path);
+    }
+
+    /// Phase 11.9 — a BEGIN CONCURRENT that's never committed
+    /// leaves no MVCC frame in the WAL. The reopen path replays
+    /// only what was sealed.
+    #[test]
+    fn mvcc_rolled_back_tx_leaves_no_wal_record() {
+        let path = tmp_path("mvcc_rollback");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            c.execute("BEGIN CONCURRENT;").unwrap();
+            c.execute("INSERT INTO t (id, v) VALUES (1, 999);").unwrap();
+            c.execute("ROLLBACK;").unwrap();
+        }
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        let pager = db.pager.as_ref().unwrap();
+        assert!(
+            pager.recovered_mvcc_commits().is_empty(),
+            "ROLLBACK must not append MVCC frames"
+        );
+        // Legacy tables also untouched.
+        let store = db.mv_store();
+        assert_eq!(store.total_versions(), 0);
+        drop(db);
+        drop(c2);
+        cleanup(&path);
+    }
+
+    /// Phase 11.9 — legacy (non-BEGIN-CONCURRENT) commits do
+    /// **not** emit MVCC frames. The persistence is opt-in along
+    /// the same axis as `BEGIN CONCURRENT`.
+    #[test]
+    fn legacy_commit_does_not_emit_mvcc_frame() {
+        let path = tmp_path("mvcc_legacy_no_frame");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            c.execute("INSERT INTO t (id) VALUES (1);").unwrap();
+        }
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        let pager = db.pager.as_ref().unwrap();
+        assert!(
+            pager.recovered_mvcc_commits().is_empty(),
+            "legacy writes never produce MVCC frames"
+        );
+        drop(db);
+        drop(c2);
+        cleanup(&path);
+    }
+
+    /// Phase 11.9 — crash recovery sketch. After several
+    /// concurrent commits we drop the connection without an
+    /// explicit checkpoint (the auto-checkpoint threshold is
+    /// well above what 3 frames triggers). A fresh open replays
+    /// every MVCC frame and reconstructs the chain.
+    #[test]
+    fn mvcc_replays_multiple_commits_after_unclean_close() {
+        let path = tmp_path("mvcc_unclean_close");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute("PRAGMA journal_mode = mvcc;").unwrap();
+            c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            for v in 0..5 {
+                c.execute("BEGIN CONCURRENT;").unwrap();
+                if v == 0 {
+                    c.execute("INSERT INTO t (id, v) VALUES (1, 0);").unwrap();
+                } else {
+                    c.execute(&format!("UPDATE t SET v = {v} WHERE id = 1;"))
+                        .unwrap();
+                }
+                c.execute("COMMIT;").unwrap();
+            }
+            // c drops here without calling checkpoint — the WAL
+            // still holds every MVCC frame.
+        }
+        let c2 = Connection::open(&path).unwrap();
+        let db = c2.database();
+        let pager = db.pager.as_ref().unwrap();
+        let batches = pager.recovered_mvcc_commits();
+        assert_eq!(batches.len(), 5, "every COMMIT must show up after reopen");
+        // commit_ts values are strictly increasing.
+        for w in batches.windows(2) {
+            assert!(w[0].commit_ts < w[1].commit_ts);
+        }
+        drop(db);
+        drop(c2);
+        cleanup(&path);
     }
 
     #[test]

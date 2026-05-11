@@ -179,9 +179,61 @@ pub fn open_database_with_mode(path: &Path, db_name: String, mode: AccessMode) -
         }
     }
 
+    // Phase 11.9 — replay any MVCC commit batches recovered from
+    // the WAL into the freshly-built `MvStore`, and seed the
+    // `MvccClock` past the highest persisted timestamp. Without
+    // this step the in-memory MVCC state would always start blank
+    // on reopen — fine for legacy single-session workloads, but a
+    // correctness gap once `BEGIN CONCURRENT` is in play (a
+    // second process could hand out a `begin_ts` below an
+    // already-committed version's `end`, breaking the visibility
+    // rule).
+    //
+    // The clock seed is the larger of (header.clock_high_water,
+    // max(commit_ts among replayed batches)) so a crash between
+    // commits and the next checkpoint — where the header's
+    // high-water lags reality — still produces a clock that
+    // doesn't regress.
+    replay_mvcc_into_db(&mut db, &pager)?;
+
     db.source_path = Some(path.to_path_buf());
     db.pager = Some(pager);
     Ok(db)
+}
+
+/// Phase 11.9 — drains every MVCC commit batch the Pager recovered
+/// from the WAL into `db.mv_store`, and advances `db.mvcc_clock`
+/// to at least the highest observed timestamp.
+///
+/// Batches are replayed in WAL order, which matches commit order
+/// (the WAL appends sequentially). Each record's `commit_ts`
+/// becomes the version's `begin`, with the previous latest
+/// version's `end` capped at the same timestamp — identical to
+/// the live-commit path's `MvStore::push_committed`.
+fn replay_mvcc_into_db(db: &mut Database, pager: &Pager) -> Result<()> {
+    use crate::mvcc::RowVersion;
+
+    let mut clock_seed = pager.clock_high_water();
+    for batch in pager.recovered_mvcc_commits() {
+        if batch.commit_ts > clock_seed {
+            clock_seed = batch.commit_ts;
+        }
+        for rec in &batch.records {
+            let version = RowVersion::committed(batch.commit_ts, rec.payload.clone());
+            db.mv_store
+                .push_committed(rec.row.clone(), version)
+                .map_err(|e| {
+                    SQLRiteError::Internal(format!(
+                        "WAL MVCC replay: push_committed failed for {}/{}: {e}",
+                        rec.row.table, rec.row.rowid,
+                    ))
+                })?;
+        }
+    }
+    if clock_seed > 0 {
+        db.mvcc_clock.observe(clock_seed);
+    }
+    Ok(())
 }
 
 /// Catalog row for a secondary index — deferred until after every table is
