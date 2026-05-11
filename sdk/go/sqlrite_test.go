@@ -12,6 +12,8 @@ package sqlrite_test
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,6 +248,76 @@ func TestBadSQLBubblesUpAsError(t *testing.T) {
 	_, err := db.Exec("THIS IS NOT SQL")
 	if err == nil {
 		t.Fatal("expected an error on garbage SQL")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11.7 — BEGIN CONCURRENT / Busy sentinel errors
+
+func TestBusySentinelsAreDistinctErrors(t *testing.T) {
+	if ErrBusy == nil {
+		t.Fatal("ErrBusy is nil")
+	}
+	if ErrBusySnapshot == nil {
+		t.Fatal("ErrBusySnapshot is nil")
+	}
+	// Sanity: the two sentinels are independent values.
+	if errors.Is(ErrBusy, ErrBusySnapshot) {
+		t.Error("ErrBusy must not match ErrBusySnapshot via errors.Is")
+	}
+	if errors.Is(ErrBusySnapshot, ErrBusy) {
+		t.Error("ErrBusySnapshot must not match ErrBusy via errors.Is")
+	}
+}
+
+func TestIsRetryableCoversBothSentinels(t *testing.T) {
+	if !IsRetryable(ErrBusy) {
+		t.Error("IsRetryable(ErrBusy) should be true")
+	}
+	if !IsRetryable(ErrBusySnapshot) {
+		t.Error("IsRetryable(ErrBusySnapshot) should be true")
+	}
+	if IsRetryable(errors.New("not a busy error")) {
+		t.Error("IsRetryable on a generic error should be false")
+	}
+	if IsRetryable(nil) {
+		t.Error("IsRetryable(nil) should be false")
+	}
+	// Wrapped errors flow through errors.Is — retry loops use
+	// `fmt.Errorf("... %w", ErrBusy)` shape, so we verify the
+	// helper recognises wrapped variants too.
+	wrapped := fmt.Errorf("commit failed: %w", ErrBusy)
+	if !IsRetryable(wrapped) {
+		t.Error("IsRetryable should unwrap %w to find ErrBusy")
+	}
+}
+
+func TestJournalModeMvccRoundTripsThroughGoDriver(t *testing.T) {
+	// Sanity that the journal_mode PRAGMA reaches the engine
+	// through cgo. BEGIN CONCURRENT itself isn't usefully
+	// exercisable through `database/sql` today (the driver
+	// doesn't expose sibling Connection handles per the Phase
+	// 11.1 multi-connection contract), but the PRAGMA path
+	// proves the cgo plumbing is right.
+	db := openMem(t)
+	mustExec(t, db, "PRAGMA journal_mode = mvcc")
+
+	// Read back via Query — the PRAGMA renders a single-row
+	// single-column result.
+	rows, err := db.Query("PRAGMA journal_mode")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("expected one row from PRAGMA journal_mode")
+	}
+	var mode string
+	if err := rows.Scan(&mode); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if mode != "mvcc" {
+		t.Errorf("expected mode 'mvcc', got %q", mode)
 	}
 }
 

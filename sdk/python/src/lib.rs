@@ -70,8 +70,55 @@ pyo3::create_exception!(
     "Base error class for SQLRite failures."
 );
 
+// Phase 11.7 — distinct exception classes for the two retryable
+// engine errors. They inherit from `SQLRiteError` so existing
+// `except sqlrite.SQLRiteError` blocks still catch them, but
+// retry helpers can branch on the specific subclass with
+// `except sqlrite.BusyError` for snapshot-isolation-style retry
+// loops without re-parsing the message.
+pyo3::create_exception!(
+    sqlrite,
+    BusyError,
+    SQLRiteError,
+    "Raised when `BEGIN CONCURRENT` commits hit a row-level \
+     write-write conflict. The transaction has already been \
+     rolled back; the caller should retry the whole transaction \
+     with a fresh `BEGIN CONCURRENT`. Subclass of `SQLRiteError`."
+);
+
+pyo3::create_exception!(
+    sqlrite,
+    BusySnapshotError,
+    SQLRiteError,
+    "Raised when a `BEGIN CONCURRENT` read sees a row that has \
+     been superseded after the transaction's snapshot was taken. \
+     Same retry semantics as `BusyError` — wired through the same \
+     SDK retry helper. Subclass of `SQLRiteError`."
+);
+
+/// Generic error mapper — produces a base `SQLRiteError`.
+/// Falls back to the engine's `Display` impl for the message
+/// regardless of the variant.
 fn map_err<E: std::fmt::Display>(e: E) -> PyErr {
     SQLRiteError::new_err(e.to_string())
+}
+
+/// Phase 11.7 — engine-typed mapper. Inspects the variant and
+/// raises `BusyError` / `BusySnapshotError` for retryable
+/// failures, the base `SQLRiteError` otherwise. Every path that
+/// receives a `Result<_, sqlrite::SQLRiteError>` should use
+/// this — `map_err` (generic, above) collapses the variant and
+/// SDK callers lose the retryability information.
+///
+/// The full-path `sqlrite::SQLRiteError::…` references below
+/// disambiguate the engine enum from the pyo3 exception class
+/// of the same short name (`SQLRiteError`) created above.
+fn map_engine_err(e: sqlrite::SQLRiteError) -> PyErr {
+    match &e {
+        sqlrite::SQLRiteError::Busy(_) => BusyError::new_err(e.to_string()),
+        sqlrite::SQLRiteError::BusySnapshot(_) => BusySnapshotError::new_err(e.to_string()),
+        _ => SQLRiteError::new_err(e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,9 +136,9 @@ fn map_err<E: std::fmt::Display>(e: E) -> PyErr {
 #[pyo3(text_signature = "(database, /)")]
 fn connect(database: &str) -> PyResult<Connection> {
     let rust_conn = if database == ":memory:" {
-        RustConnection::open_in_memory().map_err(map_err)?
+        RustConnection::open_in_memory().map_err(map_engine_err)?
     } else {
-        RustConnection::open(PathBuf::from(database)).map_err(map_err)?
+        RustConnection::open(PathBuf::from(database)).map_err(map_engine_err)?
     };
     Ok(Connection {
         inner: Some(Mutex::new(rust_conn)),
@@ -104,7 +151,8 @@ fn connect(database: &str) -> PyResult<Connection> {
 #[pyfunction]
 #[pyo3(text_signature = "(database, /)")]
 fn connect_read_only(database: &str) -> PyResult<Connection> {
-    let rust_conn = RustConnection::open_read_only(PathBuf::from(database)).map_err(map_err)?;
+    let rust_conn =
+        RustConnection::open_read_only(PathBuf::from(database)).map_err(map_engine_err)?;
     Ok(Connection {
         inner: Some(Mutex::new(rust_conn)),
         ask_config: None,
@@ -176,7 +224,7 @@ impl Connection {
     fn commit(&mut self) -> PyResult<()> {
         self.with_inner("commit", |c| {
             if c.in_transaction() {
-                c.execute("COMMIT").map(|_| ()).map_err(map_err)?;
+                c.execute("COMMIT").map(|_| ()).map_err(map_engine_err)?;
             }
             Ok(())
         })
@@ -187,7 +235,7 @@ impl Connection {
     fn rollback(&mut self) -> PyResult<()> {
         self.with_inner("rollback", |c| {
             if c.in_transaction() {
-                c.execute("ROLLBACK").map(|_| ()).map_err(map_err)?;
+                c.execute("ROLLBACK").map(|_| ()).map_err(map_engine_err)?;
             }
             Ok(())
         })
@@ -710,13 +758,13 @@ impl Cursor {
                 .unwrap_or(false);
 
             if is_query {
-                let stmt = c.prepare(sql).map_err(map_err)?;
-                let rows = stmt.query().map_err(map_err)?;
+                let stmt = c.prepare(sql).map_err(map_engine_err)?;
+                let rows = stmt.query().map_err(map_engine_err)?;
                 self.description = Some(rows.columns().to_vec());
                 self.current_rows = Some(rows);
                 self.last_status = Some("SELECT Statement prepared.".to_string());
             } else {
-                let status = c.execute(sql).map_err(map_err)?;
+                let status = c.execute(sql).map_err(map_engine_err)?;
                 self.current_rows = None;
                 self.description = None;
                 self.last_status = Some(status);
@@ -779,7 +827,7 @@ impl Cursor {
         let Some(rows) = self.take_rows_for_iteration() else {
             return Ok(None);
         };
-        match rows.next().map_err(map_err)? {
+        match rows.next().map_err(map_engine_err)? {
             Some(row) => {
                 let owned = row.to_owned_row();
                 Ok(Some(owned_row_to_tuple(py, &owned)?))
@@ -798,7 +846,7 @@ impl Cursor {
         let limit = size.unwrap_or(usize::MAX);
         let mut out: Vec<Py<PyTuple>> = Vec::new();
         while out.len() < limit {
-            match rows.next().map_err(map_err)? {
+            match rows.next().map_err(map_engine_err)? {
                 Some(row) => {
                     let owned = row.to_owned_row();
                     out.push(owned_row_to_tuple(py, &owned)?);
@@ -911,6 +959,12 @@ fn owned_row_to_tuple(py: Python<'_>, row: &OwnedRow) -> PyResult<Py<PyTuple>> {
 fn sqlrite_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SQLRiteError", m.py().get_type::<SQLRiteError>())?;
+    // Phase 11.7 — retryable engine errors. Inherit from
+    // `SQLRiteError` so existing `except sqlrite.SQLRiteError`
+    // blocks still catch them. Retry loops can branch on the
+    // narrower class with `except sqlrite.BusyError`.
+    m.add("BusyError", m.py().get_type::<BusyError>())?;
+    m.add("BusySnapshotError", m.py().get_type::<BusySnapshotError>())?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(connect_read_only, m)?)?;
     m.add_class::<Connection>()?;

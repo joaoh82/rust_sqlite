@@ -622,7 +622,7 @@ The headline slice. Multiple sibling `Connection`s can each hold their own open 
 **Known limitations carried forward (most resolved in 11.5):**
 
 - ~~Reads via `Statement::query` / `Statement::query_with_params` bypass the swap.~~ ✅ Fixed in 11.5 — `Connection.concurrent_tx` is now `Mutex<Option<…>>` and a new `with_snapshot_read` helper threads the swap through `&self`.
-- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.7 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror. (Durability already works through the legacy mirror in v0; the WAL log-record format is foundation work for cross-process MVCC.)
+- The `MvStore` write-set isn't yet persisted to the WAL — Phase 11.8 introduces an MVCC log-record frame kind so commits become durable through `MvStore` itself rather than via the legacy `Database::tables` mirror. (Durability already works through the legacy mirror in v0; the WAL log-record format is foundation work for cross-process MVCC.)
 - `AUTOINCREMENT` inside `BEGIN CONCURRENT` isn't explicitly rejected; the v0 deep-clone-snapshot model handles concurrent INSERTs by isolating each tx's `last_rowid` bumps to its private snapshot, so two concurrent INSERTs on an `AUTOINCREMENT` column may collide at COMMIT and surface as `Busy`. Adopting the plan's "reject AUTOINCREMENT under MVCC" gate is a clean follow-up.
 - Tables touched by `BEGIN CONCURRENT` writes can't carry FTS or HNSW indexes today — `restore_row` only maintains B-tree secondary indexes. Concurrent-tx tests don't exercise FTS / HNSW, but a runtime guard would surface this with a clear error rather than producing inconsistent indexes.
 
@@ -634,7 +634,7 @@ Lock order is consistently `concurrent_tx → inner` across every code path; dea
 
 This was renumbered out of plan-doc order: the plan-doc had 11.5 as checkpoint integration, but that's a much larger slice and the prepare/query-bypass-the-swap gap was a real correctness hole for users hitting `BEGIN CONCURRENT`. Plan-doc 11.5 (checkpoint) → roadmap 11.7; plan-doc 11.6 (GC) → roadmap 11.6 (this one).
 
-### 🚧 Phase 11.6 — Garbage collection *(in progress, plan-doc "Phase 10.6"; promoted ahead of plan-doc 11.5 because unbounded `MvStore` growth was the next concrete user-impact concern after 11.5 closed the snapshot-read gap)*
+### ✅ Phase 11.6 — Garbage collection *(plan-doc "Phase 10.6"; promoted ahead of plan-doc 11.5 because unbounded `MvStore` growth was the next concrete user-impact concern after 11.5 closed the snapshot-read gap)*
 
 Bounds in-memory growth of the [`MvStore`](../src/mvcc/store.rs) version chains. Without this, every committed version stays forever in the in-memory chain — a memory leak that grows linearly with commits.
 
@@ -647,21 +647,34 @@ Bounds in-memory growth of the [`MvStore`](../src/mvcc/store.rs) version chains.
 **What 11.6 doesn't yet do:**
 
 - No background GC thread or `PRAGMA mvcc_gc_interval_ms`. Per-commit sweep + explicit `vacuum_mvcc()` cover the v0 model; the periodic-sweep variant lands as a follow-up if profiles show it's needed.
-- GC sweeps don't trigger `Mvcc → Wal` journal-mode downgrades. The `set_journal_mode` setter still rejects the transition while the store carries committed versions; promoting that path requires the checkpoint-integration story from 11.7.
+- GC sweeps don't trigger `Mvcc → Wal` journal-mode downgrades. The `set_journal_mode` setter still rejects the transition while the store carries committed versions; promoting that path requires the checkpoint-integration story from 11.8.
 
-### Phase 11.7 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5"; renumbered to follow GC because durability via the legacy `save_database` mirror already works in v0; this slice is foundation work for cross-process MVCC and column-level WAL deltas)*
+### 🚧 Phase 11.7 — SDK propagation of `Busy` / `BusySnapshot` *(in progress, plan-doc "Phase 10.8"; promoted ahead of plan-doc 11.5 checkpoint work for the same reason 11.5 / 11.6 jumped the queue — surfacing retryable errors to SDK callers is what unblocks Python / Node / Go users from actually writing `BEGIN CONCURRENT` retry loops)*
+
+- **C FFI** ([`sqlrite-ffi/src/lib.rs`](../sqlrite-ffi/src/lib.rs)): new `SqlriteStatus::Busy = 5` and `SqlriteStatus::BusySnapshot = 6` codes alongside the existing `Ok` / `Error` / `InvalidArgument` set. `SqlriteStatus::is_retryable()` covers both. A new internal `status_of_sqlrite` mapper inspects the engine's `SQLRiteError` variant and routes `Busy` / `BusySnapshot` to the dedicated codes (the generic `status_of` keeps mapping every error to `Error`). `sqlrite_execute` switches to the engine-aware mapper so `BEGIN CONCURRENT` commits surface the dedicated codes through every language binding. Header regenerated automatically via `build.rs`.
+- **Python SDK** ([`sdk/python/src/lib.rs`](../sdk/python/src/lib.rs)): two new exception classes `sqlrite.BusyError` and `sqlrite.BusySnapshotError`, both inheriting from `sqlrite.SQLRiteError`. Existing `except sqlrite.SQLRiteError` blocks keep catching them; retry helpers can branch with `except sqlrite.BusyError`. A new `map_engine_err` helper inspects the engine error variant and raises the matching exception class. Every engine-typed call site (open / execute / prepare / query / rows.next) routes through it.
+- **Node.js SDK** ([`sdk/nodejs/src/lib.rs`](../sdk/nodejs/src/lib.rs)): new exported `ErrorKind` string enum (`'Busy'`, `'BusySnapshot'`, `'Other'`) and `errorKind(message: string)` classifier function. The engine's `thiserror` Display already prefixes retryable errors with `'Busy: '` / `'BusySnapshot: '`, so the classifier just regex-tests the prefix. JS callers wrap their `BEGIN CONCURRENT` loops in `try / catch (err) { if (errorKind(err.message) === ErrorKind.Busy) continue; }`.
+- **Go SDK** ([`sdk/go/sqlrite.go`](../sdk/go/sqlrite.go)): two new sentinel error values `sqlrite.ErrBusy` and `sqlrite.ErrBusySnapshot`, plus an `IsRetryable(err error) bool` helper. `wrapErr` recognises the new FFI status codes and wraps the engine message with `fmt.Errorf("…: %w", ErrBusy)` so `errors.Is(err, sqlrite.ErrBusy)` works through the `database/sql` driver chain.
+- **WASM SDK** — deliberately untouched. The browser WASM target is single-threaded; `BEGIN CONCURRENT` is meaningful but multi-handle concurrency through `Connection::connect` isn't yet exposed across `wasm-bindgen`'s lifetime model. When the multi-handle JS shape lands (separate slice), the same `Busy: …` message prefix will be the classifier hook for the WASM bindings too.
+
+**What this slice doesn't do:**
+
+- The multi-handle / sibling-`Connection` shape isn't exposed through any SDK yet. Each `sqlrite.connect(path)` / `new Database(path)` / `sql.Open(...)` builds an independent backing database. End-to-end testing of cross-handle `Busy` is therefore deferred to the multi-handle SDK slice; this PR ships the *plumbing* so once that wiring lands, callers already have the retry idioms they need.
+- The WAL log-record durability work (plan-doc 11.5 / our 11.8) stays deferred.
+
+### Phase 11.8 — Checkpoint integration + crash recovery *(planned, plan-doc "Phase 10.5"; renumbered to follow GC + SDK propagation because durability via the legacy `save_database` mirror already works in v0; this slice is foundation work for cross-process MVCC and column-level WAL deltas)*
 
 MVCC log-record WAL frame format (the deferred 11.4 piece). Commit appends log records pre-`save_database`. Reopen replays log records into `MvStore`. Checkpoint drains `MvStore` versions back into the pager (so `Mvcc → Wal` becomes legal once the store is empty). Crash-recovery test: kill mid-commit between log-record append and version-chain push; reopen; verify the committed transaction is visible and the half-written one is not.
 
-### Phase 11.8 — Indexes under MVCC *(deferred-by-design, plan-doc "Phase 10.7")*
+### Phase 11.9 — Indexes under MVCC *(deferred-by-design, plan-doc "Phase 10.7")*
 
 Each secondary-index entry becomes its own `RowVersion`. Turso explicitly punted on this; SQLRite's v0 will reject `CREATE INDEX` while `journal_mode = mvcc`.
 
-### Phase 11.9 — SDK + REPL propagation *(planned, plan-doc "Phase 10.8")*
+### Phase 11.10 — Multi-handle SDK shape + REPL `.spawn` *(planned, was plan-doc 11.8's other half)*
 
-Surface `Busy` / `BusySnapshot` through the FFI shim and each language SDK. New REPL `.spawn` meta-command + new "N concurrent writers" benchmark workload.
+Expose `Connection::connect()` through the FFI + each SDK so Python / Node / Go callers can mint sibling handles, plus a new REPL `.spawn` meta-command. Without this, the 11.7 retry-error machinery can't actually be exercised end-to-end through an SDK (each SDK `connect()` builds an independent DB). Also adds the "N concurrent writers" benchmark workload.
 
-### Phase 11.10 — Docs *(planned, plan-doc "Phase 10.9")*
+### Phase 11.11 — Docs *(planned, plan-doc "Phase 10.9")*
 
 Promote the plan to `docs/concurrent-writes.md` and update the cross-references.
 

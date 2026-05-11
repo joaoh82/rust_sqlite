@@ -27,6 +27,23 @@ typedef enum SqlriteStatus {
   // A required pointer argument was null, or an input string was
   // invalid UTF-8 / not NUL-terminated.
   InvalidArgument = 2,
+  // Phase 11.7 — a `BEGIN CONCURRENT` commit hit a row-level
+  // write-write conflict. The transaction has already been
+  // rolled back; the caller should retry the whole
+  // transaction with a fresh `BEGIN CONCURRENT`. SDK retry
+  // helpers branch on this code (or its `BusySnapshot`
+  // sibling) and call their user-provided closure again.
+  Busy = 5,
+  // Phase 11.7 — same retry semantics as [`Self::Busy`], but
+  // surfaces the snapshot-isolation specific case (a row in
+  // the transaction's read-set changed under us). Reserved
+  // for the read-anomaly path Phase 11.5+ wires through
+  // `MvStore`; today the engine emits it from the same
+  // `BEGIN CONCURRENT` commit path. Distinguished from
+  // `Busy` so SDKs can map each to its own
+  // per-language exception class without forking on the
+  // message string.
+  BusySnapshot = 6,
   // A SELECT query returned no more rows (returned from `step`).
   Done = 101,
   // A SELECT query produced a row (returned from `step`).
