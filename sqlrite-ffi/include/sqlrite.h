@@ -106,6 +106,28 @@ enum SqlriteStatus sqlrite_open_read_only(const char *path, struct SqlriteConnec
 // `out` must be a valid writable pointer.
 enum SqlriteStatus sqlrite_open_in_memory(struct SqlriteConnection **out);
 
+// Phase 11.8 — mints a sibling connection that shares the same
+// underlying database state (the in-memory tables, the MVCC
+// store, the pager). Wraps the engine's `Connection::connect`.
+//
+// Use this to drive `BEGIN CONCURRENT` from multiple FFI
+// handles: each sibling can hold its own concurrent transaction,
+// and commits validate against the shared MvStore.
+//
+// The returned handle is owned by the caller and must be freed
+// with [`sqlrite_close`]; closing one sibling doesn't affect
+// the others.
+//
+// # Safety
+//
+// `existing` must be a valid pointer returned by one of the
+// `sqlrite_open_*` functions and not yet closed. `out` must be
+// a valid writable pointer. On success the caller owns the
+// returned sibling and must call [`sqlrite_close`] on it when
+// done.
+enum SqlriteStatus sqlrite_connect_sibling(struct SqlriteConnection *existing,
+                                           struct SqlriteConnection **out);
+
 // Closes a connection and releases its file locks. Safe to call with
 // a null pointer (no-op).
 //

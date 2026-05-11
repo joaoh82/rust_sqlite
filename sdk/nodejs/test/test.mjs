@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Database } from '../index.js';
+import { Database, errorKind, ErrorKind } from '../index.js';
 
 function tmpDbPath(name) {
   const dir = mkdtempSync(join(tmpdir(), `sqlrite-node-${name}-`));
@@ -186,4 +186,87 @@ test('closed DB throws on any operation', () => {
   db.close();
   assert.throws(() => db.exec('SELECT 1'), /closed/);
   assert.throws(() => db.prepare('SELECT 1'), /closed/);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 11.8 — multi-handle (db.connect()) end-to-end
+
+test('sibling db sees writes the parent made', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+  db.exec("INSERT INTO t (id, name) VALUES (1, 'alice')");
+
+  const sibling = db.connect();
+  const rows = sibling.prepare('SELECT name FROM t WHERE id = 1').all();
+  assert.deepEqual(rows, [{ name: 'alice' }]);
+
+  // Writes on the sibling are visible to the parent.
+  sibling.exec("INSERT INTO t (id, name) VALUES (2, 'bob')");
+  const rows2 = db.prepare('SELECT name FROM t WHERE id = 2').all();
+  assert.deepEqual(rows2, [{ name: 'bob' }]);
+
+  db.close();
+  sibling.close();
+});
+
+test('sibling outlives closed parent', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+  db.exec('INSERT INTO t (id, v) VALUES (1, 100)');
+
+  const sibling = db.connect();
+  db.close();
+
+  // Sibling still operates — the underlying database is Arc-shared.
+  const rows = sibling.prepare('SELECT v FROM t WHERE id = 1').all();
+  assert.deepEqual(rows, [{ v: 100 }]);
+
+  sibling.close();
+});
+
+test('connect on closed parent throws', () => {
+  const db = new Database(':memory:');
+  db.close();
+  assert.throws(() => db.connect(), /closed/);
+});
+
+test('BEGIN CONCURRENT busy round-trips through Node siblings', () => {
+  // The end-to-end test that wasn't possible before 11.8 — Node's
+  // `new Database()` always built an isolated DB. With `db.connect()`
+  // exposed, the 11.7 retry idiom can finally be exercised from JS.
+  const db = new Database(':memory:');
+  db.exec('PRAGMA journal_mode = mvcc');
+  db.exec('CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)');
+  db.exec('INSERT INTO accounts (id, balance) VALUES (1, 100)');
+
+  const sibling = db.connect();
+
+  db.exec('BEGIN CONCURRENT');
+  sibling.exec('BEGIN CONCURRENT');
+  db.exec('UPDATE accounts SET balance = 200 WHERE id = 1');
+  sibling.exec('UPDATE accounts SET balance = 300 WHERE id = 1');
+
+  // First commit wins.
+  db.exec('COMMIT');
+
+  // Second commit aborts; the 11.7 classifier recognises it as Busy.
+  let caught;
+  try {
+    sibling.exec('COMMIT');
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, 'expected sibling commit to throw');
+  assert.equal(errorKind(caught.message), ErrorKind.Busy);
+
+  // Retry succeeds.
+  sibling.exec('BEGIN CONCURRENT');
+  sibling.exec('UPDATE accounts SET balance = 300 WHERE id = 1');
+  sibling.exec('COMMIT');
+
+  const rows = db.prepare('SELECT balance FROM accounts WHERE id = 1').all();
+  assert.deepEqual(rows, [{ balance: 300 }]);
+
+  db.close();
+  sibling.close();
 });

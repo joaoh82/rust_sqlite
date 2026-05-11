@@ -332,6 +332,43 @@ pub unsafe extern "C" fn sqlrite_open_in_memory(out: *mut *mut SqlriteConnection
     status
 }
 
+/// Phase 11.8 — mints a sibling connection that shares the same
+/// underlying database state (the in-memory tables, the MVCC
+/// store, the pager). Wraps the engine's `Connection::connect`.
+///
+/// Use this to drive `BEGIN CONCURRENT` from multiple FFI
+/// handles: each sibling can hold its own concurrent transaction,
+/// and commits validate against the shared MvStore.
+///
+/// The returned handle is owned by the caller and must be freed
+/// with [`sqlrite_close`]; closing one sibling doesn't affect
+/// the others.
+///
+/// # Safety
+///
+/// `existing` must be a valid pointer returned by one of the
+/// `sqlrite_open_*` functions and not yet closed. `out` must be
+/// a valid writable pointer. On success the caller owns the
+/// returned sibling and must call [`sqlrite_close`] on it when
+/// done.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlrite_connect_sibling(
+    existing: *mut SqlriteConnection,
+    out: *mut *mut SqlriteConnection,
+) -> SqlriteStatus {
+    if existing.is_null() || out.is_null() {
+        set_last_error("connection or output pointer is null");
+        return SqlriteStatus::InvalidArgument;
+    }
+    // Safety: caller guarantees `existing` is a valid handle.
+    let parent = unsafe { &mut *(existing as *mut ConnHandle) };
+    let sibling = parent.conn.connect();
+    let boxed = Box::new(ConnHandle { conn: sibling });
+    unsafe { *out = Box::into_raw(boxed) as *mut SqlriteConnection };
+    clear_last_error();
+    SqlriteStatus::Ok
+}
+
 /// Closes a connection and releases its file locks. Safe to call with
 /// a null pointer (no-op).
 ///
@@ -1250,6 +1287,86 @@ mod tests {
             assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
 
             sqlrite_close(b);
+            sqlrite_close(a);
+        }
+    }
+
+    /// Phase 11.8 — `sqlrite_connect_sibling` is the public path
+    /// SDK bindings use to mint a sibling handle (replacing the
+    /// hack the 11.4 test did by reaching into `ConnHandle`
+    /// directly). Same conflict scenario as
+    /// `begin_concurrent_busy_status_round_trip` but exercises
+    /// the proper public surface.
+    #[test]
+    fn connect_sibling_mints_a_handle_that_shares_state() {
+        unsafe {
+            let mut a: *mut SqlriteConnection = ptr::null_mut();
+            assert_eq!(sqlrite_open_in_memory(&mut a), SqlriteStatus::Ok);
+
+            let mut b: *mut SqlriteConnection = ptr::null_mut();
+            assert_eq!(sqlrite_connect_sibling(a, &mut b), SqlriteStatus::Ok);
+            assert!(!b.is_null());
+            // Distinct handles — different pointer values, even
+            // though they share backing state.
+            assert!(a != b);
+
+            // Set up schema + a row through `a`; sibling `b` must
+            // see it via the shared backing database.
+            let (_c, p) = cstr("PRAGMA journal_mode = mvcc;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("INSERT INTO t (id, v) VALUES (1, 100);");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+
+            // Sibling reads the same row.
+            let mut stmt: *mut SqlriteStatement = ptr::null_mut();
+            let (_c, p) = cstr("SELECT v FROM t WHERE id = 1;");
+            assert_eq!(sqlrite_query(b, p, &mut stmt), SqlriteStatus::Ok);
+            assert_eq!(sqlrite_step(stmt), SqlriteStatus::Row);
+            let mut got: i64 = 0;
+            assert_eq!(sqlrite_column_int64(stmt, 0, &mut got), SqlriteStatus::Ok);
+            assert_eq!(got, 100);
+            sqlrite_finalize(stmt);
+
+            // Two `BEGIN CONCURRENT` transactions on the same row
+            // through the two public sibling handles — second
+            // commit aborts with Busy.
+            let (_c, p) = cstr("BEGIN CONCURRENT;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("BEGIN CONCURRENT;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("UPDATE t SET v = 200 WHERE id = 1;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("UPDATE t SET v = 300 WHERE id = 1;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("COMMIT;");
+            assert_eq!(sqlrite_execute(a, p), SqlriteStatus::Ok);
+            let (_c, p) = cstr("COMMIT;");
+            assert_eq!(sqlrite_execute(b, p), SqlriteStatus::Busy);
+
+            sqlrite_close(b);
+            sqlrite_close(a);
+        }
+    }
+
+    /// Null-arg guards for the sibling minter.
+    #[test]
+    fn connect_sibling_rejects_null_inputs() {
+        unsafe {
+            let mut out: *mut SqlriteConnection = ptr::null_mut();
+            assert_eq!(
+                sqlrite_connect_sibling(ptr::null_mut(), &mut out),
+                SqlriteStatus::InvalidArgument
+            );
+            assert!(out.is_null());
+
+            let mut a: *mut SqlriteConnection = ptr::null_mut();
+            sqlrite_open_in_memory(&mut a);
+            assert_eq!(
+                sqlrite_connect_sibling(a, ptr::null_mut()),
+                SqlriteStatus::InvalidArgument
+            );
             sqlrite_close(a);
         }
     }
