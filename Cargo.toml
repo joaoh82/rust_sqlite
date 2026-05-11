@@ -73,6 +73,15 @@ path = "examples/rust/quickstart.rs"
 name = "hybrid-retrieval"
 path = "examples/hybrid-retrieval/hybrid_retrieval.rs"
 
+# Phase 11.12 — BEGIN CONCURRENT retry-loop demo. Mints a sibling
+# Connection via `Connection::connect`, runs two concurrent
+# transactions (first disjoint, then same-row), and surfaces the
+# Busy / retry path. Run with `cargo run --example concurrent_writers`.
+# See `docs/concurrent-writes.md` for the conceptual walkthrough.
+[[example]]
+name = "concurrent_writers"
+path = "examples/rust/concurrent_writers.rs"
+
 [features]
 # Default build includes everything: the REPL binary (cli) and
 # POSIX/Windows advisory file locks on the Pager (file-locks).

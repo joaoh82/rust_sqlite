@@ -564,6 +564,8 @@ Out-of-range values (anything outside `0.0..=1.0`, `NaN`, `±∞`) and unknown i
 
 ### `PRAGMA journal_mode` (Phase 11.3, SQLR-22)
 
+> The full Phase 11 user-facing reference — conceptual model, embedding API, SDK error mapping, REPL meta-commands, durability story, limitations — lives at [`docs/concurrent-writes.md`](concurrent-writes.md). This section is the SQL-syntax reference.
+
 Selects the per-database concurrency model. `wal` (default) is the legacy WAL-backed pager every pre-Phase-11 build used; `mvcc` opts the database into multi-version concurrency control (Phase 11 — concurrent writes via `BEGIN CONCURRENT`).
 
 ```sql
@@ -575,13 +577,13 @@ PRAGMA journal_mode = wal;      -- switch back (rejected if the MvStore
 
 Case-insensitive on both the pragma name and the value. Quoted values (`'mvcc'`) work; numeric values are rejected (the field is enum-shaped). Unknown modes return a typed error and don't disturb the existing setting.
 
-The setting is **per-database** — every `Connection::connect` sibling sees the same value (the [open-question](concurrent-writes-plan.md) on per-connection vs per-database journal mode resolved to per-database for v0; revisit if a workload requires the per-connection variant). Reachable through the public API as `Connection::journal_mode() -> JournalMode`.
-
-**What 11.3 changes:** the toggle is observable. The data structures backing MVCC (`MvccClock`, `MvStore`, the active-transaction registry) are allocated and round-trip through `PRAGMA`. **What 11.4 adds (this slice):** `BEGIN CONCURRENT` writes go through commit-time validation against `MvStore`; same-row conflicts surface as `SQLRiteError::Busy`. See `BEGIN CONCURRENT` below.
+The setting is **per-database** — every `Connection::connect` sibling sees the same value. Reachable through the public API as `Connection::journal_mode() -> JournalMode`.
 
 ---
 
 ## `BEGIN CONCURRENT` (Phase 11.4, SQLR-22)
+
+> For the conceptual walkthrough (version chains, snapshot-isolation visibility, the WAL log-record durability story, REPL `.spawn` demos), see [`docs/concurrent-writes.md`](concurrent-writes.md). This section is the SQL-syntax reference.
 
 Opens a transaction that doesn't acquire the engine's single-writer lock — multiple `BEGIN CONCURRENT` transactions can coexist, on the same `Connection` or across sibling [`Connection::connect`](embedding.md#sharing-one-database-across-threads) handles. Writes accumulate against a per-transaction snapshot; at `COMMIT`, the engine validates the write-set against any versions that committed after the transaction's `begin_ts` and aborts with [`SQLRiteError::Busy`](../src/error.rs) if some other transaction superseded a row.
 
@@ -681,7 +683,6 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 ### Transactions
 - Savepoints (`SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`)
 - Isolation-level control (`BEGIN IMMEDIATE`, `BEGIN EXCLUSIVE`)
-- Concurrent writes / MVCC (`BEGIN CONCURRENT`) — proposal sketched in [`docs/concurrent-writes-plan.md`](concurrent-writes-plan.md)
 
 ### Query shape
 - `OFFSET`

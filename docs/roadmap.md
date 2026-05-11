@@ -2,7 +2,7 @@
 
 The project is staged in phases. Each phase is shippable on its own, ends with a working build + full test suite + a commit on `main`, and can be paused between. The README's roadmap section is a summary of this doc.
 
-> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`, SQLR-22) is now in flight — the multi-connection foundation (11.1) is the first slice; see [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the full design.
+> **Active frontier (May 2026):** Phases 0–10 shipped end-to-end. After Phase 8 closed the v0.1.x cycle, the v0.2.0 → v0.9.1 wave (Phase 9, sub-phases 9a–9i) landed the SQL surface that had been parked under "possible extras": DDL completeness (DEFAULT, DROP TABLE/INDEX, ALTER TABLE), free-list + auto-VACUUM, IS NULL, GROUP BY + aggregates + DISTINCT + LIKE + IN, four flavors of JOIN, prepared statements with parameter binding, HNSW metric extension, and the PRAGMA dispatcher. Phase 10 published the SQLR-4 / SQLR-16 benchmarks against SQLite + DuckDB. **Current head: v0.9.1.** **Phase 11 (concurrent writes via MVCC + `BEGIN CONCURRENT`, SQLR-22) is shipped end-to-end through 11.12** — the multi-connection foundation, logical clock, `MvStore`, `BEGIN CONCURRENT` writes + commit-time validation, snapshot-isolated reads, garbage collection, SDK propagation across C / Python / Node / Go, multi-handle SDK shape, WAL log-record durability + crash recovery, REPL `.spawn` for interactive demos, and the canonical user-facing reference all landed. A small set of follow-ups (checkpoint-drain to enable `Mvcc → Wal` downgrade, indexes under MVCC, the "N concurrent writers" benchmark workload) remain explicitly parked. See [`concurrent-writes.md`](concurrent-writes.md) for the user-facing reference; [`concurrent-writes-plan.md`](concurrent-writes-plan.md) for the design rationale.
 
 ## ✅ Phase 0 — Modernization
 
@@ -581,9 +581,9 @@ Every executable statement accepts `?` placeholders anywhere a value literal is 
 
 End-to-end SQLR-4 / SQLR-16 bench harness with twelve workloads across three groups (read-by-PK, transactional CRUD, analytical slices, vector / FTS retrieval). Pluggable `Driver` trait + bundled SQLite + DuckDB drivers; criterion-based; pinned-host runs published at [`docs/benchmarks.md`](benchmarks.md). Excluded from CI (criterion is too noisy on shared runners; `rusqlite-bundled` is heavy). See [`docs/benchmarks-plan.md`](benchmarks-plan.md) for the design and PRs #102–#114 for the staged rollout.
 
-## Phase 11 — Concurrent writes via MVCC + `BEGIN CONCURRENT` *(SQLR-22; in flight — see [`concurrent-writes-plan.md`](concurrent-writes-plan.md))*
+## Phase 11 — Concurrent writes via MVCC + `BEGIN CONCURRENT` *(SQLR-22; shipped end-to-end through 11.12 — canonical reference: [`concurrent-writes.md`](concurrent-writes.md); design rationale: [`concurrent-writes-plan.md`](concurrent-writes-plan.md))*
 
-Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency control and a `BEGIN CONCURRENT` transaction mode, modelled on Turso's experimental MVCC. The plan doc internally numbers sub-phases as "Phase 10.x" (its working title before the roadmap renumbering); they're listed under Phase 11 here because Phase 10 already shipped.
+Lift SQLRite past SQLite's single-writer ceiling with multi-version concurrency control and a `BEGIN CONCURRENT` transaction mode, modelled on Turso's experimental MVCC. The plan doc internally numbers sub-phases as "Phase 10.x" (its working title before the roadmap renumbering); they're listed under Phase 11 here because Phase 10 already shipped. Remaining follow-ups (checkpoint-drain to enable `Mvcc → Wal` downgrade, indexes under MVCC, the bench workload) are explicitly carved out and parked.
 
 ### ✅ Phase 11.1 — Multi-connection foundation *(plan-doc "Phase 10.1")*
 
@@ -701,9 +701,13 @@ The downstream "N concurrent writers" benchmark workload (originally bundled int
 
 New benchmark in [`benchmarks/`](../benchmarks/) that pits SQLRite-MVCC against SQLite + DuckDB on a disjoint-row "N writers, mostly disjoint rows" scenario. Slots into the existing SQLR-16 harness as a Group D differentiator workload. Also includes Go SDK multi-handle work (cross-pool sibling shape) — see the 11.8 note for why that's a separate slice.
 
-### Phase 11.12 — Docs *(planned, plan-doc "Phase 10.9")*
+### ✅ Phase 11.12 — Docs sweep *(plan-doc "Phase 10.9")*
 
-Promote the plan to `docs/concurrent-writes.md` and update the cross-references.
+Promotes the plan to a canonical user-facing reference at [`docs/concurrent-writes.md`](concurrent-writes.md) — SQL surface, embedding API, SDK error mapping, REPL meta-commands, durability story, limitations all in one place. The original [`concurrent-writes-plan.md`](concurrent-writes-plan.md) stays as the historical design record with a redirect banner at the top.
+
+- Cross-references updated in [`docs/_index.md`](_index.md), [`docs/supported-sql.md`](supported-sql.md), [`docs/embedding.md`](embedding.md), this file, and the design-decisions doc.
+- New runnable example at [`examples/rust/concurrent_writers.rs`](../examples/rust/concurrent_writers.rs) (registered as `cargo run --example concurrent_writers`) — two sibling handles, interleaved `BEGIN CONCURRENT`s, demonstrating both the disjoint-row happy path and the same-row retry.
+- `examples/README.md` lists the new example alongside the existing quickstart and hybrid-retrieval entries.
 
 ## "Possible extras" not pinned to a phase
 

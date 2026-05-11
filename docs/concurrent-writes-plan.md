@@ -1,8 +1,16 @@
 # Concurrent writes plan — MVCC + `BEGIN CONCURRENT`
 
-**Status:** proposal, not yet scheduled. Drafted 2026-05-07.
+> 📘 **Looking for the user-facing reference?** This is the original
+> design proposal, kept as the historical record of the decisions
+> that shaped Phase 11. For the shipped surface — SQL, embedding API,
+> SDK error mapping, REPL meta-commands, durability story,
+> limitations — read [**`concurrent-writes.md`**](concurrent-writes.md)
+> first; come back here when you want the *why* and the
+> sequencing discussion.
+
+**Status:** shipped end-to-end through Phase 11.11a (May 2026); a small set of follow-ups remain explicitly parked — see the [roadmap](roadmap.md#phase-11--concurrent-writes-via-mvcc--begin-concurrent-sqlr-22-in-flight--see-concurrent-writes-planmd). Drafted 2026-05-07.
 **Inspiration:** [Turso](https://turso.tech) — a SQLite-compatible engine, written in Rust, that implements multi-version concurrency control to lift SQLite's single-writer ceiling. See [`turso/core/mvcc/`](https://github.com/tursodatabase/turso/tree/main/core/mvcc) and the [Turso concurrent-writes docs](https://docs.turso.tech/tursodb/concurrent-writes).
-**Tracks:** SQLR-?? (Marvin) — to be filed alongside this doc.
+**Tracks:** [SQLR-22](https://app.marvinapp.io/) (Marvin).
 
 This document proposes adding **multi-version concurrency control (MVCC)** and a **`BEGIN CONCURRENT`** transaction mode to SQLRite, enabling multiple writers in the same process to make progress in parallel under snapshot isolation, with row-level write-write conflict detection at commit. It is intentionally a *plan* — there is no code yet.
 
@@ -296,9 +304,11 @@ Index maintenance under MVCC is hard enough that Turso explicitly punted on it. 
 
 ### Phase 10.9 — Docs
 
-- Promote this plan to `docs/concurrent-writes.md` (the canonical user-facing reference), keeping `concurrent-writes-plan.md` as the historical design document.
-- Update [roadmap.md](roadmap.md), [`docs/_index.md`](_index.md), [supported-sql.md](supported-sql.md), [embedding.md](embedding.md), [design-decisions.md](design-decisions.md).
-- Add a worked example under `examples/rust/concurrent_writers.rs`.
+> **Status (roadmap 11.12 — May 2026):** Shipped. The canonical user-facing reference at [`docs/concurrent-writes.md`](concurrent-writes.md) covers the SQL surface, embedding API, SDK error mapping, REPL meta-commands, durability story, and limitations as of Phase 11.11a. This plan-doc is now the historical record. Cross-references in `_index.md`, `supported-sql.md`, `embedding.md`, and `design-decisions.md` point at the canonical doc; a runnable example lives at [`examples/rust/concurrent_writers.rs`](../examples/rust/concurrent_writers.rs).
+
+- Promote this plan to `docs/concurrent-writes.md` (the canonical user-facing reference), keeping `concurrent-writes-plan.md` as the historical design document. **(Shipped — 11.12.)**
+- Update [roadmap.md](roadmap.md), [`docs/_index.md`](_index.md), [supported-sql.md](supported-sql.md), [embedding.md](embedding.md), [design-decisions.md](design-decisions.md). **(Shipped — 11.12.)**
+- Add a worked example under `examples/rust/concurrent_writers.rs`. **(Shipped — 11.12.)**
 
 ---
 

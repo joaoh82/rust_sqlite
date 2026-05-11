@@ -90,13 +90,17 @@ for h in writers { h.join().unwrap()?; }
 # Ok::<(), sqlrite::SQLRiteError>(())
 ```
 
-Today every commit still serializes through the per-database mutex (and the pager's existing process-level `flock`); the goal of 11.1 is *capability*, not throughput. True multi-writer throughput on disjoint rows arrives with `BEGIN CONCURRENT` in 11.4 — see below + [`concurrent-writes-plan.md`](concurrent-writes-plan.md).
+Today every commit still serializes through the per-database mutex (and the pager's existing process-level `flock`); the goal of 11.1 is *capability*, not throughput. True multi-writer throughput on disjoint rows arrives with `BEGIN CONCURRENT` in 11.4 — see below, plus the canonical [`docs/concurrent-writes.md`](concurrent-writes.md) reference for the full Phase 11 surface.
 
 Per-handle state — the prepared-statement cache (LRU populated by `prepare_cached`), the cache capacity setter — stays on each handle, by design (no extra mutex traffic for a per-thread accelerator). The shared state is the `Database` (tables, pager, transaction snapshot, auto-VACUUM threshold).
 
 ### Concurrent writes via `BEGIN CONCURRENT` (Phase 11.4)
 
-*Phase 11.4 — see [`supported-sql.md`](supported-sql.md#begin-concurrent-phase-114-sqlr-22) for the full SQL reference.* Multi-writer concurrency is opt-in: `PRAGMA journal_mode = mvcc;` once per database, then each writer wraps its work in `BEGIN CONCURRENT;` … `COMMIT;`. Sibling [`Connection::connect`](#sharing-one-database-across-threads) handles can each hold their own open `BEGIN CONCURRENT`; commits are validated against the [`MvStore`](../src/mvcc/store.rs) version index and abort with `SQLRiteError::Busy` if another writer superseded one of our rows.
+> **Canonical reference:** [`docs/concurrent-writes.md`](concurrent-writes.md) — the full Phase 11 user-facing reference (conceptual model, SQL, SDK error mapping, durability, limitations). The summary below is the embedding-API view of the same surface.
+>
+> **Runnable example:** [`examples/rust/concurrent_writers.rs`](../examples/rust/concurrent_writers.rs) — interleaved BEGINs across two sibling handles, demonstrating both the disjoint-row happy path and the same-row retry. Run with `cargo run --example concurrent_writers`.
+
+Multi-writer concurrency is opt-in: `PRAGMA journal_mode = mvcc;` once per database, then each writer wraps its work in `BEGIN CONCURRENT;` … `COMMIT;`. Sibling [`Connection::connect`](#sharing-one-database-across-threads) handles can each hold their own open `BEGIN CONCURRENT`; commits are validated against the [`MvStore`](../src/mvcc/store.rs) version index and abort with `SQLRiteError::Busy` if another writer superseded one of our rows.
 
 ```rust
 use sqlrite::{Connection, SQLRiteError};
@@ -126,11 +130,15 @@ The retryable-error branch is the headline new flow: pick a backoff policy that 
 
 **Memory bounding.** Every successful commit triggers a per-row GC sweep over the write-set's chains, reclaiming versions no in-flight reader can possibly see anymore. For workloads where you want a deterministic full drain (memory-pressure testing, debug snapshots), call `conn.vacuum_mvcc()` — returns the count of versions reclaimed across the whole store. Both paths are correct against in-flight readers: a reader holding `BEGIN CONCURRENT; SELECT …` keeps every version its `begin_ts` snapshot needs.
 
-**What's still ahead** (11.7+):
+**What shipped after 11.4:**
 
-- Reads inside the transaction see the BEGIN-time snapshot via both `Connection::execute("SELECT…")` and `Statement::query()` / `query_with_params()` — the prepare/query gap that 11.4 left open closed in 11.5.
-- DDL inside `BEGIN CONCURRENT` is rejected with a typed error.
-- The transaction's write-set persists only via the legacy `Database::tables` mirror — a crash mid-transaction loses everything (correct behaviour, the transaction never committed). Phase 11.7 introduces an MVCC log-record WAL frame so `BEGIN CONCURRENT` writes become durable through `MvStore` itself.
+- 11.5 — reads inside the transaction see the BEGIN-time snapshot through `Statement::query` / `Statement::query_with_params` as well as `Connection::execute("SELECT…")`.
+- 11.6 — per-commit GC + `Connection::vacuum_mvcc()` bound version-chain growth.
+- 11.7 + 11.8 — every SDK (C FFI / Python / Node / Go) propagates `Busy` / `BusySnapshot` as a typed retryable error; the FFI's `sqlrite_connect_sibling`, Python's `Connection.connect()`, and Node's `db.connect()` mint sibling handles that share backing state.
+- 11.9 — every successful `BEGIN CONCURRENT` commit writes a typed `MvccCommitBatch` frame to the WAL (covered by the same fsync as the legacy page commit), and reopen replays those frames into `MvStore` so the conflict-detection window survives a process restart.
+- 11.11a — the REPL ships `.spawn` / `.use` / `.conns` for interactive multi-handle demos; the prompt shows the active handle.
+
+**What's deferred** (see [`docs/concurrent-writes.md`](concurrent-writes.md#limitations) for the full list): DDL inside `BEGIN CONCURRENT`, `CREATE INDEX` while `journal_mode = mvcc`, cross-process MVCC, the checkpoint-drain path that would re-enable `set_journal_mode(Mvcc → Wal)`, and the "N concurrent writers" benchmark workload (carved out as Phase 11.11b).
 
 ### What's deferred
 

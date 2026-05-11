@@ -32,6 +32,14 @@ cargo run --example hybrid-retrieval
 
 Combines BM25 lexical scoring (Phase 8b) with vector cosine distance (Phase 7d) in a single `ORDER BY`, showing where each ranking shape wins on the same corpus. Pre-baked vectors keep the example self-contained — no embedding-model dependency. Read [`hybrid-retrieval/README.md`](hybrid-retrieval/README.md) for the narrative.
 
+## Running the concurrent-writers example (Phase 11.12)
+
+```bash
+cargo run --example concurrent_writers
+```
+
+End-to-end `BEGIN CONCURRENT` demo with two sibling [`Connection`](../docs/embedding.md) handles minted via `Connection::connect`. Two scenarios: disjoint-row commits both succeed; interleaved same-row commits resolve with one winner and one `SQLRiteError::Busy` → retry. Reads from [`rust/concurrent_writers.rs`](rust/concurrent_writers.rs); the canonical conceptual walkthrough lives at [`docs/concurrent-writes.md`](../docs/concurrent-writes.md).
+
 ## Running the C sample
 
 ```bash
