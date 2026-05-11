@@ -309,6 +309,61 @@ the existing per-commit GC bounds in-memory chain growth.
 
 ---
 
+### 12h. REPL holds `Vec<Connection>` rather than a single `Database` (Phase 11.11a)
+
+**Decision.** The `sqlrite` REPL binary keeps its state in a small
+`ReplState` struct holding a `Vec<Connection>`, a parallel
+`Vec<String>` of stable display names (`A`, `B`, …), and a
+`usize` index pointing at the active handle. SQL dispatch goes
+through [`Connection::execute_with_render`](../src/connection.rs)
+(new in this slice); meta-commands either operate on the
+underlying `Database` via `ReplState::lock_active()` or mutate
+the connection list itself (`.spawn`, `.use`, `.conns`).
+
+**Why migrate from `&mut Database`.** `.spawn` only makes sense
+across multiple `Connection`s sharing the same
+`Arc<Mutex<Database>>` — that's the entire point of
+`Connection::connect()`. The previous REPL owned a single
+`Database` by value, which made siblings unrepresentable. The
+migration is mostly mechanical: the SQL dispatch routes through
+the active connection, and every existing meta-command keeps
+operating on the database directly by grabbing the mutex guard.
+
+**Why `Vec<Connection>` and not a `HashMap<String, Connection>`.**
+Handle creation order is the only ordering that matters for
+demos. A `Vec` keeps `.conns` output deterministic without
+sorting; the parallel `names` vector keeps the name → index
+lookup O(handles), which is fine for the realistic upper bound
+(a handful of siblings in a demo session). Skipping the map also
+avoids a `String` key per access on the hot SQL path.
+
+**Why `.open` collapses every sibling back to a single handle.**
+Replacing the underlying `Database` via the mutex guard works in
+place — every sibling sees the new content. But sibling handles
+typically hold per-connection MVCC transaction state
+(`Connection::concurrent_tx`) keyed by the *previous* clock /
+`MvStore`; after a `.open` swap, that state is meaningless and
+attempting to commit would walk the wrong active-tx registry.
+Dropping siblings on `.open` is cleaner than retroactively
+invalidating their tx state, and matches the user's mental model
+("`.open` is a fresh start").
+
+**Why `execute_with_render` instead of pre-parsing in the REPL.**
+The REPL needs both the rendered SELECT table and the BEGIN
+CONCURRENT routing. The old `process_command_with_render` gives
+the former but bypasses the per-connection MVCC dispatch
+(`BEGIN CONCURRENT` / `COMMIT` / `ROLLBACK` interception, the
+snapshot-read swap). The new method mirrors `Connection::execute`
+but threads the `CommandOutput` struct through every branch —
+the BEGIN/COMMIT/ROLLBACK arms produce
+`CommandOutput { status, rendered: None }`; the
+process-command path produces the full output. One method, one
+dispatch tree, every REPL line goes through it.
+
+**Plan-doc reference.** [`concurrent-writes-plan.md`](concurrent-writes-plan.md) §10.8 (REPL `.spawn` meta-command and demos).
+
+---
+
 ## Query execution
 
 ### 13. `NULL`-as-false in `WHERE` clauses

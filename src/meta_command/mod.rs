@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 
-use crate::repl::REPLHelper;
+use crate::repl::{REPLHelper, ReplState};
 use sqlrite::error::{Result, SQLRiteError};
 use sqlrite::sql::db::database::Database;
 use sqlrite::sql::pager::{open_database, save_database};
@@ -26,6 +26,17 @@ pub enum MetaCommand {
     /// the question text (verbatim — including punctuation, quotes,
     /// etc.). See [`handle_ask`] for the confirm-and-run UX.
     Ask(String),
+    /// `.spawn` — Phase 11.11a — mint a sibling [`Connection`]
+    /// sharing the same `Arc<Mutex<Database>>` and switch to it.
+    /// Enables interactive `BEGIN CONCURRENT` demos in the REPL.
+    Spawn,
+    /// `.use NAME` — Phase 11.11a — switch the active handle to
+    /// the one whose display name matches `NAME` (case-insensitive).
+    Use(String),
+    /// `.conns` — Phase 11.11a — list every active handle, with a
+    /// marker showing the current one and a `(tx)` flag per handle
+    /// in an open `BEGIN CONCURRENT`.
+    Conns,
     /// Parsed line that didn't match any known meta-command.
     Unknown,
 }
@@ -40,6 +51,9 @@ impl fmt::Display for MetaCommand {
             MetaCommand::Save(_) => f.write_str(".save"),
             MetaCommand::Tables => f.write_str(".tables"),
             MetaCommand::Ask(_) => f.write_str(".ask"),
+            MetaCommand::Spawn => f.write_str(".spawn"),
+            MetaCommand::Use(_) => f.write_str(".use"),
+            MetaCommand::Conns => f.write_str(".conns"),
             MetaCommand::Unknown => f.write_str("Unknown command"),
         }
     }
@@ -87,17 +101,24 @@ impl MetaCommand {
                 None => MetaCommand::Unknown,
             },
             ".tables" => MetaCommand::Tables,
+            ".spawn" => MetaCommand::Spawn,
+            ".conns" => MetaCommand::Conns,
+            ".use" => match args.get(1) {
+                Some(name) => MetaCommand::Use(name.to_string()),
+                None => MetaCommand::Unknown,
+            },
             _ => MetaCommand::Unknown,
         }
     }
 }
 
-/// Executes a parsed meta-command. May mutate `db` — `.open` replaces it
-/// with the loaded file's database; `.save` just reads it.
+/// Executes a parsed meta-command. May mutate the active handle's
+/// underlying `Database` (`.open` swaps it; `.save` reads it) or the
+/// REPL state itself (`.spawn`, `.use`, `.conns`).
 pub fn handle_meta_command(
     command: MetaCommand,
     repl: &mut Editor<REPLHelper, DefaultHistory>,
-    db: &mut Database,
+    state: &mut ReplState,
 ) -> Result<String> {
     match command {
         MetaCommand::Exit => {
@@ -105,25 +126,78 @@ pub fn handle_meta_command(
             std::process::exit(0)
         }
         MetaCommand::Help => Ok(format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}{}{}",
             "Special commands:\n",
             ".help            - Display this message\n",
             ".open <FILENAME> - Open a SQLRite database file (creates it if missing)\n",
             ".save <FILENAME> - Write the current in-memory database to FILENAME\n",
             ".tables          - List tables in the current database\n",
             ".ask <QUESTION>  - Generate SQL from a natural-language question (LLM)\n",
+            ".spawn           - Mint a sibling connection sharing this database\n",
+            ".use <NAME>      - Switch the active handle (A, B, …) — see .conns\n",
+            ".conns           - List every handle, marking the active one\n",
             ".exit            - Quit this application\n",
+            "\nMulti-handle (.spawn / .use / .conns) is Phase 11.11a — drives\n\
+             interactive BEGIN CONCURRENT demos. Every sibling handle shares\n\
+             the same backing Database via Arc<Mutex<_>>.\n",
             "\nOther meta commands (.read, .ast) are not implemented yet.\n\
              For .ask, set SQLRITE_LLM_API_KEY in your environment first."
         )),
-        MetaCommand::Open(path) => handle_open(&path, db),
-        MetaCommand::Save(path) => handle_save(&path, db),
-        MetaCommand::Tables => handle_tables(db),
-        MetaCommand::Ask(question) => handle_ask(&question, repl, db),
+        MetaCommand::Open(path) => {
+            // `.open` replaces the underlying Database, which strands
+            // any sibling pointing at the old one. Collapse to a
+            // single handle so the new file has a clean owner.
+            state.collapse_to_active();
+            let mut db = state.lock_active();
+            handle_open(&path, &mut db)
+        }
+        MetaCommand::Save(path) => {
+            let mut db = state.lock_active();
+            handle_save(&path, &mut db)
+        }
+        MetaCommand::Tables => {
+            let db = state.lock_active();
+            handle_tables(&db)
+        }
+        MetaCommand::Ask(question) => {
+            let mut db = state.lock_active();
+            handle_ask(&question, repl, &mut db)
+        }
+        MetaCommand::Spawn => handle_spawn(state),
+        MetaCommand::Use(name) => handle_use(&name, state),
+        MetaCommand::Conns => Ok(handle_conns(state)),
         MetaCommand::Unknown => Err(SQLRiteError::UnknownCommand(
             "Unknown command or invalid arguments. Enter '.help'".to_string(),
         )),
     }
+}
+
+fn handle_spawn(state: &mut ReplState) -> Result<String> {
+    let name = state.spawn_sibling();
+    Ok(format!(
+        "Spawned sibling handle '{name}' and switched to it. \
+         {n} handles open. Use '.use NAME' to switch back.",
+        n = state.handle_count()
+    ))
+}
+
+fn handle_use(target: &str, state: &mut ReplState) -> Result<String> {
+    match state.use_handle(target) {
+        Ok(name) => Ok(format!("Active handle: '{name}'.")),
+        Err(msg) => Err(SQLRiteError::General(msg)),
+    }
+}
+
+fn handle_conns(state: &ReplState) -> String {
+    let active = state.active_name().to_string();
+    let mut lines = Vec::with_capacity(state.handles_summary().len() + 1);
+    lines.push(format!("{} handle(s):", state.handles_summary().len()));
+    for (name, in_tx) in state.handles_summary() {
+        let marker = if name == active { "*" } else { " " };
+        let tx_note = if in_tx { " (BEGIN CONCURRENT)" } else { "" };
+        lines.push(format!("  {marker} {name}{tx_note}"));
+    }
+    lines.join("\n")
 }
 
 fn handle_open(path: &Path, db: &mut Database) -> Result<String> {
@@ -267,6 +341,7 @@ fn handle_ask(
 mod tests {
     use super::*;
     use crate::repl::{REPLHelper, get_config};
+    use sqlrite::Connection;
     use sqlrite::process_command;
 
     fn new_editor() -> Editor<REPLHelper, DefaultHistory> {
@@ -276,6 +351,10 @@ mod tests {
             Editor::with_config(config).expect("failed to build rustyline editor");
         repl.set_helper(Some(helper));
         repl
+    }
+
+    fn new_state() -> ReplState {
+        ReplState::new(Connection::open_in_memory().expect("in-memory open"))
     }
 
     fn tmp_path(name: &str) -> PathBuf {
@@ -301,8 +380,8 @@ mod tests {
     #[test]
     fn help_works() {
         let mut repl = new_editor();
-        let mut db = Database::new("x".to_string());
-        let result = handle_meta_command(MetaCommand::Help, &mut repl, &mut db);
+        let mut state = new_state();
+        let result = handle_meta_command(MetaCommand::Help, &mut repl, &mut state);
         assert!(result.is_ok());
     }
 
@@ -375,15 +454,18 @@ mod tests {
     #[test]
     fn tables_meta_command() {
         let mut repl = new_editor();
-        let mut db = Database::new("x".to_string());
+        let mut state = new_state();
         // Empty case.
-        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut db).unwrap();
+        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut state).unwrap();
         assert_eq!(msg, "(no tables)");
 
         // Populated case — two tables, output should be sorted.
-        process_command("CREATE TABLE zebras (id INTEGER PRIMARY KEY);", &mut db).unwrap();
-        process_command("CREATE TABLE apples (id INTEGER PRIMARY KEY);", &mut db).unwrap();
-        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut db).unwrap();
+        {
+            let mut db = state.lock_active();
+            process_command("CREATE TABLE zebras (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+            process_command("CREATE TABLE apples (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        }
+        let msg = handle_meta_command(MetaCommand::Tables, &mut repl, &mut state).unwrap();
         assert_eq!(msg, "apples\nzebras");
     }
 
@@ -393,23 +475,27 @@ mod tests {
 
         let path = tmp_path("meta_roundtrip");
         let mut repl = new_editor();
-        let mut db = Database::new("x".to_string());
+        let mut state = new_state();
 
-        process_command(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-            &mut db,
-        )
-        .unwrap();
-        process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+        {
+            let mut db = state.lock_active();
+            process_command(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+                &mut db,
+            )
+            .unwrap();
+            process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+        }
 
-        handle_meta_command(MetaCommand::Save(path.clone()), &mut repl, &mut db).expect("save");
+        handle_meta_command(MetaCommand::Save(path.clone()), &mut repl, &mut state).expect("save");
 
-        // Replace db with a fresh one, then .open the file.
-        db = Database::new("fresh".to_string());
-        let msg =
-            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+        // Replace state with a fresh one, then .open the file.
+        state = new_state();
+        let msg = handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut state)
+            .expect("open");
         assert!(msg.contains("1 table loaded"));
 
+        let db = state.lock_active();
         let users = db.get_table("users".to_string()).unwrap();
         let rowids = users.rowids();
         assert_eq!(rowids.len(), 1);
@@ -417,6 +503,7 @@ mod tests {
             users.get_value("name", rowids[0]),
             Some(Value::Text("alice".to_string()))
         );
+        drop(db);
 
         cleanup(&path);
     }
@@ -425,16 +512,18 @@ mod tests {
     fn open_missing_file_creates_fresh_db_and_materializes_file() {
         let path = tmp_path("missing");
         let mut repl = new_editor();
-        let mut db = Database::new("x".to_string());
+        let mut state = new_state();
 
-        let msg =
-            handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+        let msg = handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut state)
+            .expect("open");
         assert!(msg.contains("new database"));
+        let db = state.lock_active();
         assert_eq!(db.tables.len(), 0);
         // Auto-save expects a file to exist to auto-flush into, so open-of-missing
         // touches the file with a valid empty DB.
         assert!(path.exists());
         assert_eq!(db.source_path.as_deref(), Some(path.as_path()));
+        drop(db);
 
         cleanup(&path);
     }
@@ -445,23 +534,26 @@ mod tests {
 
         let path = tmp_path("autosave");
         let mut repl = new_editor();
-        let mut db = Database::new("x".to_string());
+        let mut state = new_state();
 
-        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut db).expect("open");
+        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut state).expect("open");
 
         // The first write should auto-flush to disk.
-        process_command(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
-            &mut db,
-        )
-        .unwrap();
-        process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+        {
+            let mut db = state.lock_active();
+            process_command(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
+                &mut db,
+            )
+            .unwrap();
+            process_command("INSERT INTO users (name) VALUES ('alice');", &mut db).unwrap();
+        }
 
-        // Drop the first Database so its exclusive lock releases before we
-        // reopen the same file for verification.
-        drop(db);
+        // Drop the state (and thus the connection holding the
+        // pager's exclusive lock) before we reopen the same file
+        // for verification.
+        drop(state);
 
-        // Reopen the file from scratch in a fresh Database — no manual .save was called.
         let fresh = sqlrite::sql::pager::open_database(&path, "x".to_string())
             .expect("open after auto-save");
         let users = fresh.get_table("users".to_string()).expect("users table");
@@ -473,5 +565,143 @@ mod tests {
         );
 
         cleanup(&path);
+    }
+
+    // ----- Phase 11.11a multi-handle tests -----------------------
+
+    #[test]
+    fn parse_spawn_no_arg() {
+        assert_eq!(MetaCommand::new(".spawn".to_string()), MetaCommand::Spawn);
+        // Trailing whitespace is fine.
+        assert_eq!(
+            MetaCommand::new(".spawn   ".to_string()),
+            MetaCommand::Spawn
+        );
+    }
+
+    #[test]
+    fn parse_use_requires_argument() {
+        assert_eq!(MetaCommand::new(".use".to_string()), MetaCommand::Unknown);
+        assert_eq!(
+            MetaCommand::new(".use B".to_string()),
+            MetaCommand::Use("B".to_string())
+        );
+        assert_eq!(
+            MetaCommand::new(".use b".to_string()),
+            MetaCommand::Use("b".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_conns_no_arg() {
+        assert_eq!(MetaCommand::new(".conns".to_string()), MetaCommand::Conns);
+    }
+
+    #[test]
+    fn spawn_creates_sibling_and_switches() {
+        let mut repl = new_editor();
+        let mut state = new_state();
+        assert_eq!(state.active_name(), "A");
+
+        let msg = handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).expect("spawn ok");
+        assert!(msg.contains("'B'"));
+        assert!(msg.contains("2 handles"));
+        assert_eq!(state.active_name(), "B");
+
+        // .use A switches back.
+        let msg = handle_meta_command(MetaCommand::Use("A".to_string()), &mut repl, &mut state)
+            .expect("use ok");
+        assert!(msg.contains("'A'"));
+        assert_eq!(state.active_name(), "A");
+    }
+
+    #[test]
+    fn use_is_case_insensitive() {
+        let mut repl = new_editor();
+        let mut state = new_state();
+        handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).unwrap();
+        // Now active is "B"; switch back via lowercase.
+        let msg = handle_meta_command(MetaCommand::Use("a".to_string()), &mut repl, &mut state)
+            .expect("lowercase use should match A");
+        assert!(msg.contains("'A'"));
+    }
+
+    #[test]
+    fn use_unknown_handle_errors_with_valid_list() {
+        let mut repl = new_editor();
+        let mut state = new_state();
+        let err = handle_meta_command(MetaCommand::Use("Z".to_string()), &mut repl, &mut state)
+            .unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("no handle named 'Z'"));
+        assert!(s.contains("current handles: A"));
+    }
+
+    #[test]
+    fn conns_reports_active_and_count() {
+        let mut repl = new_editor();
+        let mut state = new_state();
+        handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).unwrap();
+        let msg = handle_meta_command(MetaCommand::Conns, &mut repl, &mut state).expect("conns ok");
+        assert!(msg.contains("2 handle(s):"));
+        // Active is B (spawn switched to it); marked with `*`.
+        assert!(msg.lines().any(|l| l.contains("* B")));
+        assert!(msg.lines().any(|l| l.starts_with("    A")));
+    }
+
+    #[test]
+    fn siblings_share_underlying_database() {
+        let mut repl = new_editor();
+        let mut state = new_state();
+        // Create a table on handle A.
+        {
+            let mut db = state.lock_active();
+            process_command(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);",
+                &mut db,
+            )
+            .unwrap();
+            process_command("INSERT INTO t (id, v) VALUES (1, 100);", &mut db).unwrap();
+        }
+        handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).unwrap();
+        // From handle B, the same row is visible.
+        let db = state.lock_active();
+        let t = db.get_table("t".to_string()).expect("t visible on B");
+        assert_eq!(t.rowids().len(), 1);
+    }
+
+    #[test]
+    fn open_collapses_to_single_handle() {
+        let path = tmp_path("open_collapses");
+        let mut repl = new_editor();
+        let mut state = new_state();
+        handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).unwrap();
+        handle_meta_command(MetaCommand::Spawn, &mut repl, &mut state).unwrap();
+        // 3 handles, active is "C".
+        assert_eq!(state.handle_count(), 3);
+        assert_eq!(state.active_name(), "C");
+
+        // .open should collapse to 1 handle, renamed to A.
+        handle_meta_command(MetaCommand::Open(path.clone()), &mut repl, &mut state).expect("open");
+        assert_eq!(state.handle_count(), 1);
+        assert_eq!(state.active_name(), "A");
+
+        drop(state);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn handle_name_sequence_past_z_wraps_to_aa() {
+        // The Phase 11.11a roadmap caps interactive demos at a few
+        // siblings, but the naming scheme should at least not panic
+        // past 26. Test 27 -> AA.
+        let mut state = new_state();
+        // Spawn 26 siblings -> Z is the 26th. The 27th becomes AA.
+        for _ in 0..26 {
+            state.spawn_sibling();
+        }
+        // 27 total handles now (A + 26 siblings).
+        assert_eq!(state.handle_count(), 27);
+        assert_eq!(state.active_name(), "AA");
     }
 }

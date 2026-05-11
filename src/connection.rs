@@ -297,13 +297,42 @@ impl Connection {
         }
     }
 
+    /// Phase 11.11a — same as [`Connection::execute`], but returns
+    /// the full [`CommandOutput`] (status + optional pre-rendered
+    /// prettytable for `SELECT`). The REPL needs this to print the
+    /// table the engine produced *and* the status line in one
+    /// pass, while still routing `BEGIN CONCURRENT` / `COMMIT` /
+    /// `ROLLBACK` through the per-connection MVCC state.
+    ///
+    /// `BEGIN` / `COMMIT` / `ROLLBACK` carry no rendered output —
+    /// they return `CommandOutput { status, rendered: None }`.
+    pub fn execute_with_render(&mut self, sql: &str) -> Result<crate::sql::CommandOutput> {
+        let intent = concurrent_tx_intent(sql);
+        let has_tx = self.concurrent_tx_is_open();
+        let status = match intent {
+            ConcurrentTxIntent::Begin => self.begin_concurrent()?,
+            ConcurrentTxIntent::Commit if has_tx => self.commit_concurrent()?,
+            ConcurrentTxIntent::Rollback if has_tx => self.rollback_concurrent()?,
+            ConcurrentTxIntent::None
+            | ConcurrentTxIntent::Commit
+            | ConcurrentTxIntent::Rollback => return self.execute_dispatch_with_render(sql),
+        };
+        Ok(crate::sql::CommandOutput {
+            status,
+            rendered: None,
+        })
+    }
+
     /// Phase 11.5 — cheap probe used by [`Connection::execute`]
     /// (and [`Statement::query`]) to decide whether to route
     /// through the concurrent-tx dispatch. Acquires the
     /// `concurrent_tx` mutex briefly; never blocks for a
     /// meaningful amount of time because the only other lockers
     /// are this connection's own writers.
-    fn concurrent_tx_is_open(&self) -> bool {
+    ///
+    /// Public so the REPL can render per-handle tx state in
+    /// `.conns` output (Phase 11.11a).
+    pub fn concurrent_tx_is_open(&self) -> bool {
         self.lock_concurrent_tx().is_some()
     }
 
@@ -404,6 +433,20 @@ impl Connection {
         } else {
             let mut db = self.lock();
             crate::sql::process_command(sql, &mut db)
+        }
+    }
+
+    /// Phase 11.11a — render-aware twin of
+    /// [`Connection::execute_dispatch`]. Same branching, but the
+    /// non-concurrent path calls `process_command_with_render` and
+    /// the concurrent path goes through
+    /// [`Connection::execute_in_concurrent_tx_with_render`].
+    fn execute_dispatch_with_render(&mut self, sql: &str) -> Result<crate::sql::CommandOutput> {
+        if self.concurrent_tx_is_open() {
+            self.execute_in_concurrent_tx_with_render(sql)
+        } else {
+            let mut db = self.lock();
+            crate::sql::process_command_with_render(sql, &mut db)
         }
     }
 
@@ -630,6 +673,18 @@ impl Connection {
     /// new tables to the live database without a separate merge
     /// pass).
     fn execute_in_concurrent_tx(&mut self, sql: &str) -> Result<String> {
+        self.execute_in_concurrent_tx_with_render(sql)
+            .map(|o| o.status)
+    }
+
+    /// Render-aware twin of [`Connection::execute_in_concurrent_tx`].
+    /// Same swap-based dispatch; the only difference is the inner
+    /// call goes through `process_command_with_render` so the
+    /// caller gets the rendered SELECT table (Phase 11.11a).
+    fn execute_in_concurrent_tx_with_render(
+        &mut self,
+        sql: &str,
+    ) -> Result<crate::sql::CommandOutput> {
         let intent = legacy_tx_intent(sql);
         if matches!(intent, LegacyTxIntent::Begin) {
             return Err(SQLRiteError::General(
@@ -672,7 +727,7 @@ impl Connection {
             tables: HashMap::new(),
         });
 
-        let result = crate::sql::process_command(sql, &mut db);
+        let result = crate::sql::process_command_with_render(sql, &mut db);
 
         // Unwind in reverse: take the dummy txn off (don't restore
         // anything from it), swap the tables back.

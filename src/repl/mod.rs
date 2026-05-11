@@ -1,7 +1,10 @@
 use crate::meta_command::*;
+use sqlrite::Connection;
 use sqlrite::sql::SQLCommand;
+use sqlrite::sql::db::database::Database;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
+use std::sync::MutexGuard;
 
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
@@ -118,6 +121,140 @@ pub fn get_config() -> Config {
         .completion_type(CompletionType::List)
         .edit_mode(EditMode::Emacs)
         .build()
+}
+
+/// Multi-handle REPL state (Phase 11.11a).
+///
+/// Holds every `Connection` the user has minted (`.spawn`) plus the
+/// index of the currently-active one. `.spawn` is the headline
+/// feature: it appends a sibling handle that shares the same
+/// `Arc<Mutex<Database>>` so the user can drive interactive
+/// `BEGIN CONCURRENT` demos — open a tx on `A`, write the same row
+/// on `B`, watch `A`'s commit lose to `B`'s, and so on.
+///
+/// **Naming.** Handles are named `A`, `B`, `C`, …, `Z`, `AA`, `AB`,
+/// … in order of creation. Names never get reused inside a session
+/// even if a handle is later dropped (no `.drop` exists yet — but
+/// future work could keep the names monotonic regardless).
+pub struct ReplState {
+    conns: Vec<Connection>,
+    /// Per-handle display name, parallel to `conns`. Stable across
+    /// `.use` switches.
+    names: Vec<String>,
+    /// Index into `conns` (and `names`) of the active handle.
+    /// Mutated by `.use NAME`; every SQL statement and most meta-
+    /// commands route through here.
+    active: usize,
+}
+
+impl ReplState {
+    /// Builds a fresh REPL state with one connection named `A`.
+    pub fn new(conn: Connection) -> Self {
+        Self {
+            conns: vec![conn],
+            names: vec!["A".to_string()],
+            active: 0,
+        }
+    }
+
+    /// The currently-active handle's name (`A`, `B`, …) — used in
+    /// the prompt and in `.conns` output.
+    pub fn active_name(&self) -> &str {
+        &self.names[self.active]
+    }
+
+    /// All `(name, in_concurrent_tx)` tuples, in creation order.
+    /// Used by `.conns`. `in_concurrent_tx` reflects whether the
+    /// handle currently has an open `BEGIN CONCURRENT` — useful for
+    /// demos so the user can see which siblings are mid-tx.
+    pub fn handles_summary(&self) -> Vec<(String, bool)> {
+        self.conns
+            .iter()
+            .zip(self.names.iter())
+            .map(|(c, n)| (n.clone(), c.concurrent_tx_is_open()))
+            .collect()
+    }
+
+    /// Locks the active handle's database and returns the guard.
+    /// Used by meta-commands that need to mutate the underlying
+    /// `Database` directly (`.open`, `.save`, `.tables`, `.ask`).
+    pub fn lock_active(&self) -> MutexGuard<'_, Database> {
+        self.conns[self.active].database()
+    }
+
+    /// Mutable handle to the active `Connection`. The REPL's SQL
+    /// dispatch routes through this so `Connection::execute_with_render`
+    /// catches `BEGIN CONCURRENT` / `COMMIT` / `ROLLBACK` and the
+    /// per-connection MVCC state stays in sync.
+    pub fn active_conn_mut(&mut self) -> &mut Connection {
+        &mut self.conns[self.active]
+    }
+
+    /// Mints a new sibling handle off the active one and switches
+    /// to it. Returns the new handle's name. Backs `.spawn`.
+    pub fn spawn_sibling(&mut self) -> String {
+        let sibling = self.conns[self.active].connect();
+        let name = next_handle_name(self.conns.len());
+        self.conns.push(sibling);
+        self.names.push(name.clone());
+        self.active = self.conns.len() - 1;
+        name
+    }
+
+    /// Switches the active handle to the one whose display name
+    /// matches `target` (case-insensitive). Returns `Ok(name)` if
+    /// found; `Err(msg)` with a list of valid names otherwise.
+    pub fn use_handle(&mut self, target: &str) -> Result<String, String> {
+        let target_upper = target.to_ascii_uppercase();
+        if let Some(idx) = self.names.iter().position(|n| *n == target_upper) {
+            self.active = idx;
+            Ok(self.names[idx].clone())
+        } else {
+            let valid = self.names.join(", ");
+            Err(format!(
+                "no handle named '{target}'; current handles: {valid}"
+            ))
+        }
+    }
+
+    /// Number of live sibling handles. Used by `.open` to decide
+    /// whether replacing the underlying Database is safe.
+    pub fn handle_count(&self) -> usize {
+        self.conns.len()
+    }
+
+    /// Drops every sibling, keeping only handle `A`. Used by
+    /// `.open` so the new database doesn't strand siblings pointing
+    /// at the old one.
+    pub fn collapse_to_active(&mut self) {
+        if self.conns.len() == 1 {
+            return;
+        }
+        // Keep the *active* handle (so `.open` from any handle
+        // works), rename it to `A`, drop the rest.
+        let kept = self.conns.swap_remove(self.active);
+        self.conns.clear();
+        self.names.clear();
+        self.conns.push(kept);
+        self.names.push("A".to_string());
+        self.active = 0;
+    }
+}
+
+/// Returns the display name for the i-th spawned handle:
+/// `0 -> A`, `1 -> B`, …, `25 -> Z`, `26 -> AA`, `27 -> AB`, …
+fn next_handle_name(index: usize) -> String {
+    let mut n = index;
+    let mut out = String::new();
+    loop {
+        let r = n % 26;
+        out.insert(0, (b'A' + r as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    out
 }
 
 #[cfg(test)]

@@ -39,8 +39,10 @@ Enter .exit to quit.
 Enter .help for usage hints.
 Connected to a transient in-memory database.
 Use '.open FILENAME' to reopen on a persistent database.
-sqlrite>
+sqlrite[A]>
 ```
+
+(The `[A]` suffix is the active connection handle — Phase 11.11a added `.spawn` / `.use` / `.conns` for multi-handle demos.)
 
 (The version line in the banner tracks the current build — `cargo run` always shows the live value, so don't be surprised if it's later than what's printed here.)
 
@@ -58,7 +60,7 @@ Should print the project description, the meta-command table, and a summary of s
 sqlrite> .help
 ```
 
-Expect the 5-command list (`.help`, `.open`, `.save`, `.tables`, `.exit`) and a note that `.read` / `.ast` aren't implemented.
+Expect the 9-command list (`.help`, `.open`, `.save`, `.tables`, `.ask`, `.spawn`, `.use`, `.conns`, `.exit`) and a note that `.read` / `.ast` aren't implemented.
 
 ### 1.3 Create a table
 
@@ -585,7 +587,7 @@ When you want a fast before/after comparison for a change, run this condensed ch
 - [ ] `cargo run --bin sqlrite-mcp -- --help` prints the MCP server CLI without crashing — quick check that the stdio_redirect dance still works
 - [ ] `cargo run -- --help` prints the full description + meta-command table + SQL surface (not just `-h` / `-V`)
 - [ ] `cargo run -- somefile.sqlrite` on a non-existent path creates the file and enters the REPL with auto-save on
-- [ ] REPL launches, `.help` shows 5 commands
+- [ ] REPL launches, `.help` shows 9 commands
 - [ ] `.tables` in a populated DB prints one name per line
 - [ ] CREATE TABLE + INSERT + SELECT `*` work in memory
 - [ ] `SELECT ... WHERE col = literal` on a UNIQUE column returns the right row (index probe path)
