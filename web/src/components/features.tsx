@@ -36,55 +36,62 @@ const FEATURES: Feature[] = [
   },
   {
     id: "05",
+    title: "Concurrent writes · MVCC",
+    body:
+      "BEGIN CONCURRENT for multi-writer apps. Snapshot-isolated reads, row-level conflict detection at commit, retryable Busy/BusySnapshot errors across every SDK.",
+    tags: ["mvcc", "begin concurrent"],
+  },
+  {
+    id: "06",
     title: "JOINs + aggregates",
     body:
       "Four JOIN flavors with explicit ON. GROUP BY + COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE, IN, IS NULL.",
     tags: ["joins", "group by"],
   },
   {
-    id: "06",
+    id: "07",
     title: "Prepared statements",
     body:
       "? placeholders bind anywhere a literal is allowed — including vector arguments to k-NN. Per-connection LRU plan cache.",
     tags: ["params", "plan cache"],
   },
   {
-    id: "07",
+    id: "08",
     title: "Vector search · HNSW",
     body:
       "VECTOR(N) column type with cosine / dot / L2 distance. HNSW index per metric for sub-linear k-NN.",
     tags: ["ann", "rag"],
   },
   {
-    id: "08",
+    id: "09",
     title: "Full-text search · BM25",
     body:
       "FTS5-style inverted index with BM25 scoring. fts_match() / bm25_score() functions, hybrid retrieval ready.",
     tags: ["fts", "hybrid"],
   },
   {
-    id: "09",
+    id: "10",
     title: "Free-list + auto-VACUUM",
     body:
       "DROP TABLE / DROP INDEX / DROP COLUMN release pages onto a free-list. Auto-VACUUM compacts past 25%, tunable via PRAGMA.",
     tags: ["storage", "pragma"],
   },
   {
-    id: "10",
+    id: "11",
     title: "Six language SDKs",
     body:
-      "Rust crate, Python (PyO3), Node.js (napi-rs), Go (database/sql), C FFI, and WASM for the browser.",
+      "Rust crate, Python (PyO3), Node.js (napi-rs), Go (database/sql), C FFI, and WASM for the browser. All five non-Rust SDKs mint sibling connection handles for multi-writer workloads.",
     tags: ["bindings"],
   },
   {
-    id: "11",
+    id: "12",
     title: "Tauri desktop GUI · MCP server",
     body:
       "Cross-platform Svelte 5 + Tauri 2.0 client. sqlrite-mcp exposes the database as an MCP stdio server.",
     tags: ["gui", "agents"],
   },
   {
-    id: "12",
+    id: "13",
     title: "Built to be read",
     body:
       "Every phase is shippable on its own and documented. The codebase is the textbook.",

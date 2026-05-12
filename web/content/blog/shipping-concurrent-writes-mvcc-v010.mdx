@@ -1,0 +1,395 @@
+---
+title: "Concurrent writes in SQLRite: shipping BEGIN CONCURRENT and MVCC in v0.10.0"
+description: "SQLRite v0.10.0 lifts the single-writer ceiling. The release ships an in-memory version index, BEGIN CONCURRENT with row-level conflict detection at commit, snapshot-isolated reads, durable WAL log-records, and sibling connection handles across every SDK — Rust, Python, Node, Go, C FFI, and a REPL demo."
+publishedAt: "2026-05-12"
+author: "Joao Henrique Machado Silva"
+tags: ["sqlrite", "mvcc", "concurrent-writes", "rust", "sqlite", "database-internals"]
+primaryKeyword: "Rust embedded database MVCC concurrent writes"
+---
+
+SQLite serializes every writer through a single exclusive lock. The
+file-level `PENDING`/`EXCLUSIVE` mode is the design choice users hit
+first when they scale — two unrelated writers touching disjoint rows
+still wait on each other because the lock is page- or file-granularity,
+not row-granularity. For workloads where most writes don't actually
+conflict, that's throughput left on the table.
+
+[SQLRite](https://github.com/joaoh82/rust_sqlite) v0.10.0 lifts that
+ceiling. The headline shape is straight out of the
+[Hekaton paper](https://www.microsoft.com/en-us/research/wp-content/uploads/2011/01/main-mem-cc-techreport.pdf)
+and Turso's
+[experimental MVCC](https://docs.turso.tech/tursodb/concurrent-writes),
+narrowed for SQLRite's single-process scope:
+
+```sql
+PRAGMA journal_mode = mvcc;            -- once per database
+BEGIN CONCURRENT;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;                                -- may return Busy → caller retries
+```
+
+Two writers on disjoint rows now commit in parallel. Two writers on
+the same row see the second commit fail fast with
+`SQLRiteError::Busy`, which the caller retries with a fresh
+`BEGIN CONCURRENT`. The data structure backing this is a per-row
+in-memory version chain (`MvStore`) sitting in front of the existing
+pager; the on-disk format is unchanged.
+
+This post walks through the engineering — how the version chain
+works, what "snapshot isolation" actually means here, why durability
+needed a new WAL frame kind, how the SDKs got involved, and which
+parts we deliberately punted on. If you've been reading SQLRite's
+[architecture docs](https://github.com/joaoh82/rust_sqlite/blob/main/docs/architecture.md)
+this is the part Phase 11 added; if you haven't, this is a tour of
+what optimistic MVCC looks like when you build it from scratch in
+about 4 weeks of focused work.
+
+## What "concurrent writes" actually means
+
+The phrase is overloaded. There are at least four things people
+mean by "concurrent writes in a database":
+
+1. **Multiple writers, same process.** Two threads inside one app
+   each running a write transaction.
+2. **Multiple writers, same machine, different processes.** Two
+   instances of a daemon writing to the same file.
+3. **Snapshot-isolated reads.** A read transaction sees a consistent
+   point-in-time view of the database, even while writes happen.
+4. **Row-level conflict detection.** If two writers touch unrelated
+   rows, neither blocks; if they touch the same row, exactly one
+   wins.
+
+v0.10.0 ships **1**, **3**, and **4** end-to-end. **2** stays
+out-of-scope by design — multi-process MVCC would need a shared-
+memory coordination file the way SQLite's WAL does for read marks,
+and the marginal payoff is small enough that "use sibling connection
+handles inside one process" is the documented escape hatch. Today's
+file-level `flock(LOCK_EX)` still serializes between processes; the
+new story is *within* a process.
+
+That distinction matters for which Rust patterns make sense. If
+you're inside one process you can share `Arc<Mutex<Database>>`
+between threads. If you're across processes you need a coordination
+medium more complicated than a `Mutex`, and the engineering bill
+goes up by an order of magnitude. SQLRite picks intra-process and
+moves on.
+
+## The version chain in 30 seconds
+
+For every row that's been touched under `BEGIN CONCURRENT`, the
+engine holds an ordered chain of `RowVersion`s in memory:
+
+```text
+                 begin=ts1                 begin=ts3                begin=ts7
+                 end=Some(ts3)             end=Some(ts7)            end=None
+                ┌────────────┐           ┌────────────┐           ┌────────────┐
+   rowid 42  ─→ │ balance=100│ ──next──→ │ balance=150│ ──next──→ │ Tombstone │
+                │            │           │            │           │ (DELETE)  │
+                └────────────┘           └────────────┘           └────────────┘
+```
+
+A version is **visible** to a transaction with begin-timestamp `T`
+when `begin <= T < end`. That's the textbook snapshot-isolation
+visibility rule. New writes push a new head onto the chain at commit
+time, capping the previous latest version's `end` to the new
+`commit_ts`.
+
+Timestamps come from a process-wide logical clock (`MvccClock`), an
+`AtomicU64` that hands out `begin_ts` at `BEGIN CONCURRENT` and
+`commit_ts` at the start of validation. The clock's high-water mark
+is persisted in the WAL header, so a process restart doesn't reuse
+timestamps — important because the visibility rule (`begin <= T < end`)
+would mis-classify versions otherwise.
+
+## Commit-time validation, not lock-time pessimism
+
+The interesting choice happens at `COMMIT`, not at `BEGIN`. Two
+writers issue `BEGIN CONCURRENT` concurrently and neither blocks —
+they both proceed against their own private snapshot of the
+database. The conflict, if any, is decided when one of them tries
+to commit:
+
+1. Allocate a `commit_ts` from the clock.
+2. Walk the write-set. For each `(table, rowid)`, check whether any
+   committed version's `begin > tx.begin_ts`. If yes, someone else
+   superseded us → return `SQLRiteError::Busy`. The transaction is
+   dropped server-side; the caller retries with a fresh
+   `BEGIN CONCURRENT`.
+3. Otherwise, push a new `RowVersion` onto each row's chain at
+   `commit_ts`, capping the previous latest's `end`.
+4. Append an `MvccCommitBatch` frame to the WAL.
+5. Mirror the writes into the legacy `Database::tables` so the
+   non-concurrent read path stays correct after commit.
+6. Drop the transaction's handle and sweep the write-set's chains
+   for GC.
+
+This is **optimistic concurrency control** — we don't pay for locks
+upfront; we pay only when conflicts actually happen. For workloads
+where most writes are disjoint, that's a strict throughput win over
+SQLite's "every writer waits for the writer lock" model. For
+workloads where everyone fights over the same handful of rows, the
+retry loop is doing the work — and a careful caller might prefer to
+pre-serialize at the app layer to skip the retry tax.
+
+The plan was always to ship both shapes and let workloads pick.
+
+## The retry loop is the whole API
+
+The shape is the same in every language. Here's Rust:
+
+```rust
+use sqlrite::{Connection, SQLRiteError};
+
+let mut conn = Connection::open("orders.sqlrite")?;
+conn.execute("PRAGMA journal_mode = mvcc")?;
+
+loop {
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("INSERT INTO orders (id, customer, total) VALUES (1, 'alice', 100)")?;
+    conn.execute("UPDATE inventory SET stock = stock - 1 WHERE sku = 'WIDGET-A'")?;
+    match conn.execute("COMMIT") {
+        Ok(_) => break,
+        Err(e) if e.is_retryable() => {
+            conn.execute("ROLLBACK").ok();
+            continue;
+        }
+        Err(e) => return Err(e.into()),
+    }
+}
+# Ok::<(), sqlrite::SQLRiteError>(())
+```
+
+`SQLRiteError::is_retryable()` covers both `Busy` (write-write
+conflict at commit) and `BusySnapshot` (the snapshot the read path
+expected has been GC'd). Every SDK surfaces an equivalent
+classifier — `errors.Is(err, sqlrite.ErrBusy)` in Go,
+`sqlrite.BusyError` (subclass of `SQLRiteError`) in Python,
+`errorKind(err) === 'Busy'` in Node, `sqlrite_status_is_retryable`
+in the C FFI. **None of them ship an automatic backoff**: the right
+policy (immediate retry vs. exponential vs. capped attempts vs.
+jittered) depends on the workload, and forcing one would just mean
+every caller has to fight the default.
+
+A full runnable example lives at
+[`examples/rust/concurrent_writers.rs`](https://github.com/joaoh82/rust_sqlite/blob/main/examples/rust/concurrent_writers.rs).
+Two sibling `Connection`s, interleaved `BEGIN CONCURRENT`s, the
+disjoint-row happy path plus the same-row retry. Mostly under 80
+lines.
+
+## Sibling connections — the SDK plumbing
+
+A single `Connection::open` is the only call that touches the
+file. Additional handles come from `Connection::connect()`, which
+mints a sibling sharing the same `Arc<Mutex<Database>>`. Every
+sibling can hold its own independent `BEGIN CONCURRENT` — that's
+the whole point of multi-handle MVCC.
+
+Every SDK now exposes this:
+
+| SDK | Mint a sibling |
+|---|---|
+| Rust | `let b = primary.connect();` |
+| C FFI | `sqlrite_connect_sibling(existing, out)` |
+| Python | `conn.connect()` |
+| Node.js | `db.connect()` |
+| Go | All `sql.Open("sqlrite", path)` calls for the same canonical path automatically share state through a process-level path registry |
+
+The Go case is the one that ate the most time. Go's
+`database/sql` pool calls `driver.Open` whenever it wants another
+connection slot, and a second `sqlrite_open` for the same path
+would deadlock against the first one's `flock(LOCK_EX)`. The fix is
+a tiny in-process registry keyed by `filepath.Abs(name)`: the first
+opener pays for a real engine connection, subsequent openers (within
+the same pool *or* across separate `*sql.DB` instances) mint
+siblings off a hidden primary. The registry refcounts; the last
+sibling out closes the primary. It's about 80 lines of Go and it
+makes the existing `errors.Is(err, sqlrite.ErrBusy)` machinery
+actually exercisable from real Go code.
+
+## Durability needed a new WAL frame kind
+
+Phase 4's WAL was per-page: every commit appended frames for
+modified pages plus a final commit-barrier frame with the new page
+count. That's perfect for the legacy single-writer path — `COMMIT`
+fsyncs the barrier frame and the transaction is durable.
+
+The MVCC commit path mirrors writes into `Database::tables` so the
+legacy save still happens, so technically the visible row state is
+durable through the existing machinery. But the `MvStore` itself —
+the version chain that powers conflict detection — lives only in
+memory. Without persistence the conflict-detection window doesn't
+survive a process restart: a second process could legitimately hand
+out a `begin_ts` below an already-committed version's `end`, and
+the visibility rule would mis-classify one side.
+
+Phase 11.9 closes that gap with a typed `MvccCommitBatch` frame,
+distinguished from page frames by the sentinel `page_num = u32::MAX`
+(real page numbers are bounded by file size; no collision risk).
+The frame body encodes the commit timestamp plus a record stream of
+the resolved write-set:
+
+```
+┌────────┬────────┬─────────────────────────────────────────────────┐
+│ offset │ length │ content                                         │
+├────────┼────────┼─────────────────────────────────────────────────┤
+│     0  │    8   │ magic "MVCC0001"                                │
+│     8  │    8   │ commit_ts (u64 LE)                              │
+│    16  │    2   │ record count (u16 LE)                           │
+│    18  │ var.   │ per-record: op tag, table name, rowid, payload  │
+│   ...  │   ...  │ zero-padded to PAGE_SIZE                        │
+└────────┴────────┴─────────────────────────────────────────────────┘
+```
+
+The frame is appended without its own fsync — the very next legacy
+commit frame from the same `save_database` is fsync'd, and that
+flushes everything in between. So a single fsync covers both the
+MVCC frame and the page-level updates. A crash between the two
+appends drops both — torn-write atomicity for the whole transaction,
+the same property the per-page WAL already had.
+
+On reopen, the WAL replay walks every MVCC frame and re-pushes the
+versions into `MvStore` via the same `push_committed` the live
+commit path uses. The `MvccClock` is seeded past
+`max(WAL header clock_high_water, max(commit_ts in replayed frames))` —
+the max is what keeps things correct between checkpoints, since the
+header is only fsync'd at checkpoint time and the frame timestamps
+are durable on every commit.
+
+WAL format goes v1 → v3 (v2 added the clock high-water; v3 added
+the MVCC frame marker). Decoders accept all three, so v0.10.0 reads
+v0.9.1's files unchanged.
+
+## The REPL is the demo
+
+`sqlrite`, the REPL binary, used to hold a single `&mut Database`.
+v0.10.0 lifts it to `Vec<Connection>` so users can mint sibling
+handles in-session. The prompt always shows the active handle:
+
+```text
+sqlrite[A]> PRAGMA journal_mode = mvcc;
+sqlrite[A]> CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+sqlrite[A]> INSERT INTO t (id, v) VALUES (1, 0);
+sqlrite[A]> .spawn
+Spawned sibling handle 'B' and switched to it. 2 handles open.
+sqlrite[B]> .use A
+sqlrite[A]> BEGIN CONCURRENT;
+sqlrite[A]> UPDATE t SET v = 100 WHERE id = 1;
+sqlrite[A]> .conns
+2 handle(s):
+  * A (BEGIN CONCURRENT)
+    B
+sqlrite[A]> .use B
+sqlrite[B]> BEGIN CONCURRENT;
+sqlrite[B]> UPDATE t SET v = 200 WHERE id = 1;
+sqlrite[B]> COMMIT;
+sqlrite[B]> .use A
+sqlrite[A]> COMMIT;
+An error occured: Busy: write-write conflict on t/1: another transaction
+committed this row at ts=3 (after our begin_ts=1); transaction rolled
+back, retry with a fresh BEGIN CONCURRENT
+sqlrite[A]> .use B
+sqlrite[B]> SELECT * FROM t;
++----+-----+
+| id | v   |
++----+-----+
+| 1  | 200 |
++----+-----+
+```
+
+`.spawn` mints a sibling. `.use NAME` switches the active handle.
+`.conns` lists every handle, marks the active one, and flags any
+holding an open `BEGIN CONCURRENT`. The whole multi-handle MVCC
+story is reachable from a single binary, no external orchestration,
+no Docker compose.
+
+## What we left out, on purpose
+
+Three things stayed deliberately out of v0.10.0:
+
+**Indexes under MVCC** — Turso explicitly punted on this in their
+own MVCC work, and we did too. Each secondary-index entry under
+MVCC would need its own `RowVersion`, keyed by `(index_id, key, rowid)` —
+one version chain per indexed `(column, row)` pair. The memory and
+GC costs are non-trivial. The engine currently rejects `CREATE INDEX`
+while `journal_mode = mvcc;` with a typed error. We'll tackle
+indexes-under-MVCC as its own follow-up phase once the v0 is stable.
+
+**Checkpoint drain** — The checkpointer doesn't yet fold `MvStore`
+versions back into pager-level updates. As a result,
+`set_journal_mode(Mvcc → Wal)` is rejected if the store carries any
+committed versions (would silently strand them). The MVCC frames in
+the WAL still provide durability, and the per-commit GC bounds
+memory growth for normal workloads; but a clean Mvcc → Wal downgrade
+is parked.
+
+**Cross-process MVCC** — Mentioned earlier. The in-memory `MvStore`
+has no cross-process visibility; multi-process writers still
+serialize through `flock(LOCK_EX)`. SQLite's WAL coordination uses
+a shared-memory file for read marks; we could go there, but the
+intra-process story covers the workloads we actually care about.
+
+All three are tracked in the repo's [roadmap](https://github.com/joaoh82/rust_sqlite/blob/main/docs/roadmap.md)
+and as separate work items.
+
+## What it took
+
+Phase 11 was ten merged sub-phases plus a docs sweep:
+
+1. **11.1** — `Connection` becomes a thin handle over `Arc<Mutex<Database>>`
+2. **11.2** — Logical clock + active-tx registry; WAL header v1 → v2
+3. **11.3** — `MvStore` skeleton + `PRAGMA journal_mode` opt-in
+4. **11.4** — `BEGIN CONCURRENT` writes + commit-time validation
+5. **11.5** — Snapshot-isolated reads via `Statement::query`
+6. **11.6** — Per-commit GC + `Connection::vacuum_mvcc`
+7. **11.7** — SDK propagation of Busy/BusySnapshot across C, Python, Node, Go
+8. **11.8** — Sibling connection handles in the FFI and Python/Node bindings
+9. **11.9** — WAL log-record durability + crash recovery; WAL format v3
+10. **11.11a** — REPL `.spawn` / `.use` / `.conns`
+11. **11.11b** — New `W13` bench workload (4 workers × 50 BEGIN/UPDATE/COMMIT)
+12. **11.11c** — Go SDK cross-pool sibling path registry
+13. **11.12** — Canonical [`docs/concurrent-writes.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/concurrent-writes.md)
+    + worked example + roadmap cleanup
+
+The full design rationale lives in
+[`docs/concurrent-writes-plan.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/concurrent-writes-plan.md);
+the user-facing reference is [`docs/concurrent-writes.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/concurrent-writes.md).
+Each sub-phase was one PR, one review, one merge. Phase numbering is
+real and the roadmap is the single source of truth — it's how you
+keep "MVCC" from sprawling from an estimate into an engineering
+sinkhole.
+
+## Try it
+
+```bash
+# Rust
+cargo add sqlrite-engine     # v0.10.0
+
+# Python
+pip install sqlrite          # v0.10.0
+
+# Node
+npm install @joaoh82/sqlrite # v0.10.0
+
+# Go
+go get github.com/joaoh82/rust_sqlite/sdk/go@latest
+
+# REPL
+cargo install sqlrite-engine
+sqlrite some/path/to/db.sqlrite
+```
+
+Then `PRAGMA journal_mode = mvcc;`, `BEGIN CONCURRENT;`, and you're
+in. The canonical reference is at
+[`docs/concurrent-writes.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/concurrent-writes.md);
+the worked retry-loop example is at
+[`examples/rust/concurrent_writers.rs`](https://github.com/joaoh82/rust_sqlite/blob/main/examples/rust/concurrent_writers.rs);
+the design rationale is at
+[`docs/concurrent-writes-plan.md`](https://github.com/joaoh82/rust_sqlite/blob/main/docs/concurrent-writes-plan.md).
+
+If you build something on top of it, I want to hear about it —
+[open an issue](https://github.com/joaoh82/rust_sqlite/issues),
+[join the Discord](https://discord.gg/dHPmw89zAE), or just publish a
+post. SQLRite's whole premise is "implement the parts of SQLite that
+matter, in the open, so the codebase is the textbook." Phase 11 was
+the chapter on MVCC. Whatever you build with it teaches the rest.

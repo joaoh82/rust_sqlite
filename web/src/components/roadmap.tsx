@@ -159,17 +159,34 @@ const PHASES: Phase[] = [
     ],
   },
   {
+    num: "Phase 11",
+    title: "Concurrent writes via MVCC (v0.10.0)",
+    status: "done",
+    desc:
+      "BEGIN CONCURRENT for multi-writer apps. Hekaton-style optimistic MVCC, row-level conflict detection at commit, snapshot-isolated reads, and a typed retry surface across every SDK.",
+    bullets: [
+      "11.1–11.3: multi-connection foundation · logical clock · MvStore + PRAGMA journal_mode",
+      "11.4–11.6: BEGIN CONCURRENT writes + commit-time validation · snapshot reads · per-commit GC",
+      "11.7–11.8: SDK propagation of Busy/BusySnapshot · sibling Connection handles across C / Python / Node",
+      "11.9: WAL log-record durability + crash recovery (format v3) — MVCC frames share the legacy save's fsync",
+      "11.11a: REPL .spawn / .use / .conns for interactive multi-handle demos",
+      "11.11b: new W13 bench workload pitting SQLRite-MVCC against SQLite",
+      "11.11c: Go SDK cross-pool sibling shape via a process-level path registry",
+      "11.12: canonical docs/concurrent-writes.md + worked example",
+    ],
+  },
+  {
     num: "What's next",
     title: "Possible extras",
     status: "next",
     desc:
       "Smaller, well-scoped follow-ups that slot in where they make sense — see the canonical roadmap doc for the full list.",
     bullets: [
-      "Subqueries + CTEs · HAVING · CASE WHEN · BETWEEN · GLOB / REGEXP",
-      "GROUP BY / DISTINCT over JOINs · multi-column ORDER BY · OFFSET · UNION",
+      "HAVING · BETWEEN · CASE WHEN · scalar functions (LENGTH / UPPER / COALESCE / …)",
+      "Subqueries + CTEs · GROUP BY / DISTINCT over JOINs · multi-column ORDER BY · OFFSET · UNION",
       "Composite + expression indexes · CREATE VIEW / TRIGGER · FOREIGN KEY / CHECK",
-      "Concurrent writes via MVCC + BEGIN CONCURRENT (design sketch in repo)",
-      "Savepoints · more pragmas (journal_mode, synchronous, cache_size)",
+      "MVCC checkpoint drain (re-enable Mvcc → Wal downgrade) · indexes under MVCC",
+      "Savepoints · more pragmas (synchronous, cache_size)",
       "Code signing for desktop installers (Phase 6.1)",
     ],
   },
@@ -191,8 +208,8 @@ export function Roadmap() {
             <h2>Phased, shippable, public.</h2>
             <p className="sub">
               Every phase is independently usable and merges to{" "}
-              <span className="mono">main</span> before the next starts. Ten
-              phases shipped through v0.9.1; the remaining list at the bottom
+              <span className="mono">main</span> before the next starts. Eleven
+              phases shipped through v0.10.0; the remaining list at the bottom
               is small, well-scoped follow-ups.
             </p>
           </div>

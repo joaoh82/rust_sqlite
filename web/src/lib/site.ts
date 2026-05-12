@@ -1,7 +1,7 @@
 export const SITE = {
   url: "https://sqlritedb.com",
   twitterHandle: "@CodePolyglot",
-  version: "0.9.1",
+  version: "0.10.0",
   repo: "https://github.com/joaoh82/rust_sqlite",
   discord: "https://discord.gg/dHPmw89zAE",
   docsRs: "https://docs.rs/sqlrite-engine",
