@@ -247,7 +247,10 @@ The "publish" half. Auto-fires on the release commit.
     GitHub Release `sqlrite-node-vX.Y.Z`.
   - **publish-wasm** — `wasm-pack build --target bundler --release`,
     then `wasm-pack publish` via OIDC. Creates
-    `sqlrite-wasm-vX.Y.Z` GitHub Release.
+    `sqlrite-wasm-vX.Y.Z` GitHub Release. Installs a
+    [pinned binaryen / wasm-opt](#pinned-binaryen--wasm-opt) before
+    invoking `wasm-pack`, so the published bundle is byte-stable
+    across runner image cache states.
   - **publish-go** — nothing to build on the Go side. Verifies
     `sdk/go/vX.Y.Z` was pushed correctly by `tag-all`. Pulls the
     per-platform `libsqlrite_c` tarballs produced by
@@ -284,6 +287,64 @@ The "publish" half. Auto-fires on the release commit.
   auto-trigger fires. `tag-all` runs and finds the tags already
   exist (because the real release happened weeks ago). Workflow
   aborts with a clear "tag already exists" error. No damage.
+
+## Pinned binaryen / wasm-opt
+
+The WASM build paths in `ci.yml` (`wasm-build`) and `release.yml`
+(`publish-wasm`) both install a **pinned version of binaryen**
+(which provides `wasm-opt`) before invoking `wasm-pack`. The pin
+lives in a `BINARYEN_VERSION` job-level `env:` in each workflow.
+
+**Current pin: `version_122`** (released Feb 2025).
+
+### Why this exists (SQLR-58)
+
+`wasm-pack` invokes `wasm-opt` to size-optimize the published
+bundle. If `wasm-opt` is already on `PATH`, `wasm-pack` uses that
+one; otherwise it downloads its own copy into a per-runner cache.
+That cache is keyed on the runner image and survives across
+images opaquely — which means CI was getting whatever binaryen
+the cache happened to hold. When the cached copy was old enough
+to predate multi-table WASM support, `wasm-opt` would reject
+recent rustc output with:
+
+> `[parse exception: Only 1 table definition allowed in MVP]`
+> `Fatal: error in parsing input`
+> `Error: failed to execute wasm-opt: exited with exit code: 1`
+
+The failure was non-deterministic (re-runs frequently passed,
+because the new image had a different cache state), but it broke
+the release pipeline at least once before [PR #135](https://github.com/joaoh82/rust_sqlite/pull/135).
+Pinning binaryen + prepending it to `PATH` forces `wasm-pack`
+to always see the same `wasm-opt`, regardless of runner state.
+
+### Bump procedure
+
+1. Look at the [binaryen releases page](https://github.com/WebAssembly/binaryen/releases)
+   and pick a recent stable version (avoid release candidates).
+2. Locally, download that release's `x86_64-linux` tarball and
+   run `wasm-opt --version` to confirm it builds. Optional but
+   nice: also run `wasm-pack build --target web --release` in
+   `sdk/wasm` with the new `wasm-opt` on `PATH` and confirm the
+   `.wasm` artifact size is in the same ballpark as before
+   (regressions > 10% are worth investigating).
+3. Update `BINARYEN_VERSION` in both `.github/workflows/ci.yml`
+   (job `wasm-build`) and `.github/workflows/release.yml` (job
+   `publish-wasm`). Keep the two in lockstep — a divergence
+   means CI and release produce subtly different artifacts.
+4. Update the "Current pin" line above to match.
+5. PR + merge. CI will exercise the new version on the WASM
+   build job before the release pipeline ever sees it.
+
+### Why a tarball, not apt-get
+
+Ubuntu's apt-packaged `binaryen` is reliably 1–2 years behind
+upstream and pinning it requires the matching apt index, which is
+itself unstable across runner image refreshes. The official
+WebAssembly/binaryen GitHub release tarballs are stable URLs and
+sha-pinnable (we don't currently verify the sha256 — a follow-up
+if supply-chain integrity becomes a concern; the tarball is
+short-lived and contained to the runner).
 
 ## Secrets / one-time setup
 
