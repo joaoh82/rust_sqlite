@@ -222,6 +222,21 @@ fi
 
 echo
 echo "Done. Next steps:"
-echo "  cargo build    # refresh Cargo.lock with the new versions"
-echo "  git diff       # inspect the twelve-file bump"
-echo "  git checkout . # or back out if it looks wrong"
+echo "  cargo build                    # refresh Cargo.lock with the new versions"
+echo "  git diff                       # inspect the twelve-file bump"
+echo "  git checkout .                 # or back out if it looks wrong"
+echo
+echo "When the diff looks right, commit + tag with the EXACT message the"
+echo "release workflow's detect job expects (regex"
+echo "  ^release: v[0-9]+\\.[0-9]+\\.[0-9]+\$"
+echo "in .github/workflows/release.yml). Any other message and the"
+echo "release pipeline silently skips publish:"
+echo
+echo "  git commit -am 'release: v${VERSION}'"
+echo "  git tag v${VERSION}"
+echo "  git push && git push --tags"
+echo
+echo "If a push lands with a different commit-message format, the"
+echo "release workflow can be retriggered manually:"
+echo
+echo "  gh workflow run release.yml -f version=${VERSION}"

@@ -44,3 +44,12 @@ examples/wasm/pkg
 
 # macOS
 .DS_Store
+
+# Local agent / Claude Code worktrees. These shouldn't ever get
+# committed — but `git add -A` from main while a worktree is live
+# under .claude/worktrees/<name>/ will capture it as a gitlink
+# (mode 160000) because the worktree dir looks like a submodule to
+# the parent index. Ignoring the whole tree prevents that whole
+# class of accident. (The release commit 937f8b4 hit exactly this
+# bug; the next commit untracks the leftover gitlinks.)
+.claude/worktrees/
