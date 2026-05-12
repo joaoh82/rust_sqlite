@@ -40,7 +40,7 @@ export function Hero() {
             </div>
             <div className="hero-meta">
               <span>
-                <span className="dot" /> Phases 0–10 shipped
+                <span className="dot" /> Phases 0–11 shipped — concurrent writes live
               </span>
               <span>· v{SITE.version} on crates.io · PyPI · npm</span>
               <span>· Rust 2024 edition</span>
