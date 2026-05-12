@@ -1,7 +1,13 @@
 import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import { PostHogPageView, PostHogProvider } from "@posthog/next";
 import { SITE } from "@/lib/site";
 import "./globals.css";
+
+// PostHog is gated on NEXT_PUBLIC_POSTHOG_KEY so preview deploys that haven't
+// configured the secret still build/serve. The env is inlined at build time, so
+// redeploy after setting the secret in Vercel.
+const POSTHOG_ENABLED = Boolean(process.env.NEXT_PUBLIC_POSTHOG_KEY);
 
 export const viewport: Viewport = {
   width: "device-width",
@@ -100,7 +106,16 @@ export default function RootLayout({
       className={`${inter.variable} ${jetbrainsMono.variable}`}
       suppressHydrationWarning
     >
-      <body>{children}</body>
+      <body>
+        {POSTHOG_ENABLED ? (
+          <PostHogProvider clientOptions={{ api_host: "/ingest" }}>
+            <PostHogPageView />
+            {children}
+          </PostHogProvider>
+        ) : (
+          children
+        )}
+      </body>
     </html>
   );
 }
