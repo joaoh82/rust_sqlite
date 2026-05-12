@@ -225,7 +225,49 @@ box. Point Vercel at the `web/` directory:
 
 - **Root Directory:** `web`
 - **Framework Preset:** Next.js (auto-detected)
-- No environment variables required.
+
+### Environment variables
+
+| Name | Required | Default | Purpose |
+| ---- | -------- | ------- | ------- |
+| `NEXT_PUBLIC_POSTHOG_KEY` | optional | — | PostHog project API key (`phc_…`). When set, the site loads `@posthog/next` and captures pageviews + autocapture events. When unset, the PostHog provider and middleware short-circuit to a no-op so builds still succeed. |
+| `NEXT_PUBLIC_POSTHOG_HOST` | optional | `https://us.i.posthog.com` | PostHog ingest host. Set to `https://eu.i.posthog.com` for the EU region. |
+
+**Build-time baking gotcha.** `NEXT_PUBLIC_*` env vars are inlined into the
+client bundle at `next build` time, not read at deploy time. After adding
+or rotating the key in Vercel you **must redeploy** for the change to take
+effect — toggling the env var alone won't propagate to the already-built
+artifact.
+
+### Analytics surface
+
+PostHog is wired up in two places:
+
+- [`src/app/layout.tsx`](src/app/layout.tsx) — `PostHogProvider` +
+  `PostHogPageView` from `@posthog/next`. The provider is rendered only when
+  `NEXT_PUBLIC_POSTHOG_KEY` is set and runs without `bootstrapFlags`, so it
+  stays static-render-safe (the ~43 prerendered routes — `/`, `/docs`,
+  `/blog`, blog tags, RSS, OG images, sitemap, robots — keep their static
+  generation).
+- [`src/middleware.ts`](src/middleware.ts) — `postHogMiddleware({ proxy:
+  true })` seeds the anonymous identity cookie on first visit and reverse-
+  proxies `/ingest/*` to the PostHog ingest host (dodges ad-blockers). The
+  middleware matcher excludes `_next/static`, `_next/image`, `favicon.ico`,
+  any path with a file extension (sitemap, robots, rss, images, fonts…),
+  and the OG/Twitter image metadata routes to keep Vercel middleware
+  invocations bounded.
+
+If the env var is absent the provider is omitted and the middleware
+falls through to `NextResponse.next()`.
+
+### Privacy / compliance follow-ups
+
+The current wiring uses PostHog defaults — autocapture + cookies — and
+**does not** ship a consent banner. For EU visitors that is a GDPR /
+ePrivacy sharp edge: either add a consent banner before going live in the
+EU, or switch `PostHogProvider`'s `clientOptions` to `persistence:
+'memory'` and disable autocapture until consent is collected. Tracked
+separately from this initial wiring.
 
 For other hosts, `next build` produces a standard Next.js output suitable
 for any Node-friendly runtime.
