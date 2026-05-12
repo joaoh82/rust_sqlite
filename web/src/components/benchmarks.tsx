@@ -81,13 +81,14 @@ export function Benchmarks() {
         <div className="sec-head">
           <span className="eyebrow tag">07 · benchmarks</span>
           <div>
-            <h2>Honest numbers, published in public.</h2>
+            <h2>SQLRite vs SQLite benchmarks — honest numbers, published in public.</h2>
             <p className="sub">
-              Twelve workloads against SQLite (WAL+NORMAL) and DuckDB on a
-              pinned-host run. The point isn&rsquo;t to win — SQLite has 25
-              years of optimization behind it — it&rsquo;s to baseline future
-              engine work, prove the differentiator workloads deliver, and
-              ground the roadmap with evidence.
+              Twelve workloads pitch SQLRite, the embedded Rust database,
+              against SQLite (WAL+NORMAL) and DuckDB on a pinned-host run.
+              The point isn&rsquo;t to win — SQLite has 25 years of
+              optimization behind it — it&rsquo;s to baseline future engine
+              work, prove the differentiator workloads (HNSW vector search,
+              BM25 full-text) deliver, and ground the roadmap with evidence.
             </p>
           </div>
         </div>

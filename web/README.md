@@ -58,6 +58,11 @@ The canonical site URL + Twitter handle live in
 [`src/lib/site.ts`](src/lib/site.ts) (`SITE.url`, `SITE.twitterHandle`) —
 update both there if the domain or handle ever changes.
 
+The keyword strategy that drives every page's H1, lede, and `metadata`
+export lives in [`seo/keywords.md`](seo/keywords.md). When rewriting a
+page's headline or meta description, update the corresponding entry in
+that sheet so future rewrites stay coordinated.
+
 ## Local development
 
 ```sh
@@ -80,6 +85,8 @@ npm run lint       # next lint (ESLint)
 web/
 ├── content/
 │   └── blog/                # MDX posts (one .mdx file per post; frontmatter at top)
+├── seo/
+│   └── keywords.md          # keyword research + per-page primary/secondary registry (SQLR-33)
 ├── src/
 │   ├── app/
 │   │   ├── globals.css      # design tokens + utility CSS (ports the original design's styles.css)

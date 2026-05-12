@@ -4,9 +4,14 @@ import { Footer } from "@/components/footer";
 import { Nav } from "@/components/nav";
 import { SITE } from "@/lib/site";
 
-const TITLE = "Getting started with SQLRite";
+// SEO targeting: primary "SQLRite documentation / getting started with the
+// embedded Rust database"; secondary "embedded database tutorial Rust",
+// "vector search Rust quickstart", "BM25 Rust", "MCP server SQLite".
+// See web/seo/keywords.md.
+const TITLE =
+  "SQLRite docs — getting started with the embedded Rust database";
 const DESCRIPTION =
-  "A ten-minute tour from cargo install to a persistent on-disk SQLRite database — REPL, transactions, JOINs, vector search, BM25 full-text, and six language SDKs.";
+  "Install SQLRite, open your first .sqlrite file, and run SQL — transactions, JOINs, HNSW vector search, BM25 full-text, an MCP server, and six language SDKs.";
 
 export const metadata: Metadata = {
   title: TITLE,
@@ -123,12 +128,19 @@ export default function DocsPage() {
 
         <main className="docs-main">
           <span className="eyebrow">docs · getting started</span>
-          <h1 style={{ marginTop: 18 }}>Getting started with SQLRite</h1>
+          <h1 style={{ marginTop: 18 }}>
+            SQLRite docs — getting started with the embedded Rust database
+          </h1>
           <p className="lede">
-            A ten-minute tour from <code>cargo install</code> to a persistent
-            on-disk database with real transactions, vector search, and
-            full-text search. Pick the SDK that fits your language at the
-            bottom — they all wrap the same engine.
+            SQLRite is an embedded SQL + vector database in Rust. This page is
+            a ten-minute tour from <code>cargo install</code> to a persistent
+            on-disk <code>.sqlrite</code> file — transactions, JOINs, HNSW
+            vector search, BM25 full-text, and the MCP server. Skip ahead to{" "}
+            <a href="#vector">vector search</a>,{" "}
+            <a href="#fts">full-text search</a>, the{" "}
+            <a href="#mcp">MCP server</a>, or pick the SDK that fits your
+            language at the <a href="#sdk-rust">bottom</a> — they all wrap the
+            same engine.
           </p>
 
           <h2 id="install">Install</h2>
@@ -804,8 +816,11 @@ export default function DocsPage() {
             <a className="btn" href={SITE.discord}>
               Join the Discord
             </a>
+            <Link className="btn" href="/blog">
+              Read the SQLRite blog
+            </Link>
             <Link className="btn" href="/">
-              ← Back to landing
+              ← Back to the SQLRite home page
             </Link>
           </div>
         </main>
