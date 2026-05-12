@@ -14,15 +14,15 @@ export function Hero() {
               v{SITE.version} · MIT licensed · open source
             </span>
             <h1 style={{ marginTop: 24 }}>
-              An embedded SQL database,{" "}
-              <span className="accent-word">built from scratch</span> in Rust.
+              SQLRite — an embedded SQL +{" "}
+              <span className="accent-word">vector database</span> in Rust.
             </h1>
             <p className="hero-tag">
-              SQLRite is a from-the-ground-up reimagining of SQLite — a
-              single-file engine with a real B-tree, write-ahead log,
-              transactions, JOINs, aggregates, vector search, full-text search,
-              and bindings for six languages. Built to teach what databases
-              actually do.
+              SQLRite is a from-scratch SQLite alternative — a single-file
+              embedded database in Rust with a real B-tree, write-ahead log,
+              transactions, JOINs, aggregates, HNSW vector search, BM25
+              full-text search, and bindings for six languages. Built to teach
+              what databases actually do.
             </p>
             <div className="cta-row">
               <Link className="btn btn-primary" href="/docs">

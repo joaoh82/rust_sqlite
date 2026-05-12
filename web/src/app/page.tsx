@@ -13,9 +13,12 @@ import { SDKShowcase } from "@/components/sdk-showcase";
 import { SQLRef } from "@/components/sql-ref";
 import { SITE } from "@/lib/site";
 
-const TITLE = "SQLRite — embedded SQL database, built in Rust";
+// SEO targeting: primary "embedded SQL + vector database in Rust",
+// secondary "SQLite alternative" / "Rust database" / "HNSW vector search" /
+// "BM25 full-text" / "MCP server". See web/seo/keywords.md.
+const TITLE = "SQLRite — an embedded SQL + vector database in Rust";
 const DESCRIPTION =
-  "Single-file embedded SQL engine in Rust. Real B-tree, WAL, transactions, JOINs, aggregates, HNSW vector search, BM25 full-text, plus six language SDKs.";
+  "SQLRite is an embedded SQL + vector database in Rust — a SQLite alternative with WAL transactions, HNSW vector search, BM25 full-text, and six language SDKs.";
 
 export const metadata: Metadata = {
   title: { absolute: TITLE },

@@ -32,9 +32,12 @@ const jetbrainsMono = JetBrains_Mono({
   display: "swap",
 });
 
-const DEFAULT_TITLE = "SQLRite — embedded SQL database, built in Rust";
+// Header copy is the primary on-page SEO surface — see web/seo/keywords.md
+// for the keyword strategy and per-page rationale.
+const DEFAULT_TITLE =
+  "SQLRite — an embedded SQL + vector database in Rust";
 const DEFAULT_DESCRIPTION =
-  "An embedded SQL database modeled after SQLite, built from scratch in Rust. Single-file format, real B-tree, WAL, transactions, vector search, full-text search, and six language SDKs.";
+  "SQLRite is an embedded SQL + vector database in Rust. SQLite-style single-file format, WAL transactions, HNSW vector search, BM25 full-text, and six language SDKs.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE.url),
@@ -47,17 +50,17 @@ export const metadata: Metadata = {
   authors: [{ name: "Joao Henrique Machado Silva", url: SITE.socials.github }],
   keywords: [
     "SQLRite",
-    "Rust SQLite",
-    "embedded database",
-    "embedded SQL",
+    "embedded database in Rust",
+    "embedded SQL + vector database",
+    "SQLite alternative",
+    "SQLite-compatible Rust crate",
     "Rust database",
-    "vector search",
+    "embedded vector search Rust",
     "HNSW",
-    "BM25",
-    "full-text search",
+    "BM25 full-text search",
     "WAL",
-    "B-tree",
-    "MCP",
+    "single-file database",
+    "MCP server for SQLite",
   ],
   openGraph: {
     type: "website",
