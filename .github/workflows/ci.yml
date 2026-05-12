@@ -299,6 +299,15 @@ jobs:
   wasm-build:
     name: wasm-build
     runs-on: ubuntu-latest
+    # Pinned binaryen version — see docs/release-plan.md
+    # ("Pinned binaryen / wasm-opt") for the bump procedure. Older
+    # binaryen rejects rustc's multi-table WASM output with
+    # "Only 1 table definition allowed in MVP", which the runner
+    # image's cache state used to surface non-deterministically
+    # (SQLR-58). Pinning keeps wasm-opt out of "whatever's cached"
+    # territory.
+    env:
+      BINARYEN_VERSION: version_122
     steps:
       - uses: actions/checkout@v4
 
@@ -313,12 +322,29 @@ jobs:
           workspaces: sdk/wasm
           shared-key: wasm-build
 
+      - name: Install pinned binaryen (wasm-opt)
+        # MUST run before wasm-pack: wasm-pack picks up wasm-opt from
+        # PATH if present, otherwise downloads whatever binaryen its
+        # own internal cache happens to have. Pinning + prepending
+        # to PATH forces a deterministic version across runner images.
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            -o "$RUNNER_TEMP/binaryen.tar.gz"
+          tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin/wasm-opt" --version
+
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
 
       - name: wasm-pack build --target web --release
         working-directory: sdk/wasm
-        run: wasm-pack build --target web --release
+        run: |
+          # Sanity-check that the pinned wasm-opt is what wasm-pack sees.
+          which wasm-opt
+          wasm-opt --version
+          wasm-pack build --target web --release
 
       - name: Report .wasm size
         # Surfaces size regressions in PR logs. Not a hard limit yet;
