@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlrite-agent"
+version = "0.1.0"
+description = "Example: a Python CLI chat agent with persistent long-term memory backed entirely by SQLRite (vector + lexical recall, periodic summarization, structured fact extraction)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SQLRite contributors" }]
+keywords = ["sqlrite", "llm", "agent", "rag", "memory", "vector-search"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The agent binds only to the public SQLRite Python SDK surface
+# (`sqlrite.connect`, `Connection`, `Cursor`). Pinned to the 0.10.x
+# release that introduced VECTOR + HNSW + the `ask` feature.
+dependencies = [
+    "sqlrite>=0.10.0,<0.11.0",
+]
+
+[project.optional-dependencies]
+# Cloud LLM + embedding providers — install whichever you want.
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+# Local embedding model — heavy install (~500 MB with torch), but
+# means no API key is needed for the embedding half of recall.
+local-embeddings = ["sentence-transformers>=2.7"]
+# Everything at once for a full demo.
+all = ["anthropic>=0.40", "openai>=1.40", "sentence-transformers>=2.7"]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+sqlrite-agent = "sqlrite_agent.cli:main"
+
+[project.urls]
+Homepage = "https://sqlritedb.com"
+Repository = "https://github.com/joaoh82/rust_sqlite"
+"Bug Tracker" = "https://github.com/joaoh82/rust_sqlite/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sqlrite_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --tb=short"

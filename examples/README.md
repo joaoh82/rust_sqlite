@@ -16,6 +16,14 @@ Phase 5 lands these incrementally — each sub-phase fills in one language. The 
 
 See [docs/roadmap.md](../docs/roadmap.md) for what each sub-phase delivers.
 
+## End-to-end example apps
+
+Beyond the per-SDK quick-start tours above, the [SQLR-38 umbrella](../docs/roadmap.md) tracks longer, opinionated example apps that exercise SQLRite end-to-end in real-world shapes:
+
+| App | Language / SDK | What it shows | Directory |
+|---|---|---|---|
+| LLM agent with persistent memory | Python | Vector + lexical recall, fact extraction, summaries — all in one `.sqlrite` file | [`python-agent/`](python-agent/) |
+
 ## Running the Rust quickstart
 
 ```bash
@@ -62,6 +70,17 @@ python examples/python/hello.py
 ```
 
 Mirrors the Rust quickstart shape via the DB-API: `sqlrite.connect(":memory:")` → `cursor.execute` → iterate tuples, plus a BEGIN/ROLLBACK block. See [`python/hello.py`](python/hello.py) and [`sdk/python/README.md`](../sdk/python/README.md) for the full API tour.
+
+## Running the Python LLM agent (SQLR-39)
+
+```bash
+cd examples/python-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+python -m sqlrite_agent          # works offline; no API key required
+```
+
+A full CLI chat agent whose long-term memory is one `.sqlrite` file. Embeds each turn, hybrid-searches over past messages and a structured `facts` table on every recall, and survives process restarts. Read [`python-agent/README.md`](python-agent/README.md) for the demo script and architecture diagram.
 
 ## Running the Node.js sample
 
