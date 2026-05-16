@@ -108,6 +108,15 @@ Wire it into Claude Code (`~/.claude.json`):
 
 `--read-only` opens the DB with a shared lock and hides the `execute` tool. Full docs + the other six tools' references in [`docs/mcp.md`](docs/mcp.md).
 
+### End-to-end example apps
+
+Beyond the per-language quickstarts in [`examples/`](examples/), the SQLR-38 umbrella tracks longer, opinionated example apps that exercise SQLRite in real-world shapes:
+
+| App | SDK | What it shows |
+|---|---|---|
+| [Python LLM agent with persistent memory](examples/python-agent/) | Python | Vector + lexical recall, fact extraction, summaries — all in one `.sqlrite` file |
+| [Chat-with-your-notes via Claude Desktop MCP](examples/nodejs-notes/) | Node.js | Markdown → hybrid HNSW + BM25 index → `sqlrite-mcp --read-only` → Claude Desktop |
+
 ### Developer guide
 
 In-depth documentation lives under [`docs/`](docs/). Start at [`docs/_index.md`](docs/_index.md) — it navigates to:

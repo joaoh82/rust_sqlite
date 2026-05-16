@@ -1,0 +1,6 @@
+node_modules/
+*.sqlrite
+*.sqlrite-journal
+.env
+.env.local
+test-fixtures-tmp/
