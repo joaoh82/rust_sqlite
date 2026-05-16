@@ -48,6 +48,18 @@ const itemListJsonLd = {
           "A CLI chat agent whose long-term memory is a single .sqlrite file. Vector recall via HNSW, lexical recall via BM25, and a structured facts table for deterministic retrieval.",
       },
     },
+    {
+      "@type": "ListItem",
+      position: 2,
+      item: {
+        "@type": "SoftwareSourceCode",
+        name: "Chat with your notes — Node.js + Claude Desktop MCP",
+        url: `${SITE.repo}/tree/main/examples/nodejs-notes`,
+        programmingLanguage: "JavaScript",
+        description:
+          "A Node.js CLI that ingests a folder of markdown notes into SQLRite (HNSW + BM25 indexes), then exposes the database to Claude Desktop via sqlrite-mcp --read-only. Hybrid retrieval over your notes from inside the chat client.",
+      },
+    },
   ],
 };
 
@@ -76,6 +88,22 @@ const EXAMPLES: Example[] = [
     language: "Python 3.11+",
     repoPath: "examples/python-agent",
     features: ["HNSW", "VECTOR(384)", "BM25 / FTS", "PyO3 SDK"],
+  },
+  {
+    status: "shipped",
+    title: "Chat with your notes — Claude Desktop + MCP",
+    blurb:
+      "A Node.js CLI that ingests a folder of markdown notes into a SQLRite database, then exposes it to Claude Desktop (or any MCP client) via sqlrite-mcp --read-only. Claude calls bm25_search / vector_search / query directly against your local notes — no cloud sync, no custom RAG pipeline.",
+    bullets: [
+      "Markdown → frontmatter-aware chunker → hash or OpenAI embedder → SQLRite documents + chunks tables",
+      "Hybrid retrieval fuses BM25 and vector cosine in a single SQL ORDER BY (see docs/fts.md)",
+      "`sqlrite-notes serve` wraps sqlrite-mcp so the Claude Desktop config snippet is one block of JSON",
+      "Default embedder is fully offline (zero-dep hash bag-of-words); flip to text-embedding-3-small with OPENAI_API_KEY",
+      "40 unit + integration tests; works against the prebuilt @joaoh82/sqlrite npm binaries",
+    ],
+    language: "Node.js 20+",
+    repoPath: "examples/nodejs-notes",
+    features: ["HNSW", "BM25 / FTS", "MCP server", "napi-rs SDK"],
   },
 ];
 
@@ -230,11 +258,10 @@ export default function ExamplesIndexPage() {
               fontSize: 14,
             }}
           >
-            More examples in flight: a Node.js MCP-powered notes
-            assistant, a Tauri + Svelte journaling desktop app, a
-            browser SQL playground (WASM), and a Go edge/IoT event
-            collector. See <Link href="/docs">/docs</Link> for the
-            engine reference.
+            More examples in flight: a Tauri + Svelte journaling
+            desktop app, a browser SQL playground (WASM), and a Go
+            edge/IoT event collector. See{" "}
+            <Link href="/docs">/docs</Link> for the engine reference.
           </p>
         </div>
       </section>

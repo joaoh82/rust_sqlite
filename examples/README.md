@@ -23,6 +23,7 @@ Beyond the per-SDK quick-start tours above, the [SQLR-38 umbrella](../docs/roadm
 | App | Language / SDK | What it shows | Directory |
 |---|---|---|---|
 | LLM agent with persistent memory | Python | Vector + lexical recall, fact extraction, summaries — all in one `.sqlrite` file | [`python-agent/`](python-agent/) |
+| Chat with your notes (MCP)       | Node.js | Markdown → SQLRite hybrid retrieval, served to Claude Desktop via `sqlrite-mcp --read-only` | [`nodejs-notes/`](nodejs-notes/) |
 
 ## Running the Rust quickstart
 
@@ -81,6 +82,16 @@ python -m sqlrite_agent          # works offline; no API key required
 ```
 
 A full CLI chat agent whose long-term memory is one `.sqlrite` file. Embeds each turn, hybrid-searches over past messages and a structured `facts` table on every recall, and survives process restarts. Read [`python-agent/README.md`](python-agent/README.md) for the demo script and architecture diagram.
+
+## Running the Node.js notes assistant (SQLR-40)
+
+```bash
+cd examples/nodejs-notes
+npm install
+node bin/sqlrite-notes.mjs init ~/Documents/notes
+```
+
+Ingests a folder of markdown notes into a `notes.sqlrite` file with HNSW + BM25 indexes, then `sqlrite-notes serve` wraps `sqlrite-mcp --read-only` so **Claude Desktop / any MCP client** can `bm25_search` / `vector_search` / `query` / `ask` your local notes directly — no cloud sync, no third-party indexer. Default embedder is fully offline (deterministic hash bag-of-words); flip to `--embedder openai` with `OPENAI_API_KEY` set for real semantic recall. Read [`nodejs-notes/README.md`](nodejs-notes/README.md) for the Claude Desktop config snippet and the hybrid-retrieval SQL walkthrough.
 
 ## Running the Node.js sample
 
