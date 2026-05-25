@@ -247,17 +247,6 @@ Default is 0.5.
   time and won't notice newly-ingested files until you reload it
   anyway, so the gain from coexisting isn't worth the surprise.
 
-- **HNSW after delete + re-insert (engine bug, SQLR-8).** The
-  engine's HNSW chunk index panics when rows are deleted and re-
-  inserted within the same connection lifetime — `index out of
-  bounds` inside `DistanceMetric::compute`. The ingest pipeline
-  works around it by splitting refresh into a delete-phase →
-  close/reopen → insert-phase, which forces a clean index rebuild
-  on next open. We pay the close/reopen hop only when there are
-  actual deletions (so first-time `init` skips it). Once SQLR-8
-  lands in the engine, `src/ingest.mjs` can drop the `db.reopen()`
-  call.
-
 - **Aggregates limited.** The engine supports `COUNT(*)`,
   `SUM`/`AVG`/`MIN`/`MAX` but not arbitrary expressions in `SELECT`
   projection beyond aggregates (see [`docs/supported-sql.md`](../../docs/supported-sql.md)).
@@ -319,7 +308,7 @@ examples/nodejs-notes/
 │   ├── db.mjs                         # schema, migrations, every SQL string
 │   ├── chunker.mjs                    # frontmatter + heading-aware chunking
 │   ├── embeddings.mjs                 # hash + OpenAI embedders
-│   ├── ingest.mjs                     # plan → delete → reopen → insert
+│   ├── ingest.mjs                     # plan → delete → insert
 │   ├── search.mjs                     # hybrid retrieval driver
 │   ├── serve.mjs                      # spawn sqlrite-mcp --read-only
 │   └── claude-config.mjs              # Claude Desktop snippet renderer

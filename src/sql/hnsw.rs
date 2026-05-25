@@ -53,6 +53,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use crate::error::{Result, SQLRiteError};
+
 /// Distance metric used by the HNSW index. Must match what the
 /// surrounding `vec_distance_*` SQL function would compute on the same
 /// pair of vectors — otherwise the index probe and the brute-force
@@ -107,8 +109,14 @@ impl DistanceMetric {
     /// will prefer any finite alternative, which matches the SQL-level
     /// behaviour where `vec_distance_cosine` errors but the optimizer's
     /// fallback path simply skips the offending row.
-    pub fn compute(self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len(), "vector dim mismatch in HNSW distance");
+    pub fn compute(self, a: &[f32], b: &[f32]) -> Result<f32> {
+        if a.is_empty() || b.is_empty() || a.len() != b.len() {
+            return Err(SQLRiteError::General(format!(
+                "HNSW vector dimension mismatch: left has {}, right has {}",
+                a.len(),
+                b.len()
+            )));
+        }
         match self {
             DistanceMetric::L2 => {
                 let mut sum = 0.0f32;
@@ -116,7 +124,7 @@ impl DistanceMetric {
                     let d = a[i] - b[i];
                     sum += d * d;
                 }
-                sum.sqrt()
+                Ok(sum.sqrt())
             }
             DistanceMetric::Cosine => {
                 let mut dot = 0.0f32;
@@ -129,9 +137,9 @@ impl DistanceMetric {
                 }
                 let denom = (na * nb).sqrt();
                 if denom == 0.0 {
-                    f32::INFINITY
+                    Ok(f32::INFINITY)
                 } else {
-                    1.0 - dot / denom
+                    Ok(1.0 - dot / denom)
                 }
             }
             DistanceMetric::Dot => {
@@ -139,7 +147,7 @@ impl DistanceMetric {
                 for i in 0..a.len() {
                     dot += a[i] * b[i];
                 }
-                -dot
+                Ok(-dot)
             }
         }
     }
@@ -284,12 +292,12 @@ impl HnswIndex {
     /// re-inserting an existing id is a no-op (returns without error).
     /// `vec` is the new node's vector; `get_vec` looks up the vector
     /// for any other node id the algorithm touches.
-    pub fn insert<F>(&mut self, node_id: i64, vec: &[f32], get_vec: F)
+    pub fn insert<F>(&mut self, node_id: i64, vec: &[f32], get_vec: F) -> Result<()>
     where
         F: Fn(i64) -> Vec<f32>,
     {
         if self.nodes.contains_key(&node_id) {
-            return;
+            return Ok(());
         }
 
         // First node: trivial case. Becomes entry point at layer 0.
@@ -302,7 +310,7 @@ impl HnswIndex {
             );
             self.entry_point = Some(node_id);
             self.top_layer = 0;
-            return;
+            return Ok(());
         }
 
         // Pick a layer for this new node.
@@ -321,7 +329,7 @@ impl HnswIndex {
         // because the new node doesn't live there.
         let mut entry = self.entry_point.expect("non-empty index has entry point");
         for layer in (target_layer + 1..=self.top_layer).rev() {
-            let nearest = self.search_layer(vec, &[entry], 1, layer, &get_vec);
+            let nearest = self.search_layer(vec, &[entry], 1, layer, &get_vec)?;
             if let Some((_, id)) = nearest.into_iter().next() {
                 entry = id;
             }
@@ -333,7 +341,7 @@ impl HnswIndex {
         let mut entries = vec![entry];
         for layer in (0..=target_layer).rev() {
             let candidates =
-                self.search_layer(vec, &entries, self.params.ef_construction, layer, &get_vec);
+                self.search_layer(vec, &entries, self.params.ef_construction, layer, &get_vec)?;
 
             // Pick up to M neighbors from candidates (M_max0 at layer 0
             // since we allow more connections at the dense layer).
@@ -368,8 +376,12 @@ impl HnswIndex {
                     let nb_vec = get_vec(nb);
                     let mut by_dist: Vec<(f32, i64)> = nb_layers[layer]
                         .iter()
-                        .map(|id| (self.distance.compute(&nb_vec, &get_vec(*id)), *id))
-                        .collect();
+                        .map(|id| {
+                            self.distance
+                                .compute(&nb_vec, &get_vec(*id))
+                                .map(|d| (d, *id))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     by_dist
                         .sort_by(|(da, _), (db, _)| da.partial_cmp(db).unwrap_or(Ordering::Equal));
                     by_dist.truncate(m_max);
@@ -387,22 +399,23 @@ impl HnswIndex {
             self.top_layer = target_layer;
             self.entry_point = Some(node_id);
         }
+        Ok(())
     }
 
     /// Returns the k nearest node ids to `query`, in distance-ascending
     /// order (closest first). Empty index returns an empty Vec.
-    pub fn search<F>(&self, query: &[f32], k: usize, get_vec: F) -> Vec<i64>
+    pub fn search<F>(&self, query: &[f32], k: usize, get_vec: F) -> Result<Vec<i64>>
     where
         F: Fn(i64) -> Vec<f32>,
     {
         if self.is_empty() || k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Greedy descent from the top down to layer 1.
         let mut entry = self.entry_point.expect("non-empty index has entry point");
         for layer in (1..=self.top_layer).rev() {
-            let nearest = self.search_layer(query, &[entry], 1, layer, &get_vec);
+            let nearest = self.search_layer(query, &[entry], 1, layer, &get_vec)?;
             if let Some((_, id)) = nearest.into_iter().next() {
                 entry = id;
             }
@@ -410,9 +423,9 @@ impl HnswIndex {
 
         // Beam search at layer 0 with width = max(ef_search, k).
         let ef = self.params.ef_search.max(k);
-        let candidates = self.search_layer(query, &[entry], ef, 0, &get_vec);
+        let candidates = self.search_layer(query, &[entry], ef, 0, &get_vec)?;
 
-        candidates.into_iter().take(k).map(|(_, id)| id).collect()
+        Ok(candidates.into_iter().take(k).map(|(_, id)| id).collect())
     }
 
     /// Runs a beam search at one layer starting from `entries`, returning
@@ -430,7 +443,7 @@ impl HnswIndex {
         ef: usize,
         layer: usize,
         get_vec: &F,
-    ) -> Vec<(f32, i64)>
+    ) -> Result<Vec<(f32, i64)>>
     where
         F: Fn(i64) -> Vec<f32>,
     {
@@ -444,7 +457,7 @@ impl HnswIndex {
             if !visited.insert(id) {
                 continue;
             }
-            let d = self.distance.compute(query, &get_vec(id));
+            let d = self.distance.compute(query, &get_vec(id))?;
             candidates.push(MinHeapItem { dist: d, id });
             results.push(MaxHeapItem { dist: d, id });
         }
@@ -474,7 +487,7 @@ impl HnswIndex {
                 if !visited.insert(nb) {
                     continue;
                 }
-                let d = self.distance.compute(query, &get_vec(nb));
+                let d = self.distance.compute(query, &get_vec(nb))?;
                 let admit = if results.len() < ef {
                     true
                 } else {
@@ -497,7 +510,7 @@ impl HnswIndex {
             out.push((item.dist, item.id));
         }
         out.reverse();
-        out
+        Ok(out)
     }
 
     /// Picks a layer for a new node using the standard HNSW geometric
@@ -506,7 +519,7 @@ impl HnswIndex {
     ///   - P(L=0) ≈ 1 - 1/M = 15/16
     ///   - P(L=1) ≈ 1/16 - 1/256
     ///   - P(L=2) ≈ 1/256 - …
-    /// i.e., most new nodes live only at layer 0; a few percolate up.
+    ///     i.e., most new nodes live only at layer 0; a few percolate up.
     fn pick_layer(&mut self) -> usize {
         let u = self.next_uniform().max(1e-6); // guard log(0)
         let layer = (-u.ln() * self.params.m_l).floor() as usize;
@@ -629,7 +642,7 @@ mod tests {
         let mut by_dist: Vec<(f32, i64)> = vectors
             .iter()
             .enumerate()
-            .map(|(i, v)| (metric.compute(query, v), i as i64))
+            .map(|(i, v)| (metric.compute(query, v).expect("matching dims"), i as i64))
             .collect();
         by_dist.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         by_dist.into_iter().take(k).map(|(_, id)| id).collect()
@@ -650,7 +663,9 @@ mod tests {
     fn empty_index_returns_empty_search() {
         let idx = HnswIndex::new(DistanceMetric::L2, 42);
         let vectors: Vec<Vec<f32>> = vec![];
-        let result = idx.search(&[0.0; 4], 5, |id| vectors[id as usize].clone());
+        let result = idx
+            .search(&[0.0; 4], 5, |id| vectors[id as usize].clone())
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -658,9 +673,12 @@ mod tests {
     fn single_node_returns_only_itself() {
         let mut idx = HnswIndex::new(DistanceMetric::L2, 42);
         let v0 = vec![1.0, 2.0, 3.0];
-        let vectors = vec![v0.clone()];
-        idx.insert(0, &v0, |id| vectors[id as usize].clone());
-        let result = idx.search(&[0.0; 3], 5, |id| vectors[id as usize].clone());
+        let vectors = [v0.clone()];
+        idx.insert(0, &v0, |id| vectors[id as usize].clone())
+            .unwrap();
+        let result = idx
+            .search(&[0.0; 3], 5, |id| vectors[id as usize].clone())
+            .unwrap();
         assert_eq!(result, vec![0]);
     }
 
@@ -668,20 +686,36 @@ mod tests {
     fn duplicate_insert_is_noop() {
         let mut idx = HnswIndex::new(DistanceMetric::L2, 42);
         let v0 = vec![1.0, 2.0];
-        let vectors = vec![v0.clone()];
-        idx.insert(0, &v0, |id| vectors[id as usize].clone());
-        idx.insert(0, &v0, |id| vectors[id as usize].clone());
+        let vectors = [v0.clone()];
+        idx.insert(0, &v0, |id| vectors[id as usize].clone())
+            .unwrap();
+        idx.insert(0, &v0, |id| vectors[id as usize].clone())
+            .unwrap();
         assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn distance_rejects_empty_or_mismatched_vectors() {
+        let empty_err = DistanceMetric::L2.compute(&[1.0, 2.0], &[]).unwrap_err();
+        assert!(format!("{empty_err}").contains("dimension mismatch"));
+
+        let mismatch_err = DistanceMetric::Cosine
+            .compute(&[1.0, 2.0], &[1.0])
+            .unwrap_err();
+        assert!(format!("{mismatch_err}").contains("left has 2, right has 1"));
     }
 
     #[test]
     fn k_zero_returns_empty() {
         let mut idx = HnswIndex::new(DistanceMetric::L2, 42);
-        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let vectors = [vec![1.0, 0.0], vec![0.0, 1.0]];
         for (i, v) in vectors.iter().enumerate() {
-            idx.insert(i as i64, v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
-        let result = idx.search(&[0.5, 0.5], 0, |id| vectors[id as usize].clone());
+        let result = idx
+            .search(&[0.5, 0.5], 0, |id| vectors[id as usize].clone())
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -698,16 +732,21 @@ mod tests {
         ];
         let mut idx = HnswIndex::new(DistanceMetric::L2, 42);
         for (i, v) in vectors.iter().enumerate() {
-            idx.insert(i as i64, v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
 
         // Query at (1, 1): nearest is (0, 0).
-        let result = idx.search(&[1.0, 1.0], 1, |id| vectors[id as usize].clone());
+        let result = idx
+            .search(&[1.0, 1.0], 1, |id| vectors[id as usize].clone())
+            .unwrap();
         assert_eq!(result, vec![0]);
 
         // Query at (5.5, 5.5): top-3 should be id=4 (5,5), then any
         // two of the corners at distance ~7.78.
-        let result = idx.search(&[5.5, 5.5], 3, |id| vectors[id as usize].clone());
+        let result = idx
+            .search(&[5.5, 5.5], 3, |id| vectors[id as usize].clone())
+            .unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], 4, "closest to (5.5,5.5) should be id=4");
     }
@@ -728,13 +767,16 @@ mod tests {
 
         let mut idx = HnswIndex::new(DistanceMetric::L2, 42);
         for (i, v) in vectors.iter().enumerate() {
-            idx.insert(i as i64, v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
 
         let mut total_recall = 0.0f32;
         for _ in 0..queries {
             let q = random_vec(&mut state, dim);
-            let hnsw_top = idx.search(&q, k, |id| vectors[id as usize].clone());
+            let hnsw_top = idx
+                .search(&q, k, |id| vectors[id as usize].clone())
+                .unwrap();
             let baseline = brute_force_topk(&vectors, &q, k, DistanceMetric::L2);
             total_recall += recall_at_k(&hnsw_top, &baseline);
         }
@@ -759,13 +801,16 @@ mod tests {
 
         let mut idx = HnswIndex::new(DistanceMetric::Cosine, 42);
         for (i, v) in vectors.iter().enumerate() {
-            idx.insert(i as i64, v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
 
         let mut total_recall = 0.0f32;
         for _ in 0..queries {
             let q = random_vec(&mut state, dim);
-            let hnsw_top = idx.search(&q, k, |id| vectors[id as usize].clone());
+            let hnsw_top = idx
+                .search(&q, k, |id| vectors[id as usize].clone())
+                .unwrap();
             let baseline = brute_force_topk(&vectors, &q, k, DistanceMetric::Cosine);
             total_recall += recall_at_k(&hnsw_top, &baseline);
         }
@@ -791,7 +836,8 @@ mod tests {
         for i in 0..50 {
             vectors.push(random_vec(&mut state, dim));
             let v = vectors[i].clone();
-            idx.insert(i as i64, &v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, &v, |id| vectors[id as usize].clone())
+                .unwrap();
 
             // Check invariant.
             let entry = idx.entry_point.expect("non-empty");
@@ -816,7 +862,8 @@ mod tests {
         for i in 0..200 {
             vectors.push(random_vec(&mut state, dim));
             let v = vectors[i].clone();
-            idx.insert(i as i64, &v, |id| vectors[id as usize].clone());
+            idx.insert(i as i64, &v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
 
         for (id, node) in &idx.nodes {
@@ -848,8 +895,12 @@ mod tests {
         let mut idx_a = HnswIndex::new(DistanceMetric::L2, 42);
         let mut idx_b = HnswIndex::new(DistanceMetric::L2, 42);
         for (i, v) in vectors.iter().enumerate() {
-            idx_a.insert(i as i64, v, |id| vectors[id as usize].clone());
-            idx_b.insert(i as i64, v, |id| vectors[id as usize].clone());
+            idx_a
+                .insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
+            idx_b
+                .insert(i as i64, v, |id| vectors[id as usize].clone())
+                .unwrap();
         }
 
         // Same top layer.

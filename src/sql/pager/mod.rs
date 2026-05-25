@@ -280,7 +280,7 @@ fn save_database_with_mode(db: &mut Database, path: &Path, compact: bool) -> Res
     // marked dirty. Done up front under the &mut Database borrow we
     // already hold, before the immutable iteration loops below need
     // their own borrow.
-    rebuild_dirty_hnsw_indexes(db);
+    rebuild_dirty_hnsw_indexes(db)?;
     // Phase 8b — same drill for FTS indexes flagged by DELETE / UPDATE.
     rebuild_dirty_fts_indexes(db);
 
@@ -1251,55 +1251,11 @@ fn parse_hnsw_create_index_sql(sql: &str) -> Result<(String, String, DistanceMet
 /// trade-off SQLite makes for FTS5: dirtying-and-rebuilding is the
 /// MVP, more sophisticated incremental delete strategies (soft-delete
 /// + tombstones, neighbor reconnection) are future polish.
-fn rebuild_dirty_hnsw_indexes(db: &mut Database) {
-    use crate::sql::hnsw::HnswIndex;
-
+fn rebuild_dirty_hnsw_indexes(db: &mut Database) -> Result<()> {
     for table in db.tables.values_mut() {
-        // Snapshot which (index_name, column, metric) triples need
-        // rebuilding, before we go grabbing column data — keeps the
-        // borrow structure simple. The per-entry metric matters here:
-        // rebuilding a cosine-built graph as L2 (or vice versa) would
-        // silently corrupt the topology and break the SQLR-28 probe.
-        let dirty: Vec<(String, String, DistanceMetric)> = table
-            .hnsw_indexes
-            .iter()
-            .filter(|e| e.needs_rebuild)
-            .map(|e| (e.name.clone(), e.column_name.clone(), e.metric))
-            .collect();
-        if dirty.is_empty() {
-            continue;
-        }
-
-        for (idx_name, col_name, metric) in dirty {
-            // Snapshot every (rowid, vec) for this column.
-            let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
-            {
-                let row_data = table.rows.lock().expect("rows mutex poisoned");
-                if let Some(Row::Vector(map)) = row_data.get(&col_name) {
-                    for (id, v) in map.iter() {
-                        vectors.push((*id, v.clone()));
-                    }
-                }
-            }
-            // Pre-build a HashMap for the get_vec closure so we don't
-            // pay O(N) lookup per insert call.
-            let snapshot: std::collections::HashMap<i64, Vec<f32>> =
-                vectors.iter().cloned().collect();
-
-            let mut new_idx = HnswIndex::new(metric, 0xC0FFEE);
-            // Sort by id so the rebuild is deterministic across runs.
-            vectors.sort_by_key(|(id, _)| *id);
-            for (id, v) in &vectors {
-                new_idx.insert(*id, v, |q| snapshot.get(&q).cloned().unwrap_or_default());
-            }
-
-            // Replace the entry's index + clear the dirty flag.
-            if let Some(entry) = table.hnsw_indexes.iter_mut().find(|e| e.name == idx_name) {
-                entry.index = new_idx;
-                entry.needs_rebuild = false;
-            }
-        }
+        table.rebuild_dirty_hnsw_indexes()?;
     }
+    Ok(())
 }
 
 /// Synthesises the CREATE INDEX SQL stored back into `sqlrite_master`

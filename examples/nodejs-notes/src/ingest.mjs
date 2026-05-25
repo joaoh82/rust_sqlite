@@ -10,11 +10,7 @@
 //
 // Both flow through `ingestImpl`, which splits the work into three
 // phases: PLAN (read-only diff against the current DB) → DELETE (drop
-// stale documents/chunks; close + reopen the DB) → INSERT (write new
-// rows). The close/reopen between DELETE and INSERT is a workaround
-// for an engine bug where the HNSW chunk index panics when rows are
-// deleted and re-inserted in the same connection lifetime — see the
-// "Known limitations" section of this example's README.
+// stale documents/chunks) → INSERT (write new rows).
 
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -192,15 +188,6 @@ async function ingestImpl({ db, root, embedder, logger, chunkOpts, mode }) {
 
   // ----------------------------------------------------------------
   // PHASE 2 — deletes (and replacing-deletes).
-  //
-  // The engine's HNSW index has a bug where rows deleted and re-
-  // inserted within the same connection lifetime can corrupt the
-  // index's stored vectors (see ../README.md "Known limitations").
-  // Closing + reopening the connection between the delete-pass and
-  // the insert-pass forces a full index rebuild on next open,
-  // sidestepping the issue. We only pay this cost when there's
-  // actually something to delete; pure-INSERT runs (first `init`)
-  // skip this hop entirely.
   if (hasMutations) {
     db.transaction(() => {
       for (const id of planDeletes) db.deleteDocument(id);
@@ -208,7 +195,6 @@ async function ingestImpl({ db, root, embedder, logger, chunkOpts, mode }) {
         if (e.plan.priorId !== null) db.deleteDocument(e.plan.priorId);
       }
     });
-    db.reopen();
   }
 
   // ----------------------------------------------------------------

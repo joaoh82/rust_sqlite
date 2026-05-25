@@ -1468,7 +1468,7 @@ fn create_hnsw_index(
             let v_clone = v.clone();
             idx.insert(*rowid, &v_clone, |id| {
                 vec_map.get(&id).cloned().unwrap_or_default()
-            });
+            })?;
         }
     }
 
@@ -1863,12 +1863,15 @@ fn try_hnsw_probe(table: &Table, order_expr: &Expr, k: usize) -> Option<Vec<i64>
     // module stays decoupled from the SQL types.
     let column_for_closure = col_name.clone();
     let table_ref = table;
-    let result = entry.index.search(&query_vec, k, |id| {
-        match table_ref.get_value(&column_for_closure, id) {
-            Some(Value::Vector(v)) => v,
-            _ => Vec::new(),
-        }
-    });
+    let result = entry
+        .index
+        .search(&query_vec, k, |id| {
+            match table_ref.get_value(&column_for_closure, id) {
+                Some(Value::Vector(v)) => v,
+                _ => Vec::new(),
+            }
+        })
+        .ok()?;
     Some(result)
 }
 

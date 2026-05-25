@@ -133,7 +133,7 @@ Two specialized shortcuts in [`src/sql/executor.rs`](../src/sql/executor.rs) rec
 ORDER BY vec_distance_l2(<col>, <bracket-array literal>) ASC LIMIT k
 ```
 
-Returns top-k from the HNSW graph in `O(log N)` per probe. Mirrored shapes for `vec_distance_cosine` and `vec_distance_dot`.
+Returns top-k from the HNSW graph in `O(log N)` per probe. Mirrored shapes for `vec_distance_cosine` and `vec_distance_dot`. INSERT maintains HNSW incrementally. DELETE / UPDATE mark the graph dirty; the next INSERT on the indexed vector column rebuilds the in-memory graph from surviving rows before adding the new node, and save/COMMIT still rebuilds dirty graphs before serializing.
 
 `try_fts_probe` (Phase 8b) — BM25 keyword:
 
