@@ -1237,7 +1237,7 @@ impl Table {
             // pulls from the table's row storage (which we *just* updated
             // with the new value).
             if let Some(Value::Vector(new_vec)) = &typed_value {
-                self.maintain_hnsw_on_insert(key, next_rowid, new_vec);
+                self.maintain_hnsw_on_insert(key, next_rowid, new_vec)?;
             }
 
             // Step 4 (Phase 8b): maintain any FTS indexes on this column.
@@ -1257,7 +1257,9 @@ impl Table {
     /// the borrowing dance — we need both `&self.rows` (read other
     /// vectors) and `&mut self.hnsw_indexes` (insert into the graph) —
     /// stays localized.
-    fn maintain_hnsw_on_insert(&mut self, column: &str, rowid: i64, new_vec: &[f32]) {
+    fn maintain_hnsw_on_insert(&mut self, column: &str, rowid: i64, new_vec: &[f32]) -> Result<()> {
+        self.rebuild_dirty_hnsw_indexes()?;
+
         // Snapshot the current vector storage so the get_vec closure
         // doesn't fight with `&mut self.hnsw_indexes`. For a typical
         // HNSW insert we touch ef_construction × log(N) other vectors,
@@ -1279,9 +1281,52 @@ impl Table {
             if entry.column_name == column {
                 entry.index.insert(rowid, new_vec, |id| {
                     vec_snapshot.get(&id).cloned().unwrap_or_default()
-                });
+                })?;
             }
         }
+        Ok(())
+    }
+
+    /// Rebuilds any dirty HNSW index on this table from the current
+    /// vector column storage. DELETE / UPDATE mark indexes dirty because
+    /// stale graph edges may still point at removed rowids; this makes
+    /// the next in-memory operation see a clean graph without requiring
+    /// a close/reopen or save round-trip.
+    pub fn rebuild_dirty_hnsw_indexes(&mut self) -> Result<()> {
+        let dirty: Vec<(String, String, DistanceMetric)> = self
+            .hnsw_indexes
+            .iter()
+            .filter(|e| e.needs_rebuild)
+            .map(|e| (e.name.clone(), e.column_name.clone(), e.metric))
+            .collect();
+        if dirty.is_empty() {
+            return Ok(());
+        }
+
+        for (idx_name, col_name, metric) in dirty {
+            let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+            {
+                let row_data = self.rows.lock().expect("rows mutex poisoned");
+                if let Some(Row::Vector(map)) = row_data.get(&col_name) {
+                    for (id, v) in map.iter() {
+                        vectors.push((*id, v.clone()));
+                    }
+                }
+            }
+
+            let snapshot: HashMap<i64, Vec<f32>> = vectors.iter().cloned().collect();
+            let mut new_idx = HnswIndex::new(metric, 0xC0FFEE);
+            vectors.sort_by_key(|(id, _)| *id);
+            for (id, v) in &vectors {
+                new_idx.insert(*id, v, |q| snapshot.get(&q).cloned().unwrap_or_default())?;
+            }
+
+            if let Some(entry) = self.hnsw_indexes.iter_mut().find(|e| e.name == idx_name) {
+                entry.index = new_idx;
+                entry.needs_rebuild = false;
+            }
+        }
+        Ok(())
     }
 
     /// After a row insert, push the new (rowid, text) into every FTS
