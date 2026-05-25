@@ -12,6 +12,8 @@
 // schema. Unknown / missing args print usage.
 
 import { parseArgs } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { NotesDB } from './db.mjs';
 import { ingest, refresh } from './ingest.mjs';
@@ -28,7 +30,12 @@ import {
   DEFAULT_CHUNK_OVERLAP,
 } from './config.mjs';
 
-const VERSION = '0.1.0';
+// Read VERSION from package.json so scripts/bump-version.sh's
+// lockstep bump propagates automatically — no second source of
+// truth to forget about.
+const VERSION = JSON.parse(
+  readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+).version;
 
 const USAGE = `sqlrite-notes ${VERSION} — chat with your markdown notes via Claude Desktop + SQLRite MCP.
 

@@ -1,7 +1,6 @@
 {
   "name": "sqlrite-notes",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.10.1",
   "description": "Example: a Node.js CLI that ingests a folder of markdown notes into SQLRite (hybrid HNSW + BM25 retrieval), then exposes the database to Claude Desktop / any MCP client via sqlrite-mcp.",
   "type": "module",
   "engines": {
@@ -11,11 +10,16 @@
     "sqlrite-notes": "bin/sqlrite-notes.mjs"
   },
   "main": "src/cli.mjs",
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test 'test/**/*.test.mjs'"
   },
   "dependencies": {
-    "@joaoh82/sqlrite": "^0.10.0"
+    "@joaoh82/sqlrite": "^0.10.1"
   },
   "keywords": [
     "sqlrite",
@@ -34,5 +38,9 @@
     "url": "https://github.com/joaoh82/rust_sqlite",
     "directory": "examples/nodejs-notes"
   },
-  "homepage": "https://sqlritedb.com"
+  "homepage": "https://sqlritedb.com",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

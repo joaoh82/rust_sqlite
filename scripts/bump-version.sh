@@ -6,9 +6,11 @@
 #     scripts/bump-version.sh 0.2.0
 #
 # Rewrites the version field in every manifest that carries one
-# (nine Cargo.toml / pyproject.toml files, plus three JSON manifests
-# — twelve files total). Then you run `cargo build` yourself to
-# refresh Cargo.lock. Idempotent: running twice with the same version
+# (nine Cargo.toml / pyproject.toml files, plus four JSON manifests
+# — thirteen files total). Also rewrites the engine npm dep pin in
+# `examples/nodejs-notes/package.json` so the published example
+# resolves the matching engine. Then you run `cargo build` yourself
+# to refresh Cargo.lock. Idempotent: running twice with the same version
 # is a no-op; running twice with different versions lands on the
 # second.
 #
@@ -148,6 +150,7 @@ JSON_FILES=(
     "sdk/nodejs/package.json"
     "desktop/package.json"
     "desktop/src-tauri/tauri.conf.json"
+    "examples/nodejs-notes/package.json"
 )
 
 for file in "${JSON_FILES[@]}"; do
@@ -156,6 +159,24 @@ for file in "${JSON_FILES[@]}"; do
         exit 1
     fi
     sed -E "s/^(  \"version\"): *\"[^\"]*\"/\\1: \"${VERSION}\"/" "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+done
+
+# ---------------------------------------------------------------------------
+# npm dep-pin sweep: the `examples/nodejs-notes` package depends on
+# `@joaoh82/sqlrite` and the pin has to track the engine release or
+# `npx sqlrite-notes@<new>` would still resolve the *previous* engine.
+# Rewrite the `"@joaoh82/sqlrite": "^X.Y.Z"` line to the new caret pin.
+#
+# Symmetric with the inter-workspace Cargo path-dep sweep above. We
+# use a caret (`^`) rather than an exact pin so an engine patch release
+# can ship without re-publishing the example.
+NPM_DEP_PIN_FILES=(
+    "examples/nodejs-notes/package.json"
+)
+
+for file in "${NPM_DEP_PIN_FILES[@]}"; do
+    sed -E "s|(\"@joaoh82/sqlrite\"): *\"\\^[0-9]+\\.[0-9]+\\.[0-9]+\"|\\1: \"^${VERSION}\"|" "$file" > "$file.tmp"
     mv "$file.tmp" "$file"
 done
 
@@ -213,6 +234,19 @@ for file in "${TOML_FILES[@]}" "${PIN_ONLY_TOML_FILES[@]}"; do
     fi
 done
 
+# npm dep-pin verification — any `"@joaoh82/sqlrite": "^X.Y.Z"` that
+# isn't at the new $VERSION is a pin we missed. Mirrors the
+# inter-workspace Cargo sweep above.
+for file in "${NPM_DEP_PIN_FILES[@]}"; do
+    bad="$(grep -nE '"@joaoh82/sqlrite": *"\^[0-9]+\.[0-9]+\.[0-9]+"' "$file" \
+           | grep -vE "\"@joaoh82/sqlrite\": *\"\\^${VERSION}\"" || true)"
+    if [[ -n "$bad" ]]; then
+        echo "  ✗ $file — engine npm pin not at ^${VERSION}:" >&2
+        echo "$bad" | sed 's/^/      /' >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
 if [[ $FAILURES -gt 0 ]]; then
     echo
     echo "error: $FAILURES file(s) did not update as expected." >&2
@@ -223,7 +257,7 @@ fi
 echo
 echo "Done. Next steps:"
 echo "  cargo build                    # refresh Cargo.lock with the new versions"
-echo "  git diff                       # inspect the twelve-file bump"
+echo "  git diff                       # inspect the thirteen-file bump"
 echo "  git checkout .                 # or back out if it looks wrong"
 echo
 echo "When the diff looks right, commit + tag with the EXACT message the"
