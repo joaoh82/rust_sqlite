@@ -1809,6 +1809,61 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_delete_then_insert_rebuilds_in_same_connection() {
+        let mut db = Database::new(String::from("test_db"));
+        process_command(
+            "CREATE TABLE chunks (id INTEGER PRIMARY KEY, document_id INTEGER, embedding VECTOR(4));",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "CREATE INDEX idx_emb ON chunks USING hnsw (embedding);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "INSERT INTO chunks (document_id, embedding) VALUES (1, [1, 0, 0, 0]);",
+            &mut db,
+        )
+        .unwrap();
+        process_command(
+            "INSERT INTO chunks (document_id, embedding) VALUES (1, [0, 1, 0, 0]);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("DELETE FROM chunks WHERE document_id = 1;", &mut db).unwrap();
+
+        process_command(
+            "INSERT INTO chunks (document_id, embedding) VALUES (2, [0, 0, 1, 0]);",
+            &mut db,
+        )
+        .unwrap();
+        let chunks = db.get_table("chunks".to_string()).unwrap();
+        let entry = chunks
+            .hnsw_indexes
+            .iter()
+            .find(|e| e.name == "idx_emb")
+            .unwrap();
+        assert!(
+            !entry.needs_rebuild,
+            "INSERT should rebuild the dirty index"
+        );
+        assert_eq!(entry.index.len(), 1);
+
+        let out = process_command_with_render(
+            "SELECT document_id FROM chunks ORDER BY vec_distance_l2(embedding, [0, 0, 1, 0]) ASC LIMIT 1;",
+            &mut db,
+        )
+        .unwrap();
+        assert!(out.status.contains("1 row returned"), "got: {}", out.status);
+        let rendered = out.rendered.expect("SELECT should render rows");
+        assert!(
+            rendered.contains("| 2           |"),
+            "expected the post-delete inserted row: {rendered}"
+        );
+    }
+
+    #[test]
     fn update_on_hnsw_indexed_vector_col_succeeds_and_marks_dirty() {
         let mut db = seed_hnsw_table();
         process_command("CREATE INDEX ix_e ON docs USING hnsw (e);", &mut db).unwrap();
