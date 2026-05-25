@@ -76,16 +76,24 @@ GitHub Releases by product ("show me every Python release").
 | `sqlrite-mcp`   | `sqlrite-mcp-vX.Y.Z`   | crates.io + GitHub Release (per-platform binary tarballs) |
 | Python SDK      | `sqlrite-py-vX.Y.Z`    | PyPI + GitHub Release                            |
 | Node.js SDK     | `sqlrite-node-vX.Y.Z`  | npm (`@joaoh82/sqlrite`) + GitHub Release        |
+| `sqlrite-notes` example | `sqlrite-notes-vX.Y.Z` | npm (`sqlrite-notes`) + GitHub Release   |
 | Go SDK          | `sdk/go/vX.Y.Z`        | Git tag (no registry) + GitHub Release assets    |
 | WASM            | `sqlrite-wasm-vX.Y.Z`  | npm (`@joaoh82/sqlrite-wasm`) + GitHub Release   |
 | Desktop app     | `sqlrite-desktop-vX.Y.Z` | GitHub Release (unsigned installers)           |
-| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other nine; acts as the "this was release 0.2.0" anchor) |
+| **Meta**        | `vX.Y.Z`               | GitHub Release (links to the other ten; acts as the "this was release 0.2.0" anchor) |
 
-All ten tags point at the same commit — the merge commit of the
+All eleven tags point at the same commit — the merge commit of the
 release PR. The meta tag is the umbrella release users can link to
-in announcements; the nine per-product tags are for tooling
+in announcements; the ten per-product tags are for tooling
 (crates.io, Go module proxy, npm dist-tags, etc.) that expects a
 specific format.
+
+> **`sqlrite-notes` joined the lockstep wave in v0.10.2 (SQLR-64).** Pure-JS
+> CLI on top of `@joaoh82/sqlrite` + `sqlrite-mcp`; published unscoped on
+> npm so `npx sqlrite-notes init <dir>` works on a fresh machine.
+> `publish-notes-example` runs after `publish-nodejs` because the example
+> resolves its `@joaoh82/sqlrite` pin against the version that
+> publish-nodejs just put on npm.
 
 > **`sqlrite-ask` joined the lockstep wave in v0.1.17 (Phase 7g.1).** Gets
 > its own tag and crates.io publish but ships in lockstep with everything
@@ -120,6 +128,7 @@ matching new value:
 | `desktop/src-tauri/Cargo.toml`           | `[package].version`                         |
 | `desktop/src-tauri/tauri.conf.json`      | `"version"` (top-level — Tauri reads this for installer names) |
 | `desktop/package.json`                   | `"version"` (top-level)                     |
+| `examples/nodejs-notes/package.json`     | `"version"` + `"dependencies"."@joaoh82/sqlrite"` pin (caret) |
 | `Cargo.lock`                             | auto-updated by `cargo build` after the above |
 
 **Go** is not in this list — `sdk/go/go.mod` has no version field.

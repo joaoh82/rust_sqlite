@@ -48,22 +48,17 @@ straight from the inverted index).
 
 ## Install
 
-The example lives inside the SQLRite monorepo for now (the umbrella
-ticket SQLR-38 will lift it into its own repo once we've shipped a
-few more).
-
 ```bash
-git clone https://github.com/joaoh82/rust_sqlite
-cd rust_sqlite/examples/nodejs-notes
-npm install
+npx sqlrite-notes init ~/Documents/notes
 ```
 
-`npm install` pulls **`@joaoh82/sqlrite`** (pinned to `^0.10.0`) with
-prebuilt napi-rs binaries for macOS-arm64, Linux x64/arm64, and
-Windows x64 — no Rust toolchain required for the Node side.
+That's it for the Node side — `npx` downloads `sqlrite-notes`, which
+pulls **`@joaoh82/sqlrite`** with prebuilt napi-rs binaries for
+macOS-arm64, Linux x64/arm64, and Windows x64. No clone, no
+`npm install`, no Rust toolchain required.
 
-`sqlrite-mcp` is a separate Rust binary. Install it once, anywhere
-on your `PATH`:
+`sqlrite-mcp` is a separate Rust binary used by the `serve`
+subcommand. Install it once, anywhere on your `PATH`:
 
 ```bash
 # from crates.io (~30s):
@@ -80,18 +75,23 @@ absolute path — `sqlrite-notes serve` will pick it up.
 
 ```bash
 # 1. Ingest a folder of markdown into a notes.sqlrite database.
-node bin/sqlrite-notes.mjs init ~/Documents/notes
+npx sqlrite-notes init ~/Documents/notes
 
 # 2. Confirm it works locally — same retrieval shape Claude will see.
-node bin/sqlrite-notes.mjs search "what did I learn about CRDTs?"
+npx sqlrite-notes search "what did I learn about CRDTs?"
 
 # 3. Wire up Claude Desktop using the snippet printed by `init`
-#    (also available any time via `sqlrite-notes config`).
+#    (also available any time via `npx sqlrite-notes config`).
 
 # 4. Open Claude Desktop. The sqlrite-mcp tools appear in the
 #    tool picker — `bm25_search`, `vector_search`, `query`, `ask`,
 #    plus `list_tables` / `describe_table` / `schema_dump`.
 ```
+
+> **Pinning a version.** `npx sqlrite-notes` pulls the latest; pass
+> `npx sqlrite-notes@0.10.1 …` (or whichever tag) to lock to a
+> specific release. The package ships in lockstep with the SQLRite
+> engine, so the version number matches `@joaoh82/sqlrite`'s.
 
 Once you've added the snippet to `claude_desktop_config.json` and
 restarted Claude Desktop, run a chat like:
@@ -275,9 +275,16 @@ Default is 0.5.
 
 ## Development
 
+Hacking on the example itself — running tests, editing the CLI,
+iterating against a local engine binding — uses the clone path:
+
 ```bash
+git clone https://github.com/joaoh82/rust_sqlite
+cd rust_sqlite/examples/nodejs-notes
 npm install
 npm test           # offline; runs all 40 unit + integration tests
+# Iterate against the local sources:
+node bin/sqlrite-notes.mjs init ~/Documents/notes
 ```
 
 The test suite uses `node:test` and exercises:
@@ -297,7 +304,7 @@ they skip cleanly (with a message) if it isn't.
 
 ```
 examples/nodejs-notes/
-├── package.json                       # @joaoh82/sqlrite pinned to ^0.10.0
+├── package.json                       # @joaoh82/sqlrite pinned in lockstep with the engine release
 ├── README.md                          # this file
 ├── bin/
 │   └── sqlrite-notes.mjs              # entry — calls src/cli.mjs

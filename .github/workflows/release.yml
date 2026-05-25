@@ -131,6 +131,7 @@ jobs:
             "sqlrite-desktop-v$V"
             "sqlrite-py-v$V"
             "sqlrite-node-v$V"
+            "sqlrite-notes-v$V"
             "sqlrite-wasm-v$V"
             "sdk/go/v$V"
             "v$V"
@@ -1155,6 +1156,108 @@ jobs:
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
+  # Step 3g': publish the `sqlrite-notes` example as a pure-JS npm
+  # package so users can `npx sqlrite-notes init <dir>` on a fresh
+  # machine without cloning the repo. (SQLR-64, follow-up from SQLR-40.)
+  #
+  # The package itself ships no binaries — it's a thin CLI on top of
+  # the `@joaoh82/sqlrite` N-API package (which carries the prebuilt
+  # `.node` binaries via the platform-dispatch shim) and spawns
+  # `sqlrite-mcp` as a subprocess for the read side. The Node bits
+  # are platform-agnostic JS modules, so this job is a single ubuntu
+  # cell instead of the publish-nodejs build matrix.
+  #
+  # `needs: publish-nodejs` is load-bearing: the example's
+  # `@joaoh82/sqlrite` dep pin resolves against the version that
+  # publish-nodejs just put on npm. Without that ordering, `npx
+  # sqlrite-notes@<new>` would resolve a slightly-stale engine on
+  # the first install after release (caret pin floats up *eventually*
+  # but the npm cache will have served the old one for minutes).
+  #
+  # Package name: **unscoped `sqlrite-notes`** (per ticket). The
+  # similarity rejection that hit `sqlrite` (vs `sqlite`) doesn't
+  # apply here — `notes` isn't a confusable suffix. If the registry
+  # ever rejects this on a future bootstrap, fall back to
+  # `@joaoh82/sqlrite-notes` and update both `package.json` and
+  # `docs/release-secrets.md`'s trusted-publisher section.
+  #
+  # OIDC trusted-publisher setup mirrors publish-nodejs verbatim —
+  # see that job's comment block for the long-form rationale on why
+  # `registry-url` is omitted, why we force-upgrade npm to 11.5+, and
+  # why `--provenance --access public --loglevel verbose` is the
+  # canonical flag combo.
+  publish-notes-example:
+    name: Publish sqlrite-notes example to npm
+    needs: [detect, tag-all, publish-nodejs]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC for npm trusted publisher + provenance signing.
+      id-token: write
+      # For softprops/action-gh-release at the end.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same OIDC dance as publish-nodejs — see that job's comment
+      # block for why we deliberately do NOT set `registry-url:`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Upgrade npm to latest (need 11.5+ for trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: List publish payload + OIDC env diagnostics
+        working-directory: examples/nodejs-notes
+        run: |
+          ls -la
+          echo "---"
+          npm --version
+          echo "---"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL  is set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "---"
+          # `npm pack --dry-run` prints exactly what will end up in
+          # the tarball. The `files` whitelist in package.json should
+          # produce: bin/sqlrite-notes.mjs, src/*.mjs, README.md,
+          # package.json — nothing else (no test fixtures, no
+          # node_modules).
+          npm pack --dry-run
+
+      - name: Publish to npm
+        working-directory: examples/nodejs-notes
+        run: npm publish --access public --provenance --loglevel verbose
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlrite-notes-v${{ needs.detect.outputs.version }}
+          name: sqlrite-notes example v${{ needs.detect.outputs.version }}
+          body: |
+            Published to npm: https://www.npmjs.com/package/sqlrite-notes/v/${{ needs.detect.outputs.version }}
+
+            ```bash
+            # Ingest a folder of markdown notes into a SQLRite database
+            # — no clone, no Rust toolchain, no env setup beyond an
+            # optional embedding API key.
+            npx sqlrite-notes@${{ needs.detect.outputs.version }} init ~/Documents/notes
+            ```
+
+            The example uses `@joaoh82/sqlrite@^${{ needs.detect.outputs.version }}` for storage + retrieval (HNSW + BM25) and spawns [`sqlrite-mcp`](../../releases/tag/sqlrite-mcp-v${{ needs.detect.outputs.version }}) as a subprocess to expose the database to Claude Desktop / any MCP client. Install `sqlrite-mcp` separately — `cargo install sqlrite-mcp` or a prebuilt binary from the MCP release.
+
+            Verify package provenance:
+            ```bash
+            npm audit signatures
+            ```
+
+            Full docs: [`examples/nodejs-notes/README.md`](https://github.com/joaoh82/rust_sqlite/blob/main/examples/nodejs-notes/README.md).
+
+            See the umbrella release [v${{ needs.detect.outputs.version }}](../../releases/tag/v${{ needs.detect.outputs.version }}) for the full changelog.
+          generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
   # Step 3h: build the WASM package via wasm-pack and publish to
   # npm as @joaoh82/sqlrite-wasm. (Phase 6h.)
   #
@@ -1480,7 +1583,7 @@ jobs:
   # config if we add one later.
   finalize:
     name: Finalize umbrella release
-    needs: [detect, publish-crate, publish-ask, publish-mcp, build-mcp-binaries, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-wasm, publish-go]
+    needs: [detect, publish-crate, publish-ask, publish-mcp, build-mcp-binaries, publish-ffi, publish-desktop, publish-python, publish-nodejs, publish-notes-example, publish-wasm, publish-go]
     if: needs.detect.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -1504,6 +1607,7 @@ jobs:
             - 🖥️ [Desktop](../../releases/tag/sqlrite-desktop-v${{ needs.detect.outputs.version }}) — unsigned installers for Linux (AppImage + deb), macOS (dmg aarch64), Windows (msi)
             - 🐍 [Python](../../releases/tag/sqlrite-py-v${{ needs.detect.outputs.version }}) → [PyPI](https://pypi.org/project/sqlrite/${{ needs.detect.outputs.version }}/) — abi3-py38 wheels for Linux x86_64/aarch64, macOS aarch64, Windows x86_64 + sdist
             - 🟢 [Node.js](../../releases/tag/sqlrite-node-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite/v/${{ needs.detect.outputs.version }}) — N-API bindings with prebuilt `.node` binaries for Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+            - 📝 [`sqlrite-notes` example](../../releases/tag/sqlrite-notes-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/sqlrite-notes/v/${{ needs.detect.outputs.version }}) — `npx sqlrite-notes init <dir>` ingests a folder of markdown notes into a SQLRite DB and exposes it to Claude Desktop / any MCP client
             - 🌐 [WASM](../../releases/tag/sqlrite-wasm-v${{ needs.detect.outputs.version }}) → [npm](https://www.npmjs.com/package/@joaoh82/sqlrite-wasm/v/${{ needs.detect.outputs.version }}) — browser/bundler-target WebAssembly build via wasm-pack
             - 🐹 [Go SDK](../../releases/tag/sdk%2Fgo%2Fv${{ needs.detect.outputs.version }}) → `go get github.com/joaoh82/rust_sqlite/sdk/go@v${{ needs.detect.outputs.version }}` — `database/sql` driver via cgo against `libsqlrite_c`
 

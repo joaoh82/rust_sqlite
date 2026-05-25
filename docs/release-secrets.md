@@ -102,12 +102,14 @@ release, status flips to "active".
 
 ---
 
-## 3. npm trusted publishers (two packages)
+## 3. npm trusted publishers (three packages)
 
-**Why two:** we publish `@joaoh82/sqlrite` (Node.js bindings from
-`sdk/nodejs/`) and `@joaoh82/sqlrite-wasm` (browser bindings from
-`sdk/wasm/`) as separate npm packages. Each needs its own
-trusted-publisher record.
+**Why three:** we publish `@joaoh82/sqlrite` (Node.js bindings from
+`sdk/nodejs/`), `@joaoh82/sqlrite-wasm` (browser bindings from
+`sdk/wasm/`), and `sqlrite-notes` (the chat-with-your-notes example
+from `examples/nodejs-notes/`) as separate npm packages. Each needs
+its own trusted-publisher record — set up §3a + §3b for the first
+two scoped packages and §3c for the unscoped example.
 
 **Why both are scoped:** npm's registry rejects unscoped names
 that are too similar to existing popular packages — `sqlrite` is
@@ -183,6 +185,53 @@ way of saying "no trusted publisher record matches your token's
 claims". Burned us once on v0.1.7 (typo'd repo name in the
 form); kept the form field reference here so the next person
 doesn't have to re-debug.
+
+### 3c. `sqlrite-notes` example — third npm package (SQLR-64)
+
+The `examples/nodejs-notes/` example ships as a third npm package
+so users can `npx sqlrite-notes init <dir>` on a fresh machine.
+The `publish-notes-example` job in `release.yml` handles it
+end-to-end with the same OIDC pattern as `publish-nodejs`.
+
+**Why unscoped:** unlike `sqlrite` (rejected as too similar to
+`sqlite`), `sqlrite-notes` is far enough from any existing npm
+package that the similarity check shouldn't fire. If the
+placeholder publish in step 1 below is rejected, fall back to the
+scoped form `@joaoh82/sqlrite-notes` — update both
+`examples/nodejs-notes/package.json`'s `name` field and the
+`npm publish` step / GitHub Release body in `release.yml`.
+
+**Bootstrap (one-time, with your local credentials):**
+
+```bash
+mkdir /tmp/sqlrite-notes-placeholder && cd /tmp/sqlrite-notes-placeholder
+cat > package.json <<'JSON'
+{
+  "name": "sqlrite-notes",
+  "version": "0.0.0",
+  "description": "Placeholder — real package ships from rust_sqlite CI",
+  "license": "MIT"
+}
+JSON
+npm login   # if not already
+npm publish
+```
+
+If the unscoped name is rejected, retry with `@joaoh82/sqlrite-notes`
+and amend the repo per the note above.
+
+**Trusted publisher:**
+
+1. Go to <https://www.npmjs.com/package/sqlrite-notes/access> (or
+   `…/package/@joaoh82/sqlrite-notes/access` if you fell back to
+   the scoped name).
+2. **Add publisher** with the same field values as `@joaoh82/sqlrite`
+   above — Organization `joaoh82`, Repository `rust_sqlite`,
+   Workflow filename `release.yml`, Environment `release`.
+3. Save.
+
+**Verify**: status flips from "pending" to "active" after the
+first successful CI publish.
 
 ---
 
@@ -286,10 +335,10 @@ Run through this once everything above is done:
 - [ ] PyPI trusted-publisher page shows `rust_sqlite` /
       `release.yml` / `release` pending for the `sqlrite`
       project.
-- [ ] npm trusted-publisher page shows the same for both
-      `@joaoh82/sqlrite` and `@joaoh82/sqlrite-wasm` (assuming
-      the placeholders are published per §3a — if not, section
-      3a applies).
+- [ ] npm trusted-publisher page shows the same for all three of
+      `@joaoh82/sqlrite`, `@joaoh82/sqlrite-wasm`, and
+      `sqlrite-notes` (assuming the placeholders are published per
+      §3a / §3c — if not, those sections apply).
 - [ ] Branch protection on `main` requires 14 status checks + 1
       review.
 - [ ] Open a dummy PR — the "Merge" button is greyed out until
