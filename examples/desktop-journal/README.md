@@ -18,17 +18,35 @@ REPL.
 
 ## Demo
 
-1. Write three entries about different topics — markdown is supported.
-2. Search the FTS field with a keyword; matches highlight in the list.
-3. Tap **Ask my journal**, type *"what days did I write about running?"*,
-   see the generated SQL + result table.
-4. Close the app. Reopen. State persists — it's all in one file.
-5. Bonus: open `~/Library/Application Support/com.sqlrite.journal/journal.sqlrite`
-   in the SQLRite REPL and run `SELECT date, title FROM entries ORDER BY date DESC LIMIT 5;`.
+![SQLRite Journal demo](docs/demo.gif)
 
-A README screencast lives at [`docs/screencast.gif`](docs/screencast.gif)
-once recorded — not yet captured for the first cut (see "Known gaps"
-below).
+Full 1080p MP4: [`docs/demo.mp4`](docs/demo.mp4) (~21 seconds).
+Composition source under [`demo/`](demo/) — re-render after a UI
+change by replacing the affected screenshot under
+[`docs/screenshots/`](docs/screenshots/) and running
+`cd demo && npm install && npm run render`.
+
+What the demo walks through, in order:
+
+1. Empty state — fresh DB, "Click New to write one".
+2. Writing a new markdown entry with a tag and the ⌘S hint visible.
+3. Toggling the rendered preview.
+4. Sidebar after writing three entries — tag chips at the bottom
+   carry per-tag counts.
+5. **Phase 8 BM25 search** — typing `Text` highlights every match
+   across the entry list using `fts_match` + `bm25_score` in the
+   backend and a token-boundary-aware `<mark>` pass on the Rust side.
+6. ⚙ Settings dialog — paste an Anthropic key (never sent to the
+   webview after Save) or fall back to `SQLRITE_LLM_API_KEY`.
+7. **Ask my journal** — natural-language SQL via `Connection::ask`,
+   gated to `SELECT` / `WITH` before execution.
+
+You can also drive it yourself in a real session: write three entries
+on different topics, search by keyword, click **Ask my journal**, ask
+*"what days did I write about running?"*, then close the app, reopen,
+and prove state persists. Bonus shot — open
+`~/Library/Application Support/com.sqlrite.journal/journal.sqlrite` in
+the SQLRite REPL and run `SELECT date, title FROM entries ORDER BY date DESC LIMIT 5;`.
 
 ## Architecture
 
@@ -194,8 +212,9 @@ release. Trigger manually via the Actions UI or push a tag matching
 - [x] Release workflow produces packaged installers via tauri-action.
 - [x] README with architecture diagram.
 - [x] Card on https://sqlritedb.com under Examples.
-- [ ] Screencast (`docs/screencast.gif`) — to record once the app is
-      installed on a host with a clean window-recording setup.
+- [x] Screencast — composed in Remotion from real app screenshots;
+      lives at `docs/demo.gif` (960×540, ~15s) and `docs/demo.mp4`
+      (1080p, ~21s). Source under [`demo/`](demo/).
 - [ ] Custom app icon — currently reuses the playground's icon so
       the bundle isn't the default Tauri shield. Replace when a
       dedicated brand asset is ready.

@@ -83,6 +83,10 @@ type Example = {
   language: string;
   repoPath: string;
   features: string[];
+  /** Optional repo-relative path to a demo asset (GIF/MP4) rendered
+   * on the card as a poster + link. Currently only the journal app
+   * has one — see SQLR-41's Remotion composition. */
+  demoAsset?: { gifPath: string; mp4Path: string };
 };
 
 const EXAMPLES: Example[] = [
@@ -132,6 +136,10 @@ const EXAMPLES: Example[] = [
     language: "Rust + Svelte 5",
     repoPath: "examples/desktop-journal",
     features: ["Connection API", "BM25 / FTS", "ask", "Tauri 2"],
+    demoAsset: {
+      gifPath: "examples/desktop-journal/docs/demo.gif",
+      mp4Path: "examples/desktop-journal/docs/demo.mp4",
+    },
   },
 ];
 
@@ -219,6 +227,35 @@ export default function ExamplesIndexPage() {
                 <p style={{ margin: 0, color: "var(--color-fg-mute)" }}>
                   {ex.blurb}
                 </p>
+                {ex.demoAsset ? (
+                  // Inline demo. Linking the <img> at the raw.githubusercontent.com
+                  // URL means we don't have to copy the asset into web/public/
+                  // every time the journal app's UI changes — the asset lives
+                  // next to the code in the repo and the homepage picks up
+                  // the latest version on next deploy.
+                  <a
+                    href={`${SITE.repo}/blob/main/${ex.demoAsset.mp4Path}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: "block",
+                      borderRadius: 6,
+                      overflow: "hidden",
+                      border: "1px solid var(--color-line)",
+                      lineHeight: 0,
+                    }}
+                  >
+                    <img
+                      src={`${SITE.repo.replace(
+                        "github.com",
+                        "raw.githubusercontent.com",
+                      )}/main/${ex.demoAsset.gifPath}`}
+                      alt={`${ex.title} demo`}
+                      loading="lazy"
+                      style={{ width: "100%", height: "auto", display: "block" }}
+                    />
+                  </a>
+                ) : null}
                 <ul
                   style={{
                     margin: 0,
