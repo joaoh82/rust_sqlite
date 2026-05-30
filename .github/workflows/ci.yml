@@ -10,6 +10,7 @@
 #   - go-sdk                {ubuntu, macos}            cgo against libsqlrite_c + go test
 #   - wasm-build            ubuntu                     wasm-pack build + size report
 #   - desktop-build         ubuntu                     npm ci + cargo build -p sqlrite-desktop
+#   - journal-build         ubuntu                     npm ci + cargo build -p sqlrite-journal (SQLR-41 example)
 #
 # All jobs use caching so a warm PR run takes 2–3 minutes on ubuntu.
 # Go CI skips Windows for Phase 6b — Go's cgo on Windows needs a mingw
@@ -102,6 +103,7 @@ jobs:
         run: |
           cargo build --workspace \
             --exclude sqlrite-desktop \
+            --exclude sqlrite-journal \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
             --exclude sqlrite-benchmarks \
@@ -111,6 +113,7 @@ jobs:
         run: |
           cargo test --workspace \
             --exclude sqlrite-desktop \
+            --exclude sqlrite-journal \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
             --exclude sqlrite-benchmarks
@@ -147,6 +150,7 @@ jobs:
         run: |
           cargo clippy --workspace \
             --exclude sqlrite-desktop \
+            --exclude sqlrite-journal \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
             --exclude sqlrite-benchmarks \
@@ -158,6 +162,7 @@ jobs:
         run: |
           cargo doc --workspace \
             --exclude sqlrite-desktop \
+            --exclude sqlrite-journal \
             --exclude sqlrite-python \
             --exclude sqlrite-nodejs \
             --exclude sqlrite-benchmarks \
@@ -400,3 +405,58 @@ jobs:
 
       - name: Build Rust side
         run: cargo build -p sqlrite-desktop
+
+  # ---------------------------------------------------------------------------
+  # Journal example (SQLR-41): Tauri 2 + Svelte 5 daily-notes app under
+  # `examples/desktop-journal/`. Same shape as `desktop-build` — frontend
+  # first, then `cargo build -p sqlrite-journal`. Excluded from the
+  # default workspace commands for the same reasons (Svelte build is a
+  # prerequisite that the main rust-build-and-test job can't satisfy).
+  journal-build:
+    name: journal-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: examples/desktop-journal/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: journal-build
+
+      - name: npm install
+        working-directory: examples/desktop-journal
+        # `npm ci` would be ideal, but the example doesn't ship a
+        # lockfile in version control (it's listed in .gitignore so
+        # downstream forkers don't have to fight a node-version-pinned
+        # lockfile). `npm install` is acceptable for an example app;
+        # the engine API surface is what we're really exercising.
+        run: npm install
+
+      - name: Build frontend
+        working-directory: examples/desktop-journal
+        run: npm run build
+
+      - name: Build Rust side (with ask)
+        run: cargo build -p sqlrite-journal --all-targets
+
+      - name: Build Rust side (no ask)
+        run: cargo build -p sqlrite-journal --no-default-features --all-targets
+
+      - name: Run journal unit tests
+        run: cargo test -p sqlrite-journal

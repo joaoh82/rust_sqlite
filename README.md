@@ -116,6 +116,7 @@ Beyond the per-language quickstarts in [`examples/`](examples/), the SQLR-38 umb
 |---|---|---|
 | [Python LLM agent with persistent memory](examples/python-agent/) | Python | Vector + lexical recall, fact extraction, summaries — all in one `.sqlrite` file |
 | [Chat-with-your-notes via Claude Desktop MCP](examples/nodejs-notes/) | Node.js | Markdown → hybrid HNSW + BM25 index → `sqlrite-mcp --read-only` → Claude Desktop |
+| [Local-first journaling desktop app](examples/desktop-journal/) | Tauri 2 + Svelte 5 | Markdown daily-notes, BM25 full-text search with hit highlighting, "ask my journal" panel — entire data layer is one `.sqlrite` file |
 
 ### Developer guide
 

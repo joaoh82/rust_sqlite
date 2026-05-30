@@ -8,13 +8,14 @@ SQLRite is a from-scratch SQLite-style embedded database written in Rust. It's p
 
 ## Workspace layout
 
-`Cargo.toml` is a workspace whose members are: `.` (the engine, package `sqlrite-engine`, lib `sqlrite`), `desktop/src-tauri`, `sqlrite-ffi`, `sqlrite-ask`, `sqlrite-mcp`, `sdk/python`, `sdk/nodejs`, `benchmarks`. `sdk/wasm` and `sdk/go` are deliberately **not** workspace members (wasm32 target / cgo separation).
+`Cargo.toml` is a workspace whose members are: `.` (the engine, package `sqlrite-engine`, lib `sqlrite`), `desktop/src-tauri`, `examples/desktop-journal/src-tauri`, `sqlrite-ffi`, `sqlrite-ask`, `sqlrite-mcp`, `sdk/python`, `sdk/nodejs`, `benchmarks`. `sdk/wasm` and `sdk/go` are deliberately **not** workspace members (wasm32 target / cgo separation).
 
 - `src/` — engine. Public API is `Connection`/`Statement`/`Rows`/`Row`/`Value` from [src/connection.rs](src/connection.rs), re-exported via [src/lib.rs](src/lib.rs). Any new SDK should bind only to this surface.
 - `sqlrite-ask/` — pure-Rust LLM adapter (Anthropic/OpenAI/Ollama) for natural-language → SQL. The engine's `ask` feature provides the thin `ConnectionAskExt::ask` glue.
 - `sqlrite-mcp/` — MCP stdio server. Seven tools: `list_tables`, `describe_table`, `query`, `execute`, `schema_dump`, `vector_search`, `ask`. `--read-only` opens with a shared lock and hides `execute`.
 - `sqlrite-ffi/` — C ABI cdylib + generated `sqlrite.h` header. Backs the Go SDK and any C consumer.
-- `desktop/` — Tauri 2 + Svelte 5 GUI. Embeds the engine directly (no FFI hop).
+- `desktop/` — Tauri 2 + Svelte 5 generic SQL playground GUI. Embeds the engine directly (no FFI hop).
+- `examples/desktop-journal/` — Tauri 2 + Svelte 5 local-first journaling app (SQLR-41). Showcase for Phase 8 BM25 + `ask` in a non-AI-native product. Mirrors `desktop/`'s engine-as-Cargo-dep pattern but uses the modern `Connection` API.
 - `benchmarks/` — SQLR-4 / SQLR-16 bench harness. `Driver` trait + SQLRite + SQLite (rusqlite-bundled) drivers + criterion-driven workloads. Excluded from the default CI build/test/clippy/doc commands; run locally with `make bench` (or `make bench-duckdb`). See [docs/benchmarks-plan.md](docs/benchmarks-plan.md).
 - `web/` — marketing + docs site (Next.js 15 + Tailwind v4). Independent of the Cargo workspace; lives in-repo for now but is structured to lift into its own repository later. See [web/README.md](web/README.md).
 
@@ -30,16 +31,16 @@ CI is the source of truth — the workspace excludes that follow are required be
 
 ```sh
 # Build / test the Rust workspace (matches CI)
-cargo build --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
-cargo test  --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks
+cargo build --workspace --exclude sqlrite-desktop --exclude sqlrite-journal --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
+cargo test  --workspace --exclude sqlrite-desktop --exclude sqlrite-journal --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks
 
 # Single test (exact name; --nocapture to see println!)
 cargo test <test_name> -- --nocapture
 
 # Lint (CI runs all three)
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
-cargo doc    --workspace --exclude sqlrite-desktop --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --no-deps
+cargo clippy --workspace --exclude sqlrite-desktop --exclude sqlrite-journal --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --all-targets
+cargo doc    --workspace --exclude sqlrite-desktop --exclude sqlrite-journal --exclude sqlrite-python --exclude sqlrite-nodejs --exclude sqlrite-benchmarks --no-deps
 
 # Run the REPL (default features include cli + ask + file-locks)
 cargo run                                  # in-memory
@@ -50,6 +51,7 @@ cargo run -- --readonly path/to/db.sqlrite # shared-lock open
 cargo build --release -p sqlrite-ffi       # C cdylib + sqlrite.h
 cd desktop && npm install && npm run tauri dev   # desktop app dev mode
 cargo run -p sqlrite-mcp -- /path/to.sqlrite     # MCP server (stdio)
+cd examples/desktop-journal && npm install && npm run tauri dev  # journal example app
 
 # Benchmarks (SQLR-4 / SQLR-16) — local-only, never CI
 make bench                                 # SQLRite + SQLite (lean)
