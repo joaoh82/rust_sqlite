@@ -15,20 +15,27 @@
 // Prevent a second console window on Windows in release mode.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod settings;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
-use sqlrite::ask::{AskConfig, ask_with_database};
+use sqlrite::ask::ask_with_database;
 use sqlrite::sql::db::table::Value;
 use sqlrite::{Database, SQLRiteError, process_command};
 use tauri::{Manager, State};
 
-/// Holds the single active database for the app. A `None` means "no
-/// database open yet" — the frontend should nudge the user toward
-/// `.open`.
+use settings::{AskSettings, AskSettingsDto, AskSettingsUpdate};
+
+/// Holds the single active database for the app plus the path to the
+/// on-disk `settings.json`. The settings path is immutable for the
+/// app's lifetime, so it lives outside the mutex; reads/writes go
+/// through `AskSettings::load` / `AskSettings::save` which touch disk
+/// directly.
 struct AppState {
     db: Mutex<Database>,
+    settings_path: PathBuf,
 }
 
 /// Mirrors `SecondaryIndex` enough for the UI's sidebar — just name,
@@ -176,12 +183,11 @@ fn table_rows(
 /// Flow:
 /// 1. Lock the `Database` (so the schema dump is consistent with what
 ///    the user would see if they ran `.tables`).
-/// 2. Read `AskConfig` from the process's environment
-///    (`SQLRITE_LLM_API_KEY` etc.). Tauri inherits the parent shell's
-///    env when launched via `npm run tauri dev` / when launched from
-///    a terminal in production. If the var isn't set, the call fails
-///    with a clear "missing API key" message that the frontend surfaces
-///    in the existing error slot.
+/// 2. Build `AskConfig` from the saved settings (`settings.json`),
+///    falling back to `SQLRITE_LLM_API_KEY` in the environment when no
+///    key is saved. If neither is present, the call fails with a clear
+///    "no API key configured" message — pointing at the ⚙ gear icon —
+///    that the frontend surfaces in the existing error slot.
 /// 3. Call into `sqlrite::ask::ask_with_database` — schema dump +
 ///    cache-friendly prompt + sync HTTP POST happens in the Rust
 ///    backend. **The API key never crosses into the webview.** That's
@@ -203,13 +209,36 @@ fn table_rows(
 ///   strings ask() produces.
 #[tauri::command]
 fn ask_sql(question: String, state: State<'_, AppState>) -> Result<AskCommandResult, String> {
-    let cfg = AskConfig::from_env().map_err(|e| format!("ask config error: {e}"))?;
+    let saved = AskSettings::load(&state.settings_path);
+    let cfg = settings::build_ask_config(&saved)?;
     let locked = state.db.lock().map_err(engine_err)?;
     let resp = ask_with_database(&*locked, &question, &cfg).map_err(engine_err)?;
     Ok(AskCommandResult {
         sql: resp.sql,
         explanation: resp.explanation,
     })
+}
+
+/// Returns the current `ask` settings, scrubbed for the webview — the
+/// raw API key never crosses the IPC boundary, only `has_api_key`.
+#[tauri::command]
+fn get_ask_settings(state: State<'_, AppState>) -> Result<AskSettingsDto, String> {
+    Ok(AskSettings::load(&state.settings_path).to_dto())
+}
+
+/// Applies a partial update to `settings.json` (three-valued per field —
+/// see [`AskSettingsUpdate`]) and returns the scrubbed result.
+#[tauri::command]
+fn update_ask_settings(
+    update: AskSettingsUpdate,
+    state: State<'_, AppState>,
+) -> Result<AskSettingsDto, String> {
+    let mut current = AskSettings::load(&state.settings_path);
+    current.apply_update(update);
+    current
+        .save(&state.settings_path)
+        .map_err(|e| format!("save settings: {e}"))?;
+    Ok(current.to_dto())
 }
 
 #[tauri::command]
@@ -344,8 +373,19 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // Resolve the OS app-data directory so the `ask` settings
+            // file has a stable home. The playground starts in-memory
+            // (no DB file), but the settings live on disk regardless so
+            // a saved API key survives restarts.
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app_data_dir: {e}"))?;
+            std::fs::create_dir_all(&app_data_dir)?;
+            let settings_path = settings::settings_path(&app_data_dir);
             app.manage(AppState {
                 db: Mutex::new(Database::new("scratch".into())),
+                settings_path,
             });
             Ok(())
         })
@@ -356,6 +396,8 @@ fn main() {
             table_rows,
             execute_sql,
             ask_sql,
+            get_ask_settings,
+            update_ask_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running sqlrite-desktop");
