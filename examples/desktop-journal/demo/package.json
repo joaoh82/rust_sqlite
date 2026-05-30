@@ -1,0 +1,26 @@
+{
+  "name": "sqlrite-journal-demo",
+  "version": "0.10.1",
+  "private": true,
+  "description": "Remotion composition that stitches the journal app screenshots into the demo video (docs/demo.mp4 + docs/demo.gif).",
+  "type": "module",
+  "scripts": {
+    "prep": "mkdir -p public && cp ../docs/screenshots/*.png public/",
+    "studio": "npm run prep && remotion studio",
+    "render:mp4": "npm run prep && remotion render Demo ../docs/demo.mp4 --codec=h264 --crf=18",
+    "render:gif": "npm run prep && remotion render Demo ../docs/demo.gif --codec=gif --width=960 --height=540 --every-nth-frame=2 --frames=0-450",
+    "render": "npm run render:mp4 && npm run render:gif"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.0",
+    "@remotion/cli": "^4.0.0",
+    "@remotion/renderer": "^4.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "typescript": "^5.6.0"
+  }
+}

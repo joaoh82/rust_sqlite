@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SQLRite Journal",
+  "version": "0.10.1",
+  "identifier": "com.sqlrite.journal",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1421",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SQLRite Journal",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 880,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Local-first journaling on top of SQLRite",
+    "longDescription": "SQLRite Journal is an example desktop app showcasing what you can build with SQLRite: a markdown daily-notes journal with tag filtering, full-text search powered by SQLRite's Phase 8 BM25 indexes, and a natural-language 'ask my journal' panel backed by the engine's `ask` feature. Your entries live in a single .sqlrite file that you can copy between machines or open in the SQLRite REPL.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

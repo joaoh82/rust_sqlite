@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+/* Theme palette — kept here so the Svelte components only deal with
+ * semantic Tailwind utility classes (e.g. bg-panel, text-fg) rather
+ * than hardcoding hex values. The dark palette mirrors the existing
+ * desktop crate so a user who knows that app feels at home.
+ */
+@theme {
+  --color-bg: #1e1e22;
+  --color-panel: #26262b;
+  --color-panel-2: #2f2f35;
+  --color-border: #3a3a42;
+  --color-fg: #e8e8ee;
+  --color-fg-muted: #9a9aa5;
+  --color-accent: #7dd3a4;
+  --color-accent-dim: #4c8368;
+  --color-error: #f58f8f;
+
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Tailwind doesn't ship a list-reset by default in v4; do it once. */
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Markdown preview: trim default browser margins so a one-line preview
+ * doesn't push the editor down. We don't pull in @tailwindcss/typography
+ * — too heavy for this scope — and instead inline the few rules we need.
+ */
+.prose-mini {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.prose-mini h1,
+.prose-mini h2,
+.prose-mini h3 {
+  margin: 1em 0 0.5em;
+  font-weight: 600;
+}
+.prose-mini h1 {
+  font-size: 1.4em;
+}
+.prose-mini h2 {
+  font-size: 1.2em;
+}
+.prose-mini h3 {
+  font-size: 1.05em;
+}
+.prose-mini p {
+  margin: 0.5em 0;
+}
+.prose-mini ul,
+.prose-mini ol {
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+.prose-mini ul {
+  list-style: disc;
+}
+.prose-mini ol {
+  list-style: decimal;
+}
+.prose-mini code {
+  font-family: var(--font-mono);
+  background: var(--color-panel-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+.prose-mini pre {
+  background: var(--color-panel-2);
+  padding: 10px 12px;
+  border-radius: 4px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.prose-mini pre code {
+  background: transparent;
+  padding: 0;
+}
+.prose-mini blockquote {
+  border-left: 3px solid var(--color-accent-dim);
+  margin: 0.5em 0;
+  padding-left: 0.8em;
+  color: var(--color-fg-muted);
+}
+.prose-mini a {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+
+mark {
+  background: rgba(125, 211, 164, 0.25);
+  color: var(--color-fg);
+  padding: 0 2px;
+  border-radius: 2px;
+}

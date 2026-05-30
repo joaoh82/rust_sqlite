@@ -1,0 +1,9 @@
+node_modules/
+.remotion/
+out/
+*.log
+
+# Screenshots are checked in under ../docs/screenshots/; `npm run
+# prep` copies them in here at render time so we don't carry two
+# copies in version control.
+public/

@@ -1,0 +1,9 @@
+# Tauri / Vite / Node
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+*.log
+
+# Tauri builds runtime caches into the bundle dir
+src-tauri/Cargo.lock

@@ -1,0 +1,103 @@
+# SQLRite Journal — installer build workflow (SQLR-41).
+#
+# Produces packaged installers for the example desktop journal app:
+#   - macOS:  .dmg + .app bundle
+#   - Linux:  .deb + .AppImage
+#   - Windows: .msi (best-effort; flag in README if it lights up red)
+#
+# Manual trigger by default — installers are heavy (~30–40 min total
+# wall clock across the matrix), and the example app changes much less
+# often than the engine. Tagged pushes matching `journal-v*` also fire.
+# Artifacts are attached to a draft GitHub release rather than the
+# engine's own release stream so engine releases don't accidentally
+# ship a journal binary baseline that's lagging behind.
+
+name: Journal example — installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'journal-v*'
+
+permissions:
+  contents: write   # tauri-action needs this to upload to the draft release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macos-arm64
+            target: aarch64-apple-darwin
+          - os: macos-13
+            label: macos-x86_64
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            label: windows-x86_64
+            target: x86_64-pc-windows-msvc
+
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Tauri Linux deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./examples/desktop-journal/src-tauri
+          shared-key: journal-release-${{ matrix.label }}
+
+      - name: npm install
+        working-directory: examples/desktop-journal
+        run: npm install
+
+      # tauri-action does the magic: builds frontend, runs `cargo tauri
+      # build`, and uploads the resulting installers to a draft release
+      # tagged with `tagName`. We deliberately don't auto-publish — a
+      # human reviews the draft and clicks publish.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: examples/desktop-journal
+          tagName: ${{ startsWith(github.ref, 'refs/tags/journal-v') && github.ref_name || format('journal-v{0}', github.run_number) }}
+          releaseName: 'SQLRite Journal ${{ startsWith(github.ref, ''refs/tags/journal-v'') && github.ref_name || format(''build-{0}'', github.run_number) }}'
+          releaseBody: |
+            Installer artifacts for the SQLRite Journal example app
+            (SQLR-41). Built against the engine version pinned in
+            `examples/desktop-journal/src-tauri/Cargo.toml`.
+
+            * macOS: `.dmg` (Apple Silicon + Intel)
+            * Linux: `.deb` + `.AppImage`
+            * Windows: `.msi`
+
+            Source: <https://github.com/joaoh82/rust_sqlite/tree/main/examples/desktop-journal>
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}

@@ -9,7 +9,7 @@
 # wasm32-unknown-unknown. `cargo build --workspace` on a native host
 # would fail on a wasm-only crate; wasm-pack drives that build
 # separately.
-members = [".", "desktop/src-tauri", "sqlrite-ffi", "sqlrite-ask", "sqlrite-mcp", "sdk/python", "sdk/nodejs", "benchmarks"]
+members = [".", "desktop/src-tauri", "examples/desktop-journal/src-tauri", "sqlrite-ffi", "sqlrite-ask", "sqlrite-mcp", "sdk/python", "sdk/nodejs", "benchmarks"]
 resolver = "3"
 
 [package]

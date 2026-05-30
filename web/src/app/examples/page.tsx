@@ -60,6 +60,18 @@ const itemListJsonLd = {
           "A Node.js CLI that ingests a folder of markdown notes into SQLRite (HNSW + BM25 indexes), then exposes the database to Claude Desktop via sqlrite-mcp --read-only. Hybrid retrieval over your notes from inside the chat client.",
       },
     },
+    {
+      "@type": "ListItem",
+      position: 3,
+      item: {
+        "@type": "SoftwareSourceCode",
+        name: "Local-first journaling — Tauri 2 + Svelte 5 desktop app",
+        url: `${SITE.repo}/tree/main/examples/desktop-journal`,
+        programmingLanguage: "Rust",
+        description:
+          "A markdown daily-notes desktop app backed by a single .sqlrite file. Phase 8 BM25 full-text search with hit highlighting, click-to-filter tags, and an 'ask my journal' panel powered by the engine's natural-language SQL feature.",
+      },
+    },
   ],
 };
 
@@ -71,6 +83,10 @@ type Example = {
   language: string;
   repoPath: string;
   features: string[];
+  /** Optional repo-relative path to a demo asset (GIF/MP4) rendered
+   * on the card as a poster + link. Currently only the journal app
+   * has one — see SQLR-41's Remotion composition. */
+  demoAsset?: { gifPath: string; mp4Path: string };
 };
 
 const EXAMPLES: Example[] = [
@@ -104,6 +120,26 @@ const EXAMPLES: Example[] = [
     language: "Node.js 20+",
     repoPath: "examples/nodejs-notes",
     features: ["HNSW", "BM25 / FTS", "MCP server", "napi-rs SDK"],
+  },
+  {
+    status: "shipped",
+    title: "Local-first journaling — Tauri 2 + Svelte 5",
+    blurb:
+      "A markdown daily-notes desktop app whose entire data layer is one .sqlrite file you can copy between machines, back up with rsync, or open in the SQLRite REPL. Phase 8 BM25 full-text search with hit highlighting, click-to-filter tags, and an 'ask my journal' panel that turns natural language into read-only SQL against your own entries.",
+    bullets: [
+      "Tauri 2 backend owns an Arc<Mutex<Connection>> in tauri::State — commands serialise through one engine handle, no torn writes",
+      "BM25 full-text search over entry content with token-boundary-aware <mark> highlighting on the Svelte side",
+      "'Ask my journal' panel calls Connection::ask, validates the returned SQL is SELECT/WITH-only, and shows you both the SQL and the rows — API key never crosses into the webview",
+      "Export options: copy the .sqlrite file as-is, or dump every entry as YAML-frontmatter markdown into a folder",
+      "Locked-down Tauri capabilities (core window + dialog only — no fs / shell / http)",
+    ],
+    language: "Rust + Svelte 5",
+    repoPath: "examples/desktop-journal",
+    features: ["Connection API", "BM25 / FTS", "ask", "Tauri 2"],
+    demoAsset: {
+      gifPath: "examples/desktop-journal/docs/demo.gif",
+      mp4Path: "examples/desktop-journal/docs/demo.mp4",
+    },
   },
 ];
 
@@ -191,6 +227,35 @@ export default function ExamplesIndexPage() {
                 <p style={{ margin: 0, color: "var(--color-fg-mute)" }}>
                   {ex.blurb}
                 </p>
+                {ex.demoAsset ? (
+                  // Inline demo. Linking the <img> at the raw.githubusercontent.com
+                  // URL means we don't have to copy the asset into web/public/
+                  // every time the journal app's UI changes — the asset lives
+                  // next to the code in the repo and the homepage picks up
+                  // the latest version on next deploy.
+                  <a
+                    href={`${SITE.repo}/blob/main/${ex.demoAsset.mp4Path}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: "block",
+                      borderRadius: 6,
+                      overflow: "hidden",
+                      border: "1px solid var(--color-line)",
+                      lineHeight: 0,
+                    }}
+                  >
+                    <img
+                      src={`${SITE.repo.replace(
+                        "github.com",
+                        "raw.githubusercontent.com",
+                      )}/main/${ex.demoAsset.gifPath}`}
+                      alt={`${ex.title} demo`}
+                      loading="lazy"
+                      style={{ width: "100%", height: "auto", display: "block" }}
+                    />
+                  </a>
+                ) : null}
                 <ul
                   style={{
                     margin: 0,
@@ -258,9 +323,8 @@ export default function ExamplesIndexPage() {
               fontSize: 14,
             }}
           >
-            More examples in flight: a Tauri + Svelte journaling
-            desktop app, a browser SQL playground (WASM), and a Go
-            edge/IoT event collector. See{" "}
+            More examples in flight: a browser SQL playground (WASM)
+            and a Go edge/IoT event collector. See{" "}
             <Link href="/docs">/docs</Link> for the engine reference.
           </p>
         </div>

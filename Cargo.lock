@@ -4865,6 +4865,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlrite-journal"
+version = "0.10.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlrite-engine",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sqlrite-mcp"
 version = "0.10.1"
 dependencies = [
