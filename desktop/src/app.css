@@ -54,6 +54,15 @@ header {
 .actions {
   display: flex;
   gap: 8px;
+  align-items: center;
+}
+
+/* Gear button sits at the end of the header actions. Square, icon-only,
+ * deliberately quieter than the labelled file buttons next to it. */
+.settings-button {
+  padding: 6px 10px;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .logo {

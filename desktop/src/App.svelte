@@ -2,6 +2,12 @@
   import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+  import SettingsPanel from "./lib/SettingsPanel.svelte";
+
+  // ⚙ Settings dialog — paste an Anthropic API key so the Ask… button
+  // works without exporting SQLRITE_LLM_API_KEY in the launching shell
+  // (which Finder / the Dock don't inherit).
+  let settingsVisible = $state<boolean>(false);
 
   type ColumnInfo = {
     name: string;
@@ -374,8 +380,21 @@
       <button onclick={onNewClick}>New…</button>
       <button onclick={onOpenClick}>Open…</button>
       <button onclick={onSaveAsClick}>Save As…</button>
+      <button
+        class="settings-button"
+        onclick={() => (settingsVisible = true)}
+        aria-label="Settings"
+        title="Settings"
+      >⚙</button>
     </div>
   </header>
+
+  {#if settingsVisible}
+    <SettingsPanel
+      onClose={() => (settingsVisible = false)}
+      onSaved={() => {}}
+    />
+  {/if}
 
   <div class="layout">
     <aside class="sidebar">
