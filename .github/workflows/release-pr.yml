@@ -86,13 +86,15 @@ jobs:
 
       - name: Refresh Cargo.lock
         # `cargo build` updates Cargo.lock with the new workspace
-        # member versions. `--exclude sqlrite-desktop` because the
-        # desktop crate needs the Svelte frontend compiled first
-        # (Tauri's build.rs looks for `desktop/dist/`) — we're not
-        # building a release artifact here, just refreshing the lock.
-        # `--quiet` keeps the log tidy; a real compile failure still
-        # surfaces.
-        run: cargo build --workspace --exclude sqlrite-desktop --quiet
+        # member versions. We exclude the two Tauri crates
+        # (`sqlrite-desktop`, `sqlrite-journal`): both need their Svelte
+        # frontend compiled first (Tauri's build.rs looks for a `dist/`)
+        # and pull in the GTK/glib system stack that this runner doesn't
+        # install — we're not building a release artifact here, just
+        # refreshing the lock. Keep this exclude list in sync with the
+        # cargo steps in ci.yml. `--quiet` keeps the log tidy; a real
+        # compile failure still surfaces.
+        run: cargo build --workspace --exclude sqlrite-desktop --exclude sqlrite-journal --quiet
 
       - name: Configure git identity
         # Use the github-actions[bot] identity so the commit shows
