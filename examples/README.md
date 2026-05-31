@@ -24,6 +24,8 @@ Beyond the per-SDK quick-start tours above, the [SQLR-38 umbrella](../docs/roadm
 |---|---|---|---|
 | LLM agent with persistent memory | Python | Vector + lexical recall, fact extraction, summaries — all in one `.sqlrite` file | [`python-agent/`](python-agent/) |
 | Chat with your notes (MCP)       | Node.js | Markdown → SQLRite hybrid retrieval, served to Claude Desktop via `sqlrite-mcp --read-only` | [`nodejs-notes/`](nodejs-notes/) |
+| Local-first journaling           | Tauri 2 + Svelte 5 | Markdown daily notes in one `.sqlrite` file, BM25 full-text search, "ask my journal" natural-language SQL | [`desktop-journal/`](desktop-journal/) |
+| Browser SQL playground           | WASM | The full engine in WebAssembly — SQL editor, sample datasets, HNSW vector search, all in a browser tab. Live at [sqlritedb.com/playground](https://sqlritedb.com/playground) | [`wasm-playground/`](wasm-playground/) |
 
 ## Running the Rust quickstart
 
