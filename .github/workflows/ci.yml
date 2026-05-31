@@ -297,6 +297,43 @@ jobs:
         run: go test -v ./...
 
   # ---------------------------------------------------------------------------
+  # Go edge/IoT collector example (SQLR-43). Builds + tests the example
+  # app against the in-repo libsqlrite_c, so an engine/SDK API change
+  # that breaks the example is caught here. Same {ubuntu, macos} matrix
+  # and cgo wiring as the go-sdk job.
+  go-collector:
+    name: go-collector (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: examples/go-collector/go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: go-collector-${{ matrix.os }}
+
+      - name: Build libsqlrite_c
+        # The Go driver's `#cgo LDFLAGS` references target/release.
+        run: cargo build --release -p sqlrite-ffi
+
+      - name: go vet ./...
+        working-directory: examples/go-collector
+        run: go vet ./...
+
+      - name: go test ./...
+        working-directory: examples/go-collector
+        run: go test -v ./...
+
+  # ---------------------------------------------------------------------------
   # WASM: only the build + size check (no tests — the WASM module's
   # behavior is covered by the other SDKs' test suites; WASM just
   # re-targets the same engine). One cell because WASM is a

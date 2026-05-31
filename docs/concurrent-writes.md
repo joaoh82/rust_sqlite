@@ -332,6 +332,7 @@ Decoders accept v1..=v3. A v2 reader on a v3 WAL emits a clean "unsupported WAL 
 - [`docs/design-decisions.md`](design-decisions.md) §12a–§12h — the design notes accumulated across Phase 11 sub-phases.
 - [`docs/roadmap.md`](roadmap.md#phase-11--concurrent-writes-via-mvcc--begin-concurrent-sqlr-22-in-flight--see-concurrent-writes-planmd) — phase-by-phase shipped vs deferred status.
 - [`examples/rust/concurrent_writers.rs`](../examples/rust/concurrent_writers.rs) — runnable retry-loop example.
+- [`examples/go-collector/`](../examples/go-collector/) — a Go edge/IoT collector that drives `BEGIN CONCURRENT` from two writers (HTTP path + background uploader) against one file, with **measured** throughput/latency numbers that honestly show the v0 cost of the limitations above (per-tx clone + per-commit rebuild). The README is a good worked example of designing an app around the v0 sharp edges (4 KiB commit cap, no param binding, app-assigned ids under MVCC).
 
 External:
 

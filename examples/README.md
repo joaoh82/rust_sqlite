@@ -26,6 +26,7 @@ Beyond the per-SDK quick-start tours above, the [SQLR-38 umbrella](../docs/roadm
 | Chat with your notes (MCP)       | Node.js | Markdown → SQLRite hybrid retrieval, served to Claude Desktop via `sqlrite-mcp --read-only` | [`nodejs-notes/`](nodejs-notes/) |
 | Local-first journaling           | Tauri 2 + Svelte 5 | Markdown daily notes in one `.sqlrite` file, BM25 full-text search, "ask my journal" natural-language SQL | [`desktop-journal/`](desktop-journal/) |
 | Browser SQL playground           | WASM | The full engine in WebAssembly — SQL editor, sample datasets, HNSW vector search, all in a browser tab. Live at [sqlritedb.com/playground](https://sqlritedb.com/playground) | [`wasm-playground/`](wasm-playground/) |
+| Edge / IoT event collector       | Go | HTTP collector + background uploader writing one `.sqlrite` buffer concurrently via `BEGIN CONCURRENT`; durable-buffer-for-unreliable-networks shape, with measured throughput | [`go-collector/`](go-collector/) |
 
 ## Running the Rust quickstart
 

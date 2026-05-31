@@ -1,0 +1,10 @@
+# The Docker build context is the repo root (see Dockerfile header).
+# Keep the context lean: the Rust stage rebuilds target/ anyway, and
+# node_modules / git history bloat the upload.
+**/target
+**/node_modules
+.git
+**/*.sqlrite
+**/*.sqlrite-wal
+web/.next
+desktop/src-tauri/target
