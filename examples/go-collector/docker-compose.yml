@@ -1,0 +1,61 @@
+# docker-compose for the SQLRite edge/IoT collector.
+#
+# Run from the repo root (the build context must be the root):
+#
+#   docker compose -f examples/go-collector/docker-compose.yml up --build
+#
+# The collector writes to a named volume so the durable buffer survives
+# container restarts — the same property a real edge box relies on.
+
+services:
+  collector:
+    build:
+      # Build context is the repository root, two levels up.
+      context: ../..
+      dockerfile: examples/go-collector/Dockerfile
+    image: sqlrite-collector
+    ports:
+      - "8080:8080"
+    volumes:
+      - collector-data:/data
+    command:
+      - "-db"
+      - "/data/events.sqlrite"
+      - "-addr"
+      - ":8080"
+      - "-max-backlog"
+      - "100000"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/loadgen", "-target", "http://localhost:8080", "-duration", "1s", "-workers", "1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # OPTIONAL "ask the collector" sidecar. Disabled by default (profile).
+  #
+  # IMPORTANT — single-writer across processes. SQLRite's MVCC is
+  # in-process only; cross-process access still serializes through an
+  # exclusive file lock (docs/concurrent-writes.md → Limitations). So
+  # sqlrite-mcp CANNOT open the live events.sqlrite read-only while the
+  # collector holds it open for writing. Use this against a *snapshot*:
+  # stop the collector (or copy events.sqlrite to a snapshot path) and
+  # point the MCP server at that. Launch interactively for stdio MCP:
+  #
+  #   docker compose -f examples/go-collector/docker-compose.yml \
+  #     --profile mcp run --rm mcp
+  #
+  # then wire its stdio into Claude Desktop / Cursor. See the README.
+  mcp:
+    profiles: ["mcp"]
+    image: rust:1-bookworm
+    volumes:
+      - collector-data:/data:ro
+    working_dir: /data
+    # Builds + runs the MCP server read-only against a snapshot copy.
+    command: >
+      bash -lc "cargo install sqlrite-mcp >/dev/null 2>&1 || true;
+                cp -n /data/events.sqlrite /tmp/snapshot.sqlrite;
+                sqlrite-mcp --read-only /tmp/snapshot.sqlrite"
+
+volumes:
+  collector-data:

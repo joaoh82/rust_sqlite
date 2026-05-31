@@ -85,6 +85,18 @@ const itemListJsonLd = {
           "The full SQLRite engine compiled to WebAssembly, running entirely in the browser. SQL editor, sample datasets, HNSW vector search, CSV export, and shareable links — no server, no install.",
       },
     },
+    {
+      "@type": "ListItem",
+      position: 5,
+      item: {
+        "@type": "SoftwareSourceCode",
+        name: "Edge / IoT event collector — Go",
+        url: `${SITE.repo}/tree/main/examples/go-collector`,
+        programmingLanguage: "Go",
+        description:
+          "A Go HTTP collector that buffers telemetry from many concurrent producers into a local .sqlrite file while a background uploader drains it — both writing the same database via BEGIN CONCURRENT (Phase 11 MVCC). Demonstrates multi-writer concurrency + row-level conflict detection with measured throughput.",
+      },
+    },
   ],
 };
 
@@ -172,6 +184,22 @@ const EXAMPLES: Example[] = [
     repoPath: "examples/wasm-playground",
     features: ["WASM SDK", "HNSW", "CodeMirror 6", "OPFS"],
     liveUrl: "/playground",
+  },
+  {
+    status: "shipped",
+    title: "Edge / IoT event collector — Go",
+    blurb:
+      "A Go service that buffers telemetry from many concurrent HTTP producers into a local .sqlrite file, while a background uploader goroutine drains it to a remote sink — both writing the same database at once via BEGIN CONCURRENT (Phase 11 MVCC). The .sqlrite file is the durable buffer between an unreliable network and the upstream system: it survives reboots and stays queryable with SQL on-device.",
+    bullets: [
+      "HTTP write path and uploader each hold their own BEGIN CONCURRENT transaction against one engine via the Go driver's sibling-handle registry — multi-writer concurrency a single-writer DB can't express",
+      "Row-level conflict detection + the canonical retry-on-ErrBusy loop; zero dropped events under 32 concurrent producers (verified by the load generator)",
+      "Honest, measured throughput: on v0 BEGIN CONCURRENT is ~0.9× a single mutex (the win is capability + correctness, not raw speed) — the README ships all three measurement tables and explains why",
+      "Documents the v0 engine sharp edges it designs around: no param binding, 4 KiB MVCC commit cap, app-assigned ids under MVCC, reopen detection without a queryable catalog",
+      "Backpressure (503) + /healthz + /stats; Dockerfile + compose with an optional read-only sqlrite-mcp sidecar; Linux + macOS CI against the in-repo engine",
+    ],
+    language: "Go 1.21+",
+    repoPath: "examples/go-collector",
+    features: ["Go SDK (cgo)", "BEGIN CONCURRENT", "MVCC", "sqlrite-ffi"],
   },
 ];
 
@@ -360,8 +388,8 @@ export default function ExamplesIndexPage() {
               fontSize: 14,
             }}
           >
-            One more example in flight: a Go edge/IoT event collector.
-            See <Link href="/docs">/docs</Link> for the engine reference.
+            All five umbrella examples have shipped. See{" "}
+            <Link href="/docs">/docs</Link> for the engine reference.
           </p>
         </div>
       </section>
