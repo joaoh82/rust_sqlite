@@ -195,6 +195,7 @@ pub fn execute_pragma(stmt: PragmaStatement, db: &mut Database) -> Result<Comman
     match stmt.name.to_ascii_lowercase().as_str() {
         "auto_vacuum" => pragma_auto_vacuum(stmt.value, db),
         "journal_mode" => pragma_journal_mode(stmt.value, db),
+        "table_list" => pragma_table_list(stmt.value, db),
         other => Err(SQLRiteError::NotImplemented(format!(
             "PRAGMA '{other}' is not supported"
         ))),
@@ -242,6 +243,66 @@ fn parse_journal_mode_target(value: &PragmaValue) -> Result<JournalMode> {
         SQLRiteError::General(format!(
             "PRAGMA journal_mode: unknown mode '{s}' (supported: 'wal', 'mvcc')"
         ))
+    })
+}
+
+/// `PRAGMA table_list;` (SQLR-10) — lists the tables in the database so
+/// embedding SDKs can introspect the catalog (discover existing tables
+/// for idempotent migrations) without parsing a rendered `sqlrite_master`
+/// query. Read-only: the write form is rejected.
+///
+/// Columns mirror SQLite's `PRAGMA table_list`: `schema`, `name`, `type`,
+/// `ncol`, `wr`, `strict`. SQLRite has a single schema (`main`), no
+/// WITHOUT ROWID tables, and no STRICT tables, so `wr` and `strict` are
+/// always `0`. The synthetic catalog table `sqlrite_master` is listed
+/// last (matching SQLite, which lists `sqlite_schema`).
+fn pragma_table_list(value: Option<PragmaValue>, db: &Database) -> Result<CommandOutput> {
+    if value.is_some() {
+        return Err(SQLRiteError::General(
+            "PRAGMA table_list does not take a value".to_string(),
+        ));
+    }
+
+    let mut t = PrintTable::new();
+    t.add_row(PrintRow::new(vec![
+        PrintCell::new("schema"),
+        PrintCell::new("name"),
+        PrintCell::new("type"),
+        PrintCell::new("ncol"),
+        PrintCell::new("wr"),
+        PrintCell::new("strict"),
+    ]));
+
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    let mut row_count = 0usize;
+    for name in names {
+        let ncol = db.tables[name].columns.len();
+        t.add_row(PrintRow::new(vec![
+            PrintCell::new("main"),
+            PrintCell::new(name),
+            PrintCell::new("table"),
+            PrintCell::new(&ncol.to_string()),
+            PrintCell::new("0"),
+            PrintCell::new("0"),
+        ]));
+        row_count += 1;
+    }
+
+    // The catalog table itself, listed last (SQLite lists sqlite_schema).
+    t.add_row(PrintRow::new(vec![
+        PrintCell::new("main"),
+        PrintCell::new(crate::sql::pager::MASTER_TABLE_NAME),
+        PrintCell::new("table"),
+        PrintCell::new("5"),
+        PrintCell::new("0"),
+        PrintCell::new("0"),
+    ]));
+    row_count += 1;
+
+    Ok(CommandOutput {
+        status: format!("PRAGMA table_list executed. {row_count} rows returned."),
+        rendered: Some(t.to_string()),
     })
 }
 
@@ -544,6 +605,53 @@ mod tests {
 
         // Default survived the rejected set.
         assert_eq!(db.auto_vacuum_threshold(), Some(0.25));
+    }
+
+    #[test]
+    fn execute_pragma_table_list_lists_tables_and_catalog() {
+        use crate::sql::process_command;
+
+        let mut db = Database::new("t".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE TABLE posts (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+
+        let out = execute_pragma(
+            PragmaStatement {
+                name: "table_list".to_string(),
+                value: None,
+            },
+            &mut db,
+        )
+        .unwrap();
+        let rendered = out.rendered.expect("table_list renders rows");
+        assert!(rendered.contains("users"), "lists user table 'users'");
+        assert!(rendered.contains("posts"), "lists user table 'posts'");
+        assert!(
+            rendered.contains("sqlrite_master"),
+            "lists the catalog table"
+        );
+        // Header columns present.
+        assert!(rendered.contains("ncol"));
+        // 2 user tables + sqlrite_master.
+        assert!(out.status.contains("3 rows"), "status: {}", out.status);
+    }
+
+    #[test]
+    fn execute_pragma_table_list_rejects_value() {
+        let mut db = Database::new("t".to_string());
+        let err = execute_pragma(
+            PragmaStatement {
+                name: "table_list".to_string(),
+                value: Some(PragmaValue::Identifier("x".to_string())),
+            },
+            &mut db,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("does not take a value"));
     }
 
     #[test]

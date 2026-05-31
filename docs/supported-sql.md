@@ -8,7 +8,7 @@ If you're looking for _how_ to use SQLRite (REPL flow, meta-commands, history, e
 
 | Statement | Supported today |
 |---|---|
-| [`CREATE TABLE`](#create-table) | Columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT <literal>`; typed columns; auto-indexes on constrained columns |
+| [`CREATE TABLE`](#create-table) | Columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT <literal>`; typed columns; auto-indexes on constrained columns; `IF NOT EXISTS` |
 | [`CREATE [UNIQUE] INDEX`](#create-index) | Single-column named indexes, `IF NOT EXISTS`, persisted as cell-based B-Trees |
 | [`INSERT INTO`](#insert-into) | Auto-ROWID, UNIQUE/PK enforcement, clean type errors, NULL/DEFAULT padding |
 | [`SELECT`](#select) | `*` or column list, `WHERE`, single-column `ORDER BY`, `LIMIT`; index probing on `col = literal` |
@@ -52,8 +52,10 @@ let rows = stmt
 ## `CREATE TABLE`
 
 ```sql
-CREATE TABLE <name> (<col> <type> [column_constraint]* [, ...]);
+CREATE TABLE [IF NOT EXISTS] <name> (<col> <type> [column_constraint]* [, ...]);
 ```
+
+`IF NOT EXISTS` (SQLR-10) makes a re-create a no-op when a table of that name already exists, instead of erroring — so "run my schema on every startup" migrations work against a populated database. The clause is honoured **by name only**: SQLRite does not diff the existing schema against the new column list (SQLite behaves the same). Without `IF NOT EXISTS`, re-creating an existing table still errors.
 
 ### Column types
 
@@ -80,7 +82,7 @@ CREATE TABLE <name> (<col> <type> [column_constraint]* [, ...]);
 
 ### Errors returned
 
-- `Table 'foo' already exists.` — duplicate `CREATE TABLE`.
+- `Cannot create, table already exists.` — duplicate `CREATE TABLE` (suppressed to a no-op when the statement uses `IF NOT EXISTS`).
 - `'sqlrite_master' is a reserved name used by the internal schema catalog` — you tried to shadow the catalog table.
 - `Column 'foo' appears more than once in the table definition` — duplicate column names.
 - `PRIMARY KEY column must be INTEGER` — PK on a non-integer column.
@@ -108,7 +110,7 @@ Every `PRIMARY KEY` and every `UNIQUE` column gets an auto-index at `CREATE TABL
 sqlrite_autoindex_<table>_<column>
 ```
 
-These are full-citizen indexes — they're visible via `.tables`-adjacent catalog queries (once those land), persist across saves, and accelerate equality probes. You don't need to `CREATE INDEX` them yourself.
+These are full-citizen indexes — they show up in [`sqlrite_master`](#querying-the-catalog-sqlrite_master) catalog queries, persist across saves, and accelerate equality probes. You don't need to `CREATE INDEX` them yourself.
 
 ### HNSW indexes (Phase 7d)
 
@@ -266,6 +268,34 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 - **Window functions** (`OVER (...)`, `FILTER (WHERE ...)`, `WITHIN GROUP`)
 
 Any of the above reaches the executor as a parsed AST node that execution doesn't handle, producing either `NotImplemented` or a more specific error (e.g., `joins are not supported`).
+
+### Querying the catalog (`sqlrite_master`)
+
+SQLRite's schema catalog is exposed to SQL as a read-only table named `sqlrite_master` (SQLR-10), mirroring SQLite's `sqlite_master`. Embedders use it to introspect what's in a database — for example to discover existing tables before running migrations.
+
+```sql
+SELECT name FROM sqlrite_master;                       -- every table + index
+SELECT name FROM sqlrite_master WHERE type = 'table';  -- tables only
+SELECT name FROM sqlrite_master WHERE type = 'index';  -- indexes only (incl. auto-indexes)
+SELECT * FROM sqlrite_master WHERE name = 'users';     -- full row for one object
+```
+
+Columns (same schema the catalog persists with on disk):
+
+| Column | Type | Meaning |
+|---|---|---|
+| `type` | text | `'table'` or `'index'` |
+| `name` | text | object name |
+| `sql` | text | the `CREATE TABLE` / `CREATE INDEX` text that recreates the object |
+| `rootpage` | integer | always `0` in this live view — page numbers are assigned at save time, not at query time. Kept for schema parity with the persisted catalog. |
+| `last_rowid` | integer | a table's current auto-ROWID high-water mark (`0` for index rows) |
+
+Notes:
+
+- The catalog is synthesized on demand from the live database, so it reflects uncommitted in-memory state, not just what's been saved.
+- It is **read-only**: `INSERT` / `UPDATE` / `DELETE` against `sqlrite_master` are rejected, as are `CREATE TABLE` / `DROP TABLE` / `ALTER TABLE` that target the reserved name.
+- It works in the single-table `SELECT` path (`WHERE`, projections, `ORDER BY`, `LIMIT`). Joining `sqlrite_master` against another table is not supported.
+- For a lighter-weight "what tables exist" check, [`PRAGMA table_list`](#pragma-table_list-sqlr-10) returns a column count per table without synthesizing SQL.
 
 ---
 
@@ -578,6 +608,27 @@ PRAGMA journal_mode = wal;      -- switch back (rejected if the MvStore
 Case-insensitive on both the pragma name and the value. Quoted values (`'mvcc'`) work; numeric values are rejected (the field is enum-shaped). Unknown modes return a typed error and don't disturb the existing setting.
 
 The setting is **per-database** — every `Connection::connect` sibling sees the same value. Reachable through the public API as `Connection::journal_mode() -> JournalMode`.
+
+### `PRAGMA table_list` (SQLR-10)
+
+Lists the tables in the database — the quick "what's in here?" introspection that SDK / FFI / MCP consumers reach for when they can't run a full [`sqlrite_master`](#querying-the-catalog-sqlrite_master) query. Read-only; the write form (`PRAGMA table_list = …`) is rejected.
+
+```sql
+PRAGMA table_list;              -- one row per user table, plus sqlrite_master
+```
+
+Columns mirror SQLite's `PRAGMA table_list`:
+
+| Column | Meaning |
+|---|---|
+| `schema` | always `main` (SQLRite has a single schema) |
+| `name` | table name |
+| `type` | always `table` (SQLRite doesn't expose views) |
+| `ncol` | number of declared columns |
+| `wr` | always `0` (no WITHOUT ROWID tables) |
+| `strict` | always `0` (no STRICT tables) |
+
+The synthetic catalog table `sqlrite_master` is listed last (SQLite lists `sqlite_schema` the same way). Indexes are **not** listed here — query [`sqlrite_master`](#querying-the-catalog-sqlrite_master) `WHERE type = 'index'` for those.
 
 ---
 

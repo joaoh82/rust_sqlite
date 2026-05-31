@@ -618,6 +618,105 @@ fn build_empty_master_table() -> Table {
     build_empty_table(MASTER_TABLE_NAME, columns, 0)
 }
 
+/// SQLR-10 — builds an in-memory, read-only snapshot of `sqlrite_master`
+/// from the live `Database`, so `SELECT … FROM sqlrite_master` can
+/// introspect the catalog without a save round-trip. One row per user
+/// table and per index (B-Tree / HNSW / FTS), reusing the exact same SQL
+/// synthesis the persistence path uses — so the `name` / `type` / `sql`
+/// columns match byte-for-byte what a saved-then-dumped catalog shows.
+///
+/// Rows are ordered deterministically: tables sorted by name, then
+/// indexes sorted by `(owning_table, index_name)` — mirroring
+/// [`save_database_with_mode`]'s staging order.
+///
+/// The `rootpage` column is `0` for every row: page assignment only
+/// happens at save time, so a live/in-memory view has no meaningful page
+/// number. The column is kept for schema parity with the persisted
+/// catalog (and SQLite's `sqlite_master`); callers needing introspection
+/// use `type` / `name` / `sql`. `last_rowid` carries the table's current
+/// auto-increment high-water mark (0 for index rows).
+pub(crate) fn build_master_table_snapshot(db: &Database) -> Result<Table> {
+    let mut master = build_empty_master_table();
+
+    let mut entries: Vec<CatalogEntry> = Vec::new();
+
+    // Tables, sorted by name.
+    let mut table_names: Vec<&String> = db.tables.keys().collect();
+    table_names.sort();
+    for name in &table_names {
+        let table = &db.tables[*name];
+        entries.push(CatalogEntry {
+            kind: "table".into(),
+            name: (*name).clone(),
+            sql: table_to_create_sql(table),
+            rootpage: 0,
+            last_rowid: table.last_rowid,
+        });
+    }
+
+    // Indexes across all three families, sorted by (table, index name) —
+    // collected into one list so the final order matches how a reopened
+    // catalog enumerates them.
+    let mut index_entries: Vec<(String, String, String)> = Vec::new(); // (table, index_name, sql)
+    for table in db.tables.values() {
+        for idx in &table.secondary_indexes {
+            index_entries.push((
+                table.tb_name.clone(),
+                idx.name.clone(),
+                idx.synthesized_sql(),
+            ));
+        }
+        for entry in &table.hnsw_indexes {
+            index_entries.push((
+                table.tb_name.clone(),
+                entry.name.clone(),
+                synthesize_hnsw_create_index_sql(
+                    &entry.name,
+                    &table.tb_name,
+                    &entry.column_name,
+                    entry.metric,
+                ),
+            ));
+        }
+        for entry in &table.fts_indexes {
+            index_entries.push((
+                table.tb_name.clone(),
+                entry.name.clone(),
+                format!(
+                    "CREATE INDEX {} ON {} USING fts ({})",
+                    entry.name, table.tb_name, entry.column_name
+                ),
+            ));
+        }
+    }
+    index_entries.sort_by(|(ta, ia, _), (tb, ib, _)| ta.cmp(tb).then(ia.cmp(ib)));
+    for (_table, name, sql) in index_entries {
+        entries.push(CatalogEntry {
+            kind: "index".into(),
+            name,
+            sql,
+            rootpage: 0,
+            last_rowid: 0,
+        });
+    }
+
+    for (i, entry) in entries.into_iter().enumerate() {
+        let rowid = (i as i64) + 1;
+        master.restore_row(
+            rowid,
+            vec![
+                Some(Value::Text(entry.kind)),
+                Some(Value::Text(entry.name)),
+                Some(Value::Text(entry.sql)),
+                Some(Value::Integer(entry.rootpage as i64)),
+                Some(Value::Integer(entry.last_rowid)),
+            ],
+        )?;
+    }
+
+    Ok(master)
+}
+
 /// Reads a required Text column from a known-good catalog row.
 fn take_text(table: &Table, col: &str, rowid: i64) -> Result<String> {
     match table.get_value(col, rowid) {

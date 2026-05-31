@@ -20,9 +20,14 @@
 //
 //   - No parameter binding in the Go SDK → values are inlined via the
 //     helpers in sqlquote.go.
-//   - `CREATE TABLE IF NOT EXISTS` is not honored and `sqlrite_master`
-//     isn't queryable → migrate() probes for the events table with a
-//     SELECT and only runs DDL on a fresh database.
+//   - migrate() probes for the events table with a SELECT and only runs
+//     DDL on a fresh database. NOTE: as of SQLR-10 the engine now honors
+//     `CREATE TABLE IF NOT EXISTS` and exposes a queryable `sqlrite_master`
+//     (and `PRAGMA table_list`), so the table-existence probe is no longer
+//     strictly required for table creation. We keep the fresh/reopen
+//     distinction because the `CREATE INDEX` below must NOT be re-issued on
+//     reopen (it's rejected once `journal_mode = mvcc`); the probe also
+//     keeps this example working against pre-SQLR-10 engine builds.
 //   - `CREATE INDEX` is rejected once `journal_mode = mvcc` → all DDL,
 //     including the optional secondary index, runs at migrate time
 //     before MVCC is switched on.
@@ -191,18 +196,18 @@ func (s *Store) Close() error {
 }
 
 // migrate creates the schema on a fresh database and is a no-op on
-// reopen. Two engine constraints (both verified against the v0 engine)
-// shape this:
+// reopen. What shapes this:
 //
-//   - `CREATE TABLE IF NOT EXISTS` is NOT honored — a second create of
-//     an existing table errors "table already exists" — and the
-//     `sqlrite_master` catalog isn't queryable. So we detect a fresh
-//     database by probing for the events table with a cheap SELECT and
-//     only run DDL when it's absent.
+//   - We detect a fresh database by probing for the events table with a
+//     cheap SELECT and only run DDL when it's absent. As of SQLR-10 the
+//     engine honors `CREATE TABLE IF NOT EXISTS` and exposes a queryable
+//     `sqlrite_master`, so the tables alone wouldn't need the probe — but
+//     see the next point.
 //   - `CREATE INDEX` is rejected once `journal_mode = mvcc`. All DDL
 //     (tables + the optional index) therefore runs on the fresh path,
 //     in WAL mode, *before* the MVCC switch. On reopen the index already
-//     exists, so we never re-issue it.
+//     exists, so we never re-issue it — which is why the fresh/reopen
+//     probe stays even though IF NOT EXISTS would cover the tables.
 func (s *Store) migrate(ctx context.Context) error {
 	fresh := !s.tableExists(ctx, "events")
 
@@ -260,10 +265,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
-// tableExists probes for a table with a zero-row SELECT. The engine has
-// no queryable catalog and rejects `CREATE TABLE IF NOT EXISTS`, so this
-// probe is how we tell a fresh database from a reopened one. A query
-// error (the engine returns "Table '<name>' not found") means absent.
+// tableExists probes for a table with a zero-row SELECT. This is how we
+// tell a fresh database from a reopened one so the MVCC-incompatible
+// `CREATE INDEX` only runs once. A query error (the engine returns
+// "Table '<name>' not found") means absent. (As of SQLR-10 the engine
+// also exposes `sqlrite_master` and `PRAGMA table_list` for catalog
+// introspection — either could back this probe on a current engine.)
 func (s *Store) tableExists(ctx context.Context, name string) bool {
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s LIMIT 1", name))
 	if err != nil {
