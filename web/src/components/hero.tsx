@@ -28,6 +28,9 @@ export function Hero() {
               <Link className="btn btn-primary" href="/docs">
                 Get started <span>→</span>
               </Link>
+              <Link className="btn" href="/playground">
+                ▸ Try it in your browser
+              </Link>
               <a
                 className="btn"
                 href={SITE.repo}

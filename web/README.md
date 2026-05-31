@@ -16,6 +16,7 @@ extracted into its own repository later without rewrites.
 ## Pages
 
 - `/` — landing (hero with animated REPL, features, architecture, roadmap, SDK switcher, SQL surface, desktop showcase, blog series, footer)
+- `/playground` — in-browser SQL playground: the full engine compiled to WebAssembly, with a CodeMirror editor, sample datasets, HNSW vector search, and OPFS session persistence. The WASM bundle is a pinned copy of `sdk/wasm/pkg/` vendored into `public/playground/pkg/`. See [`../examples/wasm-playground/README.md`](../examples/wasm-playground/README.md).
 - `/docs` — Getting Started page (sticky sidebar nav + on-page TOC)
 - `/blog` — index of long-form posts pulled from `content/blog/*.mdx`
 - `/blog/[slug]` — per-post detail page (MDX rendered server-side, `Article` JSON-LD, breadcrumb JSON-LD, dynamic OG image, prev/next navigation)

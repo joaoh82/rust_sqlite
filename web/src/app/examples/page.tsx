@@ -72,6 +72,19 @@ const itemListJsonLd = {
           "A markdown daily-notes desktop app backed by a single .sqlrite file. Phase 8 BM25 full-text search with hit highlighting, click-to-filter tags, and an 'ask my journal' panel powered by the engine's natural-language SQL feature.",
       },
     },
+    {
+      "@type": "ListItem",
+      position: 4,
+      item: {
+        "@type": "WebApplication",
+        name: "Browser SQL playground — WASM",
+        url: `${SITE.url}/playground`,
+        applicationCategory: "DeveloperApplication",
+        operatingSystem: "Any (WebAssembly)",
+        description:
+          "The full SQLRite engine compiled to WebAssembly, running entirely in the browser. SQL editor, sample datasets, HNSW vector search, CSV export, and shareable links — no server, no install.",
+      },
+    },
   ],
 };
 
@@ -83,6 +96,8 @@ type Example = {
   language: string;
   repoPath: string;
   features: string[];
+  /** Optional live URL (the playground is hosted on the site itself). */
+  liveUrl?: string;
   /** Optional repo-relative path to a demo asset (GIF/MP4) rendered
    * on the card as a poster + link. Currently only the journal app
    * has one — see SQLR-41's Remotion composition. */
@@ -140,6 +155,23 @@ const EXAMPLES: Example[] = [
       gifPath: "examples/desktop-journal/docs/demo.gif",
       mp4Path: "examples/desktop-journal/docs/demo.mp4",
     },
+  },
+  {
+    status: "shipped",
+    title: "Browser SQL playground — WebAssembly",
+    blurb:
+      "The full SQLRite engine compiled to WebAssembly, running entirely in a browser tab — no server, no install, no account. Type SQL, hit Run, see results. Load a Pokémon / Northwind / movies-with-embeddings dataset in one click, then poke at JOINs, GROUP BY, and HNSW cosine vector search right on the page.",
+    bullets: [
+      "Same sqlrite-engine crate as every other SDK, built for wasm32 via @joaoh82/sqlrite-wasm (~750 KB gzipped, fetched once)",
+      "CodeMirror 6 editor with SQL highlighting + Cmd/Ctrl+Enter; results grid with column types, NULL highlighting, and CSV export",
+      "Vector-search demo dataset: 12 films with 4-dim embeddings + an HNSW index, ranked by vec_distance_cosine in the browser",
+      "Session persists to OPFS (localStorage fallback) via SQL-script replay; share a query by URL hash; download / upload .sql",
+      "Hosted on this site — open it live, no clone required",
+    ],
+    language: "WebAssembly",
+    repoPath: "examples/wasm-playground",
+    features: ["WASM SDK", "HNSW", "CodeMirror 6", "OPFS"],
+    liveUrl: "/playground",
   },
 ];
 
@@ -291,6 +323,11 @@ export default function ExamplesIndexPage() {
                     marginTop: 8,
                   }}
                 >
+                  {ex.liveUrl ? (
+                    <Link className="btn btn-primary" href={ex.liveUrl}>
+                      ▸ Try it live
+                    </Link>
+                  ) : null}
                   <a
                     className="btn"
                     href={`${SITE.repo}/tree/main/${ex.repoPath}`}
@@ -323,9 +360,8 @@ export default function ExamplesIndexPage() {
               fontSize: 14,
             }}
           >
-            More examples in flight: a browser SQL playground (WASM)
-            and a Go edge/IoT event collector. See{" "}
-            <Link href="/docs">/docs</Link> for the engine reference.
+            One more example in flight: a Go edge/IoT event collector.
+            See <Link href="/docs">/docs</Link> for the engine reference.
           </p>
         </div>
       </section>
