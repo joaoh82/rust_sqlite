@@ -172,14 +172,15 @@ sqlrite> DELETE FROM users WHERE age < 30;
 
 | Statement | Features |
 |---|---|
-| `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN`. Auto-creates `sqlrite_autoindex_<table>_<col>` for every PK + UNIQUE column |
+| `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; `IF NOT EXISTS` (idempotent re-create); duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN`. Auto-creates `sqlrite_autoindex_<table>_<col>` for every PK + UNIQUE column |
 | `CREATE [UNIQUE] INDEX` | Single-column, named indexes; `IF NOT EXISTS`; persists as a dedicated cell-based B-Tree. INTEGER + TEXT columns only |
 | `INSERT INTO` | Explicit column list required; auto-ROWID for `INTEGER PRIMARY KEY`; multi-row `VALUES (…), (…)`; UNIQUE enforcement; clean type errors (no panics); NULL padding for omitted columns |
-| `SELECT` | `*` or column list with optional `AS alias`; `WHERE`; `DISTINCT`; `GROUP BY col[, col …]`; aggregate projections `COUNT(*)` / `COUNT([DISTINCT] col)` / `SUM` / `AVG` / `MIN` / `MAX`; `[INNER\|LEFT OUTER\|RIGHT OUTER\|FULL OUTER] JOIN ... ON ...` with table aliases and qualified `t.col` references; single-column `ORDER BY [ASC\|DESC]` (also resolves alias and aggregate display names); `LIMIT n`. `WHERE col = literal` probes an index when one exists |
+| `SELECT` | `*` or column list with optional `AS alias`; `WHERE`; `DISTINCT`; `GROUP BY col[, col …]`; aggregate projections `COUNT(*)` / `COUNT([DISTINCT] col)` / `SUM` / `AVG` / `MIN` / `MAX`; `[INNER\|LEFT OUTER\|RIGHT OUTER\|FULL OUTER] JOIN ... ON ...` with table aliases and qualified `t.col` references; single-column `ORDER BY [ASC\|DESC]` (also resolves alias and aggregate display names); `LIMIT n`. `WHERE col = literal` probes an index when one exists. Catalog introspection via `SELECT … FROM sqlrite_master` |
 | `UPDATE` | Multi-column `SET`; `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Real transactions, snapshot-based; WAL-backed commit; single-level (no savepoints); auto-rollback if `COMMIT`'s disk write fails |
 | `PRAGMA auto_vacuum` | Read (`PRAGMA auto_vacuum;`) returns the trigger threshold as a single-row result set; set (`PRAGMA auto_vacuum = 0.5;` / `= OFF;` / `= NONE;`) tunes or disables auto-VACUUM at the SQL layer for SDK / FFI / MCP consumers |
+| `PRAGMA table_list` | Lists tables (`schema`, `name`, `type`, `ncol`, `wr`, `strict`) plus the `sqlrite_master` catalog — lightweight catalog introspection for SDK / FFI / MCP consumers |
 
 Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 

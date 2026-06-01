@@ -74,6 +74,10 @@ pub struct CreateQuery {
     pub table_name: String,
     /// Vector of `ParsedColumn` type with column metadata information
     pub columns: Vec<ParsedColumn>,
+    /// `true` when the statement was `CREATE TABLE IF NOT EXISTS …`.
+    /// When set, re-creating an existing table is a no-op rather than
+    /// an error — matching `CREATE INDEX IF NOT EXISTS` and SQLite.
+    pub if_not_exists: bool,
 }
 
 /// Parses a single sqlparser `ColumnDef` into our internal `ParsedColumn`
@@ -282,6 +286,7 @@ impl CreateQuery {
                 name,
                 columns,
                 constraints,
+                if_not_exists,
                 ..
             }) => {
                 let table_name = name;
@@ -322,6 +327,7 @@ impl CreateQuery {
                 Ok(CreateQuery {
                     table_name: table_name.to_string(),
                     columns: parsed_columns,
+                    if_not_exists: *if_not_exists,
                 })
             }
 
@@ -364,5 +370,27 @@ mod tests {
                 Err(_) => panic!("an error occured during parsing CREATE TABLE Statement"),
             }
         }
+    }
+
+    /// SQLR-10 — the `IF NOT EXISTS` clause must surface on `CreateQuery`
+    /// so the executor can treat a re-create as a no-op.
+    #[test]
+    fn create_query_captures_if_not_exists_flag() {
+        let dialect = SqlriteDialect::new();
+
+        // Without IF NOT EXISTS → flag is false.
+        let mut ast =
+            Parser::parse_sql(&dialect, "CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+        let q = ast.pop().unwrap();
+        assert!(!CreateQuery::new(&q).unwrap().if_not_exists);
+
+        // With IF NOT EXISTS → flag is true.
+        let mut ast = Parser::parse_sql(
+            &dialect,
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        let q = ast.pop().unwrap();
+        assert!(CreateQuery::new(&q).unwrap().if_not_exists);
     }
 }

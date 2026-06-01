@@ -240,9 +240,23 @@ pub fn process_ast_with_render(query: Statement, db: &mut Database) -> Result<Co
                     // Checking if table already exists, after parsing CREATE TABLE query
                     match db.contains_table(table_name.to_string()) {
                         true => {
-                            return Err(SQLRiteError::Internal(
-                                "Cannot create, table already exists.".to_string(),
-                            ));
+                            // SQLR-10: `CREATE TABLE IF NOT EXISTS` is a no-op
+                            // when the table already exists, so idempotent
+                            // "run my schema on every startup" migrations work
+                            // against a populated DB. Matches the existing
+                            // `CREATE INDEX IF NOT EXISTS` behaviour and SQLite.
+                            // The clause is honoured by name only — we do NOT
+                            // diff the existing schema against the new column
+                            // list (SQLite doesn't either).
+                            if payload.if_not_exists {
+                                message = format!(
+                                    "CREATE TABLE Statement executed. (table '{table_name}' already exists, no-op)"
+                                );
+                            } else {
+                                return Err(SQLRiteError::Internal(
+                                    "Cannot create, table already exists.".to_string(),
+                                ));
+                            }
                         }
                         false => {
                             let table = Table::new(payload);
@@ -1904,6 +1918,169 @@ mod tests {
         .unwrap();
         let table = db.get_table("docs".to_string()).unwrap();
         assert_eq!(table.hnsw_indexes.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // SQLR-10 — CREATE TABLE IF NOT EXISTS + sqlrite_master introspection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn create_table_if_not_exists_is_idempotent() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        // Second CREATE with IF NOT EXISTS must succeed as a no-op
+        // (this is the bug: it used to error "table already exists").
+        let msg = process_command(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v INTEGER);",
+            &mut db,
+        )
+        .expect("CREATE TABLE IF NOT EXISTS should be a no-op on an existing table");
+        assert!(
+            msg.to_lowercase().contains("no-op"),
+            "expected a no-op status; got: {msg}"
+        );
+        // The original table is untouched — still exactly one table.
+        assert_eq!(db.tables.len(), 1);
+    }
+
+    #[test]
+    fn create_table_without_if_not_exists_still_errors() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        let err = process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut db).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("already exists"),
+            "plain CREATE TABLE on an existing table must still error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_table_if_not_exists_on_fresh_table_creates_it() {
+        let mut db = Database::new("tempdb".to_string());
+        // IF NOT EXISTS on a brand-new name still creates the table.
+        process_command(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v INTEGER);",
+            &mut db,
+        )
+        .unwrap();
+        assert!(db.contains_table("t".to_string()));
+    }
+
+    #[test]
+    fn select_from_sqlrite_master_lists_tables_and_indexes() {
+        use crate::sql::executor::execute_select_rows;
+        use crate::sql::parser::select::SelectQuery;
+
+        let mut db = Database::new("tempdb".to_string());
+        process_command(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+            &mut db,
+        )
+        .unwrap();
+        process_command("CREATE TABLE posts (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        process_command("CREATE INDEX ix_email ON users (email);", &mut db).unwrap();
+
+        // Helper: run a SELECT and return structured rows.
+        let run = |sql: &str, db: &Database| -> Vec<Vec<Value>> {
+            let dialect = SqlriteDialect::new();
+            let mut ast = Parser::parse_sql(&dialect, sql).unwrap();
+            let sq = SelectQuery::new(&ast.pop().unwrap()).unwrap();
+            execute_select_rows(sq, db).unwrap().rows
+        };
+
+        // The exact bug from the issue: SELECT name FROM sqlrite_master.
+        let names: Vec<String> = run("SELECT name FROM sqlrite_master;", &db)
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.clone(),
+                other => panic!("expected Text name, got {other:?}"),
+            })
+            .collect();
+        assert!(names.contains(&"users".to_string()));
+        assert!(names.contains(&"posts".to_string()));
+        // The user's UNIQUE column produced an auto-index plus our explicit
+        // one — both should be visible by name.
+        assert!(names.contains(&"ix_email".to_string()));
+
+        // type filtering works through the normal WHERE path.
+        let table_rows = run("SELECT name FROM sqlrite_master WHERE type = 'table';", &db);
+        assert_eq!(table_rows.len(), 2, "two user tables");
+
+        let index_rows = run("SELECT name FROM sqlrite_master WHERE type = 'index';", &db);
+        assert!(
+            !index_rows.is_empty(),
+            "at least the explicit ix_email index"
+        );
+
+        // SELECT * exposes the full catalog schema (type, name, sql, …).
+        let all = run("SELECT * FROM sqlrite_master WHERE name = 'users';", &db);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].len(), 5, "type, name, sql, rootpage, last_rowid");
+        match &all[0][2] {
+            Value::Text(sql) => assert!(
+                sql.to_uppercase().contains("CREATE TABLE"),
+                "sql column should carry the CREATE TABLE text; got: {sql}"
+            ),
+            other => panic!("expected Text sql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writes_to_sqlrite_master_are_rejected() {
+        let mut db = Database::new("tempdb".to_string());
+        process_command("CREATE TABLE t (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        // sqlrite_master is read-only: it never lands in db.tables, so an
+        // INSERT can't find it. (The reserved-name guard also blocks
+        // CREATE/DROP/ALTER against it.)
+        assert!(
+            process_command(
+                "INSERT INTO sqlrite_master (type, name) VALUES ('table', 'x');",
+                &mut db
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn select_from_sqlrite_master_survives_save_and_reopen() {
+        use crate::sql::executor::execute_select_rows;
+        use crate::sql::pager::{open_database, save_database};
+        use crate::sql::parser::select::SelectQuery;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sqlr10_master_{}.sqlrite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::new("tempdb".to_string());
+        process_command("CREATE TABLE alpha (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        process_command("CREATE TABLE beta (id INTEGER PRIMARY KEY);", &mut db).unwrap();
+        save_database(&mut db, &path).unwrap();
+
+        let reopened = open_database(&path, "tempdb".to_string()).unwrap();
+        let dialect = SqlriteDialect::new();
+        let mut ast = Parser::parse_sql(
+            &dialect,
+            "SELECT name FROM sqlrite_master WHERE type = 'table';",
+        )
+        .unwrap();
+        let sq = SelectQuery::new(&ast.pop().unwrap()).unwrap();
+        let names: Vec<String> = execute_select_rows(sq, &reopened)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.clone(),
+                other => panic!("expected Text, got {other:?}"),
+            })
+            .collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // -----------------------------------------------------------------

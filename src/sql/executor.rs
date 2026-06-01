@@ -192,9 +192,23 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         return execute_select_rows_joined(query, db);
     }
 
-    let table = db
-        .get_table(query.table_name.clone())
-        .map_err(|_| SQLRiteError::Internal(format!("Table '{}' not found", query.table_name)))?;
+    // SQLR-10 — `SELECT … FROM sqlrite_master` introspects the catalog.
+    // The catalog isn't a live entry in `db.tables` (it's materialized at
+    // save time), so we synthesize a read-only in-memory snapshot on
+    // demand and run the normal single-table path against it. WHERE /
+    // projections / ORDER BY / LIMIT all work unchanged. Writes against
+    // sqlrite_master remain rejected (it never lands in `db.tables`), and
+    // joins against it are not supported (the joined path doesn't
+    // synthesize it).
+    let master_snapshot;
+    let table: &Table = if query.table_name == crate::sql::pager::MASTER_TABLE_NAME {
+        master_snapshot = crate::sql::pager::build_master_table_snapshot(db)?;
+        &master_snapshot
+    } else {
+        db.get_table(query.table_name.clone()).map_err(|_| {
+            SQLRiteError::Internal(format!("Table '{}' not found", query.table_name))
+        })?
+    };
 
     // SQLR-3: Materialize the projection as `Vec<ProjectionItem>` so
     // both the simple-row path and the aggregation path can iterate the
