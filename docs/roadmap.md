@@ -561,7 +561,7 @@ The biggest single SQL-surface jump in the project's history.
 - Self-joins require an alias on at least one side.
 - `WHERE` runs after joins (the standard `LEFT JOIN ... WHERE right.col IS NULL` anti-join idiom works).
 
-Not yet supported: `CROSS JOIN`, comma-separated FROMs, `NATURAL JOIN`, `JOIN ... USING (col)`, aggregates / `GROUP BY` / `DISTINCT` *over* a join, `fts_match` / `bm25_score` inside a join expression. Algorithm: plain nested-loop, O(N×M) per level — hash / merge joins are a future optimization.
+`ON`, `USING (...)`, `NATURAL`, and `CROSS JOIN` are all supported. Not yet supported: comma-separated FROMs (`FROM a, b`), aggregates / `GROUP BY` / `DISTINCT` *over* a join, `fts_match` / `bm25_score` inside a join expression. Algorithm: plain nested-loop, O(N×M) per level — hash / merge joins are a future optimization.
 
 ### ✅ Phase 9g — Prepared statements + parameter binding *(v0.9.0, SQLR-23)*
 
