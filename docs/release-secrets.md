@@ -163,8 +163,12 @@ For each placeholder you just published:
 3. **Add publisher**:
    - **Publisher**: GitHub Actions
    - **Organization or user**: `joaoh82`
-   - **Repository**: `rust_sqlite` *(repo basename, not
-     `joaoh82/rust_sqlite` — npm prepends the owner field)*
+   - **Repository**: `rust_sqlite` *(repo basename only — not
+     `joaoh82/rust_sqlite` (npm prepends the owner field), and
+     definitely not a full URL like the package's
+     `npmjs.com/package/…/access` page. Pasting that URL into this
+     field is exactly what silently broke the `sqlrite-notes`
+     publish — see §3c.)*
    - **Workflow filename**: `release.yml` *(basename, not
      `.github/workflows/release.yml`)*
    - **Environment**: `release` *(case-sensitive — must match the
@@ -232,6 +236,24 @@ and amend the repo per the note above.
 
 **Verify**: status flips from "pending" to "active" after the
 first successful CI publish.
+
+**Status (resolved — SQLR-13, June 2026):** `sqlrite-notes` is
+configured and publishing via OIDC; it shipped its first real version
+at `0.11.0`.
+
+> **Gotcha that bit us (SQLR-13):** the trusted-publisher **Repository**
+> field had been set to the package's npmjs access-page URL
+> (`https://www.npmjs.com/package/sqlrite-notes/access`) instead of the
+> bare repo name. The OIDC subject claim the workflow sends is
+> `repo:joaoh82/rust_sqlite:environment:release`, so it didn't match the
+> record, and every `publish-notes-example` run failed with `OIDC token
+> exchange error - package not found` (npm's misleading 404 for "no
+> trusted publisher matches your token's claims"). This surfaced only
+> when [#156](https://github.com/joaoh82/rust_sqlite/pull/156) made the
+> release idempotent and a re-dispatch finally *attempted* the
+> first-ever `sqlrite-notes` publish — before that, the wave had always
+> died earlier and never reached this job. **Fix:** Edit the publisher
+> and set Repository to exactly `rust_sqlite` — no owner prefix, no URL.
 
 ---
 
