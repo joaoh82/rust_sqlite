@@ -35,6 +35,28 @@ description = "Light version of SQLite developed with Rust. Published as `sqlrit
 repository = "https://github.com/joaoh82/rust_sqlite"
 license = "MIT"
 
+# Allowlist of files that ship in the published crate. The package root
+# IS the workspace root, so without this `cargo publish` sweeps the
+# ENTIRE repo tree — every sibling member, plus `web/`, `images/`, and
+# the `examples/desktop-journal/docs/` demo media. That ballooned the
+# v0.11.0 tarball to ~25 MiB and crates.io rejected it (HTTP 413, 10 MiB
+# cap) after SQLR-42/43 landed the playground wasm + the journal
+# demo.gif/.mp4. An allowlist (vs. a fragile `exclude`) keeps the crate
+# small no matter what large files land elsewhere in the repo later.
+#
+# What's listed: the library + REPL bin sources (`src/**`), the three
+# `[[example]]` targets declared below (their `.rs` files must be in the
+# tarball or `cargo publish`'s verify step fails to parse the manifest),
+# and the readme/license. `Cargo.toml` is always included implicitly.
+include = [
+    "src/**/*",
+    "examples/rust/quickstart.rs",
+    "examples/hybrid-retrieval/hybrid_retrieval.rs",
+    "examples/rust/concurrent_writers.rs",
+    "README.md",
+    "LICENSE",
+]
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
