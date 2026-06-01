@@ -6,8 +6,8 @@
 #     scripts/bump-version.sh 0.2.0
 #
 # Rewrites the version field in every manifest that carries one
-# (nine Cargo.toml / pyproject.toml files, plus four JSON manifests
-# — thirteen files total). Also rewrites the engine npm dep pin in
+# (ten Cargo.toml / pyproject.toml files, plus four JSON manifests
+# — fourteen files total). Also rewrites the engine npm dep pin in
 # `examples/nodejs-notes/package.json` so the published example
 # resolves the matching engine. Then you run `cargo build` yourself
 # to refresh Cargo.lock. Idempotent: running twice with the same version
@@ -77,6 +77,16 @@ TOML_FILES=(
     "sdk/nodejs/Cargo.toml"
     "sdk/wasm/Cargo.toml"
     "desktop/src-tauri/Cargo.toml"
+    # `sqlrite-journal` is the second Tauri desktop app (the
+    # concurrent-writes journal example, SQLR-43). It's a workspace
+    # member that pins `sqlrite-engine` via a path+version dep, so —
+    # exactly like `desktop/src-tauri` — both its package version and
+    # that dep pin have to track the bump. Omitting it survived patch
+    # releases (a `^0.10.1` pin still matched `0.10.x`) but broke the
+    # first MINOR bump: `0.11.0` falls outside `^0.10.1`, so the
+    # workspace lock refresh failed to select a version (release-pr run
+    # 26737256013). Keep it here so the dep pin never lags the engine.
+    "examples/desktop-journal/src-tauri/Cargo.toml"
 )
 
 # Files that pin `sqlrite-engine` (or any other workspace member) but
