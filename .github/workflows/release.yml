@@ -173,7 +173,33 @@ jobs:
         with:
           shared-key: publish-crate
 
+      # Idempotency guard (SQLR-12). A re-dispatch of release.yml at a
+      # version where some-but-not-all artifacts already published (the
+      # v0.11.0 partial failure: the engine 413'd but every other channel
+      # had already shipped) must SKIP what's done and publish only what's
+      # missing — instead of erroring with "crate version already uploaded".
+      # crates.io returns HTTP 200 for an existing crate@version, 404 for a
+      # missing one. The `User-Agent` header is mandatory: crates.io 403s
+      # any request without one. On a transport error (curl fails → "000")
+      # we fall through to publish, preserving the old fail-loud behavior.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-engine/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-engine@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-engine@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
       - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
@@ -236,7 +262,26 @@ jobs:
         with:
           shared-key: publish-ask
 
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. crates.io: 200 = already published (skip), else publish.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-ask/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-ask@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-ask@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
       - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         # `--no-verify` mirrors `publish-crate` — Release-PR CI
@@ -302,7 +347,26 @@ jobs:
         with:
           shared-key: publish-mcp
 
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. crates.io: 200 = already published (skip), else publish.
+      - name: Skip if already on crates.io
+        id: published_check
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: sqlrite-release-ci (https://github.com/joaoh82/rust_sqlite)' \
+            "https://crates.io/api/v1/crates/sqlrite-mcp/$V" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-mcp@$V already on crates.io (HTTP 200) — skipping cargo publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-mcp@$V not found on crates.io (HTTP $CODE) — will publish"
+          fi
+
       - name: cargo publish
+        if: steps.published_check.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         # `--no-verify` mirrors `publish-crate` / `publish-ask` —
@@ -827,17 +891,40 @@ jobs:
       - name: List files about to be uploaded
         run: ls -la dist/
 
-      # Single atomic upload of all wheels + sdist. If any file
-      # fails to upload, none are published — no partial wave
-      # on PyPI.
+      # Idempotency log line (SQLR-12). PyPI's JSON API returns HTTP 200
+      # for an existing project/version, 404 otherwise. Unlike the
+      # single-artifact crates.io / npm jobs, PyPI's publish unit is a
+      # *set* of files (one wheel per platform + the sdist), so we do NOT
+      # gate the whole step on this check: a partial wave (some wheels
+      # landed before the job died) would leave the version "present" yet
+      # incomplete, and a version-level skip would strand the missing
+      # wheels. Instead this step just records the state in the run log;
+      # `skip-existing: true` below does the actual file-granular skipping.
+      - name: Report PyPI publish state
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/sqlrite/$V/json" || true)
+          CODE=${CODE:-000}
+          if [ "$CODE" = "200" ]; then
+            echo "::notice::sqlrite==$V already present on PyPI (HTTP 200) — upload will skip files already there (skip-existing)"
+          else
+            echo "::notice::sqlrite==$V not found on PyPI (HTTP $CODE) — uploading all wheels + sdist"
+          fi
+
+      # Upload all wheels + sdist aggregated from the build matrix.
+      # `skip-existing: true` (SQLR-12) is what makes this job idempotent:
+      # a re-dispatch (full or partial-wave recovery) uploads only the
+      # files not yet on PyPI and silently skips the rest, instead of the
+      # old `skip-existing: false` which failed loudly the moment any one
+      # file already existed. File-granular skipping is the right unit for
+      # PyPI's multi-file publish — it cleanly handles both a fully-shipped
+      # version (every file skipped → no-op) and a half-shipped one.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # Keep `skip-existing: false` so a re-run of this job
-          # (after a partial-failure scenario) fails loudly rather
-          # than silently ignoring already-uploaded files.
-          skip-existing: false
+          skip-existing: true
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
@@ -1080,6 +1167,26 @@ jobs:
           # devDep pulled in by accident would be visible here.
           npm pack --dry-run
 
+      # Idempotency guard (SQLR-12) — see publish-crate for the full
+      # rationale. `npm view <pkg>@<version> version` prints the version
+      # on a hit and exits non-zero with empty stdout on a miss; the
+      # `|| true` keeps the `-e` shell from aborting on the miss path.
+      # npm's publish unit is a single tarball per version, so a present
+      # version means a complete publish — a clean version-level skip.
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: sdk/nodejs
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "@joaoh82/sqlrite@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite@$V not found on npm — will publish"
+          fi
+
       # Single atomic publish via OIDC trusted publisher.
       #
       # The `--provenance` flag is what tells npm CLI to use the
@@ -1111,6 +1218,7 @@ jobs:
       # diagnosable from the run log without re-running with
       # debug-on. Cheap insurance against another silent failure.
       - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
         working-directory: sdk/nodejs
         run: npm publish --access public --provenance --loglevel verbose
 
@@ -1226,7 +1334,24 @@ jobs:
           # node_modules).
           npm pack --dry-run
 
+      # Idempotency guard (SQLR-12) — see publish-crate / publish-nodejs.
+      # Package is the unscoped `sqlrite-notes`.
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: examples/nodejs-notes
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "sqlrite-notes@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-notes@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::sqlrite-notes@$V not found on npm — will publish"
+          fi
+
       - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
         working-directory: examples/nodejs-notes
         run: npm publish --access public --provenance --loglevel verbose
 
@@ -1386,12 +1511,32 @@ jobs:
           echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
           npm pack --dry-run
 
+      # Idempotency guard (SQLR-12) — see publish-crate / publish-nodejs.
+      # Package is the scoped `@joaoh82/sqlrite-wasm`. (The wasm-pack build
+      # above still runs on a skip — gating only the publish keeps this
+      # consistent with the other channels; the build is cheap relative to
+      # the rest of the release wave.)
+      - name: Skip if already on npm
+        id: published_check
+        working-directory: sdk/wasm/pkg
+        run: |
+          V="${{ needs.detect.outputs.version }}"
+          EXISTING=$(npm view "@joaoh82/sqlrite-wasm@$V" version 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite-wasm@$V already on npm ($EXISTING) — skipping npm publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::@joaoh82/sqlrite-wasm@$V not found on npm — will publish"
+          fi
+
       # Atomic OIDC publish. Same flag combo proven in
       # publish-nodejs: `--provenance` to trigger OIDC code path,
       # `--access public` because scoped packages default to
       # private, `--loglevel verbose` to keep error logs
       # diagnosable.
       - name: Publish to npm
+        if: steps.published_check.outputs.skip != 'true'
         working-directory: sdk/wasm/pkg
         run: npm publish --access public --provenance --loglevel verbose
 

@@ -231,9 +231,11 @@ The "publish" half. Auto-fires on the release commit.
     commit: `sqlrite-vX.Y.Z`, `sqlrite-ffi-vX.Y.Z`,
     `sqlrite-py-vX.Y.Z`, `sqlrite-node-vX.Y.Z`, `sqlrite-wasm-vX.Y.Z`,
     `sdk/go/vX.Y.Z`, `sqlrite-desktop-vX.Y.Z`, `vX.Y.Z`. Pushes
-    them. Runs *before* the publish jobs — if a tag already exists
-    (accidental re-run, cosmic ray), the whole workflow aborts
-    cleanly.
+    them. Runs *before* the publish jobs. Idempotent on re-run: if a
+    tag already exists (partial-failure re-dispatch, accidental
+    re-trigger), that tag is skipped with a `::notice::` rather than
+    failing, so a re-dispatch at the same version proceeds to the
+    publish jobs instead of aborting.
   - **publish-crate** — `cargo publish -p sqlrite-engine` the root
     crate to crates.io. (The crates.io name is `sqlrite-engine`, not
     `sqlrite`, because the short name was already taken by an
@@ -284,18 +286,41 @@ The "publish" half. Auto-fires on the release commit.
   in parallel. Umbrella GitHub Release finalizes. No branch-
   protection bypass needed, no deploy keys, no admin override.
 - **Sad path — publish fails after tag push**: say
-  `publish-python` fails on wheel upload. The tag
-  `sqlrite-py-vX.Y.Z` is already on the remote. **Convention:
-  never reuse a tag, always bump past.** Next release is
-  `v0.2.1`, not a re-try of `v0.2.0`. Partial success is visible
-  — the `sqlrite-vX.Y.Z` crate *did* publish, the Python wheels
-  didn't, and both facts are recorded. Operators can fix the
-  Python SDK and re-dispatch `release.yml` in manual mode at
-  `v0.2.1`.
+  `publish-crate` fails while the other channels succeed (this is
+  exactly the v0.11.0 wave — the engine crate hit a crates.io 413
+  but `sqlrite-ask`, npm, PyPI, FFI, Go and desktop had all
+  already shipped). The publish jobs are **idempotent** (SQLR-12):
+  each one probes its registry first and skips with a `::notice::`
+  when the version is already there. So the recovery is to fix the
+  failing channel and **re-dispatch `release.yml` at the same
+  version** — `tag-all` skips the existing tags, the
+  already-published channels skip their `publish` step, and only
+  the missing artifact actually publishes. No tag bump required;
+  the old "never reuse a tag, always bump past" workaround is
+  retired. Per-registry guards:
+    - **crates.io** (`publish-crate` / `-ask` / `-mcp`): `GET
+      crates.io/api/v1/crates/<name>/<version>` (with a mandatory
+      `User-Agent`) → HTTP 200 skips, 404 publishes.
+    - **npm** (`publish-nodejs` / `-wasm` / `-notes-example`):
+      `npm view <pkg>@<version> version` — non-empty skips.
+    - **PyPI** (`publish-python`): `GET
+      pypi.org/pypi/sqlrite/<version>/json` is logged for
+      visibility, and `skip-existing: true` does the actual
+      file-granular skipping — the right unit for PyPI's
+      multi-wheel wave (a partial wave fills in the missing wheels
+      without erroring on the ones already there).
+    - **GitHub Releases** (`publish-ffi` / `-desktop` / `-go` /
+      `build-mcp-binaries`): `softprops/action-gh-release` is
+      create-or-update, so re-runs refresh the release in place.
+- **Sad path — a fully-successful release re-dispatched at the
+  same version**: a clean no-op. Every tag is skipped, every
+  `publish` step is skipped, GitHub Releases refresh in place —
+  no wall of "already exists" failures.
 - **Sad path — an accidental `release: v…` commit message**: the
-  auto-trigger fires. `tag-all` runs and finds the tags already
-  exist (because the real release happened weeks ago). Workflow
-  aborts with a clear "tag already exists" error. No damage.
+  auto-trigger fires at a version that shipped weeks ago.
+  `tag-all` finds every tag present and skips them; each publish
+  job finds its artifact already on the registry and skips. The
+  run is a green no-op. No damage.
 
 ## Pinned binaryen / wasm-opt
 
