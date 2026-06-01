@@ -1,6 +1,6 @@
 [package]
 name = "sqlrite-journal"
-version = "0.10.1"
+version = "0.11.0"
 description = "Local-first journaling desktop app backed by SQLRite (example app)"
 authors = ["Joao Henrique Machado Silva <joaoh82@gmail.com>"]
 edition = "2024"
@@ -20,7 +20,7 @@ tauri-build = { version = "2", features = [] }
 # `version = "0.10.1"` is the floor for downstream packagers that take
 # the example out of the monorepo. Bump in lockstep with the engine
 # release via `scripts/bump-version.sh`.
-sqlrite = { package = "sqlrite-engine", path = "../../..", version = "0.10.1" }
+sqlrite = { package = "sqlrite-engine", path = "../../..", version = "0.11.0" }
 
 tauri = { version = "2", features = [] }
 # Dialog plugin powers the "Open…" / "Save As…" / "Export…" pickers.
