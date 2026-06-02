@@ -1,6 +1,6 @@
 {
   "name": "sqlrite-notes",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Example: a Node.js CLI that ingests a folder of markdown notes into SQLRite (hybrid HNSW + BM25 retrieval), then exposes the database to Claude Desktop / any MCP client via sqlrite-mcp.",
   "type": "module",
   "engines": {
@@ -19,7 +19,7 @@
     "test": "node --test 'test/**/*.test.mjs'"
   },
   "dependencies": {
-    "@joaoh82/sqlrite": "^0.11.0"
+    "@joaoh82/sqlrite": "^0.12.0"
   },
   "keywords": [
     "sqlrite",
