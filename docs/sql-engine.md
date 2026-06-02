@@ -53,7 +53,7 @@ The `sqlparser` AST is designed to cover every SQL dialect, so its types are hug
 
 `SelectQuery::joins` (SQLR-5) is a `Vec<JoinClause>` evaluated left-to-right by `execute_select_rows_joined`. Each clause carries a `JoinType` (`Inner` / `LeftOuter` / `RightOuter` / `FullOuter`), the right-table name + optional alias, and a required `ON` expression. Empty = single-table SELECT, the existing fast path with HNSW / FTS / bounded-heap optimizations.
 
-Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — `JOIN ... USING`, `NATURAL JOIN`, `CROSS JOIN`, comma joins, aggregates / GROUP BY / DISTINCT over JOINs, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there.
+Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — comma joins (`FROM a, b`), aggregates / GROUP BY / DISTINCT over JOINs, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there. (`JOIN ... USING`, `NATURAL JOIN`, and `CROSS JOIN` are now supported — see [`supported-sql.md`](supported-sql.md#join-semantics-sqlr-5).)
 
 ## Statement dispatch
 

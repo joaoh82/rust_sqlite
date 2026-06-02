@@ -310,10 +310,11 @@ export default function DocsPage() {
             The executor uses a plain nested-loop driver — adequate for an
             embedded learning database. Hash / merge joins on equi-join shapes
             are a future optimization.{" "}
-            <code>CROSS JOIN</code>, comma-FROMs, and{" "}
-            <code>NATURAL JOIN</code> /{" "}
-            <code>JOIN ... USING (col)</code> are not supported yet — write{" "}
-            <code>INNER JOIN ... ON true</code> instead. Aggregates /{" "}
+            <code>ON</code>, <code>USING (col)</code>, <code>NATURAL</code>, and{" "}
+            <code>CROSS JOIN</code> are all supported (a <code>USING</code> /{" "}
+            <code>NATURAL</code> column shows once in <code>SELECT *</code>).
+            Comma-separated FROMs (<code>FROM a, b</code>) are not — use an
+            explicit <code>JOIN</code> / <code>CROSS JOIN</code>. Aggregates /{" "}
             <code>GROUP BY</code> over a join lands once subqueries do.
           </p>
 

@@ -210,19 +210,27 @@ COUNT([DISTINCT] <column>)                     -- counts non-NULL values, option
 
 ### `JOIN` semantics (SQLR-5)
 
-Four flavors are supported, all with explicit `ON` conditions:
+Four flavors are supported, with `ON`, `USING (...)`, or `NATURAL` match
+conditions, plus `CROSS JOIN`:
 
 | Flavor | Keeps unmatched rows from… |
 |---|---|
-| `INNER JOIN` | …neither side. Only ON-matched pairs survive. |
+| `INNER JOIN` | …neither side. Only matched pairs survive. |
 | `LEFT [OUTER] JOIN` | …the left side; right-side columns become `NULL` for unmatched left rows. |
 | `RIGHT [OUTER] JOIN` | …the right side; left-side columns become `NULL` for unmatched right rows. |
 | `FULL [OUTER] JOIN` | …both sides, NULL-padded on the unmatched side. |
+| `CROSS JOIN` | …both sides (cross product — every left row paired with every right row). |
 
 - **Engine choice:** SQLite ships only `INNER` and `LEFT OUTER`. SQLRite implements all four because the per-flavor differences boil down to NULL-padding policy on top of one shared nested-loop driver — adding `RIGHT` / `FULL` was effectively free once the executor had a multi-table scope. See [`docs/design-decisions.md`](design-decisions.md) for the rationale.
+- **Match conditions:**
+  - **`ON <expr>`** — any boolean expression over the in-scope tables.
+  - **`USING (col[, col…])`** — shorthand for `left.col = right.col` AND-chained over each named column. The column must exist on the right side and on some left-side table; in a chain (`A JOIN B USING(x) JOIN C USING(x)`) each `x` resolves against the first left table that has it.
+  - **`NATURAL`** — equivalent to `USING (<every column name the two sides share>)`, discovered automatically from the schemas. If the sides share no column names, a `NATURAL JOIN` degrades to a cross product (matching SQLite). Combines with a flavor: `NATURAL LEFT JOIN`.
+  - **`CROSS JOIN`** — the cross product; the engine treats it as `INNER JOIN ... ON true`.
+- **`SELECT *` with `USING` / `NATURAL`:** each joined-on column appears **once** (SQLite convention), taking the left side's value; the right side's duplicate is omitted. Plain `ON` joins keep both copies.
 - **Aliases:** `FROM customers AS c INNER JOIN orders AS o ON c.id = o.customer_id`. When an alias is supplied the original table name leaves scope (SQL standard) — qualifier resolution uses the alias.
 - **Qualified column references:** `<table>.<col>` and `<alias>.<col>` resolve to that specific side. Bare `<col>` references must resolve to exactly one in-scope table; ambiguous references error with a "qualify it as `<table>.col`" hint.
-- **Output of `SELECT *`** over a join is every column of every in-scope table, in source order. Duplicate header names are permitted (SQLite-style). Disambiguate with explicit `SELECT t.col AS t_col, u.col AS u_col`.
+- **Output of `SELECT *`** over a join is every column of every in-scope table, in source order (minus `USING` / `NATURAL` duplicates, see above). Duplicate header names are otherwise permitted (SQLite-style). Disambiguate with explicit `SELECT t.col AS t_col, u.col AS u_col`.
 - **Multi-join** chains left-fold: `A JOIN B ON ... JOIN C ON ...` evaluates as `(A ⨝ B) ⨝ C`. Each new clause sees every prior alias / table in its `ON` expression.
 - **Self-joins** require an alias on at least one side: `FROM nodes AS p INNER JOIN nodes AS c ON p.id = c.parent_id`. Without one, you get a `duplicate table reference` error so qualifiers stay unambiguous.
 - **`WHERE` runs after joins.** A `WHERE right.col IS NULL` filter on a `LEFT JOIN` correctly returns left rows with no match (the standard "anti-join via outer-join" idiom).
@@ -231,8 +239,7 @@ Four flavors are supported, all with explicit `ON` conditions:
 
 #### What's not supported in JOINs
 
-- `JOIN ... USING (col)` and `NATURAL JOIN` — explicit `ON` only. (Both are deferred — `USING` is straightforward but adds a column-resolution rule we haven't needed yet.)
-- `CROSS JOIN` (write `INNER JOIN ... ON true` instead) and comma-separated FROM lists.
+- Comma-separated FROM lists (`FROM a, b`) — use an explicit `JOIN` / `CROSS JOIN` instead.
 - Aggregates / `GROUP BY` / `DISTINCT` *over* a join. The single-table aggregator is wired against one rowid stream; rewiring it for joined rows is a separate increment. Surfaces as a clean `NotImplemented` at parse time.
 - `fts_match` / `bm25_score` inside a JOIN expression. They need to look up an FTS index by column, which is single-table-bound today. Use them on a single-table SELECT first, or fold the FTS lookup into the FROM side.
 
@@ -255,7 +262,7 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 
 ### What doesn't work
 
-- **`CROSS JOIN`**, **comma-separated FROM lists**, **`NATURAL JOIN`**, **`JOIN ... USING (col)`** — explicit `INNER` / `LEFT` / `RIGHT` / `FULL OUTER JOIN ... ON ...` only (see [JOIN semantics](#join-semantics-sqlr-5))
+- **Comma-separated FROM lists** (`FROM a, b`) — use an explicit `JOIN` / `CROSS JOIN`. `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS` with `ON` / `USING` / `NATURAL` are all supported (see [JOIN semantics](#join-semantics-sqlr-5))
 - **Aggregates** / **`GROUP BY`** / **`DISTINCT`** over a JOIN — pipe through a subquery once subqueries land
 - **Subqueries**, CTEs (`WITH`), views
 - **`HAVING`** — pre-aggregation `WHERE` works; post-aggregation filtering does not yet
@@ -700,7 +707,7 @@ A REPL launched with `sqlrite --readonly foo.sqlrite` (or `sqlrite::open_databas
 For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when these land:
 
 ### Joins & composition
-- `CROSS JOIN`, comma joins, `NATURAL JOIN`, `JOIN ... USING` — explicit `INNER` / `LEFT` / `RIGHT` / `FULL OUTER JOIN ... ON ...` works (SQLR-5); the others don't
+- `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS JOIN` with `ON` / `USING (...)` / `NATURAL` all work (SQLR-5). Comma-separated FROM joins (`FROM a, b`) don't — use an explicit `JOIN` / `CROSS JOIN`
 - Aggregates / `GROUP BY` / `DISTINCT` *over* a JOIN — pipe through a subquery once subqueries land
 - `fts_match` / `bm25_score` inside a JOIN expression — single-table-bound today
 - Subqueries (scalar, `IN (SELECT ...)`, correlated)

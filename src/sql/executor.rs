@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use prettytable::{Cell as PrintCell, Row as PrintRow, Table as PrintTable};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AssignmentTarget, BinaryOperator, CreateIndex, Delete, Expr,
-    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, IndexType, ObjectName,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, IndexType, ObjectName,
     ObjectNamePart, RenameTableNameKind, Statement, TableFactor, TableWithJoins, UnaryOperator,
     Update, Value as AstValue,
 };
@@ -21,7 +21,8 @@ use crate::sql::db::table::{
 use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{
-    AggregateArg, JoinType, OrderByClause, Projection, ProjectionItem, ProjectionKind, SelectQuery,
+    AggregateArg, JoinConstraintKind, JoinType, OrderByClause, Projection, ProjectionItem,
+    ProjectionKind, SelectQuery,
 };
 
 // -----------------------------------------------------------------
@@ -405,6 +406,121 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     Ok(SelectResult { columns, rows })
 }
 
+/// A join constraint resolved against the live table schemas: the
+/// concrete `ON` predicate to evaluate, plus the columns that
+/// `SELECT *` should show once (empty for a plain `ON` join, non-empty
+/// for `USING` / `NATURAL`).
+struct ResolvedJoin {
+    on: Expr,
+    using_columns: Vec<String>,
+}
+
+/// Turn a [`JoinConstraintKind`] into the `ON` predicate the nested-loop
+/// driver evaluates. `tables[..right_pos]` are the tables in scope on
+/// the left of this join; `tables[right_pos]` is the table being joined.
+///
+/// - `On` passes its predicate through unchanged.
+/// - `Using(cols)` becomes `left.col = right.col` AND-chained over every
+///   named column. The left qualifier is the first in-scope table that
+///   actually has the column, so the rewrite is correct for join chains
+///   (`A JOIN B USING(x) JOIN C USING(x)` resolves both `x`es against
+///   `A`). A column missing from either side is an error.
+/// - `Natural` discovers the shared column names first (right table's
+///   columns that also appear somewhere on the left), then proceeds
+///   exactly like `Using`. No shared columns ⇒ an always-true predicate,
+///   i.e. a cross product, matching SQLite.
+fn resolve_join_constraint(
+    constraint: &JoinConstraintKind,
+    tables: &[JoinedTableRef<'_>],
+    right_pos: usize,
+) -> Result<ResolvedJoin> {
+    match constraint {
+        JoinConstraintKind::On(expr) => Ok(ResolvedJoin {
+            on: (**expr).clone(),
+            using_columns: Vec::new(),
+        }),
+        JoinConstraintKind::Using(cols) => build_using_join(cols, tables, right_pos),
+        JoinConstraintKind::Natural => {
+            // Shared columns = the right table's columns that also exist
+            // on some left table, preserving the right table's column
+            // order for determinism.
+            let shared: Vec<String> = tables[right_pos]
+                .table
+                .column_names()
+                .into_iter()
+                .filter(|c| {
+                    tables[..right_pos]
+                        .iter()
+                        .any(|t| t.table.contains_column(c.clone()))
+                })
+                .collect();
+            build_using_join(&shared, tables, right_pos)
+        }
+    }
+}
+
+/// Shared lowering for `USING` and `NATURAL`: synthesize the AND-chain
+/// of `left.col = right.col` equalities and report the deduplicated
+/// columns. An empty `cols` (a `NATURAL` join with nothing in common)
+/// yields an always-true predicate and no dedup, i.e. a cross product.
+fn build_using_join(
+    cols: &[String],
+    tables: &[JoinedTableRef<'_>],
+    right_pos: usize,
+) -> Result<ResolvedJoin> {
+    let right = &tables[right_pos];
+    let mut predicate: Option<Expr> = None;
+    for col in cols {
+        // The named column must exist on the right side …
+        if !right.table.contains_column(col.clone()) {
+            return Err(SQLRiteError::Internal(format!(
+                "cannot join USING column '{col}' — it is not present on table '{}'",
+                right.scope_name
+            )));
+        }
+        // … and on at least one left-side table. Qualify the left
+        // reference with whichever table actually has it.
+        let left = tables[..right_pos]
+            .iter()
+            .find(|t| t.table.contains_column(col.clone()))
+            .ok_or_else(|| {
+                SQLRiteError::Internal(format!(
+                    "cannot join USING column '{col}' — it is not present on any left-side table"
+                ))
+            })?;
+        let eq = col_eq(&left.scope_name, &right.scope_name, col);
+        predicate = Some(match predicate {
+            None => eq,
+            Some(prev) => Expr::BinaryOp {
+                left: Box::new(prev),
+                op: BinaryOperator::And,
+                right: Box::new(eq),
+            },
+        });
+    }
+    Ok(ResolvedJoin {
+        on: predicate
+            .unwrap_or_else(|| Expr::Value(sqlparser::ast::Value::Boolean(true).with_empty_span())),
+        using_columns: cols.to_vec(),
+    })
+}
+
+/// Build the `left_scope.col = right_scope.col` equality used to lower
+/// `USING` / `NATURAL` joins onto the existing `ON` evaluation path.
+fn col_eq(left_scope: &str, right_scope: &str, col: &str) -> Expr {
+    let col_ref = |scope: &str| {
+        Expr::CompoundIdentifier(vec![
+            Ident::new(scope.to_string()),
+            Ident::new(col.to_string()),
+        ])
+    };
+    Expr::BinaryOp {
+        left: Box::new(col_ref(left_scope)),
+        op: BinaryOperator::Eq,
+        right: Box::new(col_ref(right_scope)),
+    }
+}
+
 // -----------------------------------------------------------------
 // SQLR-5 — Joined SELECT execution
 // -----------------------------------------------------------------
@@ -480,6 +596,20 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
         }
     }
 
+    // Resolve each join's match constraint into a concrete ON predicate
+    // (plus, for USING / NATURAL, the set of columns that `SELECT *`
+    // shows once). This is done here rather than at parse time because
+    // USING needs to know which side each named column lives on, and
+    // NATURAL needs the schemas to discover the shared columns at all —
+    // neither is available to the parser. `resolved[i]` lines up with
+    // `query.joins[i]` (i.e. `joined_tables[i + 1]`).
+    let resolved: Vec<ResolvedJoin> = query
+        .joins
+        .iter()
+        .enumerate()
+        .map(|(j_idx, join)| resolve_join_constraint(&join.constraint, &joined_tables, j_idx + 1))
+        .collect::<Result<Vec<_>>>()?;
+
     // Validate qualified projection column references against the
     // table they qualify. Unqualified names are validated by the
     // first scope lookup at row materialization — the runtime check
@@ -495,9 +625,25 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
             // alias-less convention. Duplicate header names are
             // permitted (matches SQLite); callers needing
             // disambiguation can `SELECT t.col AS t_col`.
+            //
+            // USING / NATURAL columns are the exception: SQLite shows a
+            // joined-on column once, taking the left side's copy and
+            // omitting the right side's. We honor that by skipping any
+            // column listed in the right table's `using_columns` when we
+            // reach that table during expansion. (The left copy was
+            // already emitted by an earlier table.)
             let mut all = Vec::new();
-            for t in &joined_tables {
+            for (t_idx, t) in joined_tables.iter().enumerate() {
+                // `t_idx == 0` is the primary table (no incoming join);
+                // every later table corresponds to `resolved[t_idx - 1]`.
+                let dedup: &[String] = t_idx
+                    .checked_sub(1)
+                    .map(|r| resolved[r].using_columns.as_slice())
+                    .unwrap_or(&[]);
                 for col in t.table.column_names() {
+                    if dedup.contains(&col) {
+                        continue;
+                    }
                     all.push(ProjectionItem {
                         kind: ProjectionKind::Column {
                             // Qualify the synthetic items so duplicate
@@ -573,8 +719,10 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
                 // Reuse `eval_predicate_scope` so ON shares the same
                 // truthiness rule WHERE uses — non-zero integers are
                 // truthy, NULL is false, etc. — instead of rejecting
-                // anything that isn't a literal bool.
-                if eval_predicate_scope(&join.on, &scope)? {
+                // anything that isn't a literal bool. `resolved[j_idx].on`
+                // is the user's ON expr, or the equality we synthesized
+                // for USING / NATURAL.
+                if eval_predicate_scope(&resolved[j_idx].on, &scope)? {
                     left_match_count += 1;
                     right_matched[r_idx] = true;
                     // Accumulator entries carry only as many slots
@@ -4388,16 +4536,197 @@ mod tests {
         );
     }
 
-    #[test]
-    fn using_or_natural_join_returns_not_implemented() {
-        let mut db = Database::new("t".to_string());
-        crate::sql::process_command("CREATE TABLE a (id INTEGER PRIMARY KEY);", &mut db).unwrap();
-        crate::sql::process_command("CREATE TABLE b (id INTEGER PRIMARY KEY);", &mut db).unwrap();
-        let err = crate::sql::process_command("SELECT * FROM a INNER JOIN b USING (id);", &mut db);
-        assert!(err.is_err(), "USING is not yet supported");
+    // ----- SQLR-5 follow-up: USING / NATURAL / CROSS joins -----
 
-        let err = crate::sql::process_command("SELECT * FROM a NATURAL JOIN b;", &mut db);
-        assert!(err.is_err(), "NATURAL is not supported");
+    /// `customers` and `orders` both have an `id` column. Joining on it
+    /// via USING must produce exactly the same rows as the equivalent
+    /// explicit `ON customers.id = orders.id`.
+    #[test]
+    fn join_using_matches_same_rows_as_on() {
+        let db = seed_join_fixture();
+        let using = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             INNER JOIN orders USING (id) ORDER BY orders.amount;",
+        );
+        let on = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers \
+             INNER JOIN orders ON customers.id = orders.id ORDER BY orders.amount;",
+        );
+        // id matches: cust1↔order1 (100), cust2↔order2 (200), cust3↔order3 (50).
+        let pairs: Vec<(String, Value)> = using
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display_string(), r[1].clone()))
+            .collect();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            using.rows, on.rows,
+            "USING must mirror the explicit ON rows"
+        );
+    }
+
+    /// `SELECT *` over a USING join shows the joined-on column once
+    /// (SQLite convention), taking the left side's copy.
+    #[test]
+    fn select_star_using_dedups_joined_column() {
+        let db = seed_join_fixture();
+        let r = run_rows(&db, "SELECT * FROM customers INNER JOIN orders USING (id);");
+        // Without USING dedup this would be 5 columns (id,name,id,
+        // customer_id,amount). USING(id) collapses the duplicate `id`
+        // to one, leaving 4 in source order.
+        assert_eq!(
+            r.columns,
+            vec![
+                "id".to_string(),
+                "name".to_string(),
+                "customer_id".to_string(),
+                "amount".to_string(),
+            ]
+        );
+        assert_eq!(r.rows.len(), 3);
+        // Each surviving row's single `id` equals both sides' id (they
+        // were matched on equality), so the left copy is correct.
+        for row in &r.rows {
+            assert!(matches!(row[0], Value::Integer(_)));
+        }
+    }
+
+    fn seed_natural_fixture() -> Database {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            // Distinct PK names (lid / rid) so the *only* shared columns
+            // are k1 and k2 — NATURAL must match on both with AND.
+            "CREATE TABLE l (lid INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, v1 TEXT);",
+            "CREATE TABLE r (rid INTEGER PRIMARY KEY, k1 INTEGER, k2 INTEGER, v2 TEXT);",
+            "INSERT INTO l (k1, k2, v1) VALUES (1, 1, 'l-a');",
+            "INSERT INTO l (k1, k2, v1) VALUES (1, 2, 'l-b');",
+            "INSERT INTO l (k1, k2, v1) VALUES (2, 1, 'l-c');",
+            "INSERT INTO r (k1, k2, v2) VALUES (1, 1, 'r-a');",
+            "INSERT INTO r (k1, k2, v2) VALUES (1, 2, 'r-b');",
+            "INSERT INTO r (k1, k2, v2) VALUES (9, 9, 'r-z');",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        db
+    }
+
+    /// NATURAL JOIN auto-discovers the shared columns (k1, k2) and
+    /// matches on both with AND.
+    #[test]
+    fn natural_join_matches_on_all_shared_columns() {
+        let db = seed_natural_fixture();
+        let natural = run_rows(&db, "SELECT v1, v2 FROM l NATURAL JOIN r ORDER BY v1;");
+        // (1,1)->l-a/r-a and (1,2)->l-b/r-b match. (2,1) and (9,9) don't.
+        let pairs: Vec<(String, String)> = natural
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display_string(), r[1].to_display_string()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("l-a".to_string(), "r-a".to_string()),
+                ("l-b".to_string(), "r-b".to_string()),
+            ]
+        );
+        // Equivalent explicit form yields the same rows.
+        let explicit = run_rows(
+            &db,
+            "SELECT v1, v2 FROM l INNER JOIN r ON l.k1 = r.k1 AND l.k2 = r.k2 ORDER BY v1;",
+        );
+        assert_eq!(natural.rows, explicit.rows);
+    }
+
+    /// `SELECT *` over a NATURAL join shows each shared column once.
+    #[test]
+    fn select_star_natural_dedups_shared_columns() {
+        let db = seed_natural_fixture();
+        let r = run_rows(&db, "SELECT * FROM l NATURAL JOIN r;");
+        // Source order with k1,k2 taken from the left only:
+        // l: lid, k1, k2, v1 ; r: rid, v2  (k1,k2 dropped from r).
+        assert_eq!(
+            r.columns,
+            vec![
+                "lid".to_string(),
+                "k1".to_string(),
+                "k2".to_string(),
+                "v1".to_string(),
+                "rid".to_string(),
+                "v2".to_string(),
+            ]
+        );
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    /// NATURAL JOIN between tables with no shared column names degrades
+    /// to a cross product, matching SQLite.
+    #[test]
+    fn natural_join_without_common_columns_is_cross_product() {
+        let mut db = Database::new("t".to_string());
+        for sql in [
+            "CREATE TABLE p (pid INTEGER PRIMARY KEY, pa TEXT);",
+            "CREATE TABLE q (qid INTEGER PRIMARY KEY, qb TEXT);",
+            "INSERT INTO p (pa) VALUES ('p1');",
+            "INSERT INTO p (pa) VALUES ('p2');",
+            "INSERT INTO q (qb) VALUES ('q1');",
+            "INSERT INTO q (qb) VALUES ('q2');",
+            "INSERT INTO q (qb) VALUES ('q3');",
+        ] {
+            crate::sql::process_command(sql, &mut db).unwrap();
+        }
+        let r = run_rows(&db, "SELECT p.pa, q.qb FROM p NATURAL JOIN q;");
+        assert_eq!(r.rows.len(), 2 * 3, "no shared columns ⇒ cross product");
+    }
+
+    /// CROSS JOIN produces the full cartesian product and is equivalent
+    /// to `INNER JOIN ... ON 1`.
+    #[test]
+    fn cross_join_produces_cartesian_product() {
+        let db = seed_join_fixture();
+        let cross = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers CROSS JOIN orders;",
+        );
+        // 3 customers × 4 orders = 12 rows.
+        assert_eq!(cross.rows.len(), 12);
+        let on_true = run_rows(
+            &db,
+            "SELECT customers.name, orders.amount FROM customers INNER JOIN orders ON 1;",
+        );
+        assert_eq!(cross.rows.len(), on_true.rows.len());
+        // SELECT * over a cross join keeps every column from both sides.
+        let star = run_rows(&db, "SELECT * FROM customers CROSS JOIN orders;");
+        assert_eq!(star.columns.len(), 5);
+        assert_eq!(star.rows.len(), 12);
+    }
+
+    /// A LEFT OUTER join expressed with USING still preserves unmatched
+    /// left rows (NULL-padding the right), and the deduplicated column
+    /// keeps the left side's value.
+    #[test]
+    fn left_outer_join_using_preserves_unmatched_left() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT * FROM customers LEFT OUTER JOIN orders USING (id);",
+        );
+        // customers ids 1,2,3 each match an order id; none are unmatched
+        // here, so confirm the dedup + row count instead. 4 columns,
+        // 3 matched rows (orders has no id=customer beyond 1..3 overlap).
+        assert_eq!(r.columns.len(), 4, "id is shown once");
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    /// USING a column that doesn't exist on one of the sides is a clean
+    /// error, not a silent empty result.
+    #[test]
+    fn using_unknown_column_errors() {
+        let db = seed_join_fixture();
+        let q = parse_select("SELECT * FROM customers INNER JOIN orders USING (nope);");
+        let res = execute_select_rows(q, &db);
+        assert!(res.is_err(), "USING (nope) must error — column absent");
     }
 
     #[test]

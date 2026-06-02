@@ -1,7 +1,7 @@
 use sqlparser::ast::{
     DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 
 use crate::error::{Result, SQLRiteError};
@@ -162,10 +162,38 @@ impl JoinType {
     }
 }
 
+/// How a JOIN matches rows. SQLR-5 originally shipped `ON` only; the
+/// USING / NATURAL increment adds the two name-based constraints.
+/// `ON` carries its predicate straight from the parser. `USING` and
+/// `NATURAL` defer their equality synthesis to the executor because
+/// they need table schemas (which column names exist, and — for
+/// `NATURAL` — which are shared) that the parser doesn't have. The
+/// executor turns both into the same `left.col = right.col [AND …]`
+/// predicate the `ON` path already evaluates. `CROSS JOIN` is rewritten
+/// to `ON true` at parse time (no schema needed) and so reuses the
+/// `On` variant directly.
+#[derive(Debug, Clone)]
+pub enum JoinConstraintKind {
+    /// `ON <expr>` (and the parse-time rewrite of `CROSS JOIN` to
+    /// `ON true`). Evaluated per-row over the multi-table scope. Boxed
+    /// to keep this enum small — `Expr` dwarfs the other variants.
+    On(Box<Expr>),
+    /// `USING (col[, col…])` — equality on each named column, plus the
+    /// SQLite convention that each named column appears once in
+    /// `SELECT *`. Columns are validated and the predicate is
+    /// synthesized at execution time.
+    Using(Vec<String>),
+    /// `NATURAL` — the shared column names of the two sides are
+    /// discovered at execution time, then treated exactly like
+    /// `USING (<shared cols>)`. No shared columns ⇒ a cross product.
+    Natural,
+}
+
 /// One JOIN clause from the FROM list. Multi-join queries
 /// (`A JOIN B ... JOIN C ...`) become a `Vec<JoinClause>` evaluated
-/// left-to-right against the accumulator. v1 requires an ON condition;
-/// USING / NATURAL / CROSS are deferred.
+/// left-to-right against the accumulator. The match condition is one
+/// of `ON` / `USING` / `NATURAL` (see [`JoinConstraintKind`]);
+/// `CROSS JOIN` arrives here already rewritten to `ON true`.
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub join_type: JoinType,
@@ -174,9 +202,8 @@ pub struct JoinClause {
     /// from `right_table` so the executor can normalize on
     /// `alias.unwrap_or(right_table)` for qualifier matching.
     pub right_alias: Option<String>,
-    /// `ON <expr>` — required. Evaluated per-row by the executor over
-    /// the multi-table scope.
-    pub on: Expr,
+    /// What the join matches on. See [`JoinConstraintKind`].
+    pub constraint: JoinConstraintKind,
 }
 
 /// A parsed, simplified SELECT query.
@@ -342,11 +369,11 @@ impl SelectQuery {
 }
 
 /// Pull the leading FROM table (with optional alias) and any JOIN
-/// clauses out of the parsed FROM list. v1 supports a single base
-/// table plus zero or more INNER / LEFT / RIGHT / FULL OUTER joins
-/// with explicit `ON` conditions. Comma-separated FROM lists,
-/// USING / NATURAL constraints, and CROSS / SEMI / ANTI / ASOF joins
-/// surface as `NotImplemented`.
+/// clauses out of the parsed FROM list. Supports a single base table
+/// plus zero or more INNER / LEFT / RIGHT / FULL OUTER joins with an
+/// `ON`, `USING (...)`, or `NATURAL` constraint, and `CROSS JOIN`
+/// (rewritten to `INNER ... ON true`). Comma-separated FROM lists and
+/// SEMI / ANTI / ASOF / APPLY joins surface as `NotImplemented`.
 fn extract_from_clause(
     from: &[TableWithJoins],
 ) -> Result<(String, Option<String>, Vec<JoinClause>)> {
@@ -366,20 +393,28 @@ fn extract_from_clause(
     let mut joins = Vec::with_capacity(twj.joins.len());
     for j in &twj.joins {
         let (right_table, right_alias) = extract_table_factor(&j.relation)?;
-        let (join_type, on_expr) = match &j.join_operator {
+        let (join_type, constraint) = match &j.join_operator {
             // Bare `JOIN` defaults to INNER per SQL standard.
-            JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, parse_on(c)?),
+            JoinOperator::Join(c) | JoinOperator::Inner(c) => {
+                (JoinType::Inner, convert_constraint(c)?)
+            }
             JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
-                (JoinType::LeftOuter, parse_on(c)?)
+                (JoinType::LeftOuter, convert_constraint(c)?)
             }
             JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
-                (JoinType::RightOuter, parse_on(c)?)
+                (JoinType::RightOuter, convert_constraint(c)?)
             }
-            JoinOperator::FullOuter(c) => (JoinType::FullOuter, parse_on(c)?),
+            JoinOperator::FullOuter(c) => (JoinType::FullOuter, convert_constraint(c)?),
+            // `CROSS JOIN` is the cross product: INNER with an always-true
+            // ON. A constraint on a CROSS JOIN is non-standard, but if the
+            // parser handed us `USING` / `NATURAL` / `ON` we honor it
+            // rather than silently dropping it.
+            JoinOperator::CrossJoin(c) => (JoinType::Inner, convert_cross_constraint(c)?),
             other => {
                 return Err(SQLRiteError::NotImplemented(format!(
                     "join flavor {other:?} is not supported \
-                     (only INNER / LEFT OUTER / RIGHT OUTER / FULL OUTER with ON)"
+                     (only INNER / LEFT OUTER / RIGHT OUTER / FULL OUTER / CROSS, \
+                     with ON / USING / NATURAL)"
                 )));
             }
         };
@@ -387,7 +422,7 @@ fn extract_from_clause(
             join_type,
             right_table,
             right_alias,
-            on: on_expr,
+            constraint,
         });
     }
 
@@ -417,19 +452,59 @@ fn extract_table_factor(tf: &TableFactor) -> Result<(String, Option<String>)> {
     }
 }
 
-fn parse_on(constraint: &JoinConstraint) -> Result<Expr> {
+/// Lower a `sqlparser` join constraint into our [`JoinConstraintKind`].
+/// `ON` passes through; `USING` is narrowed to a list of bare column
+/// names; `NATURAL` defers to the executor. A constraint-less join
+/// (`A JOIN B` with no `ON` / `USING`) is rejected — `CROSS JOIN` is
+/// the supported way to ask for a cross product and is handled by
+/// [`convert_cross_constraint`].
+fn convert_constraint(constraint: &JoinConstraint) -> Result<JoinConstraintKind> {
     match constraint {
-        JoinConstraint::On(expr) => Ok(expr.clone()),
-        JoinConstraint::Using(_) => Err(SQLRiteError::NotImplemented(
-            "JOIN ... USING (...) is not supported yet — use JOIN ... ON instead".to_string(),
-        )),
-        JoinConstraint::Natural => Err(SQLRiteError::NotImplemented(
-            "NATURAL JOIN is not supported".to_string(),
-        )),
+        JoinConstraint::On(expr) => Ok(JoinConstraintKind::On(Box::new(expr.clone()))),
+        JoinConstraint::Using(cols) => {
+            let names = cols
+                .iter()
+                .map(extract_using_column)
+                .collect::<Result<Vec<String>>>()?;
+            Ok(JoinConstraintKind::Using(names))
+        }
+        JoinConstraint::Natural => Ok(JoinConstraintKind::Natural),
         JoinConstraint::None => Err(SQLRiteError::NotImplemented(
-            "JOIN without an ON condition is not supported (use INNER JOIN ... ON ...)".to_string(),
+            "JOIN without an ON / USING / NATURAL condition is not supported \
+             (use `... ON ...`, `... USING (...)`, `NATURAL JOIN`, or `CROSS JOIN`)"
+                .to_string(),
         )),
     }
+}
+
+/// Constraint handling for `CROSS JOIN`. The standard form carries no
+/// constraint and means "cross product", which we express as `ON true`
+/// so it flows through the same executor path as any other join.
+fn convert_cross_constraint(constraint: &JoinConstraint) -> Result<JoinConstraintKind> {
+    match constraint {
+        JoinConstraint::None => Ok(JoinConstraintKind::On(Box::new(true_literal()))),
+        // Non-standard, but if a constraint was attached to a CROSS JOIN,
+        // honor it instead of dropping it on the floor.
+        other => convert_constraint(other),
+    }
+}
+
+/// Pull a bare column name out of a `USING (...)` entry. `USING`
+/// columns are always simple identifiers; anything qualified or
+/// multi-part is rejected.
+fn extract_using_column(name: &ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => Ok(ident.value.clone()),
+        _ => Err(SQLRiteError::NotImplemented(format!(
+            "USING column must be a simple column name, got {name}"
+        ))),
+    }
+}
+
+/// An always-true boolean literal expression, used to rewrite
+/// `CROSS JOIN` into `INNER JOIN ... ON true`.
+fn true_literal() -> Expr {
+    Expr::Value(Value::Boolean(true).with_empty_span())
 }
 
 fn parse_projection(items: &[SelectItem]) -> Result<Projection> {
