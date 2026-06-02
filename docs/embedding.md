@@ -153,8 +153,8 @@ The retryable-error branch is the headline new flow: pick a backoff policy that 
 [dependencies]
 # `ask` is a default feature on sqlrite-engine; opt out with
 # default-features = false if you don't want the LLM stack pulled in.
-sqlrite-engine = "0.11"
-sqlrite-ask    = "0.11"
+sqlrite-engine = "0.12"
+sqlrite-ask    = "0.12"
 ```
 
 ```rust
