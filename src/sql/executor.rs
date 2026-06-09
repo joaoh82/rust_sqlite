@@ -21,8 +21,8 @@ use crate::sql::db::table::{
 use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{
-    AggregateArg, JoinConstraintKind, JoinType, OrderByClause, Projection, ProjectionItem,
-    ProjectionKind, SelectQuery,
+    AggregateArg, AggregateFn, JoinConstraintKind, JoinType, OrderByClause, Projection,
+    ProjectionItem, ProjectionKind, SelectQuery, parse_aggregate_call,
 };
 
 // -----------------------------------------------------------------
@@ -279,8 +279,40 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     // group, so we walk the full filtered rowid set, accumulate, then
     // sort/truncate the resulting *output rows*.
     if aggregating {
-        // Validate aggregate column args.
-        for item in &proj_items {
+        // SQLR-52 — HAVING. The expression may reference aggregates and
+        // GROUP BY keys that aren't in the SELECT output (SQLite allows
+        // both: `SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1`).
+        // We append those as *hidden* trailing projection slots so the
+        // existing `aggregate_rows` accumulator computes them alongside
+        // the visible ones, then strip them after filtering. Aggregate
+        // calls in the HAVING tree are lowered to identifiers naming
+        // their output slot (`COUNT(*)` → identifier "COUNT(*)") so the
+        // shared expression evaluator can resolve them through a
+        // `GroupRowScope` like any other column.
+        let mut all_items = proj_items.clone();
+        let having_expr = match &query.having {
+            Some(h) => {
+                for g in &query.group_by {
+                    if !all_items
+                        .iter()
+                        .any(|i| i.output_name().eq_ignore_ascii_case(g))
+                    {
+                        all_items.push(ProjectionItem {
+                            kind: ProjectionKind::Column {
+                                qualifier: None,
+                                name: g.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
+                Some(lower_having_expr(h, &mut all_items)?)
+            }
+            None => None,
+        };
+
+        // Validate aggregate column args (visible + HAVING-hidden).
+        for item in &all_items {
             if let ProjectionKind::Aggregate(call) = &item.kind
                 && let AggregateArg::Column(c) = &call.arg
                 && !table.contains_column(c.clone())
@@ -295,7 +327,18 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         }
 
         let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
-        let mut rows = aggregate_rows(table, &matching, &query.group_by, &proj_items)?;
+        let mut rows = aggregate_rows(table, &matching, &query.group_by, &all_items)?;
+
+        if let Some(h) = &having_expr {
+            let all_columns: Vec<String> = all_items.iter().map(|i| i.output_name()).collect();
+            rows = filter_groups_by_having(rows, h, &all_columns)?;
+        }
+        // Drop the hidden HAVING-only slots back to the user-visible width.
+        if all_items.len() > proj_items.len() {
+            for row in &mut rows {
+                row.truncate(proj_items.len());
+            }
+        }
 
         if query.distinct {
             rows = dedupe_rows(rows);
@@ -3335,6 +3378,165 @@ fn aggregate_rows(
     Ok(rows)
 }
 
+// -----------------------------------------------------------------
+// SQLR-52 — HAVING (post-aggregation filter)
+// -----------------------------------------------------------------
+
+/// Scope for evaluating a HAVING expression against one group's output
+/// row. Column references resolve against the output column names —
+/// GROUP BY keys, aggregate aliases, aggregate display forms like
+/// `COUNT(*)` (the lowered shape `lower_having_expr` produces), and
+/// the hidden HAVING-only slots appended by the executor.
+struct GroupRowScope<'a> {
+    columns: &'a [String],
+    values: &'a [Value],
+}
+
+impl RowScope for GroupRowScope<'_> {
+    fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value> {
+        // Output columns carry no table qualifier — `t.dept` in HAVING
+        // resolves by its column part, same as the aggregating ORDER BY.
+        let _ = qualifier;
+        self.columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col))
+            .map(|i| self.values[i].clone())
+            .ok_or_else(|| {
+                SQLRiteError::Internal(format!(
+                    "HAVING references '{col}', which is neither a GROUP BY column nor an \
+                     aggregate in scope"
+                ))
+            })
+    }
+
+    fn single_table_view(&self) -> Option<(&Table, i64)> {
+        None
+    }
+}
+
+/// Rewrite a HAVING expression for group-row evaluation: every
+/// aggregate call in the tree becomes an identifier naming its output
+/// slot (`SUM(salary)` → identifier `"SUM(salary)"`), registering a
+/// hidden projection slot for any aggregate not already in the SELECT
+/// list so `aggregate_rows` computes it. Non-aggregate functions and
+/// leaf expressions pass through untouched — the shared evaluator
+/// handles (or rejects) them at filter time.
+fn lower_having_expr(expr: &Expr, items: &mut Vec<ProjectionItem>) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Function(func) => {
+            let is_aggregate = matches!(
+                func.name.0.as_slice(),
+                [ObjectNamePart::Identifier(ident)] if AggregateFn::from_name(&ident.value).is_some()
+            );
+            if !is_aggregate {
+                return Ok(expr.clone());
+            }
+            let call = parse_aggregate_call(func)?;
+            let display = call.display_name();
+            // Resolvable already? Identifier lookup goes by output
+            // column name, so an unaliased projection of the same
+            // aggregate (output name == display form) suffices. An
+            // *aliased* one doesn't — its output name is the alias —
+            // so the call still gets a hidden slot of its own.
+            let already_known = items
+                .iter()
+                .any(|i| i.output_name().eq_ignore_ascii_case(&display));
+            if !already_known {
+                items.push(ProjectionItem {
+                    kind: ProjectionKind::Aggregate(call),
+                    alias: None,
+                });
+            }
+            Expr::Identifier(Ident::new(display))
+        }
+        Expr::Nested(inner) => Expr::Nested(Box::new(lower_having_expr(inner, items)?)),
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(lower_having_expr(inner, items)?),
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(lower_having_expr(left, items)?),
+            op: op.clone(),
+            right: Box::new(lower_having_expr(right, items)?),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(lower_having_expr(inner, items)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(lower_having_expr(inner, items)?)),
+        Expr::InList {
+            expr: lhs,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(lower_having_expr(lhs, items)?),
+            list: list
+                .iter()
+                .map(|e| lower_having_expr(e, items))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        },
+        Expr::Like {
+            negated,
+            any,
+            expr: lhs,
+            pattern,
+            escape_char,
+        } => Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(lower_having_expr(lhs, items)?),
+            pattern: Box::new(lower_having_expr(pattern, items)?),
+            escape_char: escape_char.clone(),
+        },
+        Expr::ILike {
+            negated,
+            any,
+            expr: lhs,
+            pattern,
+            escape_char,
+        } => Expr::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(lower_having_expr(lhs, items)?),
+            pattern: Box::new(lower_having_expr(pattern, items)?),
+            escape_char: escape_char.clone(),
+        },
+        // Leaves (identifiers, literals) and unsupported shapes pass
+        // through; the evaluator produces its own error for the latter.
+        other => other.clone(),
+    })
+}
+
+/// Keep only the groups whose HAVING expression evaluates truthy.
+/// NULL collapses to false — same three-valued-logic coercion the
+/// WHERE path applies.
+fn filter_groups_by_having(
+    rows: Vec<Vec<Value>>,
+    having: &Expr,
+    columns: &[String],
+) -> Result<Vec<Vec<Value>>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let scope = GroupRowScope {
+            columns,
+            values: &row,
+        };
+        let keep = match eval_expr_scope(having, &scope)? {
+            Value::Bool(b) => b,
+            Value::Null => false,
+            Value::Integer(i) => i != 0,
+            other => {
+                return Err(SQLRiteError::Internal(format!(
+                    "HAVING clause must evaluate to boolean, got {}",
+                    other.to_display_string()
+                )));
+            }
+        };
+        if keep {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// SELECT DISTINCT post-pass. Walks the rows once with a `HashSet` of
 /// row-keys, preserving first-occurrence order. NULL == NULL for
 /// dedupe purposes, which matches the SQL DISTINCT semantic.
@@ -4229,6 +4431,226 @@ mod tests {
         crate::sql::process_command("INSERT INTO t (x) VALUES (1);", &mut db).unwrap();
         let err = crate::sql::process_command("SELECT x FROM t WHERE COUNT(*) > 0;", &mut db);
         assert!(err.is_err(), "aggregates must not be allowed in WHERE");
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-52 — HAVING (post-aggregation filter)
+    // ---------------------------------------------------------------------
+    //
+    // seed_employees groups: eng × 3 (salaries 100, 120, 100 → SUM 320),
+    // sales × 2 (90, NULL → SUM 90), ops × 1 (80). Groups materialize in
+    // first-occurrence order: eng, sales, ops.
+
+    #[test]
+    fn having_count_filters_groups() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1;",
+        );
+        // ops (1 member) drops; hidden HAVING slots must not leak into
+        // the output width.
+        assert_eq!(r.columns, vec!["dept".to_string(), "COUNT(*)".to_string()]);
+        let got: Vec<(String, i64)> = r
+            .rows
+            .iter()
+            .map(|row| (row[0].to_display_string(), expect_int(&row[1])))
+            .collect();
+        assert_eq!(got, vec![("eng".to_string(), 3), ("sales".to_string(), 2)]);
+    }
+
+    #[test]
+    fn having_sum_threshold() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, SUM(salary) FROM emp GROUP BY dept HAVING SUM(salary) > 100;",
+        );
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "eng");
+        assert_eq!(r.rows[0][1], Value::Integer(320));
+    }
+
+    #[test]
+    fn having_references_aggregate_alias() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept HAVING total > 100;",
+        );
+        assert_eq!(r.columns, vec!["dept".to_string(), "total".to_string()]);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Value::Integer(320));
+    }
+
+    #[test]
+    fn having_aggregate_not_in_projection() {
+        let db = seed_employees();
+        // COUNT(*) only exists in HAVING — computed via a hidden slot,
+        // stripped before output.
+        let r = run_rows(
+            &db,
+            "SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 1;",
+        );
+        assert_eq!(r.columns, vec!["dept".to_string()]);
+        let depts: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].to_display_string())
+            .collect();
+        assert_eq!(depts, vec!["eng".to_string(), "sales".to_string()]);
+    }
+
+    #[test]
+    fn having_group_key_not_in_projection() {
+        let db = seed_employees();
+        // dept only exists in GROUP BY + HAVING, not the SELECT list.
+        let r = run_rows(
+            &db,
+            "SELECT COUNT(*) FROM emp GROUP BY dept HAVING dept = 'eng';",
+        );
+        assert_eq!(r.columns, vec!["COUNT(*)".to_string()]);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Integer(3));
+    }
+
+    #[test]
+    fn having_compound_and_predicate() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept FROM emp GROUP BY dept \
+             HAVING COUNT(*) > 1 AND SUM(salary) > 100;",
+        );
+        // eng passes both; sales passes COUNT but fails SUM (90).
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].to_display_string(), "eng");
+    }
+
+    #[test]
+    fn having_composes_with_order_by_and_limit() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, COUNT(*) AS n FROM emp GROUP BY dept \
+             HAVING n >= 1 ORDER BY n DESC LIMIT 2;",
+        );
+        let got: Vec<(String, i64)> = r
+            .rows
+            .iter()
+            .map(|row| (row[0].to_display_string(), expect_int(&row[1])))
+            .collect();
+        assert_eq!(got, vec![("eng".to_string(), 3), ("sales".to_string(), 2)]);
+    }
+
+    #[test]
+    fn having_can_exclude_every_group() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 99;",
+        );
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    fn having_null_aggregate_collapses_to_false() {
+        let mut db = seed_employees();
+        // mkt's only salary is NULL → SUM(salary) is NULL → NULL > 0 is
+        // unknown → group excluded (NULL-as-false, same as WHERE).
+        crate::sql::process_command(
+            "INSERT INTO emp (name, dept, salary) VALUES ('Zoe', 'mkt', NULL);",
+            &mut db,
+        )
+        .unwrap();
+        let r = run_rows(
+            &db,
+            "SELECT dept FROM emp GROUP BY dept HAVING SUM(salary) > 0;",
+        );
+        let depts: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].to_display_string())
+            .collect();
+        assert_eq!(
+            depts,
+            vec!["eng".to_string(), "sales".to_string(), "ops".to_string()],
+            "mkt (all-NULL salaries) must be filtered out"
+        );
+    }
+
+    #[test]
+    fn having_lowercase_function_form_matches() {
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept FROM emp GROUP BY dept HAVING count(*) > 1;",
+        );
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn having_without_group_by_is_rejected() {
+        let mut db = seed_employees();
+        let err =
+            crate::sql::process_command("SELECT COUNT(*) FROM emp HAVING COUNT(*) > 0;", &mut db);
+        match err {
+            Err(SQLRiteError::NotImplemented(msg)) => assert!(
+                msg.contains("HAVING without GROUP BY"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn having_unknown_column_is_rejected() {
+        let mut db = seed_employees();
+        // `name` is neither a GROUP BY key nor an aggregate — typed error,
+        // not a silent NULL like the legacy single-table WHERE leniency.
+        let err = crate::sql::process_command(
+            "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING name = 'Alice';",
+            &mut db,
+        );
+        match err {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("HAVING references"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Ok(_) => panic!("HAVING on an out-of-scope column must error"),
+        }
+    }
+
+    #[test]
+    fn having_over_join_rejected_for_all_flavors() {
+        // Aggregates / GROUP BY over JOIN results are a separate increment
+        // (SQLR-6); until it lands, every JOIN flavor + GROUP BY + HAVING
+        // must surface the clean NotImplemented — no wrong results.
+        for flavor in ["INNER", "LEFT OUTER", "RIGHT OUTER", "FULL OUTER"] {
+            let sql = format!(
+                "SELECT customers.name, COUNT(*) FROM customers \
+                 {flavor} JOIN orders ON customers.id = orders.customer_id \
+                 GROUP BY customers.name HAVING COUNT(*) > 1;"
+            );
+            let err = crate::sql::process_command(&sql, &mut seed_join_fixture());
+            match err {
+                Err(SQLRiteError::NotImplemented(msg)) => {
+                    assert!(msg.contains("JOIN"), "{flavor}: unexpected message: {msg}")
+                }
+                other => panic!("{flavor}: expected NotImplemented, got {other:?}"),
+            }
+        }
+    }
+
+    /// Helper: unwrap an integer `Value` in HAVING tests.
+    fn expect_int(v: &Value) -> i64 {
+        match v {
+            Value::Integer(i) => *i,
+            other => panic!("expected integer value, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------------

@@ -734,7 +734,7 @@ Promotes the plan to a canonical user-facing reference at [`docs/concurrent-writ
 The remaining items — actually open, not retroactively rewritten:
 
 - Subqueries (scalar, `IN (SELECT ...)`, correlated) and CTEs (`WITH`, recursive)
-- `HAVING` (post-aggregation filter)
+- ~~`HAVING` (post-aggregation filter)~~ ✅ Shipped (SQLR-52) — group-row filter after aggregation; references GROUP BY keys, aggregate aliases, and direct aggregate calls (hidden-slot computation for HAVING-only aggregates). `HAVING` without `GROUP BY` stays rejected in v0.
 - `CASE WHEN … THEN … END`, `BETWEEN`, `GLOB`, `REGEXP`, `LIKE … ESCAPE '<char>'`
 - Aggregates / `GROUP BY` / `DISTINCT` *over* joins (needs a single executor pass that knows about multiple input streams)
 - Multi-column / expression `ORDER BY`, `OFFSET`, `NULLS FIRST/LAST`

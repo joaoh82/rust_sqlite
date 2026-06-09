@@ -166,14 +166,20 @@ contributes to its group), so the executor takes a separate path:
 4. Emit one output row per group, in projection order — bare-column
    slots emit the captured group-key value, aggregate slots emit
    `AggState::finalize()`.
-5. Apply DISTINCT (post-projection dedup), then ORDER BY (resolved
+5. Apply `HAVING` (SQLR-52): the expression is lowered once — aggregate
+   calls become identifiers naming their output slot, with *hidden*
+   trailing slots appended for aggregates / GROUP BY keys referenced
+   only in HAVING — then evaluated per group row through a
+   `GroupRowScope` using the same expression evaluator as WHERE
+   (NULL-as-false). Hidden slots are stripped after filtering.
+6. Apply DISTINCT (post-projection dedup), then ORDER BY (resolved
    against the *output* row by alias, bare column name, or aggregate
    display form), then LIMIT.
 
 Aggregate function names (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) used in WHERE
 or any other scalar position get a friendly error redirecting the user
-to the projection list (since `HAVING` isn't supported yet). DISTINCT
-on `SUM`/`AVG`/`MIN`/`MAX` is rejected at parse time; only
+to the projection list (`HAVING` is where post-aggregate filters go).
+DISTINCT on `SUM`/`AVG`/`MIN`/`MAX` is rejected at parse time; only
 `COUNT(DISTINCT col)` is in v1.
 
 `LIKE` / `ILIKE` use a hand-rolled iterative two-pointer matcher in

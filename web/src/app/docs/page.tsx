@@ -337,6 +337,7 @@ export default function DocsPage() {
             <span className="kw">FROM</span> employees{"\n"}
             <span className="kw">WHERE</span> active = <span className="kw">TRUE</span>{"\n"}
             <span className="kw">GROUP BY</span> dept{"\n"}
+            <span className="kw">HAVING</span> <span className="kw">COUNT</span>(*) &gt; 1{"\n"}
             <span className="kw">ORDER BY</span> <span className="kw">COUNT</span>(*){" "}
             <span className="kw">DESC</span>;
           </pre>
@@ -346,8 +347,10 @@ export default function DocsPage() {
             <code>NOT LIKE</code> / <code>ILIKE</code> use SQLite-style ASCII
             case folding.{" "}
             <code>IN (literal-list)</code> uses three-valued logic.{" "}
-            <code>HAVING</code> isn&rsquo;t supported yet — wrap the aggregate
-            in a subquery once subqueries land.
+            <code>HAVING</code> filters groups after aggregation — it can
+            reference <code>GROUP BY</code> columns, aggregate aliases, or
+            aggregate calls directly (<code>HAVING COUNT(*) &gt; 1</code>),
+            and requires <code>GROUP BY</code>.
           </p>
 
           <h2 id="alter-drop">ALTER TABLE / DROP / VACUUM</h2>

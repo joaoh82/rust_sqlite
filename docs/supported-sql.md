@@ -184,6 +184,7 @@ FROM <table> [AS <alias>]
   [{INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER]} JOIN <table> [AS <alias>] ON <expr>]*
   [WHERE <expr>]
   [GROUP BY <col>[, <col>, ...]]
+  [HAVING <expr>]
   [ORDER BY <expr> [ASC|DESC]]
   [LIMIT <non-negative-integer>];
 ```
@@ -204,6 +205,7 @@ COUNT([DISTINCT] <column>)                     -- counts non-NULL values, option
 - **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering). Includes **`IS NULL`** / **`IS NOT NULL`** for explicit null tests, **`LIKE` / `NOT LIKE` / `ILIKE`** for pattern matching, and **`IN (list) / NOT IN (list)`** for set-membership against literal lists.
 - **`DISTINCT`**: `SELECT DISTINCT` deduplicates result rows after projection (and after aggregation, when both apply). `NULL` values compare equal to other `NULL`s for dedupe, matching SQL's DISTINCT semantic.
 - **`GROUP BY`**: one or more bare column names. Every non-aggregate item in the projection must appear in the `GROUP BY` list (the parser rejects the violation with a clear message). `GROUP BY <col>` without any aggregate behaves like an implicit `DISTINCT <col>`.
+- **`HAVING`** (SQLR-52): post-aggregation filter over the grouped output. `WHERE` filters rows before grouping; `HAVING` filters groups after aggregation. Requires `GROUP BY` (see [HAVING semantics](#having-semantics-sqlr-52)).
 - **Aggregates** (SQLR-3): `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`. `SUM` over an integer column stays `INTEGER` until a `REAL` input arrives or the running sum overflows `i64` (one-time promotion to `REAL`). `AVG` always returns `REAL` (or `NULL` on empty / all-NULL groups). `MIN` / `MAX` skip NULLs and use the same total order as `ORDER BY`. Aggregates over an empty table or empty group return `0` for `COUNT(*)` / `COUNT(col)` and `NULL` for the rest.
 - **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. For non-aggregating queries the key is any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. For aggregating queries the key resolves against the *output* row by name: a bare identifier matches an alias or a `GROUP BY` column, and a function call like `COUNT(*)` matches an aggregate projection by its canonical display form. Sort key types must match across rows.
 - **`LIMIT`**: non-negative integer literal. `LIMIT 0` is valid (returns zero rows). When `DISTINCT` is in play, `LIMIT` is applied after deduplication so it counts unique rows.
@@ -260,12 +262,28 @@ The executor includes a tiny optimizer: if the `WHERE` is exactly `<indexed_col>
 - Three-valued logic: if the LHS is `NULL`, the result is `NULL`; if the RHS list contains a `NULL` and no other entry matches, the result is `NULL`. In a `WHERE` both cases collapse to "row excluded", matching SQLite.
 - `IN (subquery)`, `IN UNNEST(...)`, and `BETWEEN` are not supported yet.
 
+### `HAVING` semantics (SQLR-52)
+
+- Post-aggregation filter: groups whose `HAVING` expression evaluates to false or `NULL` are dropped (NULL-as-false, the same three-valued-logic collapse `WHERE` applies).
+- **Requires `GROUP BY`.** The degenerate no-`GROUP-BY` single-group form SQLite allows is rejected with a clear `NotImplemented` — use `WHERE` for row-level filters.
+- **What's in scope:** the `GROUP BY` key columns (their per-group values), aggregate output columns by alias (`SUM(salary) AS total … HAVING total > 100`), and aggregate calls written out directly (`HAVING COUNT(*) > 1`, matched case-insensitively by canonical display form).
+- Aggregates and `GROUP BY` keys referenced **only** in `HAVING` work too — `SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 1` computes the count without projecting it.
+- Any other column reference is an error (matches SQLite: `HAVING` sees the grouped output, not the raw rows).
+- The expression surface is the same as `WHERE`: comparisons, `AND` / `OR` / `NOT`, arithmetic, `IS [NOT] NULL`, `LIKE`, `IN (list)`.
+- Runs after `WHERE` + aggregation, before `DISTINCT`, `ORDER BY`, and `LIMIT`.
+
+```sql
+SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1;
+SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept HAVING total > 100000;
+SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 1 AND SUM(salary) > 100;
+```
+
 ### What doesn't work
 
 - **Comma-separated FROM lists** (`FROM a, b`) — use an explicit `JOIN` / `CROSS JOIN`. `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS` with `ON` / `USING` / `NATURAL` are all supported (see [JOIN semantics](#join-semantics-sqlr-5))
 - **Aggregates** / **`GROUP BY`** / **`DISTINCT`** over a JOIN — pipe through a subquery once subqueries land
 - **Subqueries**, CTEs (`WITH`), views
-- **`HAVING`** — pre-aggregation `WHERE` works; post-aggregation filtering does not yet
+- **`HAVING` without `GROUP BY`** — the degenerate single-group form is rejected; `HAVING` with `GROUP BY` works (see [HAVING semantics](#having-semantics-sqlr-52))
 - **`DISTINCT`** on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
 - **`GROUP BY` on expressions** — bare column names only in v1
 - **`LIKE … ESCAPE '<char>'`**, **`IN (subquery)`**, **`BETWEEN`**, **`GLOB`**, **`REGEXP`**
@@ -715,7 +733,7 @@ For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when th
 - Views (`CREATE VIEW`)
 
 ### Aggregation & grouping
-- `HAVING` — pre-aggregation `WHERE` works; post-aggregation filtering doesn't yet
+- `HAVING` without `GROUP BY` — the degenerate single-group form; `HAVING` over grouped output works (SQLR-52)
 - `DISTINCT` on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
 - `GROUP BY` on expressions — bare column names only
 - Other aggregate functions (`GROUP_CONCAT`, `STRING_AGG`, …) — only `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` are wired
