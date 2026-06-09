@@ -106,6 +106,7 @@ const SQL_REF: Row[] = [
       "MIN",
       "MAX",
       "GROUP BY <col>",
+      "HAVING",
     ],
   },
   {
@@ -169,7 +170,7 @@ const SQL_REF: Row[] = [
 const NOT_YET = [
   "subqueries",
   "CTEs (WITH)",
-  "HAVING",
+  "HAVING without GROUP BY",
   "CASE WHEN",
   "BETWEEN",
   "GLOB / REGEXP",

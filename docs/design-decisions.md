@@ -398,7 +398,7 @@ A hidden primary that the registry itself owns sidesteps both problems: every `*
 
 **Decision.** In [`eval_predicate`](../src/sql/executor.rs), a `WHERE` expression evaluating to `NULL` is treated as `false` — the row does *not* match.
 
-**Why.** Matches SQL's three-valued logic in spirit: `NULL` propagates through comparisons, and a `WHERE` requires a definitely-true predicate. Doing strict 3VL would mean threading an explicit `Option<bool>` / "unknown" state through the evaluator. For a query surface that doesn't have `HAVING` or aggregate post-filters, implicit coercion to `false` at the `WHERE` boundary is equivalent for every statement we execute.
+**Why.** Matches SQL's three-valued logic in spirit: `NULL` propagates through comparisons, and a `WHERE` requires a definitely-true predicate. Doing strict 3VL would mean threading an explicit `Option<bool>` / "unknown" state through the evaluator. Implicit coercion to `false` at the filter boundary is equivalent for every statement we execute; `HAVING` (SQLR-52) reuses the same collapse — a group whose predicate evaluates to `NULL` is dropped.
 
 **Cost.** Diverges subtly from strict SQL on edge cases involving `NULL` through `NOT` / `AND` / `OR`. If this matters later, the evaluator can be upgraded to 3VL without touching callers.
 

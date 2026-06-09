@@ -332,7 +332,7 @@ Lockstep versioning — one dispatch bumps every product to the same `vX.Y.Z`. T
 - [ ] *(deferred to Phase 8)* Full-text search with BM25 + hybrid retrieval
 
 **Possible extras** *(no committed phase)*
-- `HAVING`, `IN (subquery)`, `BETWEEN`, `GLOB` / `REGEXP`, `GROUP_CONCAT`, window functions
+- `IN (subquery)`, `BETWEEN`, `GLOB` / `REGEXP`, `GROUP_CONCAT`, window functions
 - Composite and expression indexes (with cost analysis)
 - Alternate storage engines — LSM/SSTable for write-heavy workloads alongside the B-Tree
 - Benchmarks against SQLite

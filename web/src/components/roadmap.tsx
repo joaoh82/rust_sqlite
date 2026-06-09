@@ -182,7 +182,7 @@ const PHASES: Phase[] = [
     desc:
       "Smaller, well-scoped follow-ups that slot in where they make sense — see the canonical roadmap doc for the full list.",
     bullets: [
-      "HAVING · BETWEEN · CASE WHEN · scalar functions (LENGTH / UPPER / COALESCE / …)",
+      "BETWEEN · CASE WHEN · scalar functions (LENGTH / UPPER / COALESCE / …)",
       "Subqueries + CTEs · GROUP BY / DISTINCT over JOINs · multi-column ORDER BY · OFFSET · UNION",
       "Composite + expression indexes · CREATE VIEW / TRIGGER · FOREIGN KEY / CHECK",
       "MVCC checkpoint drain (re-enable Mvcc → Wal downgrade) · indexes under MVCC",

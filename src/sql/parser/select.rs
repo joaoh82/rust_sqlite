@@ -27,7 +27,7 @@ impl AggregateFn {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "count" => Some(AggregateFn::Count),
             "sum" => Some(AggregateFn::Sum),
@@ -226,6 +226,11 @@ pub struct SelectQuery {
     pub distinct: bool,
     /// `GROUP BY a, b` — bare column names. Empty = no GROUP BY.
     pub group_by: Vec<String>,
+    /// SQLR-52 — raw sqlparser HAVING expression, evaluated by the
+    /// executor against each group's output row after aggregation.
+    /// Parser-level invariant: `Some` implies `group_by` is non-empty
+    /// (HAVING without GROUP BY is rejected in v0).
+    pub having: Option<Expr>,
 }
 
 impl SelectQuery {
@@ -272,11 +277,6 @@ impl SelectQuery {
                 ));
             }
         };
-        if having.is_some() {
-            return Err(SQLRiteError::NotImplemented(
-                "HAVING is not supported yet".to_string(),
-            ));
-        }
         // SQLR-3: parse GROUP BY into a list of bare column names.
         // GroupByExpr::Expressions(v, _) with an empty v is the "no
         // GROUP BY" shape; non-empty means we've got grouping. Reject
@@ -308,6 +308,19 @@ impl SelectQuery {
                 ));
             }
         };
+
+        // SQLR-52 — HAVING is the post-aggregation filter, so it only
+        // makes sense against grouped output. SQLite allows the
+        // degenerate no-GROUP-BY single-group form, but the Phase 9e
+        // executor's grouping pipeline assumes an explicit GROUP BY;
+        // reject the degenerate shape rather than special-casing it.
+        if having.is_some() && group_by_cols.is_empty() {
+            return Err(SQLRiteError::NotImplemented(
+                "HAVING without GROUP BY is not supported in v0; use WHERE for row-level \
+                 filters or restructure with a subquery"
+                    .to_string(),
+            ));
+        }
 
         let (table_name, table_alias, joins) = extract_from_clause(from)?;
         let projection = parse_projection(projection)?;
@@ -364,6 +377,7 @@ impl SelectQuery {
             limit,
             distinct: distinct_flag,
             group_by: group_by_cols,
+            having: having.clone(),
         })
     }
 }
@@ -577,7 +591,7 @@ fn parse_projection_expr(expr: &Expr, alias: Option<String>) -> Result<Projectio
     }
 }
 
-fn parse_aggregate_call(func: &sqlparser::ast::Function) -> Result<AggregateCall> {
+pub(crate) fn parse_aggregate_call(func: &sqlparser::ast::Function) -> Result<AggregateCall> {
     // Function name: only unqualified names like COUNT(...). Qualified
     // names like `pkg.fn(...)` are out of scope.
     let name = match func.name.0.as_slice() {
