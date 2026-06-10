@@ -175,7 +175,7 @@ sqlrite> DELETE FROM users WHERE age < 30;
 | `CREATE TABLE` | `PRIMARY KEY`, `UNIQUE`, `NOT NULL`; `IF NOT EXISTS` (idempotent re-create); duplicate-column detection; types `INTEGER`/`INT`/`BIGINT`/`SMALLINT`, `TEXT`/`VARCHAR`, `REAL`/`FLOAT`/`DOUBLE`/`DECIMAL`, `BOOLEAN`. Auto-creates `sqlrite_autoindex_<table>_<col>` for every PK + UNIQUE column |
 | `CREATE [UNIQUE] INDEX` | Single-column, named indexes; `IF NOT EXISTS`; persists as a dedicated cell-based B-Tree. INTEGER + TEXT columns only |
 | `INSERT INTO` | Explicit column list required; auto-ROWID for `INTEGER PRIMARY KEY`; multi-row `VALUES (…), (…)`; UNIQUE enforcement; clean type errors (no panics); NULL padding for omitted columns |
-| `SELECT` | `*` or column list with optional `AS alias`; `WHERE`; `DISTINCT`; `GROUP BY col[, col …]`; aggregate projections `COUNT(*)` / `COUNT([DISTINCT] col)` / `SUM` / `AVG` / `MIN` / `MAX`; `[INNER\|LEFT OUTER\|RIGHT OUTER\|FULL OUTER\|CROSS] JOIN` with `ON ...` / `USING (...)` / `NATURAL` constraints, table aliases and qualified `t.col` references; single-column `ORDER BY [ASC\|DESC]` (also resolves alias and aggregate display names); `LIMIT n`. `WHERE col = literal` probes an index when one exists. Catalog introspection via `SELECT … FROM sqlrite_master` |
+| `SELECT` | `*` or column list with optional `AS alias`; `WHERE`; `DISTINCT`; `GROUP BY col[, t.col …]` (qualified keys allowed); `HAVING`; aggregate projections `COUNT(*)` / `COUNT([DISTINCT] col)` / `SUM` / `AVG` / `MIN` / `MAX`; `[INNER\|LEFT OUTER\|RIGHT OUTER\|FULL OUTER\|CROSS] JOIN` with `ON ...` / `USING (...)` / `NATURAL` constraints, table aliases and qualified `t.col` references — aggregates / `GROUP BY` / `DISTINCT` / `HAVING` all compose over join results; single-column `ORDER BY [ASC\|DESC]` (also resolves alias and aggregate display names); `LIMIT n`. `WHERE col = literal` probes an index when one exists. Catalog introspection via `SELECT … FROM sqlrite_master` |
 | `UPDATE` | Multi-column `SET`; `WHERE`; UNIQUE + type enforcement; arithmetic in assignments (`SET age = age + 1`) |
 | `DELETE` | `WHERE` predicate or full-table delete |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Real transactions, snapshot-based; WAL-backed commit; single-level (no savepoints); auto-rollback if `COMMIT`'s disk write fails |
@@ -193,7 +193,7 @@ Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 - String concat — `||`
 - Literals — integer + real numbers, `'single-quoted strings'`, `TRUE` / `FALSE`, `NULL`; parentheses for grouping
 
-**Not yet supported** (common ones): subqueries, CTEs, `HAVING`, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `DISTINCT` on `SUM`/`AVG`/`MIN`/`MAX`, GROUP BY on expressions, expressions in the projection list, `OFFSET`, multi-column `ORDER BY`, savepoints, comma joins (`FROM a, b`), aggregates / DISTINCT / GROUP BY *over* JOIN results. The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
+**Not yet supported** (common ones): subqueries, CTEs, `HAVING` without `GROUP BY`, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `DISTINCT` on `SUM`/`AVG`/`MIN`/`MAX`, GROUP BY on expressions, expressions in the projection list, `OFFSET`, multi-column `ORDER BY`, savepoints, comma joins (`FROM a, b`). The [full list with context](docs/supported-sql.md#not-yet-supported) lives in the reference.
 
 #### Meta commands
 

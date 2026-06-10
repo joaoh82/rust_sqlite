@@ -74,7 +74,7 @@ Quick hits worth knowing when you're working at the REPL:
 - **Arithmetic stays honest.** Integer-only operations stay integer; any `REAL` operand promotes to `f64`; divide-by-zero is a typed runtime error, never a panic.
 - **NULL follows three-valued logic.** `NULL = NULL` is unknown (not true) — treated as false in `WHERE`. Use `IS NULL` / `IS NOT NULL` for explicit null tests, e.g. `SELECT id FROM t WHERE qty IS NULL;`.
 - **Identifiers are case-sensitive** (table / column names; no normalization), but keywords aren't. String literals preserve case.
-- **Not yet supported**: joins, subqueries, `GROUP BY` / aggregates, `DISTINCT`, `LIKE` / `IN`, projection expressions, column aliases, `OFFSET`, multi-column `ORDER BY`, savepoints, `ALTER TABLE`, `DROP TABLE`, `DROP INDEX`. See the [full list in the reference](supported-sql.md#not-yet-supported).
+- **Not yet supported**: subqueries, CTEs, views, comma joins (`FROM a, b`), projection expressions beyond aggregate calls, `OFFSET`, multi-column `ORDER BY`, savepoints. See the [full list in the reference](supported-sql.md#not-yet-supported).
 
 ## History
 

@@ -39,11 +39,18 @@ impl AggregateFn {
     }
 }
 
-/// What the aggregate is fed: `*` (only valid for COUNT) or a bare column.
+/// What the aggregate is fed: `*` (only valid for COUNT) or a column
+/// reference. SQLR-6 — the column carries its optional `t.` qualifier
+/// so joined aggregation (`SUM(orders.amount)`) can disambiguate
+/// same-named columns across in-scope tables; the single-table path
+/// ignores it, same as projection qualifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArg {
     Star,
-    Column(String),
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
 }
 
 /// A parsed aggregate call like `COUNT(*)`, `SUM(salary)`, `COUNT(DISTINCT dept)`.
@@ -60,13 +67,29 @@ impl AggregateCall {
     /// aggregate output columns when the user didn't supply an alias.
     /// Mirrors the output-header convention.
     pub fn display_name(&self) -> String {
+        self.display_name_impl(true)
+    }
+
+    /// Display form with the argument's `t.` qualifier stripped. Used
+    /// as a fallback when matching ORDER BY function calls against
+    /// projection slots, so `ORDER BY SUM(amount)` still finds a
+    /// `SELECT SUM(o.amount)` slot (and vice versa).
+    pub(crate) fn display_name_unqualified(&self) -> String {
+        self.display_name_impl(false)
+    }
+
+    fn display_name_impl(&self, qualified: bool) -> String {
         let inner = match &self.arg {
             AggregateArg::Star => "*".to_string(),
-            AggregateArg::Column(c) => {
+            AggregateArg::Column { qualifier, name } => {
+                let col = match qualifier {
+                    Some(q) if qualified => format!("{q}.{name}"),
+                    _ => name.clone(),
+                };
                 if self.distinct {
-                    format!("DISTINCT {c}")
+                    format!("DISTINCT {col}")
                 } else {
-                    c.clone()
+                    col
                 }
             }
         };
@@ -123,6 +146,32 @@ pub enum Projection {
     /// Explicit, ordered projection list — possibly mixing bare columns
     /// with aggregate calls (`SELECT dept, COUNT(*) FROM t`).
     Items(Vec<ProjectionItem>),
+}
+
+/// SQLR-6 — one GROUP BY key: an optionally-qualified column reference
+/// (`dept` or `t.dept`). The qualifier matters for joined SELECTs,
+/// where the same column name can exist on several in-scope tables;
+/// the single-table path ignores it, mirroring projection qualifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupByKey {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
+impl GroupByKey {
+    /// Does a (possibly qualified) column reference name this key?
+    /// Names must match exactly; qualifiers must match (ASCII
+    /// case-insensitively) only when both sides carry one — a bare
+    /// reference matches a qualified key and vice versa. Callers that
+    /// need strict table-resolution equality (the joined executor)
+    /// layer that check on top.
+    pub(crate) fn matches_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.name == name
+            && match (self.qualifier.as_deref(), qualifier) {
+                (Some(kq), Some(q)) => kq.eq_ignore_ascii_case(q),
+                _ => true,
+            }
+    }
 }
 
 /// A parsed `ORDER BY` clause: a single sort key (expression), ascending
@@ -224,8 +273,9 @@ pub struct SelectQuery {
     pub limit: Option<usize>,
     /// `SELECT DISTINCT`.
     pub distinct: bool,
-    /// `GROUP BY a, b` — bare column names. Empty = no GROUP BY.
-    pub group_by: Vec<String>,
+    /// `GROUP BY a, t.b` — optionally-qualified column references in
+    /// source order. Empty = no GROUP BY.
+    pub group_by: Vec<GroupByKey>,
     /// SQLR-52 — raw sqlparser HAVING expression, evaluated by the
     /// executor against each group's output row after aggregation.
     /// Parser-level invariant: `Some` implies `group_by` is non-empty
@@ -277,28 +327,44 @@ impl SelectQuery {
                 ));
             }
         };
-        // SQLR-3: parse GROUP BY into a list of bare column names.
+        // SQLR-3: parse GROUP BY into a list of column references.
         // GroupByExpr::Expressions(v, _) with an empty v is the "no
         // GROUP BY" shape; non-empty means we've got grouping. Reject
-        // GROUP BY ALL and GROUP BY on non-bare expressions for v1.
-        let group_by_cols: Vec<String> = match group_by {
+        // GROUP BY ALL and GROUP BY on non-column expressions for v1.
+        // SQLR-6 — keys keep their `t.` qualifier so joined grouping
+        // (`GROUP BY customers.name`) can disambiguate.
+        let group_by_cols: Vec<GroupByKey> = match group_by {
             sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
                 let mut out = Vec::with_capacity(exprs.len());
                 for e in exprs {
-                    let col = match e {
-                        Expr::Identifier(ident) => ident.value.clone(),
-                        Expr::CompoundIdentifier(parts) => {
-                            parts.last().map(|p| p.value.clone()).ok_or_else(|| {
-                                SQLRiteError::Internal("empty compound identifier".to_string())
-                            })?
-                        }
+                    let key = match e {
+                        Expr::Identifier(ident) => GroupByKey {
+                            qualifier: None,
+                            name: ident.value.clone(),
+                        },
+                        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                            [only] => GroupByKey {
+                                qualifier: None,
+                                name: only.value.clone(),
+                            },
+                            [q, c] => GroupByKey {
+                                qualifier: Some(q.value.clone()),
+                                name: c.value.clone(),
+                            },
+                            _ => {
+                                return Err(SQLRiteError::NotImplemented(format!(
+                                    "GROUP BY identifier with {} parts is not supported",
+                                    parts.len()
+                                )));
+                            }
+                        },
                         other => {
                             return Err(SQLRiteError::NotImplemented(format!(
                                 "GROUP BY only supports bare column references for now, got {other:?}"
                             )));
                         }
                     };
-                    out.push(col);
+                    out.push(key);
                 }
                 out
             }
@@ -330,40 +396,24 @@ impl SelectQuery {
         // SQLR-3 validation: when GROUP BY is present, every bare-column
         // entry in the projection must appear in the GROUP BY list. Bare
         // columns in the SELECT are otherwise undefined per group.
-        if !group_by_cols.is_empty()
+        // SQLR-6 — only the single-table case validates here; the joined
+        // case needs the table schemas to resolve qualifiers, so the
+        // joined executor performs the equivalent check against the
+        // full in-scope table list.
+        if joins.is_empty()
+            && !group_by_cols.is_empty()
             && let Projection::Items(items) = &projection
         {
             for item in items {
-                if let ProjectionKind::Column { name: c, .. } = &item.kind
-                    && !group_by_cols.contains(c)
+                if let ProjectionKind::Column { qualifier, name: c } = &item.kind
+                    && !group_by_cols
+                        .iter()
+                        .any(|g| g.matches_column(qualifier.as_deref(), c))
                 {
                     return Err(SQLRiteError::Internal(format!(
                         "column '{c}' must appear in GROUP BY or be used in an aggregate function"
                     )));
                 }
-            }
-        }
-
-        // SQLR-5 — aggregations across joined results aren't covered
-        // by the current single-table grouping pipeline. Reject GROUP
-        // BY / aggregates over a join up front so the user gets a clear
-        // message rather than wrong results.
-        if !joins.is_empty() {
-            let has_agg = matches!(
-                &projection,
-                Projection::Items(items)
-                    if items.iter().any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)))
-            );
-            if has_agg || !group_by_cols.is_empty() {
-                return Err(SQLRiteError::NotImplemented(
-                    "GROUP BY / aggregate functions over JOIN results are not supported yet"
-                        .to_string(),
-                ));
-            }
-            if distinct_flag {
-                return Err(SQLRiteError::NotImplemented(
-                    "SELECT DISTINCT over JOIN results is not supported yet".to_string(),
-                ));
             }
         }
 
@@ -656,14 +706,28 @@ pub(crate) fn parse_aggregate_call(func: &sqlparser::ast::Function) -> Result<Ag
     let arg = match &arg_list.args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => AggregateArg::Star,
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
-            AggregateArg::Column(ident.value.clone())
+            AggregateArg::Column {
+                qualifier: None,
+                name: ident.value.clone(),
+            }
         }
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
-            let c = parts
-                .last()
-                .map(|p| p.value.clone())
-                .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?;
-            AggregateArg::Column(c)
+            match parts.as_slice() {
+                [only] => AggregateArg::Column {
+                    qualifier: None,
+                    name: only.value.clone(),
+                },
+                [q, c] => AggregateArg::Column {
+                    qualifier: Some(q.value.clone()),
+                    name: c.value.clone(),
+                },
+                _ => {
+                    return Err(SQLRiteError::NotImplemented(format!(
+                        "{name}(...) — argument identifier with {} parts is not supported",
+                        parts.len()
+                    )));
+                }
+            }
         }
         other => {
             return Err(SQLRiteError::NotImplemented(format!(

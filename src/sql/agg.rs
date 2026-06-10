@@ -91,7 +91,7 @@ impl AggState {
         match call.func {
             AggregateFn::Count => match &call.arg {
                 AggregateArg::Star => AggState::CountStar(0),
-                AggregateArg::Column(_) => AggState::Count {
+                AggregateArg::Column { .. } => AggState::Count {
                     non_null: 0,
                     distinct: if call.distinct {
                         Some(HashSet::new())
@@ -445,7 +445,10 @@ mod tests {
     fn count_col_skips_nulls() {
         let call = AggregateCall {
             func: AggregateFn::Count,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: false,
         };
         let mut s = AggState::new(&call);
@@ -459,7 +462,10 @@ mod tests {
     fn count_distinct_dedupes() {
         let call = AggregateCall {
             func: AggregateFn::Count,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: true,
         };
         let mut s = AggState::new(&call);
@@ -474,7 +480,10 @@ mod tests {
     fn sum_int_stays_int_until_real() {
         let call = AggregateCall {
             func: AggregateFn::Sum,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: false,
         };
         let mut s = AggState::new(&call);
@@ -493,7 +502,10 @@ mod tests {
     fn sum_all_null_is_null() {
         let call = AggregateCall {
             func: AggregateFn::Sum,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: false,
         };
         let mut s = AggState::new(&call);
@@ -506,7 +518,10 @@ mod tests {
     fn avg_always_real() {
         let call = AggregateCall {
             func: AggregateFn::Avg,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: false,
         };
         let mut s = AggState::new(&call);
@@ -522,7 +537,10 @@ mod tests {
     fn min_max_skip_nulls() {
         let mk = |f| AggregateCall {
             func: f,
-            arg: AggregateArg::Column("x".into()),
+            arg: AggregateArg::Column {
+                qualifier: None,
+                name: "x".into(),
+            },
             distinct: false,
         };
         let mut mn = AggState::new(&mk(AggregateFn::Min));

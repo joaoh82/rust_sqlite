@@ -204,7 +204,7 @@ COUNT([DISTINCT] <column>)                     -- counts non-NULL values, option
 - **Projection**: `*` (all columns in declaration order), a bare column list, or an explicit list mixing bare columns and aggregate calls. Each item can carry an optional `AS alias` (the alias becomes the output column header and is recognized by `ORDER BY`).
 - **`WHERE`**: any [expression](#expressions). Evaluated per row; NULL-as-false in WHERE context (three-valued logic collapsed to two-valued for filtering). Includes **`IS NULL`** / **`IS NOT NULL`** for explicit null tests, **`LIKE` / `NOT LIKE` / `ILIKE`** for pattern matching, and **`IN (list) / NOT IN (list)`** for set-membership against literal lists.
 - **`DISTINCT`**: `SELECT DISTINCT` deduplicates result rows after projection (and after aggregation, when both apply). `NULL` values compare equal to other `NULL`s for dedupe, matching SQL's DISTINCT semantic.
-- **`GROUP BY`**: one or more bare column names. Every non-aggregate item in the projection must appear in the `GROUP BY` list (the parser rejects the violation with a clear message). `GROUP BY <col>` without any aggregate behaves like an implicit `DISTINCT <col>`.
+- **`GROUP BY`**: one or more column names, optionally qualified (`GROUP BY customers.name`) — the qualifier disambiguates same-named columns across joined tables (SQLR-6). Every non-aggregate item in the projection must appear in the `GROUP BY` list (rejected with a clear message — by the parser for single-table queries, by the executor for joined ones, where resolving qualifiers needs the schemas). `GROUP BY <col>` without any aggregate behaves like an implicit `DISTINCT <col>`.
 - **`HAVING`** (SQLR-52): post-aggregation filter over the grouped output. `WHERE` filters rows before grouping; `HAVING` filters groups after aggregation. Requires `GROUP BY` (see [HAVING semantics](#having-semantics-sqlr-52)).
 - **Aggregates** (SQLR-3): `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`. `SUM` over an integer column stays `INTEGER` until a `REAL` input arrives or the running sum overflows `i64` (one-time promotion to `REAL`). `AVG` always returns `REAL` (or `NULL` on empty / all-NULL groups). `MIN` / `MAX` skip NULLs and use the same total order as `ORDER BY`. Aggregates over an empty table or empty group return `0` for `COUNT(*)` / `COUNT(col)` and `NULL` for the rest.
 - **`ORDER BY`**: single sort key, `ASC` (default) or `DESC`. For non-aggregating queries the key is any expression — including function calls — so KNN queries like `ORDER BY vec_distance_l2(embedding, [...]) LIMIT k` work end-to-end *(Phase 7b)*. For aggregating queries the key resolves against the *output* row by name: a bare identifier matches an alias or a `GROUP BY` column, and a function call like `COUNT(*)` matches an aggregate projection by its canonical display form. Sort key types must match across rows.
@@ -237,12 +237,12 @@ conditions, plus `CROSS JOIN`:
 - **Self-joins** require an alias on at least one side: `FROM nodes AS p INNER JOIN nodes AS c ON p.id = c.parent_id`. Without one, you get a `duplicate table reference` error so qualifiers stay unambiguous.
 - **`WHERE` runs after joins.** A `WHERE right.col IS NULL` filter on a `LEFT JOIN` correctly returns left rows with no match (the standard "anti-join via outer-join" idiom).
 - **`ORDER BY` and `LIMIT`** apply to the fully joined row stream.
+- **Aggregates / `GROUP BY` / `DISTINCT` / `HAVING` over joins** (SQLR-6): the fully-joined, `WHERE`-filtered row stream feeds the same aggregation pipeline single-table queries use. `GROUP BY` keys may be qualified (`GROUP BY customers.name`) and must resolve unambiguously; NULL-padded outer-join rows group under a `NULL` key, and `COUNT(col)` skips their NULLs while `COUNT(*)` counts them. `SELECT DISTINCT` dedupes the projected join output (with `LIMIT` applied after the dedupe).
 - **Algorithm:** plain nested-loop join, O(N×M) per join level. Adequate for an embedded learning database; hash / merge joins on equi-join shapes are a future optimization.
 
 #### What's not supported in JOINs
 
 - Comma-separated FROM lists (`FROM a, b`) — use an explicit `JOIN` / `CROSS JOIN` instead.
-- Aggregates / `GROUP BY` / `DISTINCT` *over* a join. The single-table aggregator is wired against one rowid stream; rewiring it for joined rows is a separate increment. Surfaces as a clean `NotImplemented` at parse time.
 - `fts_match` / `bm25_score` inside a JOIN expression. They need to look up an FTS index by column, which is single-table-bound today. Use them on a single-table SELECT first, or fold the FTS lookup into the FROM side.
 
 ### Index probing
@@ -281,7 +281,6 @@ SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 1 AND SUM(salary) > 100;
 ### What doesn't work
 
 - **Comma-separated FROM lists** (`FROM a, b`) — use an explicit `JOIN` / `CROSS JOIN`. `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS` with `ON` / `USING` / `NATURAL` are all supported (see [JOIN semantics](#join-semantics-sqlr-5))
-- **Aggregates** / **`GROUP BY`** / **`DISTINCT`** over a JOIN — pipe through a subquery once subqueries land
 - **Subqueries**, CTEs (`WITH`), views
 - **`HAVING` without `GROUP BY`** — the degenerate single-group form is rejected; `HAVING` with `GROUP BY` works (see [HAVING semantics](#having-semantics-sqlr-52))
 - **`DISTINCT`** on `SUM` / `AVG` / `MIN` / `MAX` (only `COUNT(DISTINCT col)` is supported)
@@ -725,8 +724,7 @@ A REPL launched with `sqlrite --readonly foo.sqlrite` (or `sqlrite::open_databas
 For context when you hit `NotImplemented`. See [Roadmap](roadmap.md) for when these land:
 
 ### Joins & composition
-- `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS JOIN` with `ON` / `USING (...)` / `NATURAL` all work (SQLR-5). Comma-separated FROM joins (`FROM a, b`) don't — use an explicit `JOIN` / `CROSS JOIN`
-- Aggregates / `GROUP BY` / `DISTINCT` *over* a JOIN — pipe through a subquery once subqueries land
+- `INNER` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS JOIN` with `ON` / `USING (...)` / `NATURAL` all work (SQLR-5), and aggregates / `GROUP BY` / `DISTINCT` / `HAVING` compose over join results (SQLR-6). Comma-separated FROM joins (`FROM a, b`) don't — use an explicit `JOIN` / `CROSS JOIN`
 - `fts_match` / `bm25_score` inside a JOIN expression — single-table-bound today
 - Subqueries (scalar, `IN (SELECT ...)`, correlated)
 - CTEs (`WITH`), recursive CTEs

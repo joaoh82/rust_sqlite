@@ -561,7 +561,7 @@ The biggest single SQL-surface jump in the project's history.
 - Self-joins require an alias on at least one side.
 - `WHERE` runs after joins (the standard `LEFT JOIN ... WHERE right.col IS NULL` anti-join idiom works).
 
-`ON`, `USING (...)`, `NATURAL`, and `CROSS JOIN` are all supported. Not yet supported: comma-separated FROMs (`FROM a, b`), aggregates / `GROUP BY` / `DISTINCT` *over* a join, `fts_match` / `bm25_score` inside a join expression. Algorithm: plain nested-loop, O(N×M) per level — hash / merge joins are a future optimization.
+`ON`, `USING (...)`, `NATURAL`, and `CROSS JOIN` are all supported, and aggregates / `GROUP BY` / `DISTINCT` / `HAVING` compose over join results (SQLR-6). Not yet supported: comma-separated FROMs (`FROM a, b`), `fts_match` / `bm25_score` inside a join expression. Algorithm: plain nested-loop, O(N×M) per level — hash / merge joins are a future optimization.
 
 ### ✅ Phase 9g — Prepared statements + parameter binding *(v0.9.0, SQLR-23)*
 
@@ -736,7 +736,7 @@ The remaining items — actually open, not retroactively rewritten:
 - Subqueries (scalar, `IN (SELECT ...)`, correlated) and CTEs (`WITH`, recursive)
 - ~~`HAVING` (post-aggregation filter)~~ ✅ Shipped (SQLR-52) — group-row filter after aggregation; references GROUP BY keys, aggregate aliases, and direct aggregate calls (hidden-slot computation for HAVING-only aggregates). `HAVING` without `GROUP BY` stays rejected in v0.
 - `CASE WHEN … THEN … END`, `BETWEEN`, `GLOB`, `REGEXP`, `LIKE … ESCAPE '<char>'`
-- Aggregates / `GROUP BY` / `DISTINCT` *over* joins (needs a single executor pass that knows about multiple input streams)
+- ~~Aggregates / `GROUP BY` / `DISTINCT` *over* joins~~ ✅ Shipped (SQLR-6) — the joined row stream feeds the same scope-generic aggregation pipeline the single-table path uses; `GROUP BY` keys accept `t.col` qualifiers; `HAVING` and `SELECT DISTINCT` compose too.
 - Multi-column / expression `ORDER BY`, `OFFSET`, `NULLS FIRST/LAST`
 - `UNION` / `INTERSECT` / `EXCEPT`, `INSERT ... SELECT`
 - Composite + expression indexes
