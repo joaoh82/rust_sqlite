@@ -168,6 +168,8 @@ These should each print a clean `An error occured: …` message and leave the RE
 INSERT INTO users (email, dept) VALUES ('e', 'x', 999);           -- 3 values for 2 columns
 SELECT * FROM nope;                                                -- unknown table
 SELECT height FROM users;                                          -- unknown column
+SELECT * FROM users WHERE height IS NULL;                          -- unknown column in WHERE (SQLR-2)
+DELETE FROM users WHERE height IS NULL;                            -- unknown column in WHERE — must not delete anything (SQLR-2)
 CREATE TABLE sqlrite_master (x INTEGER);                           -- reserved name
 SELECT * FROM users WHERE hired / 0 > 0;                           -- division by zero
 ```
