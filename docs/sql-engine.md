@@ -49,11 +49,11 @@ The `sqlparser` AST is designed to cover every SQL dialect, so its types are hug
 
 `UPDATE` and `DELETE` don't have a dedicated internal struct — the executor pattern-matches the sqlparser types directly because there's less transformation needed.
 
-`SelectQuery::projection` is now `Projection::All | Projection::Items(Vec<ProjectionItem>)`, where each item carries a `ProjectionKind::Column { qualifier, name }` (qualifier is `Some` for `t.col` shapes, used by JOIN execution to disambiguate) or `ProjectionKind::Aggregate(AggregateCall)` plus an optional `AS alias`. `AggregateCall` covers `COUNT(*)`, `COUNT([DISTINCT] col)`, `SUM` / `AVG` / `MIN` / `MAX` of a bare column. `group_by` is a `Vec<String>` of bare column names (empty = no GROUP BY); the parser validates that every non-aggregate projection item appears in `GROUP BY`.
+`SelectQuery::projection` is now `Projection::All | Projection::Items(Vec<ProjectionItem>)`, where each item carries a `ProjectionKind::Column { qualifier, name }` (qualifier is `Some` for `t.col` shapes, used by JOIN execution to disambiguate) or `ProjectionKind::Aggregate(AggregateCall)` plus an optional `AS alias`. `AggregateCall` covers `COUNT(*)`, `COUNT([DISTINCT] col)`, `SUM` / `AVG` / `MIN` / `MAX` of a column reference (optionally qualified, `SUM(o.amount)`). `group_by` is a `Vec<GroupByKey>` of optionally-qualified column references (`GROUP BY dept`, `GROUP BY customers.name`; empty = no GROUP BY). The parser validates that every non-aggregate projection item appears in `GROUP BY` for single-table queries; joined queries defer that check to the executor, which resolves qualifiers against the in-scope table schemas (SQLR-6).
 
 `SelectQuery::joins` (SQLR-5) is a `Vec<JoinClause>` evaluated left-to-right by `execute_select_rows_joined`. Each clause carries a `JoinType` (`Inner` / `LeftOuter` / `RightOuter` / `FullOuter`), the right-table name + optional alias, and a required `ON` expression. Empty = single-table SELECT, the existing fast path with HNSW / FTS / bounded-heap optimizations.
 
-Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — comma joins (`FROM a, b`), aggregates / GROUP BY / DISTINCT over JOINs, `HAVING`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there. (`JOIN ... USING`, `NATURAL JOIN`, and `CROSS JOIN` are now supported — see [`supported-sql.md`](supported-sql.md#join-semantics-sqlr-5).)
+Each parser module still rejects features we don't implement with `SQLRiteError::NotImplemented` — comma joins (`FROM a, b`), `HAVING` without `GROUP BY`, `DISTINCT ON (...)`, `GROUP BY` on expressions, `LIKE … ESCAPE '<char>'`, `IN (subquery)`, `OFFSET`, multi-table DELETE, tuple assignment targets, etc. These errors carry the feature name in the message so the user knows what isn't there. (`JOIN ... USING`, `NATURAL JOIN`, and `CROSS JOIN` are now supported — see [`supported-sql.md`](supported-sql.md#join-semantics-sqlr-5).)
 
 ## Statement dispatch
 
@@ -175,6 +175,14 @@ contributes to its group), so the executor takes a separate path:
 6. Apply DISTINCT (post-projection dedup), then ORDER BY (resolved
    against the *output* row by alias, bare column name, or aggregate
    display form), then LIMIT.
+
+SQLR-6 made steps 2–6 scope-generic: the accumulator consumes
+`RowScope`s instead of `(table, rowid)` pairs, so a joined SELECT feeds
+its fully-joined, WHERE-filtered rows (each one a `JoinedScope`)
+through the exact same pipeline. `GROUP BY` keys and aggregate args
+carry an optional `t.` qualifier for disambiguation; NULL-padded
+outer-join rows group under a `NULL` key and are skipped by
+`COUNT(col)` like any other NULL.
 
 Aggregate function names (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) used in WHERE
 or any other scalar position get a friendly error redirecting the user

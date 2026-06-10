@@ -178,7 +178,6 @@ const NOT_YET = [
   "multi-column ORDER BY",
   "UNION / INTERSECT / EXCEPT",
   "INSERT … SELECT",
-  "GROUP BY / DISTINCT over JOINs",
   "CREATE VIEW / TRIGGER",
   "FOREIGN KEY / CHECK",
   "savepoints",

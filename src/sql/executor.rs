@@ -21,7 +21,7 @@ use crate::sql::db::table::{
 use crate::sql::fts::{Bm25Params, PostingList};
 use crate::sql::hnsw::{DistanceMetric, HnswIndex};
 use crate::sql::parser::select::{
-    AggregateArg, AggregateFn, JoinConstraintKind, JoinType, OrderByClause, Projection,
+    AggregateArg, AggregateFn, GroupByKey, JoinConstraintKind, JoinType, OrderByClause, Projection,
     ProjectionItem, ProjectionKind, SelectQuery, parse_aggregate_call,
 };
 
@@ -243,11 +243,11 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
             )));
         }
     }
-    for c in &query.group_by {
-        if !table.contains_column(c.clone()) {
+    for g in &query.group_by {
+        if !table.contains_column(g.name.clone()) {
             return Err(SQLRiteError::Internal(format!(
-                "GROUP BY references unknown column '{c}' on table '{}'",
-                query.table_name
+                "GROUP BY references unknown column '{}' on table '{}'",
+                g.name, query.table_name
             )));
         }
     }
@@ -279,42 +279,12 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     // group, so we walk the full filtered rowid set, accumulate, then
     // sort/truncate the resulting *output rows*.
     if aggregating {
-        // SQLR-52 — HAVING. The expression may reference aggregates and
-        // GROUP BY keys that aren't in the SELECT output (SQLite allows
-        // both: `SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1`).
-        // We append those as *hidden* trailing projection slots so the
-        // existing `aggregate_rows` accumulator computes them alongside
-        // the visible ones, then strip them after filtering. Aggregate
-        // calls in the HAVING tree are lowered to identifiers naming
-        // their output slot (`COUNT(*)` → identifier "COUNT(*)") so the
-        // shared expression evaluator can resolve them through a
-        // `GroupRowScope` like any other column.
-        let mut all_items = proj_items.clone();
-        let having_expr = match &query.having {
-            Some(h) => {
-                for g in &query.group_by {
-                    if !all_items
-                        .iter()
-                        .any(|i| i.output_name().eq_ignore_ascii_case(g))
-                    {
-                        all_items.push(ProjectionItem {
-                            kind: ProjectionKind::Column {
-                                qualifier: None,
-                                name: g.clone(),
-                            },
-                            alias: None,
-                        });
-                    }
-                }
-                Some(lower_having_expr(h, &mut all_items)?)
-            }
-            None => None,
-        };
+        let (all_items, having_expr) = lower_having_into_hidden_slots(&query, &proj_items)?;
 
         // Validate aggregate column args (visible + HAVING-hidden).
         for item in &all_items {
             if let ProjectionKind::Aggregate(call) = &item.kind
-                && let AggregateArg::Column(c) = &call.arg
+                && let AggregateArg::Column { name: c, .. } = &call.arg
                 && !table.contains_column(c.clone())
             {
                 return Err(SQLRiteError::Internal(format!(
@@ -326,32 +296,8 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
             }
         }
 
-        let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
-        let mut rows = aggregate_rows(table, &matching, &query.group_by, &all_items)?;
-
-        if let Some(h) = &having_expr {
-            let all_columns: Vec<String> = all_items.iter().map(|i| i.output_name()).collect();
-            rows = filter_groups_by_having(rows, h, &all_columns)?;
-        }
-        // Drop the hidden HAVING-only slots back to the user-visible width.
-        if all_items.len() > proj_items.len() {
-            for row in &mut rows {
-                row.truncate(proj_items.len());
-            }
-        }
-
-        if query.distinct {
-            rows = dedupe_rows(rows);
-        }
-
-        if let Some(order) = &query.order_by {
-            sort_output_rows(&mut rows, &columns, &proj_items, order)?;
-        }
-        if let Some(k) = query.limit {
-            rows.truncate(k);
-        }
-
-        return Ok(SelectResult { columns, rows });
+        let scopes = matching.iter().map(|&r| SingleTableScope::new(table, r));
+        return run_aggregation_pipeline(scopes, &query, &proj_items, &all_items, &having_expr);
     }
 
     // Non-aggregating path — same flow as before, with the extra
@@ -584,12 +530,10 @@ fn col_eq(left_scope: &str, right_scope: &str, col: &str) -> Expr {
 // learning database" niche; a future phase could layer hash / merge
 // joins on equi-join shapes without changing the surface API.
 //
-// Aggregates / GROUP BY / DISTINCT over joined results are rejected
-// at parse time (see SelectQuery::new). They aren't impossible —
-// the joined-row stream is just a different rowid source feeding
-// the same aggregator — but we left the validator that ties bare
-// columns to GROUP BY a single-table assumption, and reworking it
-// is outside this phase. Surfaces as a clean NotImplemented today.
+// SQLR-6 — aggregates / GROUP BY / DISTINCT compose with joins: the
+// fully-joined row stream feeds the same scope-generic aggregation
+// pipeline the single-table path uses (Stage 3.5 below), and DISTINCT
+// dedupes the projected output rows.
 fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<SelectResult> {
     // Resolve every participating table once and capture its scope
     // name (alias if supplied, else table name). Scope names are
@@ -824,6 +768,59 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
         acc
     };
 
+    // Stage 3.5 — SQLR-6: aggregation over the joined row stream. The
+    // fully-joined, WHERE-filtered rows are just another row source
+    // for the shared grouping accumulator: each joined row becomes a
+    // `JoinedScope` and feeds the same pipeline the single-table path
+    // uses (grouping, HAVING, DISTINCT, output-row ORDER BY, LIMIT).
+    // NULL-padded outer-join rows group under a NULL key and are
+    // skipped by `COUNT(col)` like any other NULL.
+    let has_aggregates = proj_items
+        .iter()
+        .any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)));
+    if has_aggregates || !query.group_by.is_empty() {
+        let (all_items, having_expr) = lower_having_into_hidden_slots(&query, &proj_items)?;
+
+        // Validate every column reference against the joined scope up
+        // front: GROUP BY keys and aggregate args must resolve to
+        // exactly one in-scope table, and every bare projection column
+        // must resolve to the same table+column as some GROUP BY key
+        // (the joined-scope equivalent of the parser's single-table
+        // "must appear in GROUP BY" check).
+        for g in &query.group_by {
+            resolve_scope_column(&joined_tables, g.qualifier.as_deref(), &g.name)?;
+        }
+        for item in &all_items {
+            match &item.kind {
+                ProjectionKind::Aggregate(call) => {
+                    if let AggregateArg::Column { qualifier, name } = &call.arg {
+                        resolve_scope_column(&joined_tables, qualifier.as_deref(), name)?;
+                    }
+                }
+                ProjectionKind::Column { qualifier, name } => {
+                    let pos = resolve_scope_column(&joined_tables, qualifier.as_deref(), name)?;
+                    let in_group_by = query.group_by.iter().any(|g| {
+                        g.name == *name
+                            && resolve_scope_column(&joined_tables, g.qualifier.as_deref(), &g.name)
+                                == Ok(pos)
+                    });
+                    if !in_group_by {
+                        return Err(SQLRiteError::Internal(format!(
+                            "column '{name}' must appear in GROUP BY or be used in an \
+                             aggregate function"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let scopes = filtered.iter().map(|row| JoinedScope {
+            tables: &joined_tables,
+            rowids: row,
+        });
+        return run_aggregation_pipeline(scopes, &query, &proj_items, &all_items, &having_expr);
+    }
+
     // Stage 4: ORDER BY across the joined scope. We pre-compute the
     // sort key per row (same approach as `sort_rowids`) so the
     // comparator runs on Values, not against the expression tree.
@@ -850,8 +847,13 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
         filtered = sorted;
     }
 
-    // Stage 5: LIMIT.
-    if let Some(k) = query.limit {
+    // Stage 5: LIMIT. SQLR-6 — when DISTINCT is on, truncating the
+    // joined rows here would over-truncate (duplicates collapse later),
+    // so the limit is deferred past the dedupe step, mirroring the
+    // single-table path.
+    if let Some(k) = query.limit
+        && !query.distinct
+    {
         filtered.truncate(k);
     }
 
@@ -870,10 +872,11 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
                     scope.lookup(qualifier.as_deref(), name)?
                 }
                 ProjectionKind::Aggregate(_) => {
-                    // SelectQuery::new already rejects this combination,
-                    // but defense in depth keeps the pattern match total.
+                    // Aggregates are handled by the Stage 3.5 pipeline,
+                    // which returns before reaching this projection —
+                    // defense in depth keeps the pattern match total.
                     return Err(SQLRiteError::Internal(
-                        "aggregate functions over JOIN are not supported".to_string(),
+                        "aggregate projection reached the non-aggregating join path".to_string(),
                     ));
                 }
             };
@@ -882,7 +885,62 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
         rows.push(out_row);
     }
 
+    // SQLR-6 — SELECT DISTINCT over a join: dedupe the projected
+    // output rows, then apply the LIMIT that Stage 5 deferred.
+    if query.distinct {
+        rows = dedupe_rows(rows);
+        if let Some(k) = query.limit {
+            rows.truncate(k);
+        }
+    }
+
     Ok(SelectResult { columns, rows })
+}
+
+/// Resolve an optionally-qualified column reference to the index of
+/// the in-scope joined table that owns it. Schema-only counterpart of
+/// [`JoinedScope::lookup`]: a qualified reference must name a known
+/// scope and the column must exist there; an unqualified reference
+/// must exist on exactly one in-scope table (zero → unknown column,
+/// several → ambiguous).
+fn resolve_scope_column(
+    tables: &[JoinedTableRef<'_>],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<usize> {
+    if let Some(q) = qualifier {
+        let pos = tables
+            .iter()
+            .position(|t| t.scope_name.eq_ignore_ascii_case(q))
+            .ok_or_else(|| {
+                SQLRiteError::Internal(format!(
+                    "unknown table qualifier '{q}' in column reference '{q}.{name}'"
+                ))
+            })?;
+        if !tables[pos].table.contains_column(name.to_string()) {
+            return Err(SQLRiteError::Internal(format!(
+                "column '{name}' does not exist on '{}'",
+                tables[pos].scope_name
+            )));
+        }
+        return Ok(pos);
+    }
+    let mut hit: Option<usize> = None;
+    for (i, t) in tables.iter().enumerate() {
+        if t.table.contains_column(name.to_string()) {
+            if hit.is_some() {
+                return Err(SQLRiteError::Internal(format!(
+                    "column reference '{name}' is ambiguous — qualify it as <table>.{name}"
+                )));
+            }
+            hit = Some(i);
+        }
+    }
+    hit.ok_or_else(|| {
+        SQLRiteError::Internal(format!(
+            "unknown column '{name}' in joined SELECT (no in-scope table has it)"
+        ))
+    })
 }
 
 /// Executes a SELECT and returns `(rendered_table, row_count)`. The
@@ -2648,10 +2706,10 @@ fn eval_function(func: &sqlparser::ast::Function, scope: &dyn RowScope) -> Resul
         }
         // SQLR-3: catch aggregate names used in scalar position (e.g.
         // `WHERE COUNT(*) > 1`) with a clearer message than "unknown
-        // function". HAVING isn't supported yet, hence the explicit nudge.
+        // function".
         "count" | "sum" | "avg" | "min" | "max" => Err(SQLRiteError::NotImplemented(format!(
             "aggregate function '{name}' is not allowed in WHERE / projection-scalar position; \
-             use it as a top-level projection item (HAVING is not yet supported)"
+             use it as a top-level projection item or in HAVING"
         ))),
         other => Err(SQLRiteError::NotImplemented(format!(
             "unknown function: {other}(...)"
@@ -3274,16 +3332,102 @@ fn eval_in_list(scope: &dyn RowScope, lhs: &Expr, list: &[Expr], negated: bool) 
 // SQLR-3 — Aggregation phase, DISTINCT, post-projection sort
 // -----------------------------------------------------------------
 
-/// Walk `matching` rowids, partition into groups (one synthetic group
+/// SQLR-52 — HAVING lowering, shared by the single-table and joined
+/// aggregation paths. The expression may reference aggregates and
+/// GROUP BY keys that aren't in the SELECT output (SQLite allows
+/// both: `SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1`).
+/// We append those as *hidden* trailing projection slots so the
+/// `aggregate_rows` accumulator computes them alongside the visible
+/// ones; the pipeline strips them after filtering. Aggregate calls in
+/// the HAVING tree are lowered to identifiers naming their output slot
+/// (`COUNT(*)` → identifier "COUNT(*)") so the shared expression
+/// evaluator can resolve them through a `GroupRowScope` like any other
+/// column. Returns the widened projection list plus the lowered
+/// HAVING expression (`None` when the query has no HAVING).
+fn lower_having_into_hidden_slots(
+    query: &SelectQuery,
+    proj_items: &[ProjectionItem],
+) -> Result<(Vec<ProjectionItem>, Option<Expr>)> {
+    let mut all_items = proj_items.to_vec();
+    let having_expr = match &query.having {
+        Some(h) => {
+            for g in &query.group_by {
+                if !all_items
+                    .iter()
+                    .any(|i| i.output_name().eq_ignore_ascii_case(&g.name))
+                {
+                    all_items.push(ProjectionItem {
+                        kind: ProjectionKind::Column {
+                            qualifier: g.qualifier.clone(),
+                            name: g.name.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            Some(lower_having_expr(h, &mut all_items)?)
+        }
+        None => None,
+    };
+    Ok((all_items, having_expr))
+}
+
+/// The aggregation tail shared by the single-table and joined SELECT
+/// paths: accumulate groups over the row scopes, apply HAVING, strip
+/// hidden HAVING-only slots, then DISTINCT / ORDER BY / LIMIT on the
+/// output rows. Callers validate column references against their own
+/// scope (table schema vs. joined-table list) before invoking.
+fn run_aggregation_pipeline<S: RowScope>(
+    scopes: impl IntoIterator<Item = S>,
+    query: &SelectQuery,
+    proj_items: &[ProjectionItem],
+    all_items: &[ProjectionItem],
+    having_expr: &Option<Expr>,
+) -> Result<SelectResult> {
+    let columns: Vec<String> = proj_items.iter().map(|i| i.output_name()).collect();
+    let mut rows = aggregate_rows(scopes, &query.group_by, all_items)?;
+
+    if let Some(h) = having_expr {
+        let all_columns: Vec<String> = all_items.iter().map(|i| i.output_name()).collect();
+        rows = filter_groups_by_having(rows, h, &all_columns)?;
+    }
+    // Drop the hidden HAVING-only slots back to the user-visible width.
+    if all_items.len() > proj_items.len() {
+        for row in &mut rows {
+            row.truncate(proj_items.len());
+        }
+    }
+
+    if query.distinct {
+        rows = dedupe_rows(rows);
+    }
+
+    if let Some(order) = &query.order_by {
+        sort_output_rows(&mut rows, &columns, proj_items, order)?;
+    }
+    if let Some(k) = query.limit {
+        rows.truncate(k);
+    }
+
+    Ok(SelectResult { columns, rows })
+}
+
+/// Walk the row scopes, partition into groups (one synthetic group
 /// when `group_by` is empty), update one `AggState` per aggregate
 /// projection slot per group, then materialize one output row per
 /// group in projection order. Group-key columns surface their original
 /// `Value` (captured the first time the group was seen); aggregate
 /// slots surface `AggState::finalize()`.
-fn aggregate_rows(
-    table: &Table,
-    matching: &[i64],
-    group_by: &[String],
+///
+/// SQLR-6 — generic over [`RowScope`] so the same accumulator serves
+/// the single-table path (a [`SingleTableScope`] per matching rowid)
+/// and the joined path (a [`JoinedScope`] per joined row, where
+/// NULL-padded outer-join sides surface as `Value::Null` — grouped
+/// together like any other NULL, and skipped by `COUNT(col)` per the
+/// usual NULL-skipping aggregate semantics).
+fn aggregate_rows<S: RowScope>(
+    scopes: impl IntoIterator<Item = S>,
+    group_by: &[GroupByKey],
     proj_items: &[ProjectionItem],
 ) -> Result<Vec<Vec<Value>>> {
     // Build the per-projection-slot accumulator template once. Each
@@ -3306,11 +3450,11 @@ fn aggregate_rows(
     let mut group_states: Vec<Vec<Option<AggState>>> = Vec::new();
     let mut group_key_values: Vec<Vec<Value>> = Vec::new();
 
-    for &rowid in matching {
+    for scope in scopes {
         let mut key_values: Vec<Value> = Vec::with_capacity(group_by.len());
         let mut key: Vec<DistinctKey> = Vec::with_capacity(group_by.len());
-        for col in group_by {
-            let v = table.get_value(col, rowid).unwrap_or(Value::Null);
+        for g in group_by {
+            let v = scope.lookup(g.qualifier.as_deref(), &g.name)?;
             key.push(DistinctKey::from_value(&v));
             key_values.push(v);
         }
@@ -3328,7 +3472,9 @@ fn aggregate_rows(
             if let ProjectionKind::Aggregate(call) = &item.kind {
                 let v = match &call.arg {
                     AggregateArg::Star => Value::Null,
-                    AggregateArg::Column(c) => table.get_value(c, rowid).unwrap_or(Value::Null),
+                    AggregateArg::Column { qualifier, name } => {
+                        scope.lookup(qualifier.as_deref(), name)?
+                    }
                 };
                 if let Some(state) = group_states[idx][slot].as_mut() {
                     state.update(&v)?;
@@ -3356,13 +3502,20 @@ fn aggregate_rows(
         let mut row: Vec<Value> = Vec::with_capacity(proj_items.len());
         for (slot, item) in proj_items.iter().enumerate() {
             match &item.kind {
-                ProjectionKind::Column { name: c, .. } => {
-                    // The validation in execute_select_rows guarantees
-                    // bare-column projections are also in `group_by`.
+                ProjectionKind::Column { qualifier, name: c } => {
+                    // Parser / executor validation ties bare-column
+                    // projections to GROUP BY entries, but `SELECT *`
+                    // expansions reach here unvalidated — surface a
+                    // clean error rather than panicking.
                     let pos = group_by
                         .iter()
-                        .position(|g| g == c)
-                        .expect("validated to be in GROUP BY");
+                        .position(|g| g.matches_column(qualifier.as_deref(), c))
+                        .ok_or_else(|| {
+                            SQLRiteError::Internal(format!(
+                                "column '{c}' must appear in GROUP BY or be used in an \
+                                 aggregate function"
+                            ))
+                        })?;
                     row.push(group_key_values[group_idx][pos].clone());
                 }
                 ProjectionKind::Aggregate(_) => {
@@ -3601,12 +3754,26 @@ fn resolve_order_by_index(
     }
     // Function form: match by display name against any aggregate item
     // whose canonical display equals the user's call. Tolerate case
-    // differences in the function name.
+    // differences in the function name. SQLR-6 — a second pass with
+    // `t.` qualifiers stripped from both sides keeps qualifier
+    // spelling differences from blocking the match (`ORDER BY
+    // SUM(amount)` finds a `SELECT SUM(o.amount)` slot and vice
+    // versa), preserving the pre-qualifier behavior.
     if let Expr::Function(func) = expr {
-        let user_disp = format_function_display(func);
+        let user_disp = format_function_display(func, true);
         for (i, item) in proj_items.iter().enumerate() {
             if let ProjectionKind::Aggregate(call) = &item.kind
                 && call.display_name().eq_ignore_ascii_case(&user_disp)
+            {
+                return Ok(i);
+            }
+        }
+        let user_disp_unqualified = format_function_display(func, false);
+        for (i, item) in proj_items.iter().enumerate() {
+            if let ProjectionKind::Aggregate(call) = &item.kind
+                && call
+                    .display_name_unqualified()
+                    .eq_ignore_ascii_case(&user_disp_unqualified)
             {
                 return Ok(i);
             }
@@ -3623,7 +3790,9 @@ fn resolve_order_by_index(
 /// Format a sqlparser function call into the same canonical form
 /// `AggregateCall::display_name()` uses, so ORDER BY on
 /// `COUNT(*)` / `SUM(salary)` matches its projection counterpart.
-fn format_function_display(func: &sqlparser::ast::Function) -> String {
+/// `qualified` keeps or strips the argument's `t.` qualifier, matching
+/// `display_name()` / `display_name_unqualified()` respectively.
+fn format_function_display(func: &sqlparser::ast::Function, qualified: bool) -> String {
     let name = match func.name.0.as_slice() {
         [ObjectNamePart::Identifier(ident)] => ident.value.to_uppercase(),
         _ => format!("{:?}", func.name).to_uppercase(),
@@ -3638,7 +3807,15 @@ fn format_function_display(func: &sqlparser::ast::Function) -> String {
                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => "*".to_string(),
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(i))) => i.value.clone(),
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
-                    parts.last().map(|p| p.value.clone()).unwrap_or_default()
+                    if qualified {
+                        parts
+                            .iter()
+                            .map(|p| p.value.clone())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    } else {
+                        parts.last().map(|p| p.value.clone()).unwrap_or_default()
+                    }
                 }
                 _ => String::new(),
             });
@@ -4625,23 +4802,21 @@ mod tests {
     }
 
     #[test]
-    fn having_over_join_rejected_for_all_flavors() {
-        // Aggregates / GROUP BY over JOIN results are a separate increment
-        // (SQLR-6); until it lands, every JOIN flavor + GROUP BY + HAVING
-        // must surface the clean NotImplemented — no wrong results.
+    fn having_over_join_filters_groups_for_all_flavors() {
+        // SQLR-6 — GROUP BY + HAVING compose with every join flavor.
+        // Only Alice has more than one order; the dangling order (RIGHT /
+        // FULL) groups under a NULL name with count 1 and is filtered.
         for flavor in ["INNER", "LEFT OUTER", "RIGHT OUTER", "FULL OUTER"] {
             let sql = format!(
                 "SELECT customers.name, COUNT(*) FROM customers \
                  {flavor} JOIN orders ON customers.id = orders.customer_id \
                  GROUP BY customers.name HAVING COUNT(*) > 1;"
             );
-            let err = crate::sql::process_command(&sql, &mut seed_join_fixture());
-            match err {
-                Err(SQLRiteError::NotImplemented(msg)) => {
-                    assert!(msg.contains("JOIN"), "{flavor}: unexpected message: {msg}")
-                }
-                other => panic!("{flavor}: expected NotImplemented, got {other:?}"),
-            }
+            let db = seed_join_fixture();
+            let r = run_rows(&db, &sql);
+            assert_eq!(r.rows.len(), 1, "{flavor}: only Alice has >1 order");
+            assert_eq!(r.rows[0][0].to_display_string(), "Alice", "{flavor}");
+            assert_eq!(expect_int(&r.rows[0][1]), 2, "{flavor}");
         }
     }
 
@@ -5151,16 +5326,239 @@ mod tests {
         assert!(res.is_err(), "USING (nope) must error — column absent");
     }
 
+    // ---------------------------------------------------------------------
+    // SQLR-6 — aggregates / GROUP BY / DISTINCT over JOIN results
+    // ---------------------------------------------------------------------
+
     #[test]
-    fn aggregates_over_join_are_rejected() {
+    fn group_by_with_aggregates_over_inner_join() {
         let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, COUNT(*), SUM(orders.amount) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name ORDER BY customers.name;",
+        );
+        assert_eq!(r.columns, vec!["name", "COUNT(*)", "SUM(orders.amount)"]);
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0].to_display_string(), "Alice");
+        assert_eq!(expect_int(&r.rows[0][1]), 2);
+        assert_eq!(expect_int(&r.rows[0][2]), 300);
+        assert_eq!(r.rows[1][0].to_display_string(), "Bob");
+        assert_eq!(expect_int(&r.rows[1][1]), 1);
+        assert_eq!(expect_int(&r.rows[1][2]), 50);
+    }
+
+    #[test]
+    fn aggregates_over_join_without_group_by() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT COUNT(*), SUM(orders.amount) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(expect_int(&r.rows[0][0]), 3);
+        assert_eq!(expect_int(&r.rows[0][1]), 350);
+    }
+
+    #[test]
+    fn count_column_skips_outer_join_null_padding() {
+        // Carol has no orders: her LEFT-JOIN row is NULL-padded on the
+        // right. COUNT(*) counts the padded row; COUNT(orders.id) skips
+        // its NULL, per the usual NULL-skipping aggregate semantics.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, COUNT(*), COUNT(orders.id) FROM customers \
+             LEFT OUTER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name ORDER BY customers.name;",
+        );
+        assert_eq!(r.rows.len(), 3);
+        let carol = &r.rows[2];
+        assert_eq!(carol[0].to_display_string(), "Carol");
+        assert_eq!(expect_int(&carol[1]), 1, "COUNT(*) counts the padded row");
+        assert_eq!(expect_int(&carol[2]), 0, "COUNT(col) skips the NULL");
+    }
+
+    #[test]
+    fn outer_join_null_keys_group_together() {
+        // FULL OUTER surfaces the dangling order (customer_id 4) with a
+        // NULL customers.name — it must form its own group, not vanish.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, COUNT(*) FROM customers \
+             FULL OUTER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name;",
+        );
+        assert_eq!(r.rows.len(), 4, "Alice, Bob, Carol, NULL");
+        let null_group = r
+            .rows
+            .iter()
+            .find(|row| row[0] == Value::Null)
+            .expect("dangling order groups under NULL");
+        assert_eq!(expect_int(&null_group[1]), 1);
+    }
+
+    #[test]
+    fn count_distinct_over_join() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT COUNT(DISTINCT customers.name) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        assert_eq!(expect_int(&r.rows[0][0]), 2);
+    }
+
+    #[test]
+    fn group_by_qualified_key_resolves_ambiguous_name() {
+        // `id` exists on both tables — the qualified GROUP BY key picks
+        // the customers side.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.id, COUNT(*) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.id ORDER BY customers.id;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(expect_int(&r.rows[0][0]), 1);
+        assert_eq!(expect_int(&r.rows[0][1]), 2);
+    }
+
+    #[test]
+    fn group_by_ambiguous_unqualified_key_over_join_errors() {
         let err = crate::sql::process_command(
             "SELECT COUNT(*) FROM customers \
-             INNER JOIN orders ON customers.id = orders.customer_id;",
+             INNER JOIN orders ON customers.id = orders.customer_id GROUP BY id;",
             &mut seed_join_fixture(),
         );
-        assert!(err.is_err(), "aggregates over JOIN are not yet supported");
-        let _ = db; // keep compiler happy if unused
+        match err {
+            Err(e) => assert!(
+                e.to_string().contains("ambiguous"),
+                "unexpected message: {e}"
+            ),
+            Ok(_) => panic!("ambiguous GROUP BY key must error"),
+        }
+    }
+
+    #[test]
+    fn bare_column_not_in_group_by_over_join_errors() {
+        let err = crate::sql::process_command(
+            "SELECT orders.amount, COUNT(*) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name;",
+            &mut seed_join_fixture(),
+        );
+        match err {
+            Err(e) => assert!(
+                e.to_string().contains("must appear in GROUP BY"),
+                "unexpected message: {e}"
+            ),
+            Ok(_) => panic!("bare column outside GROUP BY must error"),
+        }
+    }
+
+    #[test]
+    fn aggregate_in_where_over_join_errors_cleanly() {
+        // Code-review gap from SQLR-5: aggregate misuse inside WHERE on
+        // a joined query must be a typed error, not wrong results.
+        let err = crate::sql::process_command(
+            "SELECT COUNT(*) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             WHERE COUNT(*) > 1;",
+            &mut seed_join_fixture(),
+        );
+        match err {
+            Err(SQLRiteError::NotImplemented(msg)) => assert!(
+                msg.contains("not allowed in WHERE"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_aggregate_over_join() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT customers.name, SUM(orders.amount) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name ORDER BY SUM(orders.amount) DESC;",
+        );
+        assert_eq!(r.rows[0][0].to_display_string(), "Alice");
+        // Qualifier-stripped fallback: ORDER BY SUM(amount) finds the
+        // SUM(orders.amount) slot even though the spellings differ.
+        let r2 = run_rows(
+            &db,
+            "SELECT customers.name, SUM(orders.amount) FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id \
+             GROUP BY customers.name ORDER BY SUM(amount) DESC;",
+        );
+        assert_eq!(r2.rows[0][0].to_display_string(), "Alice");
+    }
+
+    #[test]
+    fn distinct_over_join_dedupes_output_rows() {
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT DISTINCT customers.name FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id;",
+        );
+        assert_eq!(r.rows.len(), 2);
+        let names: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row[0].to_display_string())
+            .collect();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn distinct_over_join_defers_limit_past_dedupe() {
+        // Without deferral, LIMIT 2 would truncate the joined rows to
+        // Alice's two orders and dedupe to a single row.
+        let db = seed_join_fixture();
+        let r = run_rows(
+            &db,
+            "SELECT DISTINCT customers.name FROM customers \
+             INNER JOIN orders ON customers.id = orders.customer_id LIMIT 2;",
+        );
+        assert_eq!(r.rows.len(), 2, "LIMIT applies after DISTINCT collapses");
+    }
+
+    #[test]
+    fn select_star_group_by_errors_instead_of_panicking() {
+        // Single-table regression: the parser's "must appear in GROUP BY"
+        // check skips `SELECT *`, so the executor used to hit an
+        // `expect()` panic when a non-grouped column reached projection.
+        let err = crate::sql::process_command(
+            "SELECT * FROM orders GROUP BY customer_id;",
+            &mut seed_join_fixture(),
+        );
+        match err {
+            Err(e) => assert!(
+                e.to_string().contains("must appear in GROUP BY"),
+                "unexpected message: {e}"
+            ),
+            Ok(_) => panic!("SELECT * with GROUP BY must error, not panic"),
+        }
+    }
+
+    #[test]
+    fn group_by_qualified_key_single_table_still_works() {
+        // Qualified GROUP BY keys are accepted on the single-table path
+        // too (qualifier ignored, same posture as projections).
+        let db = seed_employees();
+        let r = run_rows(
+            &db,
+            "SELECT dept, COUNT(*) FROM emp GROUP BY emp.dept ORDER BY dept;",
+        );
+        assert_eq!(r.rows.len(), 3, "eng / sales / ops");
     }
 
     #[test]

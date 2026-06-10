@@ -315,7 +315,9 @@ export default function DocsPage() {
             <code>NATURAL</code> column shows once in <code>SELECT *</code>).
             Comma-separated FROMs (<code>FROM a, b</code>) are not — use an
             explicit <code>JOIN</code> / <code>CROSS JOIN</code>. Aggregates /{" "}
-            <code>GROUP BY</code> over a join lands once subqueries do.
+            <code>GROUP BY</code> / <code>DISTINCT</code> /{" "}
+            <code>HAVING</code> compose over join results, with optionally
+            qualified keys (<code>GROUP BY customers.name</code>).
           </p>
 
           <h2 id="aggregates">GROUP BY &amp; aggregates</h2>
