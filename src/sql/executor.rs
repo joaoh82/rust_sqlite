@@ -44,10 +44,10 @@ use crate::sql::parser::select::{
 // The trait stays small on purpose:
 //
 //   - `lookup` resolves a column reference (`col` or `t.col`) to a
-//     `Value`. Unknown columns error in both scopes (SQLR-2).
-//     NULL-padded joined rows yield `Value::Null` for any column
-//     from their side. Ambiguous unqualified references in joined
-//     scope error.
+//     `Value`. Unknown columns error in both scopes (SQLR-2), and so
+//     do unknown table qualifiers (SQLR-14). NULL-padded joined rows
+//     yield `Value::Null` for any column from their side. Ambiguous
+//     unqualified references in joined scope error.
 //
 //   - `single_table_view` lets index-probing helpers (FTS, HNSW,
 //     vec_distance) bail out cleanly when invoked over a join — they
@@ -66,24 +66,32 @@ pub(crate) trait RowScope {
 }
 
 /// The default scope for non-join queries: one table, one rowid.
+/// `scope_name` is the user-visible name a `t.col` qualifier must
+/// match — the FROM alias when one is declared, else the table name
+/// (SQLR-14; mirrors [`JoinedTableRef::scope_name`]).
 pub(crate) struct SingleTableScope<'a> {
     table: &'a Table,
     rowid: i64,
+    scope_name: &'a str,
 }
 
 impl<'a> SingleTableScope<'a> {
-    pub(crate) fn new(table: &'a Table, rowid: i64) -> Self {
-        Self { table, rowid }
+    pub(crate) fn new(table: &'a Table, rowid: i64, scope_name: &'a str) -> Self {
+        Self {
+            table,
+            rowid,
+            scope_name,
+        }
     }
 }
 
 impl RowScope for SingleTableScope<'_> {
     fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value> {
-        // The qualifier (if any) is ignored — we only have one table
-        // in scope, so `t.col` resolves the same as `col`. Validating
-        // it against the table name/alias requires plumbing the FROM
-        // alias through every `eval_expr` callsite (SQLR-2 follow-up).
-        let _ = qualifier;
+        // SQLR-14 — a qualifier must name the one table in scope,
+        // matching `JoinedScope`'s qualified-reference arm. When an
+        // alias is declared it is the *only* valid qualifier
+        // (`SELECT t.id FROM t AS a` errors), per SQLite.
+        check_single_scope_qualifier(qualifier, self.scope_name, col)?;
         // SQLR-2 — unknown columns error, matching `JoinedScope`. A
         // schema column whose cell was never written (omitted from the
         // INSERT column list) still reads as NULL.
@@ -178,6 +186,27 @@ impl RowScope for JoinedScope<'_> {
     }
 }
 
+/// SQLR-14 — reject a `q.col` qualifier that doesn't name the single
+/// table in scope (alias if declared, else table name). Shared by
+/// [`SingleTableScope::lookup`] (per-row evaluation) and the
+/// schema-level checks that run before any row is visited (projection
+/// list, GROUP BY keys, aggregate args, index-probe WHERE shapes).
+/// Wording matches `JoinedScope`'s unknown-qualifier error.
+fn check_single_scope_qualifier(
+    qualifier: Option<&str>,
+    scope_name: &str,
+    col: &str,
+) -> Result<()> {
+    if let Some(q) = qualifier
+        && !q.eq_ignore_ascii_case(scope_name)
+    {
+        return Err(SQLRiteError::Internal(format!(
+            "unknown table qualifier '{q}' in column reference '{q}.{col}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Executes a parsed `SelectQuery` against the database and returns a
 /// human-readable rendering of the result set (prettytable). Also returns
 /// the number of rows produced, for the top-level status message.
@@ -221,6 +250,11 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         })?
     };
 
+    // SQLR-14 — the name a `q.col` qualifier must match: the FROM
+    // alias when declared, else the table name (same normalization the
+    // joined path applies per table).
+    let scope_name: &str = query.table_alias.as_deref().unwrap_or(&query.table_name);
+
     // SQLR-3: Materialize the projection as `Vec<ProjectionItem>` so
     // both the simple-row path and the aggregation path can iterate the
     // same shape. `Projection::All` expands to bare-column items in
@@ -242,18 +276,21 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     let has_aggregates = proj_items
         .iter()
         .any(|i| matches!(i.kind, ProjectionKind::Aggregate(_)));
-    // Validate bare-column references against the table schema.
+    // Validate column references against the table schema, and their
+    // qualifiers (if any) against the scope name (SQLR-14).
     for item in &proj_items {
-        if let ProjectionKind::Column { name: c, .. } = &item.kind
-            && !table.contains_column(c.clone())
-        {
-            return Err(SQLRiteError::Internal(format!(
-                "Column '{c}' does not exist on table '{}'",
-                query.table_name
-            )));
+        if let ProjectionKind::Column { qualifier, name: c } = &item.kind {
+            check_single_scope_qualifier(qualifier.as_deref(), scope_name, c)?;
+            if !table.contains_column(c.clone()) {
+                return Err(SQLRiteError::Internal(format!(
+                    "Column '{c}' does not exist on table '{}'",
+                    query.table_name
+                )));
+            }
         }
     }
     for g in &query.group_by {
+        check_single_scope_qualifier(g.qualifier.as_deref(), scope_name, &g.name)?;
         if !table.contains_column(g.name.clone()) {
             return Err(SQLRiteError::Internal(format!(
                 "GROUP BY references unknown column '{}' on table '{}'",
@@ -264,13 +301,13 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
     // Collect matching rowids. If the WHERE is the shape `col = literal`
     // and `col` has a secondary index, probe the index for an O(log N)
     // seek; otherwise fall back to the full table scan.
-    let matching = match select_rowids(table, query.selection.as_ref())? {
+    let matching = match select_rowids(table, query.selection.as_ref(), scope_name)? {
         RowidSource::IndexProbe(rowids) => rowids,
         RowidSource::FullScan => {
             let mut out = Vec::new();
             for rowid in table.rowids() {
                 if let Some(expr) = &query.selection
-                    && !eval_predicate(expr, table, rowid)?
+                    && !eval_predicate(expr, table, rowid, scope_name)?
                 {
                     continue;
                 }
@@ -294,19 +331,23 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
         // Validate aggregate column args (visible + HAVING-hidden).
         for item in &all_items {
             if let ProjectionKind::Aggregate(call) = &item.kind
-                && let AggregateArg::Column { name: c, .. } = &call.arg
-                && !table.contains_column(c.clone())
+                && let AggregateArg::Column { qualifier, name: c } = &call.arg
             {
-                return Err(SQLRiteError::Internal(format!(
-                    "{}({}) references unknown column '{c}' on table '{}'",
-                    call.func.as_str(),
-                    c,
-                    query.table_name
-                )));
+                check_single_scope_qualifier(qualifier.as_deref(), scope_name, c)?;
+                if !table.contains_column(c.clone()) {
+                    return Err(SQLRiteError::Internal(format!(
+                        "{}({}) references unknown column '{c}' on table '{}'",
+                        call.func.as_str(),
+                        c,
+                        query.table_name
+                    )));
+                }
             }
         }
 
-        let scopes = matching.iter().map(|&r| SingleTableScope::new(table, r));
+        let scopes = matching
+            .iter()
+            .map(|&r| SingleTableScope::new(table, r, scope_name));
         return run_aggregation_pipeline(scopes, &query, &proj_items, &all_items, &having_expr);
     }
 
@@ -358,10 +399,10 @@ pub fn execute_select_rows(query: SelectQuery, db: &Database) -> Result<SelectRe
             matching = try_fts_probe(table, &order.expr, order.ascending, k).unwrap();
         }
         (Some(order), Some(k)) if !defer_limit_for_distinct && k < matching.len() => {
-            matching = select_topk(&matching, table, order, k)?;
+            matching = select_topk(&matching, table, order, k, scope_name)?;
         }
         (Some(order), _) => {
-            sort_rowids(&mut matching, table, order)?;
+            sort_rowids(&mut matching, table, order, scope_name)?;
             if let Some(k) = query.limit
                 && !defer_limit_for_distinct
             {
@@ -990,20 +1031,23 @@ pub fn execute_delete(stmt: &Statement, db: &mut Database) -> Result<usize> {
     let tables = match from {
         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
     };
-    let table_name = extract_single_table_name(tables)?;
+    let (table_name, table_alias) = extract_single_table_name(tables)?;
+    // SQLR-14 — qualifiers in the WHERE must name this table (or its
+    // alias, which shadows the table name when declared).
+    let scope_name = table_alias.as_deref().unwrap_or(&table_name);
 
     // Compute matching rowids with an immutable borrow, then mutate.
     let matching: Vec<i64> = {
         let table = db
             .get_table(table_name.clone())
             .map_err(|_| SQLRiteError::Internal(format!("Table '{table_name}' not found")))?;
-        match select_rowids(table, selection.as_ref())? {
+        match select_rowids(table, selection.as_ref(), scope_name)? {
             RowidSource::IndexProbe(rowids) => rowids,
             RowidSource::FullScan => {
                 let mut out = Vec::new();
                 for rowid in table.rowids() {
                     if let Some(expr) = selection {
-                        if !eval_predicate(expr, table, rowid)? {
+                        if !eval_predicate(expr, table, rowid, scope_name)? {
                             continue;
                         }
                     }
@@ -1058,7 +1102,11 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
         ));
     }
 
-    let table_name = extract_table_name(table)?;
+    let (table_name, table_alias) = extract_table_name(table)?;
+    // SQLR-14 — qualifiers in the WHERE / SET expressions must name
+    // this table (or its alias, which shadows the table name when
+    // declared).
+    let scope_name = table_alias.as_deref().unwrap_or(&table_name);
 
     // Resolve assignment targets to plain column names and verify they exist.
     let mut parsed_assignments: Vec<(String, Expr)> = Vec::with_capacity(assignments.len());
@@ -1093,13 +1141,13 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
     // `col = literal` on an indexed column.
     let work: Vec<(i64, Vec<(String, Value)>)> = {
         let tbl = db.get_table(table_name.clone())?;
-        let matched_rowids: Vec<i64> = match select_rowids(tbl, selection.as_ref())? {
+        let matched_rowids: Vec<i64> = match select_rowids(tbl, selection.as_ref(), scope_name)? {
             RowidSource::IndexProbe(rowids) => rowids,
             RowidSource::FullScan => {
                 let mut out = Vec::new();
                 for rowid in tbl.rowids() {
                     if let Some(expr) = selection {
-                        if !eval_predicate(expr, tbl, rowid)? {
+                        if !eval_predicate(expr, tbl, rowid, scope_name)? {
                             continue;
                         }
                     }
@@ -1114,7 +1162,7 @@ pub fn execute_update(stmt: &Statement, db: &mut Database) -> Result<usize> {
             for (col, expr) in &parsed_assignments {
                 // UPDATE's RHS is evaluated in the context of the row being updated,
                 // so column references on the right resolve to the current row's values.
-                let v = eval_expr(expr, tbl, rowid)?;
+                let v = eval_expr(expr, tbl, rowid, scope_name)?;
                 values.push((col.clone(), v));
             }
             rows_to_update.push((rowid, values));
@@ -1926,7 +1974,7 @@ fn clone_datatype(dt: &DataType) -> DataType {
     }
 }
 
-fn extract_single_table_name(tables: &[TableWithJoins]) -> Result<String> {
+fn extract_single_table_name(tables: &[TableWithJoins]) -> Result<(String, Option<String>)> {
     if tables.len() != 1 {
         return Err(SQLRiteError::NotImplemented(
             "multi-table DELETE is not supported yet".to_string(),
@@ -1935,14 +1983,20 @@ fn extract_single_table_name(tables: &[TableWithJoins]) -> Result<String> {
     extract_table_name(&tables[0])
 }
 
-fn extract_table_name(twj: &TableWithJoins) -> Result<String> {
+/// Pull `(table_name, alias)` out of a plain single-table reference.
+/// UPDATE / DELETE use this; the alias feeds qualifier validation
+/// (SQLR-14) the same way `SelectQuery.table_alias` does for SELECT.
+fn extract_table_name(twj: &TableWithJoins) -> Result<(String, Option<String>)> {
     if !twj.joins.is_empty() {
         return Err(SQLRiteError::NotImplemented(
             "JOIN is not supported yet".to_string(),
         ));
     }
     match &twj.relation {
-        TableFactor::Table { name, .. } => Ok(name.to_string()),
+        TableFactor::Table { name, alias, .. } => Ok((
+            name.to_string(),
+            alias.as_ref().map(|a| a.name.value.clone()),
+        )),
         _ => Err(SQLRiteError::NotImplemented(
             "only plain table references are supported".to_string(),
         )),
@@ -1964,13 +2018,17 @@ enum RowidSource {
 /// simplest shape: a single `col = literal` (or `literal = col`) where
 /// `col` is on a secondary index. AND/OR/range predicates fall back to
 /// full scan — those can be layered on later without changing the caller.
-fn select_rowids(table: &Table, selection: Option<&Expr>) -> Result<RowidSource> {
+fn select_rowids(table: &Table, selection: Option<&Expr>, scope_name: &str) -> Result<RowidSource> {
     let Some(expr) = selection else {
         return Ok(RowidSource::FullScan);
     };
-    let Some((col, literal)) = try_extract_equality(expr) else {
+    let Some((qualifier, col, literal)) = try_extract_equality(expr) else {
         return Ok(RowidSource::FullScan);
     };
+    // SQLR-14 — `bogus.col = 1` must not silently probe an index on
+    // `col`; the qualifier has to name the table in scope, same as the
+    // per-row evaluation path it short-circuits.
+    check_single_scope_qualifier(qualifier.as_deref(), scope_name, &col)?;
     let Some(idx) = table.index_for_column(&col) else {
         return Ok(RowidSource::FullScan);
     };
@@ -1991,10 +2049,12 @@ fn select_rowids(table: &Table, selection: Option<&Expr>) -> Result<RowidSource>
     Ok(RowidSource::IndexProbe(rowids))
 }
 
-/// Recognizes `expr` as a simple equality on a column reference against a
-/// literal. Returns `(column_name, literal_value)` if the shape matches;
-/// `None` otherwise. Accepts both `col = literal` and `literal = col`.
-fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> {
+/// Recognizes `expr` as a simple equality on a column reference against
+/// a literal. Returns `(qualifier, column_name, literal_value)` if the
+/// shape matches; `None` otherwise. Accepts both `col = literal` and
+/// `literal = col`. The qualifier (SQLR-14) lets the caller validate
+/// `t.col = 1` shapes instead of silently stripping the `t.`.
+fn try_extract_equality(expr: &Expr) -> Option<(Option<String>, String, sqlparser::ast::Value)> {
     // Peel off Nested parens so `WHERE (x = 1)` is recognized too.
     let peeled = match expr {
         Expr::Nested(inner) => inner.as_ref(),
@@ -2006,10 +2066,14 @@ fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> 
     if !matches!(op, BinaryOperator::Eq) {
         return None;
     }
-    let col_from = |e: &Expr| -> Option<String> {
+    let col_from = |e: &Expr| -> Option<(Option<String>, String)> {
         match e {
-            Expr::Identifier(ident) => Some(ident.value.clone()),
-            Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+            Expr::Identifier(ident) => Some((None, ident.value.clone())),
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [only] => Some((None, only.value.clone())),
+                [q, c] => Some((Some(q.value.clone()), c.value.clone())),
+                _ => None,
+            },
             _ => None,
         }
     };
@@ -2020,11 +2084,11 @@ fn try_extract_equality(expr: &Expr) -> Option<(String, sqlparser::ast::Value)> 
             None
         }
     };
-    if let (Some(c), Some(l)) = (col_from(left), literal_from(right)) {
-        return Some((c, l));
+    if let (Some((q, c)), Some(l)) = (col_from(left), literal_from(right)) {
+        return Some((q, c, l));
     }
-    if let (Some(l), Some(c)) = (literal_from(left), col_from(right)) {
-        return Some((c, l));
+    if let (Some(l), Some((q, c))) = (literal_from(left), col_from(right)) {
+        return Some((q, c, l));
     }
     None
 }
@@ -2302,6 +2366,7 @@ fn select_topk(
     table: &Table,
     order: &OrderByClause,
     k: usize,
+    scope_name: &str,
 ) -> Result<Vec<i64>> {
     use std::collections::BinaryHeap;
 
@@ -2312,7 +2377,7 @@ fn select_topk(
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
 
     for &rowid in matching {
-        let key = eval_expr(&order.expr, table, rowid)?;
+        let key = eval_expr(&order.expr, table, rowid, scope_name)?;
         let entry = HeapEntry {
             key,
             rowid,
@@ -2343,7 +2408,12 @@ fn select_topk(
         .collect())
 }
 
-fn sort_rowids(rowids: &mut [i64], table: &Table, order: &OrderByClause) -> Result<()> {
+fn sort_rowids(
+    rowids: &mut [i64],
+    table: &Table,
+    order: &OrderByClause,
+    scope_name: &str,
+) -> Result<()> {
     // Phase 7b: ORDER BY now accepts any expression (column ref,
     // arithmetic, function call, …). Pre-compute the sort key for
     // every rowid up front so the comparator is called O(N log N)
@@ -2353,7 +2423,7 @@ fn sort_rowids(rowids: &mut [i64], table: &Table, order: &OrderByClause) -> Resu
     // could be running tens of millions of distance computations.
     let mut keys: Vec<(i64, Result<Value>)> = rowids
         .iter()
-        .map(|r| (*r, eval_expr(&order.expr, table, *r)))
+        .map(|r| (*r, eval_expr(&order.expr, table, *r, scope_name)))
         .collect();
 
     // Surface the FIRST evaluation error if any. We could be lazy
@@ -2408,9 +2478,12 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     }
 }
 
-/// Returns `true` if the row at `rowid` matches the predicate expression.
-pub fn eval_predicate(expr: &Expr, table: &Table, rowid: i64) -> Result<bool> {
-    eval_predicate_scope(expr, &SingleTableScope::new(table, rowid))
+/// Returns `true` if the row at `rowid` matches the predicate
+/// expression. `scope_name` is the user-visible name a `t.col`
+/// qualifier must match — the FROM alias when declared, else the
+/// table name (SQLR-14).
+pub fn eval_predicate(expr: &Expr, table: &Table, rowid: i64, scope_name: &str) -> Result<bool> {
+    eval_predicate_scope(expr, &SingleTableScope::new(table, rowid, scope_name))
 }
 
 /// Scope-aware predicate evaluation. The single-table fast path wraps
@@ -2430,8 +2503,8 @@ pub(crate) fn eval_predicate_scope(expr: &Expr, scope: &dyn RowScope) -> Result<
 }
 
 /// Single-table convenience wrapper around [`eval_expr_scope`].
-fn eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value> {
-    eval_expr_scope(expr, &SingleTableScope::new(table, rowid))
+fn eval_expr(expr: &Expr, table: &Table, rowid: i64, scope_name: &str) -> Result<Value> {
+    eval_expr_scope(expr, &SingleTableScope::new(table, rowid, scope_name))
 }
 
 fn eval_expr_scope(expr: &Expr, scope: &dyn RowScope) -> Result<Value> {
@@ -2457,11 +2530,12 @@ fn eval_expr_scope(expr: &Expr, scope: &dyn RowScope) -> Result<Value> {
         }
 
         Expr::CompoundIdentifier(parts) => {
-            // `qualifier.col` — single-table scope ignores the qualifier
-            // (legacy behavior). Joined scope dispatches to the table
-            // matching `qualifier`. The compound form must have at
-            // least two parts; deeper paths (`db.schema.t.col`) are
-            // not supported.
+            // `qualifier.col` — single-table scope requires the
+            // qualifier to name its one table (alias if declared,
+            // SQLR-14). Joined scope dispatches to the table matching
+            // `qualifier`. The compound form must have at least two
+            // parts; deeper paths (`db.schema.t.col`) are not
+            // supported.
             match parts.as_slice() {
                 [only] => scope.lookup(None, &only.value),
                 [q, c] => scope.lookup(Some(&q.value), &c.value),
@@ -4021,11 +4095,11 @@ mod tests {
 
         // Full-sort path
         let mut full = all_rowids.clone();
-        sort_rowids(&mut full, table, order).unwrap();
+        sort_rowids(&mut full, table, order, "docs").unwrap();
         full.truncate(10);
 
         // Bounded-heap path
-        let topk = select_topk(&all_rowids, table, order, 10).unwrap();
+        let topk = select_topk(&all_rowids, table, order, 10, "docs").unwrap();
 
         assert_eq!(topk, full, "top-k via heap should match full-sort+truncate");
     }
@@ -4040,10 +4114,10 @@ mod tests {
         let all_rowids = table.rowids();
 
         let mut full = all_rowids.clone();
-        sort_rowids(&mut full, table, order).unwrap();
+        sort_rowids(&mut full, table, order, "docs").unwrap();
         full.truncate(10);
 
-        let topk = select_topk(&all_rowids, table, order, 10).unwrap();
+        let topk = select_topk(&all_rowids, table, order, 10, "docs").unwrap();
 
         assert_eq!(
             topk, full,
@@ -4061,7 +4135,7 @@ mod tests {
         let table = db.get_table("docs".to_string()).unwrap();
         let q = parse_select("SELECT * FROM docs ORDER BY score ASC LIMIT 1000;");
         let order = q.order_by.as_ref().unwrap();
-        let topk = select_topk(&table.rowids(), table, order, 1000).unwrap();
+        let topk = select_topk(&table.rowids(), table, order, 1000, "docs").unwrap();
         assert_eq!(topk.len(), 50);
         // All scores in ascending order.
         let scores: Vec<f64> = topk
@@ -4080,7 +4154,7 @@ mod tests {
         let table = db.get_table("docs".to_string()).unwrap();
         let q = parse_select("SELECT * FROM docs ORDER BY score ASC LIMIT 1;");
         let order = q.order_by.as_ref().unwrap();
-        let topk = select_topk(&table.rowids(), table, order, 0).unwrap();
+        let topk = select_topk(&table.rowids(), table, order, 0, "docs").unwrap();
         assert!(topk.is_empty());
     }
 
@@ -4090,7 +4164,7 @@ mod tests {
         let table = db.get_table("docs".to_string()).unwrap();
         let q = parse_select("SELECT * FROM docs ORDER BY score ASC LIMIT 5;");
         let order = q.order_by.as_ref().unwrap();
-        let topk = select_topk(&[], table, order, 5).unwrap();
+        let topk = select_topk(&[], table, order, 5, "docs").unwrap();
         assert!(topk.is_empty());
     }
 
@@ -4168,13 +4242,13 @@ mod tests {
 
         // Time bounded heap.
         let t0 = Instant::now();
-        let _topk = select_topk(&all_rowids, table, order, K).unwrap();
+        let _topk = select_topk(&all_rowids, table, order, K, "docs").unwrap();
         let heap_dur = t0.elapsed();
 
         // Time full sort + truncate.
         let t1 = Instant::now();
         let mut full = all_rowids.clone();
-        sort_rowids(&mut full, table, order).unwrap();
+        sort_rowids(&mut full, table, order, "docs").unwrap();
         full.truncate(K);
         let sort_dur = t1.elapsed();
 
@@ -4395,6 +4469,168 @@ mod tests {
             response.contains("1 row returned"),
             "IS NULL combined with AND should match exactly row 2, got: {response}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-14 — table qualifiers are validated in single-table scope,
+    // matching JoinedScope. Before the fix, `SELECT x.id FROM t`
+    // resolved `x.id` as plain `id`, silently accepting any qualifier.
+    // ---------------------------------------------------------------------
+
+    /// Assert `sql` fails with the SQLR-14 unknown-qualifier message.
+    fn assert_unknown_qualifier(db: &mut Database, sql: &str, qualifier: &str) {
+        let err = crate::sql::process_command(sql, db)
+            .expect_err("a bogus table qualifier must error, not be ignored");
+        assert!(
+            err.to_string()
+                .contains(&format!("unknown table qualifier '{qualifier}'")),
+            "expected unknown-qualifier error for `{sql}`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qualifier_matching_table_name_works() {
+        let mut db = seed_sqlr2();
+        let rows = run_select(&mut db, "SELECT t.id FROM t WHERE t.id = 1 ORDER BY t.id;");
+        assert!(rows.contains("1 row returned"), "got: {rows}");
+    }
+
+    #[test]
+    fn qualifier_matching_alias_works() {
+        let mut db = seed_sqlr2();
+        let rows = run_select(
+            &mut db,
+            "SELECT a.id FROM t AS a WHERE a.id = 1 ORDER BY a.id;",
+        );
+        assert!(rows.contains("1 row returned"), "got: {rows}");
+    }
+
+    #[test]
+    fn qualifier_match_is_case_insensitive() {
+        let mut db = seed_sqlr2();
+        let rows = run_select(&mut db, "SELECT T.id FROM t WHERE T.id = 1;");
+        assert!(rows.contains("1 row returned"), "got: {rows}");
+    }
+
+    #[test]
+    fn unknown_qualifier_in_projection_errors() {
+        let mut db = seed_sqlr2();
+        assert_unknown_qualifier(&mut db, "SELECT x.id FROM t;", "x");
+    }
+
+    #[test]
+    fn unknown_qualifier_in_where_errors() {
+        let mut db = seed_sqlr2();
+        assert_unknown_qualifier(&mut db, "SELECT id FROM t WHERE bogus.id = 1;", "bogus");
+    }
+
+    #[test]
+    fn unknown_qualifier_in_indexed_where_errors() {
+        // The `col = literal` WHERE shape short-circuits per-row
+        // evaluation via the index probe — the qualifier check must
+        // hold there too.
+        let mut db = seed_sqlr2();
+        crate::sql::process_command("CREATE INDEX idx_name ON t (name);", &mut db).unwrap();
+        assert_unknown_qualifier(
+            &mut db,
+            "SELECT id FROM t WHERE bogus.name = 'alice';",
+            "bogus",
+        );
+    }
+
+    #[test]
+    fn unknown_qualifier_in_order_by_errors() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("SELECT id FROM t ORDER BY x.id;", &mut db);
+        let err = res.expect_err("ORDER BY with a bogus qualifier must error");
+        assert!(
+            err.to_string().contains("unknown table qualifier 'x'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn alias_shadows_table_name_as_qualifier() {
+        // SQLite semantics: once `FROM t AS a` declares an alias, the
+        // alias is the *only* valid qualifier — `t.id` errors.
+        let mut db = seed_sqlr2();
+        assert_unknown_qualifier(&mut db, "SELECT t.id FROM t AS a;", "t");
+        assert_unknown_qualifier(&mut db, "SELECT id FROM t AS a WHERE t.id = 1;", "t");
+    }
+
+    #[test]
+    fn unknown_qualifier_in_group_by_and_aggregates_errors() {
+        let mut db = seed_sqlr2();
+        assert_unknown_qualifier(&mut db, "SELECT COUNT(x.id) FROM t;", "x");
+        assert_unknown_qualifier(
+            &mut db,
+            "SELECT x.name, COUNT(*) FROM t GROUP BY x.name;",
+            "x",
+        );
+        // Matching qualifiers keep working through the aggregation path.
+        let rows = run_select(
+            &mut db,
+            "SELECT t.name, COUNT(t.id) FROM t GROUP BY t.name;",
+        );
+        assert!(rows.contains("2 rows returned"), "got: {rows}");
+    }
+
+    #[test]
+    fn update_unknown_qualifier_in_where_errors_and_mutates_nothing() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("UPDATE t SET name = 'x' WHERE x.id = 1;", &mut db);
+        assert!(
+            res.is_err(),
+            "UPDATE with a bogus WHERE qualifier must error"
+        );
+        let rows = run_select(&mut db, "SELECT id FROM t WHERE name = 'x';");
+        assert!(
+            rows.contains("0 rows returned"),
+            "no row may be updated when the WHERE errors, got: {rows}"
+        );
+    }
+
+    #[test]
+    fn update_set_rhs_unknown_qualifier_errors() {
+        let mut db = seed_sqlr2();
+        assert_unknown_qualifier(&mut db, "UPDATE t SET name = x.name;", "x");
+    }
+
+    #[test]
+    fn update_with_alias_validates_against_alias() {
+        let mut db = seed_sqlr2();
+        // Alias works as the qualifier …
+        crate::sql::process_command("UPDATE t AS a SET name = 'x' WHERE a.id = 1;", &mut db)
+            .expect("alias qualifier must be accepted in UPDATE");
+        let rows = run_select(&mut db, "SELECT id FROM t WHERE name = 'x';");
+        assert!(rows.contains("1 row returned"), "got: {rows}");
+        // … and shadows the table name, per SQLite.
+        assert_unknown_qualifier(&mut db, "UPDATE t AS a SET name = 'y' WHERE t.id = 1;", "t");
+    }
+
+    #[test]
+    fn delete_unknown_qualifier_in_where_errors_and_deletes_nothing() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("DELETE FROM t WHERE x.id = 1;", &mut db);
+        assert!(
+            res.is_err(),
+            "DELETE with a bogus WHERE qualifier must error"
+        );
+        let rows = run_select(&mut db, "SELECT id FROM t;");
+        assert!(
+            rows.contains("2 rows returned"),
+            "no row may be deleted when the WHERE errors, got: {rows}"
+        );
+    }
+
+    #[test]
+    fn delete_with_alias_validates_against_alias() {
+        let mut db = seed_sqlr2();
+        crate::sql::process_command("DELETE FROM t AS a WHERE a.id = 2;", &mut db)
+            .expect("alias qualifier must be accepted in DELETE");
+        let rows = run_select(&mut db, "SELECT id FROM t;");
+        assert!(rows.contains("1 row returned"), "got: {rows}");
+        assert_unknown_qualifier(&mut db, "DELETE FROM t AS a WHERE t.id = 1;", "t");
     }
 
     // ---------------------------------------------------------------------

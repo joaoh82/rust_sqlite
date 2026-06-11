@@ -43,7 +43,8 @@ impl AggregateFn {
 /// reference. SQLR-6 — the column carries its optional `t.` qualifier
 /// so joined aggregation (`SUM(orders.amount)`) can disambiguate
 /// same-named columns across in-scope tables; the single-table path
-/// ignores it, same as projection qualifiers.
+/// validates it against the FROM table/alias (SQLR-14), same as
+/// projection qualifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArg {
     Star,
@@ -128,8 +129,8 @@ pub enum ProjectionKind {
     /// Column reference. `qualifier` is `Some` for `t.col` shapes
     /// (SQLR-5 — needed so JOIN execution can disambiguate
     /// same-named columns across tables); `None` for bare `col`.
-    /// The single-table path ignores the qualifier and looks up the
-    /// name directly, preserving legacy behavior.
+    /// The single-table path validates the qualifier against the FROM
+    /// table name / alias (SQLR-14) and then looks up the bare name.
     Column {
         qualifier: Option<String>,
         name: String,
@@ -151,7 +152,8 @@ pub enum Projection {
 /// SQLR-6 — one GROUP BY key: an optionally-qualified column reference
 /// (`dept` or `t.dept`). The qualifier matters for joined SELECTs,
 /// where the same column name can exist on several in-scope tables;
-/// the single-table path ignores it, mirroring projection qualifiers.
+/// the single-table path validates it against the FROM table/alias
+/// (SQLR-14), mirroring projection qualifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupByKey {
     pub qualifier: Option<String>,
