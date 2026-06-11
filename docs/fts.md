@@ -105,6 +105,8 @@ The function requires a TEXT column with an FTS index attached. Without one, it 
 fts_match(body, ...): no FTS index on column 'body' (run CREATE INDEX <name> ON <table> USING fts(body) first)
 ```
 
+The column argument may be qualified (`fts_match(docs.body, 'q')` or the FROM alias). The qualifier is validated the same way as any column reference (SQLR-15): it must name the table in scope, else the query errors with `unknown table qualifier`.
+
 This contrasts with SQLite's `MATCH` operator, which is parser-level; SQLRite uses a function-call shape because `sqlparser`'s SQLite dialect doesn't expose a `BinaryOperator::Match` variant we can dispatch on ([Q1](phase-8-plan.md#q1-match-operator-syntax)).
 
 ### `bm25_score(col, 'q')`
@@ -119,7 +121,7 @@ Notes:
 
 - **`DESC`** is the conventional direction. `ASC` works (returns least-relevant first) but disables the optimizer probe — see [Optimizer hook](#optimizer-hook).
 - **Same query string** must appear in `WHERE fts_match(...)` and `ORDER BY bm25_score(...)`. The optimizer recognizes the joint pattern; mismatched strings fall through to a slow per-row evaluation.
-- **Same caveats as `fts_match`:** requires an FTS index on the column; errors clearly otherwise.
+- **Same caveats as `fts_match`:** requires an FTS index on the column; errors clearly otherwise. Qualified column args (`bm25_score(docs.body, …)`) are validated against the table in scope (SQLR-15) — note the optimizer probe only matches a *bare* column identifier, so a qualified arg always takes the per-row evaluation path.
 
 The math is the standard BM25+ variant (`k1 = 1.5`, `b = 0.75`, fixed at SQLite FTS5 defaults). Full formula in [`src/sql/fts/bm25.rs`](../src/sql/fts/bm25.rs).
 

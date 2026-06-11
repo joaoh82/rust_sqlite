@@ -63,6 +63,14 @@ pub(crate) trait RowScope {
     /// single-table path; calling them from a joined query produces
     /// a `NotImplemented` error rather than wrong results.
     fn single_table_view(&self) -> Option<(&Table, i64)>;
+
+    /// The user-visible name a `t.col` qualifier must match in this
+    /// scope (FROM alias if declared, else table name), or `None` when
+    /// no single name applies (joined / group-row scopes). SQLR-15 —
+    /// lets helpers that extract a column *name* syntactically (rather
+    /// than resolving a value through `lookup`) run the same SQLR-14
+    /// qualifier check as plain column references.
+    fn scope_name(&self) -> Option<&str>;
 }
 
 /// The default scope for non-join queries: one table, one rowid.
@@ -106,6 +114,10 @@ impl RowScope for SingleTableScope<'_> {
 
     fn single_table_view(&self) -> Option<(&Table, i64)> {
         Some((self.table, self.rowid))
+    }
+
+    fn scope_name(&self) -> Option<&str> {
+        Some(self.scope_name)
     }
 }
 
@@ -182,6 +194,12 @@ impl RowScope for JoinedScope<'_> {
     }
 
     fn single_table_view(&self) -> Option<(&Table, i64)> {
+        None
+    }
+
+    fn scope_name(&self) -> Option<&str> {
+        // Qualified references in joined scope resolve per-table in
+        // `lookup`; there is no single name to check against.
         None
     }
 }
@@ -2839,10 +2857,25 @@ fn resolve_fts_args<'t>(
     };
     let col_name = match col_expr {
         Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map(|p| p.value.clone())
-            .ok_or_else(|| SQLRiteError::Internal("empty compound identifier".to_string()))?,
+        // SQLR-15 — a `t.col` argument extracts the column *name*
+        // without going through `RowScope::lookup`, so it must run the
+        // SQLR-14 qualifier check itself: `fts_match(bogus.body, …)`
+        // errors instead of silently dropping the `bogus.`.
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [only] => only.value.clone(),
+            [q, c] => {
+                if let Some(scope_name) = scope.scope_name() {
+                    check_single_scope_qualifier(Some(&q.value), scope_name, &c.value)?;
+                }
+                c.value.clone()
+            }
+            _ => {
+                return Err(SQLRiteError::NotImplemented(format!(
+                    "compound identifier with {} parts is not supported",
+                    parts.len()
+                )));
+            }
+        },
         other => {
             return Err(SQLRiteError::General(format!(
                 "{fn_name}() argument 0 must be a column reference, got {other:?}"
@@ -3647,6 +3680,12 @@ impl RowScope for GroupRowScope<'_> {
     }
 
     fn single_table_view(&self) -> Option<(&Table, i64)> {
+        None
+    }
+
+    fn scope_name(&self) -> Option<&str> {
+        // Output rows carry no table qualifier — `lookup` ignores
+        // qualifiers entirely, so there is nothing to validate.
         None
     }
 }
