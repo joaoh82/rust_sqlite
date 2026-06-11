@@ -2315,6 +2315,127 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // SQLR-15 — table qualifiers in FTS function column args are
+    // validated like plain column references (SQLR-14). Before the
+    // fix, `fts_match(bogus.body, …)` silently dropped the `bogus.`.
+    // -----------------------------------------------------------------
+
+    /// Assert `sql` fails with the SQLR-14/15 unknown-qualifier message.
+    fn assert_fts_unknown_qualifier(db: &mut Database, sql: &str, qualifier: &str) {
+        let err = process_command(sql, db)
+            .expect_err("a bogus qualifier in an FTS function arg must error, not be ignored");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&format!("unknown table qualifier '{qualifier}'")),
+            "expected unknown-qualifier error for `{sql}`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fts_match_with_matching_table_qualifier_works() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(docs.body, 'rust');",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+        // Case-insensitive match, same as plain column references.
+        let resp = process_command(
+            "SELECT id FROM docs WHERE fts_match(DOCS.body, 'rust');",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn fts_match_with_matching_alias_qualifier_works() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let resp = process_command(
+            "SELECT id FROM docs AS d WHERE fts_match(d.body, 'rust');",
+            &mut db,
+        )
+        .unwrap();
+        assert!(resp.contains("3 rows returned"), "got: {resp}");
+    }
+
+    #[test]
+    fn fts_match_alias_shadows_table_name_as_qualifier() {
+        // Once `FROM docs AS d` declares an alias, the alias is the
+        // only valid qualifier — `docs.body` errors (SQLite semantics,
+        // mirrors the SQLR-14 plain-column tests).
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        assert_fts_unknown_qualifier(
+            &mut db,
+            "SELECT id FROM docs AS d WHERE fts_match(docs.body, 'rust');",
+            "docs",
+        );
+    }
+
+    #[test]
+    fn fts_match_unknown_qualifier_in_where_errors() {
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        assert_fts_unknown_qualifier(
+            &mut db,
+            "SELECT id FROM docs WHERE fts_match(bogus.body, 'rust');",
+            "bogus",
+        );
+    }
+
+    #[test]
+    fn bm25_score_unknown_qualifier_in_order_by_errors() {
+        // ORDER BY position exercises the scalar-eval path: the FTS
+        // probe only matches bare identifiers, so the qualified arg
+        // falls through to resolve_fts_args.
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        assert_fts_unknown_qualifier(
+            &mut db,
+            "SELECT id FROM docs ORDER BY bm25_score(bogus.body, 'rust') DESC LIMIT 1;",
+            "bogus",
+        );
+    }
+
+    #[test]
+    fn bm25_score_unknown_qualifier_in_where_errors() {
+        // (Projection position can't reach the FTS helper — scalar
+        // functions are rejected in the projection list outright, so
+        // WHERE-comparison is the other scalar-eval position.)
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        assert_fts_unknown_qualifier(
+            &mut db,
+            "SELECT id FROM docs WHERE bm25_score(bogus.body, 'rust') > 0.0;",
+            "bogus",
+        );
+    }
+
+    #[test]
+    fn bm25_score_with_matching_qualifier_still_ranks_correctly() {
+        // Qualified arg bypasses the FTS probe (bare-identifier match
+        // only) — the scalar path must produce the same top result.
+        let mut db = seed_fts_table();
+        process_command("CREATE INDEX ix_body ON docs USING fts (body);", &mut db).unwrap();
+        let out = process_command_with_render(
+            "SELECT id FROM docs WHERE fts_match(docs.body, 'rust') \
+             ORDER BY bm25_score(docs.body, 'rust') DESC LIMIT 1;",
+            &mut db,
+        )
+        .unwrap();
+        assert!(out.status.contains("1 row returned"), "got: {}", out.status);
+        let rendered = out.rendered.expect("SELECT should produce rendered output");
+        assert!(
+            rendered.contains(" 5 "),
+            "expected id=5 to be top-ranked; rendered:\n{rendered}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Phase 7b — vector distance functions through process_command
     // -----------------------------------------------------------------
 

@@ -82,7 +82,7 @@ match query {
 
 - `Expr::Nested(inner)` → recurse
 - `Expr::Identifier(ident)` → look up `ident.value` on the table at the given rowid
-- `Expr::CompoundIdentifier(parts)` → same, after validating the qualifier against the one table in scope — `scope_name` is the FROM alias when declared, else the table name, and anything else errors with `unknown table qualifier` (SQLR-14, matching the joined scope's behavior)
+- `Expr::CompoundIdentifier(parts)` → same, after validating the qualifier against the one table in scope — `scope_name` is the FROM alias when declared, else the table name, and anything else errors with `unknown table qualifier` (SQLR-14, matching the joined scope's behavior). Functions that extract a column *name* syntactically instead of resolving a value — `fts_match` / `bm25_score`'s first argument — run the same check via `RowScope::scope_name()` (SQLR-15)
 - `Expr::Value(v)` → convert a sqlparser literal to a runtime `Value`
 - `Expr::UnaryOp { op, expr }` → recurse on inner, apply `+` / `-` / `NOT`
 - `Expr::BinaryOp { left, op, right }` → recurse on both sides, apply the operator
