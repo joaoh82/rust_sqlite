@@ -214,8 +214,8 @@ Expressions in `WHERE` and `UPDATE`'s `SET` RHS:
 
 ```toml
 [dependencies]
-sqlrite-engine = "0.13"
-sqlrite-ask    = "0.13"
+sqlrite-engine = "0.14"
+sqlrite-ask    = "0.14"
 ```
 
 ```rust

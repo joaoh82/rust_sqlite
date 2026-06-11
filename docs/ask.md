@@ -131,8 +131,8 @@ If `SQLRITE_LLM_API_KEY` is missing, the panel surfaces a clean "missing API key
 
 ```toml
 [dependencies]
-sqlrite-engine = "0.13"
-sqlrite-ask    = "0.13"
+sqlrite-engine = "0.14"
+sqlrite-ask    = "0.14"
 ```
 
 ```rust
