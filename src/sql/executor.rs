@@ -44,9 +44,10 @@ use crate::sql::parser::select::{
 // The trait stays small on purpose:
 //
 //   - `lookup` resolves a column reference (`col` or `t.col`) to a
-//     `Value`. NULL-padded joined rows yield `Value::Null` for any
-//     column from their side. Ambiguous unqualified references in
-//     joined scope error.
+//     `Value`. Unknown columns error in both scopes (SQLR-2).
+//     NULL-padded joined rows yield `Value::Null` for any column
+//     from their side. Ambiguous unqualified references in joined
+//     scope error.
 //
 //   - `single_table_view` lets index-probing helpers (FTS, HNSW,
 //     vec_distance) bail out cleanly when invoked over a join — they
@@ -79,10 +80,19 @@ impl<'a> SingleTableScope<'a> {
 impl RowScope for SingleTableScope<'_> {
     fn lookup(&self, qualifier: Option<&str>, col: &str) -> Result<Value> {
         // The qualifier (if any) is ignored — we only have one table
-        // in scope, so `t.col` resolves the same as `col`. This
-        // matches the historical single-table path which did the
-        // same thing in `eval_expr`.
+        // in scope, so `t.col` resolves the same as `col`. Validating
+        // it against the table name/alias requires plumbing the FROM
+        // alias through every `eval_expr` callsite (SQLR-2 follow-up).
         let _ = qualifier;
+        // SQLR-2 — unknown columns error, matching `JoinedScope`. A
+        // schema column whose cell was never written (omitted from the
+        // INSERT column list) still reads as NULL.
+        if !self.table.contains_column(col.to_string()) {
+            return Err(SQLRiteError::Internal(format!(
+                "Column '{col}' does not exist on table '{}'",
+                self.table.tb_name
+            )));
+        }
         Ok(self.table.get_value(col, self.rowid).unwrap_or(Value::Null))
     }
 
@@ -4289,6 +4299,79 @@ mod tests {
         assert!(
             response.contains("1 row returned"),
             "IS NULL should match the omitted-column row, got: {response}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SQLR-2 — unknown columns error in single-table scope, matching
+    // JoinedScope. Before the fix, lookup silently returned NULL, so a
+    // typo'd WHERE matched every row (catastrophic for UPDATE/DELETE).
+    // ---------------------------------------------------------------------
+
+    /// Seed a two-row table the SQLR-2 tests share.
+    fn seed_sqlr2() -> Database {
+        let mut db = Database::new("t".to_string());
+        crate::sql::process_command(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);",
+            &mut db,
+        )
+        .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, name) VALUES (1, 'alice');", &mut db)
+            .unwrap();
+        crate::sql::process_command("INSERT INTO t (id, name) VALUES (2, 'bob');", &mut db)
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn where_unknown_column_errors_single_table() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("SELECT id FROM t WHERE typo IS NULL;", &mut db);
+        let err = res.expect_err("WHERE on an unknown column must error, not match via NULL");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "expected unknown-column error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn order_by_unknown_column_errors_single_table() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("SELECT id FROM t ORDER BY typo;", &mut db);
+        assert!(
+            res.is_err(),
+            "ORDER BY on an unknown column must error, not sort by NULL"
+        );
+    }
+
+    #[test]
+    fn update_with_unknown_column_in_where_errors_and_mutates_nothing() {
+        let mut db = seed_sqlr2();
+        let res =
+            crate::sql::process_command("UPDATE t SET name = 'x' WHERE typo IS NULL;", &mut db);
+        assert!(
+            res.is_err(),
+            "UPDATE with a typo'd WHERE column must error, not update every row"
+        );
+        let rows = run_select(&mut db, "SELECT id FROM t WHERE name = 'x';");
+        assert!(
+            rows.contains("0 rows returned"),
+            "no row may be updated when the WHERE errors, got: {rows}"
+        );
+    }
+
+    #[test]
+    fn delete_with_unknown_column_in_where_errors_and_deletes_nothing() {
+        let mut db = seed_sqlr2();
+        let res = crate::sql::process_command("DELETE FROM t WHERE typo IS NULL;", &mut db);
+        assert!(
+            res.is_err(),
+            "DELETE with a typo'd WHERE column must error, not delete every row"
+        );
+        let rows = run_select(&mut db, "SELECT id FROM t;");
+        assert!(
+            rows.contains("2 rows returned"),
+            "no row may be deleted when the WHERE errors, got: {rows}"
         );
     }
 
