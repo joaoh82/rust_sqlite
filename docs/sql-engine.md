@@ -78,11 +78,11 @@ match query {
 
 ### The expression evaluator
 
-`eval_expr(expr: &Expr, table: &Table, rowid: i64) -> Result<Value>` walks a `sqlparser::Expr` and produces a runtime [`Value`](storage-model.md#runtime-value-vs-storage-row). It's a straightforward recursive match:
+`eval_expr(expr: &Expr, table: &Table, rowid: i64, scope_name: &str) -> Result<Value>` walks a `sqlparser::Expr` and produces a runtime [`Value`](storage-model.md#runtime-value-vs-storage-row). It's a straightforward recursive match:
 
 - `Expr::Nested(inner)` → recurse
 - `Expr::Identifier(ident)` → look up `ident.value` on the table at the given rowid
-- `Expr::CompoundIdentifier(parts)` → same, using the last component (we ignore qualifiers because there's only one table in scope)
+- `Expr::CompoundIdentifier(parts)` → same, after validating the qualifier against the one table in scope — `scope_name` is the FROM alias when declared, else the table name, and anything else errors with `unknown table qualifier` (SQLR-14, matching the joined scope's behavior)
 - `Expr::Value(v)` → convert a sqlparser literal to a runtime `Value`
 - `Expr::UnaryOp { op, expr }` → recurse on inner, apply `+` / `-` / `NOT`
 - `Expr::BinaryOp { left, op, right }` → recurse on both sides, apply the operator
