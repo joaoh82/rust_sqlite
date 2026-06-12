@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { cache } from "react";
+import GithubSlugger from "github-slugger";
 import matter from "gray-matter";
 
 export type PostFrontmatter = {
@@ -113,6 +114,52 @@ export function tagToSlug(tag: string): string {
 export function slugToTag(slug: string): string | null {
   const tags = getAllTags().map(({ tag }) => tag);
   return tags.find((t) => tagToSlug(t) === slug) ?? null;
+}
+
+export type TocEntry = { id: string; text: string };
+
+// Pull `## ` headings out of a post body for the on-page ToC. Slugs are
+// computed with github-slugger — the same library rehype-slug uses in
+// blog-mdx.tsx — so the ToC anchors always match the rendered ids.
+export function extractToc(content: string): TocEntry[] {
+  const slugger = new GithubSlugger();
+  const entries: TocEntry[] = [];
+  // Drop fenced code blocks first so a `## ` inside a snippet (e.g. a
+  // shell comment) can't masquerade as a heading.
+  const prose = content.replace(/^```[\s\S]*?^```/gm, "");
+  for (const line of prose.split("\n")) {
+    const m = /^##\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const text = m[1]
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // [text](url) → text
+      .replace(/[`*_]/g, "")
+      .trim();
+    entries.push({ id: slugger.slug(text), text });
+  }
+  return entries;
+}
+
+export function wordCount(content: string): number {
+  return content.trim().split(/\s+/).length;
+}
+
+// Sibling posts for the "Related" footer: rank by shared tags (newest-first
+// within a score band, since getAllPosts() is already sorted), so there are
+// always `limit` entries as long as the blog has that many posts.
+export function getRelatedPosts(slug: string, limit = 3): Post[] {
+  const all = getAllPosts();
+  const current = all.find((p) => p.slug === slug);
+  if (!current) return all.slice(0, limit);
+  const currentTags = new Set(current.frontmatter.tags);
+  return all
+    .filter((p) => p.slug !== slug)
+    .map((post) => ({
+      post,
+      shared: post.frontmatter.tags.filter((t) => currentTags.has(t)).length,
+    }))
+    .sort((a, b) => b.shared - a.shared)
+    .slice(0, limit)
+    .map((s) => s.post);
 }
 
 export function formatDate(iso: string): string {

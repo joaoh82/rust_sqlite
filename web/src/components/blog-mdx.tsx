@@ -1,10 +1,14 @@
 import Link from "next/link";
 import type { ComponentProps } from "react";
 import { MDXRemote } from "next-mdx-remote/rsc";
+import rehypeAutolinkHeadings, {
+  type Options as RehypeAutolinkOptions,
+} from "rehype-autolink-headings";
 import rehypePrettyCode, {
   type Options as RehypePrettyCodeOptions,
   type Theme as RehypePrettyCodeTheme,
 } from "rehype-pretty-code";
+import rehypeSlug from "rehype-slug";
 import { sqlriteShikiTheme } from "@/lib/highlight";
 
 function isInternal(href: string | undefined): boolean {
@@ -49,6 +53,18 @@ const prettyCodeOptions: RehypePrettyCodeOptions = {
   defaultLang: { block: "plaintext" },
 };
 
+// Append a `#` anchor link inside every slugged heading. The slugs come
+// from rehype-slug (github-slugger), so they're stable across renders and
+// match what the article ToC in [slug]/page.tsx computes server-side.
+const autolinkOptions: RehypeAutolinkOptions = {
+  behavior: "append",
+  properties: {
+    className: ["heading-anchor"],
+    ariaLabel: "Link to this section",
+  },
+  content: { type: "text", value: "#" },
+};
+
 export function BlogMDX({ source }: { source: string }) {
   return (
     <MDXRemote
@@ -56,7 +72,11 @@ export function BlogMDX({ source }: { source: string }) {
       components={components}
       options={{
         mdxOptions: {
-          rehypePlugins: [[rehypePrettyCode, prettyCodeOptions]],
+          rehypePlugins: [
+            rehypeSlug,
+            [rehypeAutolinkHeadings, autolinkOptions],
+            [rehypePrettyCode, prettyCodeOptions],
+          ],
         },
       }}
     />
