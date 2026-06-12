@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Brand mark: same orange rounded square + play glyph as og.tsx and .brand-mark -->
+  <rect width="32" height="32" rx="7" fill="#f97316"/>
+  <path d="M12 8l13 8-13 8z" fill="#0d1117"/>
+</svg>

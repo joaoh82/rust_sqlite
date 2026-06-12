@@ -43,6 +43,14 @@ Each public route ships full search/social metadata. The pieces:
   [`src/lib/og.tsx`](src/lib/og.tsx) so each route just supplies a
   page-specific eyebrow / title / subtitle. The brand mark is inlined as
   SVG (Satori's dynamic-font fallback 400s on uncommon glyphs).
+- **Favicons** — Next 15 file conventions in `src/app/`:
+  [`icon.svg`](src/app/icon.svg) (the orange brand mark, served as the
+  `<link rel="icon">`), `favicon.ico` (16/32/48 raster fallback so direct
+  `/favicon.ico` requests return 200 instead of 404), and `apple-icon.png`
+  (180×180, full-bleed — iOS applies its own corner mask). The `.ico` and
+  the apple icon are rasterized from the same play-glyph mark used in
+  [`src/lib/og.tsx`](src/lib/og.tsx) and `.brand-mark`; regenerate them
+  from `icon.svg` (e.g. with `sharp`) if the mark ever changes.
 - **`/sitemap.xml` + `/robots.txt`** — Next 15 metadata routes
   ([`src/app/sitemap.ts`](src/app/sitemap.ts),
   [`src/app/robots.ts`](src/app/robots.ts)). Add a route to the `ROUTES`
@@ -91,6 +99,7 @@ web/
 ├── src/
 │   ├── app/
 │   │   ├── globals.css      # design tokens + utility CSS (ports the original design's styles.css)
+│   │   ├── icon.svg         # favicon (brand mark; favicon.ico + apple-icon.png are rasterized from it)
 │   │   ├── layout.tsx       # root layout, fonts (Inter + JetBrains Mono via next/font)
 │   │   ├── page.tsx         # landing
 │   │   ├── docs/page.tsx    # /docs
