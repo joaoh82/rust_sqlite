@@ -1658,6 +1658,219 @@ footer {
   color: var(--color-fg);
 }
 
+/* heading anchors — the `#` link appended to docs h2s and blog headings
+   (SQLR-36); invisible until the heading is hovered or the anchor focused */
+.heading-anchor {
+  margin-left: 8px;
+  color: var(--color-fg-dim);
+  opacity: 0;
+  font-weight: 400;
+  text-decoration: none;
+  transition: opacity 0.12s ease;
+}
+h1:hover .heading-anchor,
+h2:hover .heading-anchor,
+h3:hover .heading-anchor,
+.heading-anchor:focus-visible {
+  opacity: 1;
+}
+.heading-anchor:hover {
+  color: var(--color-accent);
+}
+@media (hover: none) {
+  .heading-anchor {
+    opacity: 0.6;
+  }
+}
+
+/* docs search — Pagefind-backed input + results dropdown (SQLR-36) */
+.docs-search {
+  position: relative;
+  margin-bottom: 28px;
+  max-width: 520px;
+}
+.docs-search-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.docs-search-input::placeholder {
+  color: var(--color-fg-dim);
+}
+.docs-search-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+.docs-search-results {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  box-shadow: 0 16px 48px rgb(0 0 0 / 0.5);
+}
+.docs-search-results ul {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+}
+.docs-search-results li + li {
+  border-top: 1px solid var(--color-line-soft);
+}
+.docs-search-results a {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 6px;
+  text-decoration: none;
+}
+.docs-search-results a:hover {
+  background: color-mix(in oklab, var(--color-fg) 6%, transparent);
+}
+.docs-search-title {
+  display: block;
+  font-size: 13.5px;
+  color: var(--color-fg);
+}
+.docs-search-excerpt {
+  display: block;
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-fg-mute);
+}
+.docs-search-excerpt mark {
+  background: transparent;
+  color: var(--color-accent);
+  font-weight: 500;
+}
+.docs-search-empty {
+  margin: 0;
+  padding: 14px;
+  font-size: 13px;
+  color: var(--color-fg-mute);
+}
+
+/* "Was this page helpful?" vote row (SQLR-36) */
+.helpful-vote {
+  margin-top: 32px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+  color: var(--color-fg-mute);
+}
+.helpful-vote .btn {
+  min-height: 36px;
+  padding: 6px 14px;
+}
+
+/* blog on-page ToC (SQLR-36) */
+.blog-toc {
+  margin: 28px 0 0;
+  padding: 16px 20px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-line-soft);
+  border-radius: 8px;
+}
+.blog-toc-title {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-fg-dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.blog-toc ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.blog-toc li {
+  padding: 3px 0;
+}
+.blog-toc a {
+  font-size: 13.5px;
+  color: var(--color-fg-mute);
+  text-decoration: none;
+}
+.blog-toc a:hover {
+  color: var(--color-accent);
+}
+
+/* related-posts footer on blog articles (SQLR-36) */
+.blog-related {
+  margin-bottom: 36px;
+}
+.blog-related-title {
+  font-size: 18px;
+  margin-bottom: 12px;
+}
+.blog-related ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.blog-related a {
+  display: block;
+  padding: 12px 16px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-line-soft);
+  border-radius: 8px;
+  text-decoration: none;
+}
+.blog-related a:hover {
+  border-color: var(--color-line);
+}
+.blog-related-link-title {
+  display: block;
+  font-size: 14px;
+  color: var(--color-fg);
+}
+.blog-related-link-desc {
+  display: block;
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-fg-mute);
+}
+
+/* landing FAQ (SQLR-36) — h3/p pairs mirrored into FAQPage JSON-LD */
+.faq-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 28px 48px;
+  max-width: 1020px;
+}
+@media (max-width: 800px) {
+  .faq-list {
+    grid-template-columns: 1fr;
+  }
+}
+.faq-item h3 {
+  font-size: 16px;
+  margin-bottom: 8px;
+}
+.faq-item p {
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--color-fg-mute);
+}
+
 /* ===========================================================
    Mobile / tablet adjustments
    =========================================================== */

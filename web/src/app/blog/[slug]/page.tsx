@@ -2,16 +2,23 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Footer } from "@/components/footer";
+import { HelpfulVote } from "@/components/helpful-vote";
 import { Nav } from "@/components/nav";
 import { BlogMDX } from "@/components/blog-mdx";
 import { SITE } from "@/lib/site";
 import {
+  extractToc,
   formatDate,
   getAllPostSlugs,
   getAllPosts,
   getPostBySlug,
+  getRelatedPosts,
   tagToSlug,
+  wordCount,
 } from "@/lib/blog";
+
+// Only long-form posts get an on-page ToC; short notes don't need one.
+const TOC_WORD_THRESHOLD = 600;
 
 type RouteParams = { params: Promise<{ slug: string }> };
 
@@ -61,6 +68,11 @@ export default async function BlogPostPage({ params }: RouteParams) {
   if (!post) notFound();
 
   const url = `${SITE.url}/blog/${post.slug}`;
+  const toc =
+    wordCount(post.content) > TOC_WORD_THRESHOLD
+      ? extractToc(post.content)
+      : [];
+  const related = getRelatedPosts(post.slug);
   const allPosts = getAllPosts();
   const idx = allPosts.findIndex((p) => p.slug === post.slug);
   // Posts sort newest-first, so idx-1 is newer and idx+1 is older.
@@ -126,7 +138,10 @@ export default async function BlogPostPage({ params }: RouteParams) {
       />
       <Nav variant="docs" />
 
-      <article className="blog-article">
+      {/* data-pagefind-body scopes the Pagefind index to article content;
+          pages without the attribute (landing, playground…) stay out of
+          the search index entirely. */}
+      <article className="blog-article" data-pagefind-body>
         <header className="blog-article-head">
           <nav className="blog-crumbs" aria-label="Breadcrumb">
             <Link href="/blog">← All posts</Link>
@@ -165,11 +180,46 @@ export default async function BlogPostPage({ params }: RouteParams) {
           </div>
         </header>
 
+        {toc.length > 0 && (
+          <nav className="blog-toc" aria-label="Table of contents">
+            <span className="blog-toc-title">On this page</span>
+            <ul>
+              {toc.map((entry) => (
+                <li key={entry.id}>
+                  <a href={`#${entry.id}`}>{entry.text}</a>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        )}
+
         <div className="blog-article-body">
           <BlogMDX source={post.content} />
         </div>
 
-        <footer className="blog-article-foot">
+        <footer className="blog-article-foot" data-pagefind-ignore>
+          <HelpfulVote />
+
+          {related.length >= 1 && (
+            <nav className="blog-related" aria-label="Related posts">
+              <h2 className="blog-related-title">Related</h2>
+              <ul>
+                {related.map((p) => (
+                  <li key={p.slug}>
+                    <Link href={`/blog/${p.slug}`}>
+                      <span className="blog-related-link-title">
+                        {p.frontmatter.title}
+                      </span>
+                      <span className="blog-related-link-desc">
+                        {p.frontmatter.description}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          )}
+
           <div className="blog-cta-card">
             <h3>Liked this post?</h3>
             <p>

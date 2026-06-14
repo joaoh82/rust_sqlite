@@ -4,6 +4,7 @@ import { Benchmarks } from "@/components/benchmarks";
 import { Blog } from "@/components/blog";
 import { CTAStrip } from "@/components/cta-strip";
 import { Desktop } from "@/components/desktop";
+import { FAQ } from "@/components/faq";
 import { Features } from "@/components/features";
 import { Footer } from "@/components/footer";
 import { Hero } from "@/components/hero";
@@ -97,6 +98,7 @@ export default function Home() {
       <Benchmarks />
       <Desktop />
       <Blog />
+      <FAQ />
       <CTAStrip />
       <Footer />
     </>

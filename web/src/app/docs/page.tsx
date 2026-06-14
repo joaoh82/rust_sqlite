@@ -1,8 +1,28 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import type { ReactNode } from "react";
+import { DocsSearch } from "@/components/docs-search";
 import { Footer } from "@/components/footer";
+import { HelpfulVote } from "@/components/helpful-vote";
 import { Nav } from "@/components/nav";
 import { SITE } from "@/lib/site";
+
+// Section heading with a shareable `#` anchor link — keeps every h2 id
+// linkable for humans and quotable-with-anchor for AI tools.
+function H2({ id, children }: { id: string; children: ReactNode }) {
+  return (
+    <h2 id={id}>
+      {children}
+      <a
+        className="heading-anchor"
+        href={`#${id}`}
+        aria-label="Link to this section"
+      >
+        #
+      </a>
+    </h2>
+  );
+}
 
 // SEO targeting: primary "SQLRite documentation / getting started with the
 // embedded Rust database"; secondary "embedded database tutorial Rust",
@@ -126,7 +146,10 @@ export default function DocsPage() {
           <a href="#contributing">Contributing</a>
         </aside>
 
-        <main className="docs-main">
+        {/* data-pagefind-body scopes the Pagefind index to docs content;
+            pages without the attribute stay out of the search index. */}
+        <main className="docs-main" data-pagefind-body>
+          <DocsSearch />
           <span className="eyebrow">docs · getting started</span>
           <h1 style={{ marginTop: 18 }}>
             SQLRite docs — getting started with the embedded Rust database
@@ -143,7 +166,7 @@ export default function DocsPage() {
             same engine.
           </p>
 
-          <h2 id="install">Install</h2>
+          <H2 id="install">Install</H2>
           <p>
             SQLRite ships as a CLI binary, a Rust library, an MCP stdio server,
             and five language SDKs. Pick whichever matches your project:
@@ -177,7 +200,7 @@ export default function DocsPage() {
             unsigned until Phase 6.1 — see the README for first-launch steps.
           </div>
 
-          <h2 id="first-db">Your first database</h2>
+          <H2 id="first-db">Your first database</H2>
           <p>
             Create a file-backed database and run some SQL. Everything below
             works against an in-memory or on-disk database — the only
@@ -215,7 +238,7 @@ export default function DocsPage() {
             +----+-------+-----+
           </pre>
 
-          <h2 id="repl">Using the REPL</h2>
+          <H2 id="repl">Using the REPL</H2>
           <p>
             The REPL is built on rustyline and supports history, syntax
             highlighting, bracket matching, and multi-line input. Useful meta
@@ -249,7 +272,7 @@ export default function DocsPage() {
             lock — multiple read-only sessions can coexist on the same file.
           </p>
 
-          <h2 id="persistence">Persistence &amp; the WAL</h2>
+          <H2 id="persistence">Persistence &amp; the WAL</H2>
           <p>
             SQLRite stores each database as one <code>.sqlrite</code> file plus
             a sidecar <code>&lt;db&gt;.sqlrite-wal</code>. Pages are 4 KiB; rows
@@ -268,7 +291,7 @@ export default function DocsPage() {
             overrides any stale main-file header on reopen.
           </p>
 
-          <h2 id="transactions">Transactions</h2>
+          <H2 id="transactions">Transactions</H2>
           <p>
             SQLRite supports real <code>BEGIN</code> / <code>COMMIT</code> /{" "}
             <code>ROLLBACK</code> with snapshot isolation. Single level — no
@@ -289,7 +312,7 @@ export default function DocsPage() {
             </span>
           </pre>
 
-          <h2 id="joins">JOINs</h2>
+          <H2 id="joins">JOINs</H2>
           <p>
             All four SQL-standard JOIN flavors are supported with explicit{" "}
             <code>ON</code> conditions:{" "}
@@ -320,7 +343,7 @@ export default function DocsPage() {
             qualified keys (<code>GROUP BY customers.name</code>).
           </p>
 
-          <h2 id="aggregates">GROUP BY &amp; aggregates</h2>
+          <H2 id="aggregates">GROUP BY &amp; aggregates</H2>
           <p>
             <code>COUNT(*)</code>, <code>COUNT(col)</code>,{" "}
             <code>COUNT(DISTINCT col)</code>, <code>SUM</code>, <code>AVG</code>,{" "}
@@ -355,7 +378,7 @@ export default function DocsPage() {
             and requires <code>GROUP BY</code>.
           </p>
 
-          <h2 id="alter-drop">ALTER TABLE / DROP / VACUUM</h2>
+          <H2 id="alter-drop">ALTER TABLE / DROP / VACUUM</H2>
           <p>
             Schema evolution is one operation per statement (SQLite parity):
           </p>
@@ -376,7 +399,7 @@ export default function DocsPage() {
           </p>
           <pre><span className="kw">VACUUM</span>;</pre>
 
-          <h2 id="prepared">Prepared statements</h2>
+          <H2 id="prepared">Prepared statements</H2>
           <p>
             Every executable statement accepts <code>?</code> placeholders
             anywhere a value literal is allowed. The Rust API:
@@ -405,7 +428,7 @@ export default function DocsPage() {
             supported yet.
           </p>
 
-          <h2 id="pragma">PRAGMA</h2>
+          <H2 id="pragma">PRAGMA</H2>
           <p>
             <code>PRAGMA &lt;name&gt;;</code> reads, <code>PRAGMA &lt;name&gt; = &lt;value&gt;;</code>{" "}
             writes. The dispatcher is in place; the first wired pragma is{" "}
@@ -428,7 +451,7 @@ export default function DocsPage() {
             <code>execute_pragma</code>.
           </p>
 
-          <h2 id="vector">Vector search</h2>
+          <H2 id="vector">Vector search</H2>
           <p>
             SQLRite supports a <code>VECTOR(N)</code> column type with cosine,
             dot-product, and L2 distance. Build an HNSW index for sub-linear
@@ -453,7 +476,7 @@ export default function DocsPage() {
             <span className="num">10</span>;
           </pre>
 
-          <h2 id="fts">Full-text search</h2>
+          <H2 id="fts">Full-text search</H2>
           <p>
             Phase 8 ships an FTS5-style inverted index with BM25 scoring.{" "}
             <code>fts_match()</code> filters and <code>bm25_score()</code>{" "}
@@ -490,7 +513,7 @@ export default function DocsPage() {
             .
           </p>
 
-          <h2 id="desktop">Desktop app</h2>
+          <H2 id="desktop">Desktop app</H2>
           <p>
             The desktop client is a Svelte 5 + Tauri 2.0 GUI. Three-pane
             layout: header (file pickers), sidebar (tables + schema), and a
@@ -513,7 +536,7 @@ export default function DocsPage() {
             <span className="prompt">$</span> npm run tauri dev
           </pre>
 
-          <h2 id="mcp">MCP server</h2>
+          <H2 id="mcp">MCP server</H2>
           <p>
             <code>sqlrite-mcp</code> exposes a SQLRite database as a Model
             Context Protocol stdio server. Eight tools out of the box:{" "}
@@ -530,7 +553,7 @@ export default function DocsPage() {
             /path/to/app.sqlrite
           </pre>
 
-          <h2 id="sdk-rust">Rust crate</h2>
+          <H2 id="sdk-rust">Rust crate</H2>
           <pre>
             <span className="kw">use</span> sqlrite::Connection;{"\n\n"}
             <span className="kw">fn</span> main() -&gt; sqlrite::Result&lt;()&gt;
@@ -573,7 +596,7 @@ export default function DocsPage() {
             {"}"}
           </pre>
 
-          <h2 id="sdk-python">Python</h2>
+          <H2 id="sdk-python">Python</H2>
           <pre>
             <span className="kw">import</span> sqlrite{"\n\n"}
             <span className="kw">with</span> sqlrite.connect(
@@ -603,7 +626,7 @@ export default function DocsPage() {
             <span className="kw">print</span>(row)
           </pre>
 
-          <h2 id="sdk-node">Node.js</h2>
+          <H2 id="sdk-node">Node.js</H2>
           <pre>
             <span className="kw">import</span> {"{"} Database {"}"}{" "}
             <span className="kw">from</span>{" "}
@@ -630,7 +653,7 @@ export default function DocsPage() {
             ).all());
           </pre>
 
-          <h2 id="sdk-go">Go</h2>
+          <H2 id="sdk-go">Go</H2>
           <pre>
             <span className="kw">import</span> ({"\n"}
             {"    "}
@@ -664,7 +687,7 @@ export default function DocsPage() {
             );
           </pre>
 
-          <h2 id="sdk-c">C FFI</h2>
+          <H2 id="sdk-c">C FFI</H2>
           <p>
             The C ABI is stable and ships with a cbindgen-generated{" "}
             <code>sqlrite.h</code>. Opaque pointer types, thread-local
@@ -673,7 +696,7 @@ export default function DocsPage() {
             iteration).
           </p>
 
-          <h2 id="sdk-wasm">WASM</h2>
+          <H2 id="sdk-wasm">WASM</H2>
           <p>
             The engine compiles to a ~1.8 MB / 500 KB-gzipped WebAssembly
             module. Three <code>wasm-pack</code> targets (web, bundler,
@@ -694,7 +717,7 @@ export default function DocsPage() {
             );
           </pre>
 
-          <h2 id="supported">Supported SQL</h2>
+          <H2 id="supported">Supported SQL</H2>
           <p>
             The complete reference lives in <code>docs/supported-sql.md</code>{" "}
             in the repo. Quick summary:
@@ -763,7 +786,7 @@ export default function DocsPage() {
             </li>
           </ul>
 
-          <h2 id="errors">Errors &amp; limits</h2>
+          <H2 id="errors">Errors &amp; limits</H2>
           <p>
             Every malformed input path returns a typed{" "}
             <code>SQLRiteError</code> instead of panicking. Common error
@@ -797,7 +820,7 @@ export default function DocsPage() {
             readers OR a writer, never both at once).
           </div>
 
-          <h2 id="contributing">Contributing</h2>
+          <H2 id="contributing">Contributing</H2>
           <p>
             SQLRite welcomes pull requests. For larger changes open an issue
             first. The codebase is documented phase-by-phase in{" "}
@@ -815,7 +838,44 @@ export default function DocsPage() {
             </li>
           </ul>
 
-          <div className="docs-cta">
+          <div data-pagefind-ignore>
+            <H2 id="related">Related</H2>
+            <p>Keep going with the rest of the SQLRite surface:</p>
+            <ul>
+              <li>
+                <Link href="/playground">SQL playground</Link> — the full
+                engine compiled to WASM, runnable in your browser with sample
+                datasets and vector search
+              </li>
+              <li>
+                <Link href="/examples">Examples</Link> — runnable snippets per
+                language and use case
+              </li>
+              <li>
+                <Link href="/blog/sqlrite-vs-sqlite-benchmarks">
+                  SQLRite vs SQLite: honest benchmarks
+                </Link>{" "}
+                — where the engine stands on the twelve-workload bench suite
+              </li>
+              <li>
+                <Link href="/blog/adding-vector-search-with-hnsw">
+                  Adding vector search with HNSW
+                </Link>{" "}
+                — the design story behind <code>VECTOR(N)</code> and the HNSW
+                index
+              </li>
+              <li>
+                <a href={`${SITE.repo}/blob/main/docs/_index.md`}>
+                  Developer guide
+                </a>{" "}
+                — the in-repo deep dives: file format, pager, B-tree, MVCC
+              </li>
+            </ul>
+
+            <HelpfulVote />
+          </div>
+
+          <div className="docs-cta" data-pagefind-ignore>
             <a className="btn btn-primary" href={SITE.repo}>
               View on GitHub
             </a>

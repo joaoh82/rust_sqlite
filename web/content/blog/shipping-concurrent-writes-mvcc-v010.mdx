@@ -229,7 +229,7 @@ distinguished from page frames by the sentinel `page_num = u32::MAX`
 The frame body encodes the commit timestamp plus a record stream of
 the resolved write-set:
 
-```
+```text
 ┌────────┬────────┬─────────────────────────────────────────────────┐
 │ offset │ length │ content                                         │
 ├────────┼────────┼─────────────────────────────────────────────────┤
