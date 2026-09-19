@@ -275,8 +275,8 @@ against the engine, each with a code comment pointing here:
 | Constraint | Where it bites | How the collector handles it |
 |---|---|---|
 | **No parameter binding** in the Go driver | every write | All values are inlined through `internal/store/sqlquote.go`, the single chokepoint that escapes text (doubled `''`) and validates JSON. |
-| **`CREATE TABLE IF NOT EXISTS` not honored**; `sqlrite_master` not queryable | reopening a populated DB | `migrate()` probes for the `events` table with a `SELECT` and only runs DDL on a fresh database. |
-| **`CREATE INDEX` rejected under `journal_mode = mvcc`** | the optional index | All DDL runs in WAL mode *before* the MVCC switch; the index choice is fixed at DB-creation time. |
+| **`CREATE INDEX` has no `IF NOT EXISTS` under MVCC** | reopening a populated DB | Tables use `CREATE TABLE IF NOT EXISTS` on every startup (SQLR-10). The optional `idx_events_device` is created only when `sqlrite_master` does not already list it, in WAL mode, before the MVCC switch. |
+| **`CREATE INDEX` rejected under `journal_mode = mvcc`** | the optional index | Issued only when `sqlrite_master` does not already list `idx_events_device`, before the MVCC switch. Reopening with a different `-indexed` flag does not drop an existing index. |
 | **`BEGIN CONCURRENT` commit batch capped at 4 KiB** (the encoded row image, not just the SQL) | a large checkpoint, and any single oversized row | Two guards: event payloads are bounded at ingest (`maxPayloadBytes`, returns `400`) so any one row commits; and `CommitUpload` marks rows in adaptively-sized chunks that halve on a cap error down to one-per-commit (`writeAdaptive`). Relaxes the checkpoint from atomic to incremental → at-least-once delivery. |
 | **`AUTOINCREMENT` rowids collide under MVCC** | concurrent inserts | Event ids are assigned application-side from an atomic counter seeded off `MAX(id)` at open. |
 | **`IS NULL` never uses an index** | the backlog scan | `WHERE uploaded_at IS NULL` is a full scan by design — fine for a bounded edge buffer; the optional index is on `device_id` instead. |

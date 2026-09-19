@@ -321,6 +321,63 @@ func TestSerializedModeWrites(t *testing.T) {
 	}
 }
 
+// TestMigrateIdempotentFreshAndReopen is the SQLR-11 regression: CREATE
+// TABLE IF NOT EXISTS must be a no-op on reopen, and CREATE INDEX must
+// not be re-issued (it is rejected under persisted MVCC).
+func TestMigrateIdempotentFreshAndReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	for _, tc := range []struct {
+		name    string
+		mode    WriteMode
+		indexed bool
+	}{
+		{"concurrent-plain", Concurrent, false},
+		{"concurrent-indexed", Concurrent, true},
+		{"serialized-plain", Serialized, false},
+		{"serialized-indexed", Serialized, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".sqlrite")
+			st1, err := Open(ctx, Options{Path: path, Mode: tc.mode, Indexed: tc.indexed, MaxOpenConns: 4})
+			if err != nil {
+				t.Fatalf("fresh open: %v", err)
+			}
+			if _, err := st1.InsertEvent(ctx, ev("d", "k", 1)); err != nil {
+				st1.Close()
+				t.Fatalf("insert on fresh: %v", err)
+			}
+			if got := st1.indexExists(ctx, "idx_events_device"); got != tc.indexed {
+				st1.Close()
+				t.Fatalf("fresh indexExists = %v, want %v", got, tc.indexed)
+			}
+			if n := scalar(t, st1, "SELECT COUNT(*) FROM sqlrite_master WHERE type = 'table' AND name = 'events'"); n != 1 {
+				st1.Close()
+				t.Fatalf("events catalog count = %d, want 1", n)
+			}
+			if err := st1.Close(); err != nil {
+				t.Fatalf("close fresh: %v", err)
+			}
+
+			st2, err := Open(ctx, Options{Path: path, Mode: tc.mode, Indexed: tc.indexed, MaxOpenConns: 4})
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer st2.Close()
+			if _, err := st2.InsertEvent(ctx, ev("d", "k", 2)); err != nil {
+				t.Fatalf("insert on reopen: %v", err)
+			}
+			if got, err := st2.CountEvents(ctx); err != nil || got != 2 {
+				t.Fatalf("CountEvents after reopen = %d, err=%v, want 2", got, err)
+			}
+			if got := st2.indexExists(ctx, "idx_events_device"); got != tc.indexed {
+				t.Fatalf("reopen indexExists = %v, want %v", got, tc.indexed)
+			}
+		})
+	}
+}
+
 // --- helpers ---
 
 func scalar(t *testing.T, st *Store, q string) int64 {

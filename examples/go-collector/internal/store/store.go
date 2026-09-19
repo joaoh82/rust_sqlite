@@ -20,17 +20,14 @@
 //
 //   - No parameter binding in the Go SDK → values are inlined via the
 //     helpers in sqlquote.go.
-//   - migrate() probes for the events table with a SELECT and only runs
-//     DDL on a fresh database. NOTE: as of SQLR-10 the engine now honors
-//     `CREATE TABLE IF NOT EXISTS` and exposes a queryable `sqlrite_master`
-//     (and `PRAGMA table_list`), so the table-existence probe is no longer
-//     strictly required for table creation. We keep the fresh/reopen
-//     distinction because the `CREATE INDEX` below must NOT be re-issued on
-//     reopen (it's rejected once `journal_mode = mvcc`); the probe also
-//     keeps this example working against pre-SQLR-10 engine builds.
-//   - `CREATE INDEX` is rejected once `journal_mode = mvcc` → all DDL,
-//     including the optional secondary index, runs at migrate time
-//     before MVCC is switched on.
+//   - migrate() runs `CREATE TABLE IF NOT EXISTS` unconditionally (SQLR-10
+//     made that a no-op on reopen). The optional `CREATE INDEX` is still
+//     gated: it is rejected once `journal_mode = mvcc`, including on reopen
+//     of a DB that already switched, so we only issue it when
+//     `sqlrite_master` does not already list `idx_events_device`, and only
+//     before the MVCC switch below.
+//   - `CREATE INDEX` is rejected once `journal_mode = mvcc` → the optional
+//     secondary index runs at migrate time before MVCC is switched on.
 //   - A single BEGIN CONCURRENT commit batch is capped at 4 KiB → event
 //     payloads are bounded at ingest (see maxPayloadBytes) so any one
 //     row commits, and the uploader's checkpoint marks rows in
@@ -141,10 +138,10 @@ type Store struct {
 	devs  map[string]int64
 }
 
-// Open creates/opens the database, applies the schema on first use, and
-// (in Concurrent mode) switches the database into MVCC. DDL runs before
-// the MVCC switch because CREATE INDEX is rejected once
-// journal_mode = mvcc; see migrate for the fresh-vs-reopen detection.
+// Open creates/opens the database, applies the schema (idempotent
+// CREATE TABLE IF NOT EXISTS), and (in Concurrent mode) switches the
+// database into MVCC. The optional CREATE INDEX runs before the MVCC
+// switch and only when sqlrite_master does not already list it.
 func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.MaxOpenConns <= 0 {
 		opts.MaxOpenConns = 8
@@ -195,63 +192,56 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// migrate creates the schema on a fresh database and is a no-op on
-// reopen. What shapes this:
+// migrate applies the schema on every open. What shapes this:
 //
-//   - We detect a fresh database by probing for the events table with a
-//     cheap SELECT and only run DDL when it's absent. As of SQLR-10 the
-//     engine honors `CREATE TABLE IF NOT EXISTS` and exposes a queryable
-//     `sqlrite_master`, so the tables alone wouldn't need the probe — but
-//     see the next point.
-//   - `CREATE INDEX` is rejected once `journal_mode = mvcc`. All DDL
-//     (tables + the optional index) therefore runs on the fresh path,
-//     in WAL mode, *before* the MVCC switch. On reopen the index already
-//     exists, so we never re-issue it — which is why the fresh/reopen
-//     probe stays even though IF NOT EXISTS would cover the tables.
+//   - Tables use `CREATE TABLE IF NOT EXISTS` (SQLR-10). Running them
+//     on reopen is a no-op; there is no SELECT-to-probe workaround.
+//   - `CREATE INDEX` is rejected once `journal_mode = mvcc`, including
+//     on reopen of a DB that already switched. The optional index is
+//     therefore issued only when `sqlrite_master` does not already list
+//     `idx_events_device`, and only *before* the MVCC switch below.
 func (s *Store) migrate(ctx context.Context) error {
-	fresh := !s.tableExists(ctx, "events")
+	tables := []string{
+		`CREATE TABLE IF NOT EXISTS events (
+			id           INTEGER PRIMARY KEY,
+			device_id    TEXT NOT NULL,
+			kind         TEXT NOT NULL,
+			payload_json JSON,
+			ts           INTEGER NOT NULL,
+			uploaded_at  INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS devices (
+			id           INTEGER PRIMARY KEY,
+			device_key   TEXT NOT NULL,
+			label        TEXT,
+			last_seen_at INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS upload_runs (
+			id          INTEGER PRIMARY KEY,
+			started_at  INTEGER NOT NULL,
+			finished_at INTEGER,
+			event_count INTEGER NOT NULL,
+			status      TEXT NOT NULL,
+			error       TEXT
+		)`,
+	}
+	for _, q := range tables {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+	}
 
-	if fresh {
-		ddl := []string{
-			`CREATE TABLE events (
-				id           INTEGER PRIMARY KEY,
-				device_id    TEXT NOT NULL,
-				kind         TEXT NOT NULL,
-				payload_json JSON,
-				ts           INTEGER NOT NULL,
-				uploaded_at  INTEGER
-			)`,
-			`CREATE TABLE devices (
-				id           INTEGER PRIMARY KEY,
-				device_key   TEXT NOT NULL,
-				label        TEXT,
-				last_seen_at INTEGER
-			)`,
-			`CREATE TABLE upload_runs (
-				id          INTEGER PRIMARY KEY,
-				started_at  INTEGER NOT NULL,
-				finished_at INTEGER,
-				event_count INTEGER NOT NULL,
-				status      TEXT NOT NULL,
-				error       TEXT
-			)`,
-		}
-		if s.opts.Indexed {
-			// Single-column B-tree index (composite indexes are
-			// unsupported). Accelerates per-device diagnostic queries
-			// (`WHERE device_id = '...'`); the trade is extra index
-			// maintenance on every concurrent write, which the loadgen
-			// measures. The index choice is fixed at DB-creation time —
-			// reopening with a different -indexed flag does not add or
-			// drop it (we'd have to CREATE INDEX under MVCC, which the
-			// engine rejects).
-			ddl = append(ddl,
-				`CREATE INDEX idx_events_device ON events (device_id)`)
-		}
-		for _, q := range ddl {
-			if _, err := s.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("migrate: %w", err)
-			}
+	if s.opts.Indexed && !s.indexExists(ctx, "idx_events_device") {
+		// Single-column B-tree index (composite indexes are
+		// unsupported). Accelerates per-device diagnostic queries
+		// (`WHERE device_id = '...'`); the trade is extra index
+		// maintenance on every concurrent write, which the loadgen
+		// measures. Do not re-issue this on reopen: CREATE INDEX is
+		// rejected under MVCC, and SQLRite has no IF NOT EXISTS
+		// escape for indexes.
+		q := `CREATE INDEX idx_events_device ON events (device_id)`
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("migrate index: %w", err)
 		}
 	}
 
@@ -265,19 +255,18 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
-// tableExists probes for a table with a zero-row SELECT. This is how we
-// tell a fresh database from a reopened one so the MVCC-incompatible
-// `CREATE INDEX` only runs once. A query error (the engine returns
-// "Table '<name>' not found") means absent. (As of SQLR-10 the engine
-// also exposes `sqlrite_master` and `PRAGMA table_list` for catalog
-// introspection — either could back this probe on a current engine.)
-func (s *Store) tableExists(ctx context.Context, name string) bool {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s LIMIT 1", name))
-	if err != nil {
+// indexExists reports whether sqlrite_master already lists the named
+// index. Used to skip CREATE INDEX on reopen (SQLR-10 catalog).
+func (s *Store) indexExists(ctx context.Context, name string) bool {
+	q := fmt.Sprintf(
+		"SELECT name FROM sqlrite_master WHERE type = 'index' AND name = %s LIMIT 1",
+		quoteText(name),
+	)
+	var found string
+	if err := s.db.QueryRowContext(ctx, q).Scan(&found); err != nil {
 		return false
 	}
-	_ = rows.Close()
-	return true
+	return found != ""
 }
 
 // seed primes the atomic id counters and the backlog gauge from
