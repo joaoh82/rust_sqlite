@@ -599,6 +599,11 @@ fn col_eq(left_scope: &str, right_scope: &str, col: &str) -> Expr {
 // learning database" niche; a future phase could layer hash / merge
 // joins on equi-join shapes without changing the surface API.
 //
+// SQLR-4 — the nested loop used to clone the left row for every
+// right candidate (`N×M` heap allocs, most dropped on non-match).
+// A reused scratch vec now allocates only on matches (plus one
+// buffer per join fold). The algorithmic bound is unchanged.
+//
 // SQLR-6 — aggregates / GROUP BY / DISTINCT compose with joins: the
 // fully-joined row stream feeds the same scope-generic aggregation
 // pipeline the single-table path uses (Stage 3.5 below), and DISTINCT
@@ -759,18 +764,25 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
         // silently `NULL → false`-ing every row.
         let on_scope_tables: &[JoinedTableRef<'_>] = &joined_tables[..=right_pos];
 
+        // SQLR-4 — one scratch row for this join fold. Capacity is
+        // the eventual full join width so later folds do not grow
+        // the buffer; `len` is the in-scope width (`right_pos + 1`)
+        // so `JoinedScope` still sees only tables joined so far.
+        let mut scratch: Vec<Option<i64>> = Vec::with_capacity(joined_tables.len());
+
         for left_row in acc.into_iter() {
-            // Build a row prefix and extend it with each candidate
-            // right rowid; record whether any matched (for outer
-            // padding on the left side).
+            // Fill the left prefix once, then overwrite the trailing
+            // slot per right rowid. Non-matches no longer allocate.
             let mut left_match_count = 0usize;
+            scratch.clear();
+            scratch.extend_from_slice(&left_row);
+            scratch.push(None);
+            debug_assert_eq!(scratch.len(), on_scope_tables.len());
             for (r_idx, &rrid) in right_rowids.iter().enumerate() {
-                let mut on_rowids: Vec<Option<i64>> = left_row.clone();
-                on_rowids.push(Some(rrid));
-                debug_assert_eq!(on_rowids.len(), on_scope_tables.len());
+                scratch[right_pos] = Some(rrid);
                 let scope = JoinedScope {
                     tables: on_scope_tables,
-                    rowids: &on_rowids,
+                    rowids: &scratch,
                 };
                 // Reuse `eval_predicate_scope` so ON shares the same
                 // truthiness rule WHERE uses — non-zero integers are
@@ -785,7 +797,7 @@ fn execute_select_rows_joined(query: SelectQuery, db: &Database) -> Result<Selec
                     // as join levels processed so far; the next
                     // iteration extends them again. No trailing
                     // padding needed here.
-                    next_acc.push(on_rowids);
+                    next_acc.push(scratch.clone());
                 }
             }
 
